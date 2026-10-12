@@ -2,6 +2,7 @@
 
 #include "wallpaper_manager.h"
 
+#include "audio/audio_output.h"
 #include "config_preserve.h"
 #include "crash_record.h"
 #include "kept_rows.h"
@@ -157,6 +158,13 @@ std::chrono::nanoseconds intervalAtSpeed(const PictureTiming& picture, double sp
 // and each still drops one picture per round, so none stalls. Well under a 60 Hz frame.
 constexpr std::chrono::milliseconds kCatchUpSlice{4};
 
+// How far a heard video's sound may stray from its pictures before it is moved back to them. Well
+// inside what anyone notices, and far above the rounding in the picture schedule.
+constexpr std::chrono::milliseconds kSoundDrift{20};
+// The most pictures that catch a heard video up to its sound, shown at the rate cap: about a tenth of
+// a second. Pictures further behind move the sound instead.
+constexpr int kSoundCatchUpPictures = 12;
+
 // The pipeline's next picture, dropping one picture at a time on the way until `until`, and at least one.
 VideoPipeline::Decode decodeUntil(VideoPipeline& pipeline, SteadyTime until) {
     for (;;) {
@@ -194,7 +202,22 @@ WallpaperManager::WallpaperManager(Config config)
     : m_config(withCheckedTiming(std::move(config))),
       m_store(m_config.configFile),
       m_writer(m_store),
-      m_playing(m_config.stateDir) {
+      m_playing(m_config.stateDir),
+      m_audio(std::make_unique<AudioOutput>(
+          [](const std::string& line) {
+              std::fprintf(stderr, "wallpaperx-daemon: %s\n", sanitizeForLog(line, 1024, LogFraming::Bare).c_str());
+          },
+          // A track's tag is its session's blame line, so a death in its sound counts against the
+          // video as one in its pictures does.
+          [](const std::string& blame, const std::function<void()>& work) {
+              const PlayingBlame decoding(blame);
+              work();
+          },
+          // A parked session's lifetime rests on its sound being there, which only a round reads.
+          [this] {
+              std::lock_guard<std::mutex> lock(m_clockWakeMutex);
+              if (m_clockWake) m_clockWake();
+          })) {
     if (!m_store.enabled()) {
         // Ok, not Fail: this feeds a worst-wins aggregate, so Fail would make every daemon
         // that never opted in report itself broken.
@@ -2101,6 +2124,15 @@ bool WallpaperManager::watchedLocked(int monitorId, const MonitorState& state) c
     return now - *state.uncollectedSince < m_config.unwatchedAfter;
 }
 
+std::optional<SteadyTime> WallpaperManager::unwatchedAtLocked(const MonitorState& state) const {
+    // A credit already due holds until a picture spends it, which is an event of its own.
+    if (!state.uncollectedSince ||
+        (resumeCreditStands(state) && std::chrono::steady_clock::now() >= *state.resumeCredit.at)) {
+        return std::nullopt;
+    }
+    return *state.uncollectedSince + m_config.unwatchedAfter;
+}
+
 std::optional<uint64_t> WallpaperManager::currentSeqLocked(int monitorId, uint64_t wallpaperSeq) const {
     const auto it = m_monitors.find(monitorId);
     if (it == m_monitors.end() || !it->second.hasFrame || it->second.requestSeq != it->second.servicedSeq ||
@@ -2112,12 +2144,20 @@ std::optional<uint64_t> WallpaperManager::currentSeqLocked(int monitorId, uint64
     return it->second.requestSeq;
 }
 
-std::optional<uint64_t> WallpaperManager::playingSeqLocked(int monitorId, uint64_t wallpaperSeq) const {
-    const std::optional<uint64_t> current = currentSeqLocked(monitorId, wallpaperSeq);
-    if (!current || pausedLocked(monitorId)) return std::nullopt;
+WallpaperManager::Motion WallpaperManager::motionLocked(int monitorId, uint64_t wallpaperSeq) const {
     const auto it = m_monitors.find(monitorId);
-    if (!watchedLocked(monitorId, it->second)) return std::nullopt;
-    return current;
+    if (it == m_monitors.end() || !it->second.hasFrame || it->second.wallpaperSeq != wallpaperSeq ||
+        pausedLocked(monitorId) || !watchedLocked(monitorId, it->second)) {
+        return Motion::Stopped;
+    }
+    // A file with one picture is already showing all it has.
+    if (it->second.parkedWallpaperSeq == wallpaperSeq) return Motion::Parked;
+    return currentSeqLocked(monitorId, wallpaperSeq) ? Motion::Playing : Motion::RenderOwed;
+}
+
+std::optional<uint64_t> WallpaperManager::playingSeqLocked(int monitorId, uint64_t wallpaperSeq) const {
+    if (motionLocked(monitorId, wallpaperSeq) != Motion::Playing) return std::nullopt;
+    return m_monitors.at(monitorId).requestSeq;
 }
 
 bool WallpaperManager::recordDeliveredLocked(int monitorId, const std::string& client) noexcept {
@@ -2252,11 +2292,13 @@ WallpaperManager::VideoSession& WallpaperManager::videoSessionLocked(int monitor
 
     using Clock = decltype(VideoSession::clock);
     const Clock clock = startAt ? Clock(VideoSession::CatchingUp{}) : Clock(VideoSession::Undrawn{});
+    const std::optional<std::chrono::nanoseconds> average = pipeline->averageFrameInterval();
     const auto entry = m_videoSessions
                            .insert_or_assign(monitorId, VideoSession{wallpaperSeq, ++m_videoSessionUse, path,
                                                                      std::move(blame), std::move(pipeline), startAt,
                                                                      clock})
                            .first;
+    entry->second.slowedByCap = average && *average < kMinPictureInterval;
     {
         // A new session's readers are all new to it, and its play starts afresh. This is the only
         // place a session is made, so the only reset any of these needs.
@@ -2313,6 +2355,15 @@ WallpaperManager::VideoSession::OnScreen WallpaperManager::VideoSession::Waiting
     return OnScreen{timeline, std::max(timeline, previous.due + kMinPictureInterval)};
 }
 
+WallpaperManager::VideoSession::OnScreen WallpaperManager::VideoSession::Waiting::shownAt(
+    SteadyTime now, std::chrono::nanoseconds interval) const {
+    const OnScreen plan = planned();
+    // Late against `due`: under the picture-rate cap `timeline` trails on purpose. The trail is
+    // bounded to one interval so a long run at the cap banks no lag to be shown back to back.
+    if (now - plan.due <= interval) return {std::max(plan.timeline, plan.due - interval), plan.due};
+    return {now, now};
+}
+
 void WallpaperManager::markShown(VideoSession& session, SteadyTime now, double speed) {
     using Session = VideoSession;
     // Terminal for the schedule: what is on screen is what the session holds.
@@ -2320,13 +2371,112 @@ void WallpaperManager::markShown(VideoSession& session, SteadyTime now, double s
     Session::OnScreen shown{now, now};
     if (auto* waiting = std::get_if<Session::Waiting>(&session.clock)) {
         waiting->retime(now, speed);
-        const Session::OnScreen planned = waiting->planned();
-        // Late against `due`: under the picture-rate cap `timeline` trails on purpose. The trail is
-        // bounded to one interval so a long run at the cap banks no lag to be shown back to back.
-        const std::chrono::nanoseconds interval = intervalAtSpeed(session.pipeline->timing(), speed);
-        if (now - planned.due <= interval) shown = {std::max(planned.timeline, planned.due - interval), planned.due};
+        shown = waiting->shownAt(now, intervalAtSpeed(session.pipeline->timing(), speed));
     }
     session.clock = shown;
+}
+
+bool WallpaperManager::soundWanted(const VideoSession& session, const SoundWanted& wanted) {
+    // A file whose pictures the rate cap slows would need its sound stretched too.
+    return wanted.audible() && !session.slowedByCap;
+}
+
+AudioTrack* WallpaperManager::heardTrackLocked(int monitorId, VideoSession& session, const SoundWanted& wanted) {
+    if (!soundWanted(session, wanted)) {
+        if (session.audio) session.audio->stop();
+        return nullptr;
+    }
+    if (!session.audio) {
+        // What the sound server lists the stream as: the screen, which outlasts any one file.
+        std::string screen = "monitor " + std::to_string(monitorId);
+        {
+            std::lock_guard<std::mutex> stateLock(m_stateMutex);
+            for (const auto& [name, boundId] : m_outputs) {
+                if (boundId == monitorId) screen = name;
+            }
+        }
+        session.audio = m_audio->track(session.path, *session.blame, "Wallpaper on " + screen);
+    }
+    // Cubed, as desktop mixers do, so the slider's middle sounds like the middle.
+    session.audio->setVolume(wanted.volume * wanted.volume * wanted.volume);
+    return session.audio.get();
+}
+
+void WallpaperManager::steerSoundLocked(int monitorId, VideoSession& session, VideoSession::Waiting& waiting,
+                                        const SoundWanted& wanted, SteadyTime now) noexcept {
+    try {
+        const PictureTiming next = session.pipeline->timing();
+        AudioTrack* track = heardTrackLocked(monitorId, session, wanted);
+        if (track == nullptr) return;
+        if (!next.presentation) {
+            track->stop();
+            return;
+        }
+        const VideoSession::OnScreen planned = waiting.planned();
+        if (!track->anchor()) {
+            if (planned.due <= now) {
+                // Drawn this round, so heard from where markShown() puts it rather than on a schedule
+                // that stood still while play was stopped.
+                track->play({*next.presentation, waiting.shownAt(now, intervalAtSpeed(next, 1.0)).timeline});
+            } else if (!next.startsPass) {
+                track->play({*next.presentation - waiting.left, waiting.from});
+            } else if (waiting.reaches) {
+                // Sound starting on a pass's last picture plays the rest of that pass; the next round
+                // finds it off the new pass's schedule and hands it over.
+                track->play({*waiting.reaches - waiting.left, waiting.from});
+            } else {
+                track->play({*next.presentation, planned.timeline});
+            }
+            return;
+        }
+
+        // Where the picture schedule has the file: the waiting picture is `left` of the file's time
+        // after the moment `from`.
+        const AudioTrack::Anchor schedule{*next.presentation - waiting.left, waiting.from};
+        const AudioTrack::Anchor playing = *track->anchor();
+        // How far ahead of the pictures the sound is, in the file's time.
+        const std::chrono::nanoseconds lead = playing.from + (schedule.at - playing.at) - schedule.from;
+        if (std::chrono::abs(lead) <= kSoundDrift) return;
+        if (!next.startsPass) {
+            // Pictures held up, as markShown() lets a late one be, catch the sound up at the rate cap
+            // rather than have it play again what it has played -- while that takes few pictures.
+            if (lead > std::chrono::nanoseconds::zero() &&
+                lead <= kSoundCatchUpPictures * (ownInterval(next) - kMinPictureInterval)) {
+                waiting.from -= lead;
+                return;
+            }
+            track->play(schedule);
+            return;
+        }
+        // A new pass keeps the last one's sound until its own first picture is due, or until that
+        // sound reaches the pass's end where the two agree, so the loop does not move the sound.
+        SteadyTime passStarts = planned.timeline;
+        if (waiting.reaches) {
+            const SteadyTime soundReaches = playing.at + (*waiting.reaches - playing.from);
+            if (std::chrono::abs(soundReaches - planned.timeline) <= kSoundDrift) passStarts = soundReaches;
+        }
+        track->play({*next.presentation, passStarts});
+    } catch (const std::exception&) {
+        // Only making the track allocates. Without one the picture plays on silent, and the next
+        // round tries again.
+    }
+}
+
+AudioTrack* WallpaperManager::loopParkedSoundLocked(int monitorId, VideoSession& session, const SoundWanted& wanted,
+                                                   SteadyTime now) noexcept {
+    try {
+        AudioTrack* track = heardTrackLocked(monitorId, session, wanted);
+        if (track == nullptr) return nullptr;
+        // From the picture's time, which is where the file's sound starts too; nothing re-anchors it.
+        if (!track->anchor() || !track->anchor()->loop) {
+            const PictureTiming shown = session.pipeline->timing();
+            track->play({shown.presentation.value_or(std::chrono::nanoseconds::zero()), now, true});
+        }
+        return track;
+    } catch (const std::exception&) {
+        if (session.audio) session.audio->stop();
+        return nullptr;
+    }
 }
 
 uint64_t WallpaperManager::commitFrameLocked(MonitorState& state, const OffscreenTarget& target) {
@@ -2408,6 +2558,12 @@ void WallpaperManager::recordFailureLocked(MonitorState& state, const std::strin
     state.hasFrame = false;
 }
 
+void WallpaperManager::setClockWake(std::function<void()> wake) {
+    // Under the lock the output's thread calls it under, so once this returns the old one is not running.
+    std::lock_guard<std::mutex> lock(m_clockWakeMutex);
+    m_clockWake = std::move(wake);
+}
+
 ClockRound WallpaperManager::advanceVideo(SteadyTime now) {
     std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
     ClockRound round;
@@ -2470,6 +2626,22 @@ void WallpaperManager::reopenVideosLocked(SteadyTime now, bool freedSession, Clo
         // either opens a session or clears the frame, and both end this.
         bool owed = playingSeqLocked(monitorId, state.wallpaperSeq).has_value();
 
+        // Or a file whose one picture is on screen and whose sound would be heard, unless it has
+        // been found to have none. Once posted it owes that render, which ends this.
+        if (!owed && motionLocked(monitorId, state.wallpaperSeq) == Motion::Parked &&
+            state.requestSeq == state.servicedSeq &&
+            SoundWanted{soundHeardLocked(monitorId), playbackSpeed(state.properties), wallpaperVolume(state.properties)}
+                .audible()) {
+            using Why = MonitorState::NoSound::Why;
+            if (state.noSound.forSeq != state.wallpaperSeq) {
+                owed = true;
+            } else if (state.noSound.why == Why::Failed && playbackBudgetLocked(state).spend(Fault::Daemon)) {
+                // Spent here, so only another failure of the session this opens records one again.
+                state.noSound = {};
+                owed = true;
+            }
+        }
+
         // Or one that never got a session at all because of the daemon's own failure; a broken file
         // records the file's fault instead. Only in a round that freed a slot -- an open that fails
         // makes no session, so cannot free the one that brings it back -- and only while the budget
@@ -2497,21 +2669,60 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
     const uint64_t wallpaperSeq = session.wallpaperSeq;
     const bool resuming = std::holds_alternative<Session::CatchingUp>(session.clock);
 
+    Motion motion = Motion::Stopped;
     std::optional<uint64_t> playing;
     bool paused = false;
     // For the whole round: a change arriving meanwhile wakes the worker for another.
     double speed = 1.0;
+    SoundWanted sound;
+    // Sound that plays with no pictures has no picture deadline to bring the round that stops it.
+    std::optional<SteadyTime> unwatchedAt;
     {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        motion = motionLocked(monitorId, wallpaperSeq);
         playing = playingSeqLocked(monitorId, wallpaperSeq);
         paused = pausedLocked(monitorId);
+        sound.heard = soundHeardLocked(monitorId);
         if (const auto it = m_monitors.find(monitorId); it != m_monitors.end()) {
+            unwatchedAt = unwatchedAtLocked(it->second);
             speed = playbackSpeed(it->second.properties);
+            sound.volume = wallpaperVolume(it->second.properties);
             // Stopped play ends the stretch the next picture's time is counted from.
             if (!playing) it->second.cleanPlay.lastShown.reset();
         }
+        sound.speed = speed;
     }
-    if (!playing) {
+    // A parked session opened at the picture on screen holds no picture yet, and its sound starts
+    // from that picture's time, so it is decoded first, as a playing one would be.
+    const bool parkedCatchingUp = motion == Motion::Parked && resuming && soundWanted(session, sound);
+    if (!playing && !parkedCatchingUp) {
+        // A file whose one picture is on screen plays its sound alone, and its session is in use
+        // while it does. A render owed redraws this same video, so the sound plays on through it.
+        // Anything else stops the sound with the pictures; it starts again with the next one shown.
+        if (motion == Motion::Parked) {
+            using Content = AudioTrack::Content;
+            const AudioTrack* track = loopParkedSoundLocked(monitorId, session, sound, now);
+            // Null while wanted is a track that could not be made; null otherwise, a sound not to be
+            // heard, which the rate cap makes a lasting answer for this file.
+            const Content content = track != nullptr ? track->content()
+                                    : soundWanted(session, sound) ? Content::Failed
+                                    : Content::None;
+            if (content == Content::Unknown || content == Content::Sound) {
+                // The output wakes a round when the content changes, which is when this is asked again.
+                session.idleSince.reset();
+                return unwatchedAt;
+            }
+            if (sound.audible()) {
+                using Why = MonitorState::NoSound::Why;
+                std::lock_guard<std::mutex> stateLock(m_stateMutex);
+                const auto it = m_monitors.find(monitorId);
+                if (it != m_monitors.end() && it->second.wallpaperSeq == wallpaperSeq) {
+                    it->second.noSound = {wallpaperSeq, content == Content::Failed ? Why::Failed : Why::Silent};
+                }
+            }
+        }
+        const bool soundPlays = motion == Motion::RenderOwed && soundWanted(session, sound) && session.audio;
+        if (!soundPlays && session.audio) session.audio->stop();
         // Stopped, for whatever reason: paused, nobody can see it, a render is owed, its file held
         // one picture. The picture on screen stays where it is -- nothing here touches the frame --
         // and all this decides is how long the decoder and its picture pool are kept against playing
@@ -2523,11 +2734,10 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
         if (!session.idleSince) session.idleSince = now;
         const SteadyTime releaseAt =
             *session.idleSince + (paused ? m_config.pausedSessionRelease : m_config.idleSessionRelease);
-        if (now < releaseAt) return releaseAt;
+        if (now < releaseAt) return soundPlays && unwatchedAt ? std::min(releaseAt, *unwatchedAt) : releaseAt;
         releaseVideoSessionLocked(monitorId);
         return std::nullopt;
     }
-    const uint64_t seq = *playing;
     session.idleSince.reset();
 
     try {
@@ -2540,6 +2750,11 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
             if (step == Decode::Dropping) return now;
             if (step == Decode::Exhausted) {
                 throw WallpaperContentError(describeRejection("VideoPipeline", "no picture could be decoded", session.path));
+            }
+            // Parked: the picture is the one on screen, and the next round starts its sound.
+            if (!playing) {
+                session.clock = Session::Undrawn{};
+                return now;
             }
             // Drawn like a render's first picture, though it is usually the one on screen already: the
             // start may have given its position up for an earlier picture.
@@ -2575,11 +2790,15 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
                 }
                 return now;
             }
-            session.clock = Session::Waiting{shown, shown.timeline, gapBetween(before, after), speed};
+            const std::chrono::nanoseconds gap = gapBetween(before, after);
+            std::optional<std::chrono::nanoseconds> reaches;
+            if (before.presentation) reaches = *before.presentation + gap;
+            session.clock = Session::Waiting{shown, shown.timeline, gap, speed, reaches};
         }
         // Every draw below passes here first, so what it reads is timed at this round's speed.
         if (auto* waiting = std::get_if<Session::Waiting>(&session.clock)) {
             waiting->retime(now, speed);
+            steerSoundLocked(monitorId, session, *waiting, sound, now);
             if (const SteadyTime due = waiting->planned().due; due > now) return due;
         }
 
@@ -2604,7 +2823,7 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
             // Asked again with a fresh reading, since the decode above may have crossed the moment
             // this monitor stopped being watched. `now`, not nothing, for the park branch's reason:
             // a session that stops here has nothing else scheduled to start its idle countdown.
-            if (it == m_monitors.end() || playingSeqLocked(monitorId, wallpaperSeq) != seq) {
+            if (it == m_monitors.end() || playingSeqLocked(monitorId, wallpaperSeq) != playing) {
                 if (it != m_monitors.end()) it->second.cleanPlay.lastShown.reset();
                 return now;
             }

@@ -123,10 +123,13 @@ endfunction()
 # is a dbus-run-session, what its private-bus runs leave in /tmp and the paths they accept
 # (test_isolation_wrapper_tmp). Needs the wallpaperx-wrapper-probe target (renderer/CMakeLists.txt).
 function(wallpaperx_add_isolation_wrapper_tests)
+    get_filename_component(_wx_sound_test "${WALLPAPERX_ISOLATION_SUPPORT_DIR}/../../../backend/tests/audio_playback_test.cpp"
+                           ABSOLUTE)
     wallpaperx_add_test(NAME test_isolation_wrapper
                         COMMAND ${CMAKE_COMMAND} -DWRAPPER=${WALLPAPERX_ISOLATED_RUN}
                                 -DCONF=${WALLPAPERX_ISOLATED_SESSION_CONF}
                                 -DPROBE=$<TARGET_FILE:wallpaperx-wrapper-probe>
+                                -DSOUND_TEST_SOURCE=${_wx_sound_test}
                                 -P ${WALLPAPERX_ISOLATION_SUPPORT_DIR}/isolation_wrapper_test.cmake)
     set_tests_properties(test_isolation_wrapper PROPERTIES LABELS "novulkan")
     get_filename_component(_wx_ci_file "${WALLPAPERX_ISOLATION_SUPPORT_DIR}/../../../.github/workflows/ci.yml" ABSOLUTE)

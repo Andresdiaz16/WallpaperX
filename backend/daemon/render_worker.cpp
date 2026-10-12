@@ -12,11 +12,14 @@
 namespace wallpaperx {
 
 RenderWorker::RenderWorker(WallpaperManager& manager, FrameReadyFn onFrameReady)
-    : m_manager(manager), m_onFrameReady(std::move(onFrameReady)), m_thread([this] { run(); }) {}
+    : m_manager(manager), m_onFrameReady(std::move(onFrameReady)), m_thread([this] { run(); }) {
+    m_manager.setClockWake([this] { wake(); });
+}
 
 RenderWorker::~RenderWorker() { stop(); }
 
 void RenderWorker::stop() {
+    m_manager.setClockWake({});
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_stop = true;

@@ -117,6 +117,13 @@ bool wallpaperMuted(const WallpaperProperties& properties) {
     return mute != nullptr && *mute;
 }
 
+float wallpaperVolume(const WallpaperProperties& properties) {
+    const auto it = properties.find(kVolume);
+    const double* volume = it == properties.end() ? nullptr : std::get_if<double>(&it->second);
+    if (volume == nullptr || !std::isfinite(*volume)) return 1.0f;
+    return static_cast<float>(std::clamp(*volume, 0.0, 1.0));
+}
+
 nlohmann::json toJson(const WallpaperProperties& properties) {
     nlohmann::json object = nlohmann::json::object();
     for (const auto& [key, value] : properties) object[key] = toJson(value);

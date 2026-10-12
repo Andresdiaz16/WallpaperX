@@ -229,6 +229,79 @@ if(NOT o MATCHES "RAN" OR NOT layers STREQUAL want_layers OR NOT implicit STREQU
          "wanted '${want_layers}'; VK_ADD_IMPLICIT_LAYER_PATH='${implicit}'; VK_ADD_DRIVER_FILES='${drivers}')")
 endif()
 
+# ---- no way to the caller's sound server --------------------------------------------------------
+# GOAL: a caller whose environment names its PipeWire or PulseAudio server -- a socket, a runtime
+#       directory, a cookie, a config or module directory -- hands none of it to the entry, so a
+#       daemon under test that plays sound can reach only a server inside its private runtime directory.
+# WHY-THIS-SHAPE: every name set to a decoy under the made-up caller's runtime directory and looked
+#       for by name AND by value, so a renamed copy (PIPEWIRE_REMOTE kept as another variable) is red too.
+#       The end-to-end half -- the daemon's sound engine not connecting to a listening decoy -- is the
+#       audio_isolation entry's.
+# CONTROL: via control_run.sh 2026-10-11, reverted: the sound-server `unset` in
+#       renderer/tests/support/isolated_run.sh deleted -> "FAIL: the caller's sound-server variables do not
+#       reach the entry (PIPEWIRE_RUNTIME_DIR=...".
+# The names are the wrapper's own `unset` statement under its sound-server comment, read from the script,
+# so the list has one source; audio_playback_test's kSoundServerVariables must hold the same names.
+# GOAL: S15.541 -- the sound-server variables this case decoys, the ones the wrapper unsets and the ones
+#       audio_playback_test refuses to run with are one list. False if a name is added to one copy only.
+# WHY-THIS-SHAPE: parsed, not written out a third time; a parse that finds nothing fails, so a moved
+#       comment or reshaped statement cannot empty the loop below and leave this case vacuous.
+# CONTROL: via control_run.sh 2026-10-11, reverted, in renderer/tests/support/isolated_run.sh: PIPEWIRE_LATENCY
+#       added to the unset -> "FAIL: audio_playback_test's kSoundServerVariables is isolated_run.sh's
+#       sound-server unset list"; the comment above the unset reworded -> "FAIL: the sound-server variables
+#       read from ...'s unset statement include PIPEWIRE_RUNTIME_DIR (found '')", and each other required name.
+file(READ "${WRAPPER}" wrapper_text)
+string(REGEX MATCH "# What leads a sound client[^\n]*\n(#[^\n]*\n)*unset ([^\n]*\\\\\n)*[^\n]*" sound_unset "${wrapper_text}")
+string(REGEX REPLACE "^.*\nunset " "" sound_unset "${sound_unset}")
+string(REGEX REPLACE "[\\\\ \t\n]+" ";" sound_vars "${sound_unset}")
+list(REMOVE_ITEM sound_vars "")
+# GOAL: S15.541, second clause -- the names that lead a client straight to a server are always in that
+#       list, so the script and the array cannot drop one together with the suite green.
+# WHY-THIS-SHAPE: a short required set, not the whole list a third time; an empty parse misses every name.
+# CONTROL: via control_run.sh 2026-10-11, reverted: PULSE_SERVER taken out of both isolated_run.sh's unset
+#       and kSoundServerVariables -> "FAIL: the sound-server variables read from ...'s unset statement include
+#       PULSE_SERVER".
+foreach(required PIPEWIRE_RUNTIME_DIR PIPEWIRE_REMOTE PIPEWIRE_CORE PULSE_SERVER USERPROFILE)
+    if(NOT required IN_LIST sound_vars)
+        fail("the sound-server variables read from ${WRAPPER}'s unset statement include ${required} (found '${sound_vars}')")
+    endif()
+endforeach()
+if(NOT DEFINED SOUND_TEST_SOURCE OR NOT EXISTS "${SOUND_TEST_SOURCE}")
+    fail("audio_playback_test's source is given to this check (-DSOUND_TEST_SOURCE='${SOUND_TEST_SOURCE}')")
+else()
+    file(READ "${SOUND_TEST_SOURCE}" sound_test_text)
+    string(REGEX MATCH "kSoundServerVariables\\[\\] = {[^}]*}" sound_array "${sound_test_text}")
+    string(REGEX MATCHALL "\"[A-Z_]+\"" test_vars "${sound_array}")
+    string(REPLACE "\"" "" test_vars "${test_vars}")
+    set(script_sorted ${sound_vars})
+    list(SORT script_sorted)
+    list(SORT test_vars)
+    if(NOT script_sorted STREQUAL test_vars)
+        fail("audio_playback_test's kSoundServerVariables is isolated_run.sh's sound-server unset list (script: "
+             "'${script_sorted}'; test: '${test_vars}')")
+    endif()
+endif()
+set(decoy "${caller_runtime}/decoy-sound-server")
+set(sound_env "")
+foreach(var IN LISTS sound_vars)
+    list(APPEND sound_env "${var}=${decoy}-${var}")
+endforeach()
+run_wrapper(o rc "${sound_env}" bus ${show})
+math(EXPR cases "${cases} + 1")
+set(leaked_sound "")
+foreach(var IN LISTS sound_vars)
+    value_of("${o}" ${var} got)
+    if(NOT got STREQUAL "")
+        list(APPEND leaked_sound "${var}=${got}")
+    endif()
+endforeach()
+if(o MATCHES "decoy-sound-server")
+    list(APPEND leaked_sound "a decoy path under another name")
+endif()
+if(NOT o MATCHES "RAN" OR NOT leaked_sound STREQUAL "")
+    fail("the caller's sound-server variables do not reach the entry (${leaked_sound}; ran: ${rc})")
+endif()
+
 # ---- the Qt platform ----------------------------------------------------------------------------
 run_wrapper(o rc "QT_QPA_PLATFORM=offscreen" display ${show})
 math(EXPR cases "${cases} + 1")
@@ -373,8 +446,8 @@ endif()
 
 file(REMOVE_RECURSE "${root}")
 message("test_isolation_wrapper: ${cases} case(s) run")
-if(NOT cases EQUAL 15)
-    fail("15 cases were expected to run, ${cases} did")
+if(NOT cases EQUAL 16)
+    fail("16 cases were expected to run, ${cases} did")
 endif()
 if(failures GREATER 0)
     message(FATAL_ERROR "test_isolation_wrapper: ${failures} failure(s)")

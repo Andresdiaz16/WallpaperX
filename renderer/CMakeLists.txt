@@ -26,10 +26,12 @@ pkg_check_modules(SHADERC  REQUIRED shaderc)
 # ffmpeg — decode for the video renderer. libavcodec decodes into the Vulkan device
 # this renderer already owns (AVVulkanDeviceContext takes an existing VkDevice and
 # returns VkImages), which is why no second GPU context is needed for video.
+# libswresample brings a video's sound to the one format its PipeWire stream takes.
 pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET
     libavcodec>=61
     libavformat>=61
     libavutil>=59
+    libswresample>=5
 )
 
 # VulkanMemoryAllocator — vendored single header
@@ -87,10 +89,13 @@ add_library(wallpaperx-renderer STATIC
     vulkan/format_features.cpp
     renderers/static_renderer.cpp
     renderers/video_renderer.cpp
+    video/ffmpeg_file.cpp
     video/video_decoder.cpp
     video/reset_point.cpp
     video/frame_converter.cpp
     video/video_pipeline.cpp
+    audio/audio_decoder.cpp
+    audio/audio_output.cpp
 )
 
 target_include_directories(wallpaperx-renderer
@@ -99,6 +104,8 @@ target_include_directories(wallpaperx-renderer
         ${Vulkan_INCLUDE_DIRS}
         ${STB_INCLUDE_DIR}
         ${VMA_INCLUDE_DIR}
+    PRIVATE
+        ${PIPEWIRE_INCLUDE_DIRS}
 )
 
 target_link_libraries(wallpaperx-renderer

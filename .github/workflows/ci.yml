@@ -31,7 +31,7 @@ jobs:
             build-essential cmake ninja-build pkg-config \
             libvulkan-dev vulkan-validation-layers mesa-vulkan-drivers \
             glslc libshaderc-dev \
-            libavcodec-dev libavformat-dev libavutil-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libswresample-dev \
             libswscale-dev ffmpeg \
             libpipewire-0.3-dev libfftw3-dev \
             libstb-dev nlohmann-json3-dev \
@@ -99,7 +99,7 @@ jobs:
             build-essential cmake ninja-build pkg-config git \
             libvulkan-dev vulkan-validation-layers mesa-vulkan-drivers \
             glslc libshaderc-dev \
-            libavcodec-dev libavformat-dev libavutil-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libswresample-dev \
             libswscale-dev ffmpeg \
             libpipewire-0.3-dev libfftw3-dev \
             libstb-dev nlohmann-json3-dev \

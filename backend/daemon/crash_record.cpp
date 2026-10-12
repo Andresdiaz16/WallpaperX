@@ -53,14 +53,15 @@ std::atomic<int> g_fd{-1};
 std::atomic<pid_t> g_tid{0};
 char g_path[PATH_MAX] = {};
 
-// The playing record's descriptor, -1 while none is open; claimed by compare-exchange. And the
-// video a thread is working on: its blame line and that thread. The line is stored after the
-// thread and withdrawn before it is freed, both by the thread itself, so a handler on that thread
-// reading it sees a live string, and one on any other thread sees a thread id that is not its own.
+// The playing record's descriptor, -1 while none is open; claimed by compare-exchange.
 constexpr int kPlayingClaimed = -2;  // a record owns the slot but has no descriptor to write to
 std::atomic<int> g_playingFd{-1};
-std::atomic<const std::string*> g_blame{nullptr};
-std::atomic<pid_t> g_blameTid{0};
+
+// The blame line of the video this thread is working on. Per thread, so the render thread and the
+// audio thread each name their own; only the owning thread writes it, so the handler on that
+// thread sees a live string. Constant-initialized and initial-exec: the handler's read then runs
+// no TLS initializer and no __tls_get_addr, neither of which is async-signal-safe.
+[[gnu::tls_model("initial-exec")]] constinit thread_local std::atomic<const std::string*> t_blame{nullptr};
 
 // Set by stopBlamingWallpapers(). Sequentially consistent against g_slot's publish, so a record
 // being constructed as it is set is seen by one side or the other and removed.
@@ -116,10 +117,10 @@ void unlinkPublished(uint64_t generation) {
 // Everything here is async-signal-safe: the records were formatted in advance, so this only
 // writes to open descriptors, or unlinks a path already spelled out.
 void onFatalSignal(int sig, siginfo_t* info, void* context) {
-    const std::string* blame = g_blame.load(std::memory_order_acquire);
+    const std::string* blame = t_blame.load(std::memory_order_acquire);
     const int playingFd = g_playingFd.load(std::memory_order_acquire);
     const bool blameless = g_blameless.load();
-    if (!blameless && blame != nullptr && playingFd >= 0 && ::gettid() == g_blameTid.load(std::memory_order_acquire)) {
+    if (!blameless && blame != nullptr && playingFd >= 0) {
         const ssize_t ignored = ::write(playingFd, blame->data(), blame->size());
         (void)ignored;
         writeSignalLine(playingFd, sig);
@@ -433,23 +434,13 @@ void PlayingRecord::end() {
     if (mine >= 0) g_playingFd.compare_exchange_strong(mine, kPlayingClaimed, std::memory_order_acq_rel);
 }
 
-PlayingBlame::PlayingBlame(const std::string& line)
-    : m_previous(g_blame.load(std::memory_order_relaxed)), m_previousTid(g_blameTid.load(std::memory_order_relaxed)) {
+PlayingBlame::PlayingBlame(const std::string& line) : m_previous(t_blame.load(std::memory_order_relaxed)) {
     // An empty line names nothing, and so blames nothing an outer guard names either: the thread is
     // working on this video now, and it cannot be recorded.
-    if (line.empty()) {
-        g_blame.store(nullptr, std::memory_order_release);
-        return;
-    }
-    g_blameTid.store(::gettid(), std::memory_order_release);
-    g_blame.store(&line, std::memory_order_release);
+    t_blame.store(line.empty() ? nullptr : &line, std::memory_order_release);
 }
 
-PlayingBlame::~PlayingBlame() {
-    g_blame.store(nullptr, std::memory_order_release);
-    g_blameTid.store(m_previousTid, std::memory_order_release);
-    g_blame.store(m_previous, std::memory_order_release);
-}
+PlayingBlame::~PlayingBlame() { t_blame.store(m_previous, std::memory_order_release); }
 
 ApplyingRecord::ApplyingRecord(const std::filesystem::path& stateDir, int monitorId, const std::string& type,
                                const std::string& path) {

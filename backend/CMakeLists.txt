@@ -901,8 +901,103 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         COMMENT "Generating video wallpaper fixture wallpaper_4k_long_gop.mp4"
         VERBATIM
     )
+    # Two seconds of 160x120 pictures at 30 a second with an AAC stereo sound track at 48 kHz, for
+    # audio_playback_test. `beeps`: a 40 ms 1 kHz beep at 0.5 amplitude every half second, so each
+    # beep's heard time can be set against the picture at its timestamp; `tone`: a 440 Hz tone, a whole
+    # number of cycles long, so a loop that plays correctly has no gap and no dip; `beeps_short_audio`:
+    # the beeps with the sound ending 50 ms before the pictures; `beeps_long`: twelve seconds, the beeps on
+    # the left and a 440 Hz tone at 0.3 on the right, for checks that must finish before a loop could
+    # re-anchor the sound and that need a stretch with no sound told from a quiet one; `tone_slow`: the
+    # tone under one picture every two seconds, so a round runs only when something wakes the worker;
+    # `beeps_slow`: beeps_long's sound under those slow pictures, so a beep can be set against a picture
+    # that stays on screen for two seconds; `tone_rate240` and `tone_rate120`: the tone under pictures
+    # above and at the daemon's 120-a-second cap; `one_picture_tone`: one picture and three seconds of
+    # the tone, a file that plays its sound alone.
+    # Quoted so the commas stay in the filter. Fields, '@'-separated: name, sound, sound length,
+    # picture length, pictures a second.
+    foreach(sound
+            "wallpaper_beeps.mp4@0.5*sin(2*PI*1000*t)*lt(mod(t,0.5),0.04)@2@2@30"
+            "wallpaper_tone.mp4@0.5*sin(2*PI*440*t)@2@2@30"
+            "wallpaper_beeps_short_audio.mp4@0.5*sin(2*PI*1000*t)*lt(mod(t,0.5),0.04)@1.95@2@30"
+            "wallpaper_beeps_long.mp4@0.5*sin(2*PI*1000*t)*lt(mod(t,0.5),0.04)|0.3*sin(2*PI*440*t)@12@12@30"
+            "wallpaper_tone_slow.mp4@0.5*sin(2*PI*440*t)@10@10@0.5"
+            "wallpaper_beeps_slow.mp4@0.5*sin(2*PI*1000*t)*lt(mod(t,0.5),0.04)|0.3*sin(2*PI*440*t)@10@10@0.5"
+            "wallpaper_tone_rate240.mp4@0.5*sin(2*PI*440*t)@4@4@240"
+            "wallpaper_tone_rate120.mp4@0.5*sin(2*PI*440*t)@4@4@120"
+            "wallpaper_one_picture_tone.mp4@0.5*sin(2*PI*440*t)@3@1@1")
+        string(REPLACE "@" ";" sound "${sound}")
+        list(GET sound 0 sound_name)
+        list(GET sound 1 sound_expr)
+        list(GET sound 2 sound_length)
+        list(GET sound 3 picture_length)
+        list(GET sound 4 picture_rate)
+        add_custom_command(
+            OUTPUT ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/${sound_name}
+            COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error
+                    -f lavfi -i color=c=gray:size=160x120:rate=${picture_rate}:duration=${picture_length}
+                    -f lavfi -i "aevalsrc=exprs='${sound_expr}':s=48000:d=${sound_length}"
+                    -c:v libx264 -profile:v baseline -g 30 -pix_fmt yuv420p
+                    -c:a aac -b:a 128k -ar 48000 -ac 2
+                    ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/${sound_name}
+            COMMENT "Generating video wallpaper fixture ${sound_name}"
+            VERBATIM
+        )
+        list(APPEND WALLPAPERX_BACKEND_SOUND_ASSETS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/${sound_name})
+    endforeach()
+    # Two seconds of the tone in the other containers a wallpaper's sound may come in, for
+    # audio_playback_test's seek to the start. Fields, '@'-separated: name, picture codec, sound codec.
+    foreach(container
+            "wallpaper_seek_mp3.avi@mpeg4@libmp3lame"
+            "wallpaper_seek_aac.flv@libx264@aac"
+            "wallpaper_seek_aac.mkv@libx264@aac"
+            "wallpaper_seek_aac.ts@libx264@aac"
+            "wallpaper_seek_opus.webm@libvpx-vp9@libopus"
+            "wallpaper_seek_vorbis.webm@libvpx-vp9@libvorbis"
+            "wallpaper_seek_vorbis.ogv@libtheora@libvorbis")
+        string(REPLACE "@" ";" container "${container}")
+        list(GET container 0 container_name)
+        list(GET container 1 picture_codec)
+        list(GET container 2 sound_codec)
+        add_custom_command(
+            OUTPUT ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/${container_name}
+            COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error
+                    -f lavfi -i color=c=gray:size=160x120:rate=30:duration=2
+                    -f lavfi -i "aevalsrc=exprs='0.5*sin(2*PI*440*t)':s=48000:d=2"
+                    -c:v ${picture_codec} -pix_fmt yuv420p -c:a ${sound_codec} -ac 2
+                    ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/${container_name}
+            COMMENT "Generating video wallpaper fixture ${container_name}"
+            VERBATIM
+        )
+        list(APPEND WALLPAPERX_BACKEND_SOUND_ASSETS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/${container_name})
+    endforeach()
+    # Two seconds of a moving pattern with B-frames (-bf 3), over twice ffmpeg's 32 KiB read buffer, so a
+    # read after a seek reaches the file. B-frames give its first packet a presentation time apart from
+    # its decode time, so a rewind has a second seek to try, and its pass ends on a read that fails at
+    # the end of the file. Not noise: on noise x264 makes no B-frames however it is asked. No sound track.
+    add_custom_command(
+        OUTPUT ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_reads_bframes.mp4
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error
+                -f lavfi -i testsrc2=s=320x240:r=30:d=2
+                -c:v libx264 -pix_fmt yuv420p -preset veryfast -bf 3
+                ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_reads_bframes.mp4
+        COMMENT "Generating video wallpaper fixture wallpaper_reads_bframes.mp4"
+        VERBATIM
+    )
+    list(APPEND WALLPAPERX_BACKEND_SOUND_ASSETS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_reads_bframes.mp4)
+    # Exactly 16384 frames of 48 kHz stereo, one fill of the sound engine: the first fill takes it whole
+    # without meeting its end.
+    add_custom_command(
+        OUTPUT ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/sound_16384_frames.wav
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error
+                -f lavfi -i "sine=f=440:r=48000" -af "atrim=end_sample=16384,volume=2" -ac 2 -c:a pcm_s16le
+                ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/sound_16384_frames.wav
+        COMMENT "Generating sound fixture sound_16384_frames.wav"
+        VERBATIM
+    )
+    list(APPEND WALLPAPERX_BACKEND_SOUND_ASSETS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/sound_16384_frames.wav)
     add_custom_target(wallpaperx-backend-video-fixtures
-                      DEPENDS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_4k_long_gop.mp4
+                      DEPENDS ${WALLPAPERX_BACKEND_SOUND_ASSETS}
+                              ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_4k_long_gop.mp4
                               ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_rate240.mp4
                               ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_bands.mp4
                               ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_one_picture.mp4
@@ -943,6 +1038,33 @@ endif()
 if(WALLPAPERX_HAVE_FRAME_IMPORT)
     target_link_libraries(wallpaperx-video-wallpaper-test PRIVATE wallpaperx-frame-import)
     target_compile_definitions(wallpaperx-video-wallpaper-test PRIVATE WALLPAPERX_HAVE_FRAME_IMPORT=1)
+endif()
+
+# A video's sound (Step 15 chunk 5c): the decoder alone, the output against a private PipeWire the
+# test starts in its entry's own runtime directory, the manager's steering of it, and fatal signals
+# on the sound thread. It interposes pw_stream_new/connect/queue_buffer, swr_convert/swr_free and
+# av_find_best_stream, so
+# it needs libpipewire's headers and dlsym. Without a pipewire binary the sound phases skip.
+find_program(WALLPAPERX_PIPEWIRE_EXECUTABLE pipewire DOC "The private sound server audio_playback_test starts")
+pkg_check_modules(WALLPAPERX_TEST_PIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3)
+add_executable(wallpaperx-audio-playback-test tests/audio_playback_test.cpp)
+# libswresample comes with the renderer, through wallpaperx-daemon-lib.
+target_link_libraries(wallpaperx-audio-playback-test PRIVATE wallpaperx-daemon-lib
+    PkgConfig::WALLPAPERX_TEST_PIPEWIRE ${CMAKE_DL_LIBS})
+target_include_directories(wallpaperx-audio-playback-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests ${CMAKE_CURRENT_SOURCE_DIR}/../renderer)
+set_target_properties(wallpaperx-audio-playback-test PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+if(WALLPAPERX_PIPEWIRE_EXECUTABLE)
+    set(_wx_pipewire "${WALLPAPERX_PIPEWIRE_EXECUTABLE}")
+else()
+    set(_wx_pipewire "")
+endif()
+target_compile_definitions(wallpaperx-audio-playback-test PRIVATE
+    WALLPAPERX_VIDEO_ASSET_DIR="${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}"
+    WALLPAPERX_PIPEWIRE_BINARY="${_wx_pipewire}"
+    WALLPAPERX_PRIVATE_PIPEWIRE_CONF="${CMAKE_CURRENT_SOURCE_DIR}/tests/private_pipewire.conf")
+if(WALLPAPERX_FFMPEG_EXECUTABLE)
+    add_dependencies(wallpaperx-audio-playback-test wallpaperx-backend-video-fixtures)
 endif()
 
 # The HTTP tier reads the same clip, for the one thing only it can answer: what /health says about a
@@ -1445,6 +1567,36 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
             RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
     endif()
+
+    # A video's sound. The shared lock because its checks time sound against pictures to a few
+    # milliseconds; SKIP_RETURN_CODE for a host with no ffmpeg command line, no pipewire binary or no
+    # Vulkan stack. The lavapipe twin is the one CI and the controls run: the sound logic does not
+    # depend on the driver, and a software decode keeps the GPU free.
+    wallpaperx_add_test(NAME audio_playback COMMAND $<TARGET_FILE:wallpaperx-audio-playback-test>)
+    set_tests_properties(audio_playback PROPERTIES
+        ENVIRONMENT "WALLPAPERX_FORCE_TIER="
+        RESOURCE_LOCK wallpaperx_bus_tests
+        TIMEOUT 600
+        SKIP_RETURN_CODE 77)
+    if(WALLPAPERX_LAVAPIPE_ICD)
+        wallpaperx_add_test(NAME audio_playback_lavapipe COMMAND $<TARGET_FILE:wallpaperx-audio-playback-test>)
+        set_tests_properties(audio_playback_lavapipe PROPERTIES
+            ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_TIER="
+            LABELS "lavapipe"
+            RESOURCE_LOCK wallpaperx_bus_tests
+            TIMEOUT 600
+            SKIP_RETURN_CODE 77)
+    endif()
+    # The same binary run as a caller whose environment names PipeWire servers: decoy sockets the test
+    # listens on, which the wrapper must keep from it. No GPU and no sound server needed. No PulseAudio
+    # decoy: the engine is a native PipeWire client, so one could never be reached.
+    set(_wx_decoy "${CMAKE_CURRENT_BINARY_DIR}/sound-decoy")
+    wallpaperx_add_test(NAME audio_isolation COMMAND $<TARGET_FILE:wallpaperx-audio-playback-test>)
+    set_tests_properties(audio_isolation PROPERTIES
+        ENVIRONMENT "WALLPAPERX_TEST_SOUND_DECOY=${_wx_decoy};PIPEWIRE_RUNTIME_DIR=${_wx_decoy};PIPEWIRE_REMOTE=${_wx_decoy}/remote"
+        LABELS "novulkan"
+        TIMEOUT 60
+        SKIP_RETURN_CODE 77)
 
     # The QQuickItem driven by a stub daemon answering GetFrame with a frame the importer must
     # refuse. Here for the private bus: on the developer's real bus it would reach their daemon.

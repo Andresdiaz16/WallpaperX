@@ -67,6 +67,9 @@ double playbackSpeed(const WallpaperProperties& properties);
 // The wallpaper's own sound level: "mute" switches it off, unset means on.
 bool wallpaperMuted(const WallpaperProperties& properties);
 
+// What "volume" says the sound plays at, 0 to 1: 1 without one.
+float wallpaperVolume(const WallpaperProperties& properties);
+
 // An object of numbers, booleans and "#rrggbb" strings: the form both the config file and
 // GetStatus carry.
 nlohmann::json toJson(const WallpaperProperties& properties);

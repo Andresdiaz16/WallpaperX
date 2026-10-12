@@ -2,7 +2,7 @@
 
 #include "video_decoder.h"
 
-#include "ffmpeg_fd_io.h"
+#include "ffmpeg_file.h"
 #include "frame_converter.h"
 #include "reset_point.h"
 
@@ -40,18 +40,8 @@ namespace wallpaperx {
 
 namespace {
 
-std::string avErrorString(int err) {
-    char text[AV_ERROR_MAX_STRING_SIZE]{};
-    av_strerror(err, text, sizeof text);
-    return text;
-}
-
-[[noreturn]] void throwOutOfMemory(const std::string& context) {
-    throw ResourceExhausted(context + ": out of memory");
-}
-
-// ffmpeg's own default for a file it opens, and what its probes are sized against.
-constexpr int kIoBufferSize = 32768;
+using ffmpeg_file::avErrorString;
+using ffmpeg_file::throwOutOfMemory;
 
 constexpr const char* kComponent = "VideoDecoder";
 
@@ -60,25 +50,8 @@ constexpr const char* kComponent = "VideoDecoder";
 // closed-GOP file always reaches its picture.
 constexpr int64_t kCatchUpPictures = 250;
 
-// An ffmpeg error that is not the GPU's: memory, or the file, which it names.
 [[noreturn]] void throwFileFailure(const std::string& reason, int err, const std::string& file) {
-    if (err == AVERROR(ENOMEM)) throwOutOfMemory(kComponent);
-    throw WallpaperContentError(describeRejection(kComponent, reason + " (" + avErrorString(err) + ")", file));
-}
-
-// throwFileFailure() for opening a container. One that is a list of other files fails because
-// openContainer() lets ffmpeg open nothing by itself, and ffmpeg's reason ("Invalid argument") says
-// nothing of that.
-[[noreturn]] void throwOpenFailure(const std::string& reason, int err, const std::string& file,
-                                   const AVInputFormat* format) {
-    if (err != AVERROR(ENOMEM) && format != nullptr && av_match_name(format->name, "concat,hls,dash,imf")) {
-        throw WallpaperContentError(describeRejection(
-            kComponent,
-            "the wallpaper is a list of other files to play (a playlist or an ffconcat script); only a single "
-            "self-contained video file can be shown",
-            file));
-    }
-    throwFileFailure(reason, err, file);
+    ffmpeg_file::throwFileFailure(kComponent, reason, err, file);
 }
 
 struct BufferRef {
@@ -407,7 +380,7 @@ void VideoDecoder::closeAll() noexcept {
     closeDecoder();
     av_packet_free(&m_packet);
     avformat_close_input(&m_format);
-    closeFile();
+    m_reader.close();
 }
 
 // The one bounded question this renderer can ask of the GPU: an empty batch through the
@@ -497,54 +470,14 @@ void VideoDecoder::releaseIdleFramesContexts() noexcept {
     });
 }
 
-void VideoDecoder::openFile() {
-    m_fd = openWallpaperFile(m_file, kComponent);
-    if (m_fd < 0) {
-        // Taken before the message is built: building one allocates, an allocator may leave errno
-        // changed behind it, and a reason that reads as out of memory would send the daemon off
-        // freeing another monitor's decoder to retry this open.
-        const int why = errno;
-        throwFileFailure("cannot open the wallpaper", AVERROR(why), m_file);
-    }
-
-    m_io = ffmpeg_fd::openReader(&m_fd, kIoBufferSize);
-    if (m_io == nullptr) throwOutOfMemory("VideoDecoder");
-}
-
-// The I/O context before the file it reads.
-void VideoDecoder::closeFile() noexcept {
-    if (m_io != nullptr) av_freep(&m_io->buffer);
-    avio_context_free(&m_io);
-    if (m_fd >= 0) {
-        ::close(m_fd);
-        m_fd = -1;
-    }
-}
-
 // The first call opens the file; a later one reads it again from its start.
 void VideoDecoder::openContainer() {
-    if (m_io == nullptr) {
-        openFile();
-    } else if (const int64_t err = avio_seek(m_io, 0, SEEK_SET); err < 0) {
+    if (m_reader.io() == nullptr) {
+        m_reader.open(m_file, kComponent);
+    } else if (const int64_t err = avio_seek(m_reader.io(), 0, SEEK_SET); err < 0) {
         throwFileFailure("cannot return to the start of the wallpaper", static_cast<int>(err), m_file);
     }
-    m_format = avformat_alloc_context();
-    if (m_format == nullptr) throwOutOfMemory("VideoDecoder");
-    if (!ffmpeg_fd::readOnlyThrough(m_format, m_io)) throwOutOfMemory("VideoDecoder");
-    // Frees the context on failure, never a caller's I/O context.
-    if (const int err = avformat_open_input(&m_format, m_file.c_str(), nullptr, nullptr); err < 0) {
-        // The context and the demuxer it found are gone, so the file is probed again to say what it
-        // was -- on this path only, so a file that opens is opened exactly as before.
-        const AVInputFormat* format = nullptr;
-        if (avio_seek(m_io, 0, SEEK_SET) < 0 ||
-            av_probe_input_buffer2(m_io, &format, m_file.c_str(), nullptr, 0, 0) < 0) {
-            format = nullptr;
-        }
-        throwOpenFailure("cannot open the wallpaper", err, m_file, format);
-    }
-    if (const int err = avformat_find_stream_info(m_format, nullptr); err < 0) {
-        throwOpenFailure("cannot read the wallpaper's streams", err, m_file, m_format->iformat);
-    }
+    ffmpeg_file::openContainer(m_format, m_reader.io(), m_file, kComponent);
     const int stream = av_find_best_stream(m_format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     if (stream == AVERROR_STREAM_NOT_FOUND) {
         throw WallpaperContentError(describeRejection(kComponent, "the wallpaper has no video stream", m_file));
@@ -656,6 +589,12 @@ bool VideoDecoder::withinCatchUp(int64_t distance) const {
     return interval && span && *span <= kCatchUpPictures * *interval;
 }
 
+std::optional<std::chrono::nanoseconds> VideoDecoder::averageFrameInterval() const {
+    const AVRational rate = m_format->streams[m_stream]->avg_frame_rate;
+    if (rate.num <= 0 || rate.den <= 0) return std::nullopt;
+    return inNanoseconds(1, av_inv_q(rate));
+}
+
 int64_t VideoDecoder::nextSeekBack(int64_t back) const {
     if (back != 0) return av_sat_add64(back, back);
     return std::max<int64_t>(1, av_rescale_q(1, AVRational{1, 1}, m_format->streams[m_stream]->time_base));
@@ -669,7 +608,7 @@ void VideoDecoder::startAtResetPoint(int64_t resume) {
     for (int64_t back = 0;; back = nextSeekBack(back)) {
         const int64_t target = av_sat_sub64(resume, back);
         bool fromStart = target <= streamStart();
-        if (!fromStart && av_seek_frame(m_format, m_stream, target, AVSEEK_FLAG_BACKWARD) < 0) {
+        if (!fromStart && ffmpeg_file::seekFrame(*m_format, m_stream, target, AVSEEK_FLAG_BACKWARD) < 0) {
             // Where a failed seek left the container is not known, and reading from the first packet
             // is bounded only when the position itself is within the budget; seekToResume() decides alike.
             if (!withinCatchUp(resume - streamStart())) {
@@ -746,7 +685,7 @@ VideoDecoder::Window VideoDecoder::scanWindow(int64_t resume, const std::optiona
 // could be that same one, which would then be sent twice.
 bool VideoDecoder::seekToPacket(const PacketMark& mark, std::optional<int64_t> target) {
     av_packet_unref(m_packet);
-    if (target && av_seek_frame(m_format, m_stream, *target, AVSEEK_FLAG_BACKWARD) >= 0) {
+    if (target && ffmpeg_file::seekFrame(*m_format, m_stream, *target, AVSEEK_FLAG_BACKWARD) >= 0) {
         m_packetsRead.reset();
         if (skipToPacket(mark)) return true;
     }
@@ -802,7 +741,7 @@ void VideoDecoder::seekToResume() {
         return;
     }
     const int64_t target = av_sat_sub64(*m_returned.lastTimestamp, back);
-    if (target > streamStart() && av_seek_frame(m_format, m_stream, target, AVSEEK_FLAG_BACKWARD) >= 0) {
+    if (target > streamStart() && ffmpeg_file::seekFrame(*m_format, m_stream, target, AVSEEK_FLAG_BACKWARD) >= 0) {
         m_packetsRead.reset();
         m_resume = Seeked{back};
     } else if (starting && !withinCatchUp(*m_returned.lastTimestamp - streamStart())) {
@@ -847,7 +786,7 @@ bool VideoDecoder::seekToFirstPacket() {
 
 bool VideoDecoder::seekLandsOnFirstPacket(int64_t target, int flags) {
     const int stream = (flags & AVSEEK_FLAG_BYTE) != 0 ? -1 : m_stream;
-    if (av_seek_frame(m_format, stream, target, flags) < 0) return false;
+    if (ffmpeg_file::seekFrame(*m_format, stream, target, flags) < 0) return false;
     if (readVideoPacket() >= 0 && m_firstPacket->matches(*m_packet)) return true;
     av_packet_unref(m_packet);
     return false;
@@ -1198,7 +1137,7 @@ bool VideoDecoder::holds(const AVBufferRef& frames, int width, int height) const
 
 int VideoDecoder::readVideoPacket() {
     for (;;) {
-        const int err = av_read_frame(m_format, m_packet);
+        const int err = ffmpeg_file::readPacket(*m_format, m_packet);
         if (err < 0) return err;
         if (m_packet->stream_index == m_stream) {
             if (m_packetsRead) numberPacket();

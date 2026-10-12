@@ -36,6 +36,8 @@
 
 namespace wallpaperx {
 
+class AudioOutput;
+class AudioTrack;
 class Device;
 class OffscreenTargetManager;
 struct OffscreenTarget;
@@ -482,8 +484,9 @@ public:
     // every time.
     static constexpr uint32_t kShortageRetries = 10;
 
-    // Fatal signals caught while the render thread was working on one video's content -- decoding
-    // or drawing it, or freeing it after its own failure -- before the next start refuses it.
+    // Fatal signals caught while a thread was working on one video's content -- decoding its
+    // pictures or its sound, drawing it, or freeing it after its own failure -- before the next
+    // start refuses it.
     // Counted across every stop, never for a death that names no video, and cleared when the video
     // is set again or has played kCleanPlayAfter. Two, so one crash that merely landed there -- a
     // driver fault while drawing it -- never costs a working wallpaper, while a file that kills
@@ -687,6 +690,11 @@ public:
     // requestSeq: a picture is not a render anyone asked for. Failures land in lastError, as a
     // render's do, and stop that video.
     ClockRound advanceVideo(std::chrono::steady_clock::time_point now);
+
+    // What asks the render worker for a clock round when something only a round acts on changes off
+    // its thread -- a video's sound found to be there or gone. Set by the worker while it runs and
+    // emptied before it stops; must not block, nor call into this manager. Any thread.
+    void setClockWake(std::function<void()> wake);
 
     // Whether the device this manager built has been lost and Config::onDeviceLost, which the loss
     // has already called, is set: the process is stopping for it. Permanent: the device is built
@@ -1032,6 +1040,16 @@ private:
         // wallpaperSeq for ReopenBudget's reason, and held here rather than on the session
         // because the session is freed while the fact stays true.
         uint64_t parkedWallpaperSeq = 0;
+        // Why the parked wallpaper `forSeq` names gave no sound when it was wanted, so its released
+        // session is not opened again for nothing. Silent: the file has none, and it is never opened
+        // again for it. Failed: what failed may not fail again, so it is opened again while the
+        // reopen budget lasts, and the record is spent by that reopen. Keyed as parkedWallpaperSeq is.
+        struct NoSound {
+            enum class Why { Silent, Failed };
+            uint64_t forSeq = 0;
+            Why why = Why::Silent;
+        };
+        NoSound noSound;
 
         // Reopens the clock has spent on the wallpaper `forSeq` names. Keyed by the wallpaper
         // rather than reset when one arrives: a count whose key names a wallpaper this monitor no
@@ -1190,6 +1208,9 @@ private:
     // sitting uncollected. Reads the clock itself, so no caller can ask with a stale one. Caller
     // must hold m_stateMutex.
     bool watchedLocked(int monitorId, const MonitorState& state) const;
+    // When watchedLocked() turns false with nothing but time passing; nothing when time alone never
+    // turns it. Caller must hold m_stateMutex.
+    std::optional<std::chrono::steady_clock::time_point> unwatchedAtLocked(const MonitorState& state) const;
 
     // Whether this monitor's resume credit is unspent and could still be spent: it holds a frame of
     // a video that has more than one picture. Anything else -- a still, a one-picture file, a
@@ -1511,11 +1532,18 @@ private:
             std::chrono::steady_clock::time_point from;
             std::chrono::nanoseconds left{};
             double speed = 1.0;
+            // Where the file is, on the pass of the picture on screen, when the wait ends. Not the
+            // waiting picture's own time when that picture starts a new pass. Empty when the picture
+            // on screen has no time.
+            std::optional<std::chrono::nanoseconds> reaches;
 
             // Re-times the rest of the wait from `now` when `speed` differs. A picture already
             // due stays due where it was.
             void retime(std::chrono::steady_clock::time_point now, double newSpeed);
             OnScreen planned() const;
+            // Where the waiting picture stands once drawn at `now`, `interval` being its own at the
+            // current speed.
+            OnScreen shownAt(std::chrono::steady_clock::time_point now, std::chrono::nanoseconds interval) const;
         };
         std::variant<Undrawn, OnScreen, Waiting, CatchingUp> clock;
 
@@ -1524,8 +1552,54 @@ private:
         // this is what says how long it has been stopped, whatever stopped it. Which release delay
         // runs from it is decided each round by what stops it then.
         std::optional<std::chrono::steady_clock::time_point> idleSince;
+
+        // The file's sound, made the first time its screen is heard and kept, silent, while it is
+        // not. Its anchor is the one record of where the sound was told to be.
+        std::unique_ptr<AudioTrack> audio;
+
+        // The file's average rate is above the picture-rate cap, so its pictures play slower than its
+        // sound would: it plays silent until sound can be stretched. Set once, at the open.
+        bool slowedByCap = false;
     };
+    // Before the output, whose thread calls it until the output is destroyed.
+    std::mutex m_clockWakeMutex;
+    std::function<void()> m_clockWake;
+    // Before the sessions, whose tracks it must outlive.
+    std::unique_ptr<AudioOutput> m_audio;
     std::map<int, VideoSession> m_videoSessions;
+
+    // What a session's monitor lets it do, the reasons its pictures stand still told apart where its
+    // sound treats them differently: a render owed redraws the same video and leaves the sound be,
+    // and a file whose one picture is on screen plays its sound alone. Stopped is everything else:
+    // paused, unwatched, no frame, or another wallpaper set. Caller holds m_stateMutex.
+    enum class Motion { Playing, RenderOwed, Parked, Stopped };
+    Motion motionLocked(int monitorId, uint64_t wallpaperSeq) const;
+
+    // What a session's sound should do this round. `heard` is soundHeardLocked().
+    struct SoundWanted {
+        bool heard = false;
+        double speed = 1.0;
+        float volume = 1.0f;
+        // Whatever the file: any speed but its own would need the sound stretched, which nothing
+        // here does yet. At volume 0 nothing is heard, so nothing is decoded or kept open for it.
+        bool audible() const { return heard && speed == 1.0 && volume > 0.0f; }
+    };
+    // Whether the session's sound is to be heard, given what its monitor wants.
+    static bool soundWanted(const VideoSession& session, const SoundWanted& wanted);
+    // The session's track, made if need be and at the wanted volume, or null -- having stopped any
+    // -- when its sound is not to be heard. Throws only on making a track. Caller holds m_gpuMutex
+    // and not m_stateMutex.
+    AudioTrack* heardTrackLocked(int monitorId, VideoSession& session, const SoundWanted& wanted);
+    // Points a playing session's sound at the picture schedule `waiting` belongs to, or silences it.
+    // A sound already playing that the pictures trail by little is kept, and `waiting` moved to it
+    // instead. Never fails the session: sound is lost before a picture is. Caller holds m_gpuMutex
+    // and not m_stateMutex.
+    void steerSoundLocked(int monitorId, VideoSession& session, VideoSession::Waiting& waiting,
+                          const SoundWanted& wanted, std::chrono::steady_clock::time_point now) noexcept;
+    // Plays a parked session's sound on its own, looping, when it would be heard, and returns its
+    // track; null, with the sound stopped, otherwise. Caller holds m_gpuMutex and not m_stateMutex.
+    AudioTrack* loopParkedSoundLocked(int monitorId, VideoSession& session, const SoundWanted& wanted,
+                                      std::chrono::steady_clock::time_point now) noexcept;
 
     // Counts draws that wanted a session, so the least recently wanted one can be told from the
     // rest. Guarded by m_gpuMutex with the map it orders.

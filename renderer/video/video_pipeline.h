@@ -86,6 +86,9 @@ public:
     // Throws std::logic_error before the first picture.
     PictureTiming timing() const;
 
+    // As VideoDecoder::averageFrameInterval().
+    std::optional<std::chrono::nanoseconds> averageFrameInterval() const { return m_decoder.averageFrameInterval(); }
+
     // Where the picture draw() last showed lies in the file, for a pipeline opened on it later to
     // start there. Empty before the first draw and when the decoder could not find it again.
     std::optional<StreamPosition> shownPosition() const { return m_shownPosition; }

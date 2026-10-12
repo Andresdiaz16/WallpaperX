@@ -49,6 +49,7 @@ public:
 
     // `manager` must outlive this worker, as must anything the callbacks touch. Call stop()
     // before tearing either down; the destructor does too, but stop() lets the owner pick when.
+    // The manager's clock wake is this worker's wake() until stop(), so one worker per manager.
     RenderWorker(WallpaperManager& manager, FrameReadyFn onFrameReady);
     ~RenderWorker();
 

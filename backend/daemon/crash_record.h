@@ -75,7 +75,7 @@ struct PlayingHistory {
     // The counts it carried in from the runs before it.
     std::vector<PlayingVideo> videos;
 
-    // The video its render thread was working on when a fatal signal killed it, if any.
+    // The video the dying thread was working on when a fatal signal killed it, if any.
     std::optional<VideoOnMonitor> died;
     std::optional<int> signal;
 };
@@ -134,8 +134,9 @@ private:
 };
 
 // While one exists, a fatal signal on the thread that made it writes `line` into the playing
-// record: that thread is working on the video `line` names. A death on any other thread names
-// nothing. `line` must be a playingBlameLine() and outlive the guard; guards nest on one thread.
+// record: that thread is working on the video `line` names. A death on any other thread names only
+// what that thread's own guard names, if any. `line` must be a playingBlameLine() and outlive the
+// guard; guards nest on one thread, and threads hold theirs independently.
 class PlayingBlame {
 public:
     explicit PlayingBlame(const std::string& line);
@@ -146,7 +147,6 @@ public:
 
 private:
     const std::string* m_previous;
-    pid_t m_previousTid;
 };
 
 // SIGSEGV, SIGBUS, SIGILL, SIGFPE and SIGABRT: stamps the live record with the signal when the

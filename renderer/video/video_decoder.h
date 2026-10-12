@@ -3,6 +3,7 @@
 #pragma once
 
 #include "../vulkan/device.h"
+#include "ffmpeg_file.h"
 #include "stream_position.h"
 
 extern "C" {
@@ -26,7 +27,6 @@ struct AVCodecContext;
 struct AVDictionary;
 struct AVFormatContext;
 struct AVFrame;
-struct AVIOContext;
 struct AVPacket;
 
 namespace wallpaperx {
@@ -261,6 +261,11 @@ public:
     // start falls back to the first picture.
     bool startedMidStream() const { return m_startedAfter.has_value(); }
 
+    // The stream's average time between pictures, as its container declares it or as ffmpeg measured
+    // it while probing; nothing when neither is known. Never ffmpeg's guessed base rate, which for a
+    // file of varying rate is often its time base's tick.
+    std::optional<std::chrono::nanoseconds> averageFrameInterval() const;
+
     Path path() const { return m_path; }
 
 private:
@@ -275,10 +280,6 @@ private:
     void releaseIdleFramesContexts() noexcept;
     void releaseRetiredCodec() noexcept;
     void openContainer();
-    // Opens the file through openWallpaperFile() and the I/O context every container reads it
-    // through. ffmpeg is given the path only as a hint to probing and as text in its messages.
-    void openFile();
-    void closeFile() noexcept;
     void openDecoder();
     void closeDecoder() noexcept;
     void retireDecoder() noexcept;
@@ -344,9 +345,9 @@ private:
     std::string m_file;
     // The file, opened once, and the I/O context that reads it. Every container reads through them
     // and closing one leaves them open, so a reopened container reads the same file after its path
-    // is deleted or renamed over.
-    int m_fd = -1;
-    AVIOContext* m_io = nullptr;
+    // is deleted or renamed over. ffmpeg is given the path only as a hint to probing and as text in
+    // its messages.
+    ffmpeg_file::Reader m_reader;
     AVFormatContext* m_format = nullptr;
     AVCodecContext* m_codec = nullptr;
     AVPacket* m_packet = nullptr;

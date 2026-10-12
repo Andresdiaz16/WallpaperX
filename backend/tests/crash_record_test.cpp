@@ -931,8 +931,10 @@ void runReportChecks() {
 //       machine slower or faster than this one.
 // CONTROL: in backend/daemon/crash_record.cpp, ApplyingRecord's constructor changed to return
 //       before its write loop (`if (true) { ::close(fd); return; }`) -> "a process killed while
-//       applying leaves a record" red, with every other phase that reads a record back (seven
-//       lines in all). Observed 2026-09-25 via control_run.sh; reverted.
+//       applying leaves a record" red, with the six other lines that read an applying record back
+//       (stampedFault, stampedAbort, otherThread, logWriterFault, cleanExit, chaining); the
+//       playing-record phases, playingBothBlamed among them, stay green. Re-run 2026-10-11 via
+//       control_run.sh; reverted.
 void runKilledChecks() {
     ScratchDir scratch("crashkilled");
     if (!scratch.ok()) {
@@ -1134,6 +1136,10 @@ enum class PlayingMode {
     FaultAfterGuard,  // the guard has been destroyed; the same thread then faults
     FaultAfterEnd,    // the guard is live but the record was ended (an orderly stop began)
     KilledNamed,      // SIGKILL while the guard is live: no handler runs
+    // Two threads each hold a guard -- as the render and sound threads do -- and the one whose guard
+    // was made FIRST faults: monitor 2's (BothFirstFaults) or monitor 6's (BothOtherFirstFaults).
+    BothFirstFaults,
+    BothOtherFirstFaults,
 };
 
 const char* playingModeName(PlayingMode mode) {
@@ -1143,6 +1149,8 @@ const char* playingModeName(PlayingMode mode) {
         case PlayingMode::FaultAfterGuard: return "a fault after the guard ended";
         case PlayingMode::FaultAfterEnd: return "a fault after the record ended";
         case PlayingMode::KilledNamed: return "killed while guarded";
+        case PlayingMode::BothFirstFaults: return "a fault on the first of two guarded threads";
+        case PlayingMode::BothOtherFirstFaults: return "a fault on the first of two guarded threads, the other way round";
     }
     return "an unnamed mode";
 }
@@ -1155,6 +1163,28 @@ const char* playingModeName(PlayingMode mode) {
     std::error_code ec;
     if (!std::filesystem::exists(wallpaperx::playingRecordPath(dir), ec)) _exit(kChildRecordFailedExit);
     const std::string line = wallpaperx::playingBlameLine(kPlayingMonitor, kPlayingPath);
+
+    if (mode == PlayingMode::BothFirstFaults || mode == PlayingMode::BothOtherFirstFaults) {
+        const std::string other = wallpaperx::playingBlameLine(kOtherPlayingMonitor, kOtherPlayingPath);
+        const std::string& first = mode == PlayingMode::BothFirstFaults ? line : other;
+        const std::string& second = mode == PlayingMode::BothFirstFaults ? other : line;
+        std::promise<void> firstLive, secondLive;
+        std::future<void> firstUp = firstLive.get_future();
+        std::shared_future<void> secondUp = secondLive.get_future().share();
+        std::thread faulting([&] {
+            const wallpaperx::PlayingBlame blame(first);
+            firstLive.set_value();
+            secondUp.wait();
+            faultNow();
+        });
+        firstUp.wait();
+        std::thread holding([&] {
+            const wallpaperx::PlayingBlame blame(second);
+            secondLive.set_value();
+            sleepForever();
+        });
+        sleepForever();
+    }
 
     std::promise<void> guardLive;
     std::future<void> live = guardLive.get_future();
@@ -1179,6 +1209,8 @@ const char* playingModeName(PlayingMode mode) {
                 guardLive.set_value();
                 sleepForever();
             }
+            case PlayingMode::BothFirstFaults:
+            case PlayingMode::BothOtherFirstFaults: sleepForever();  // handled above
         }
     });
     if (mode == PlayingMode::FaultElsewhere || mode == PlayingMode::KilledNamed) {
@@ -1238,9 +1270,10 @@ ChildResult runPlayingChild(PlayingMode mode, const std::filesystem::path& dir, 
         ::kill(pid, SIGKILL);
     }
     // runChild's attribution. CONTROL: in backend/daemon/crash_record.cpp via control_run.sh
-    //       2026-09-27, reverted: onFatalSignal made to pause for good after writing the blame line
+    //       2026-10-11, reverted: onFatalSignal made to pause for good after writing the blame line
     //       -> "a playing-record child (a fault on the guarded thread) ended within 20 s of its
-    //       handlers taking over" red, once for each of the two phases that fault a guarded thread.
+    //       handlers taking over" red in phases playingBlame and playingRecordRules, and "(a fault on
+    //       the first of two guarded threads)" and "(..., the other way round)" in playingBothBlamed.
     out.reaped = waitForExit(pid, out.status);
     if (!out.reaped) {
         ::kill(pid, SIGKILL);
@@ -1320,16 +1353,15 @@ void runPlayingBlameChecks() {
 // WHY-THIS-SHAPE: four children, each one change away from runPlayingBlameChecks' child, which is
 //       the positive reading that proves a name CAN be written in this directory layout. The kill
 //       is sent once the child says its guard is live, over a pipe, for runKilledChecks' reason.
-// CONTROL: in backend/daemon/crash_record.cpp, (a) the `::gettid() == g_blameTid.load(...)` term
-//       deleted from onFatalSignal() -> "FAIL: a fault on another thread while a video is being
-//       worked on names nothing", printing "names monitor 2"; (b) `g_blame.store(nullptr, ...)`
-//       and the restore of m_previous deleted from ~PlayingBlame -> "FAIL: a fault after the guard
-//       has gone names nothing"; (c) PlayingRecord::end() made a no-op -> "FAIL: a fault after the
-//       record was ended names nothing"; (d) PlayingBlame's constructor made to write `line` into
-//       the record at once, as a record-per-picture design would -> "FAIL: SIGKILL while a video is
-//       being worked on names nothing" and the three cases above with it. Each of (a)-(c) reddened
-//       its own case alone. (a) observed 2026-09-25 via control_run.sh, the others 2026-09-21;
-//       reverted.
+// CONTROL: in backend/daemon/crash_record.cpp, (a) `thread_local` dropped from t_blame (one slot for
+//       the process) -> "FAIL: a fault on another thread while a video is being worked on names
+//       nothing", printing "names monitor 2"; (b) ~PlayingBlame no longer restoring t_blame ->
+//       "FAIL: a fault after the guard has gone names nothing"; (c) PlayingRecord::end() made a
+//       no-op -> "FAIL: a fault after the record was ended names nothing"; (d) PlayingBlame's
+//       constructor made to write `line` into the record at once, as a record-per-picture design
+//       would -> "FAIL: SIGKILL while a video is being worked on names nothing" and the three cases
+//       above with it. Each of (a)-(c) reddened its own case alone. (a) and (b) observed 2026-10-11
+//       via control_run.sh against the per-thread t_blame, (c) and (d) 2026-09-21; reverted.
 void runPlayingNamesNothingChecks() {
     struct Case {
         PlayingMode mode;
@@ -1360,6 +1392,50 @@ void runPlayingNamesNothingChecks() {
         const bool nothing = history && !history->died && !history->signal;
         check(nothing, c.what);
         if (!nothing) std::fprintf(stderr, "  the record %s\n", describeDied(history).c_str());
+    }
+}
+
+// GOAL: S15.514 -- two threads working on two videos at once (the render thread and the sound thread)
+//       each name their own: a fatal signal on either writes the video ITS guard names, whichever guard
+//       was made last. False for one blame slot shared by the process, where the later guard's video is
+//       named for a death on the other thread.
+// WHY-THIS-SHAPE: the thread that faults is always the one whose guard was made FIRST, both ways
+//       round. A shared slot holds the last guard made, so a fault on the last-guarded thread would name
+//       the right video under that defect too and grade nothing. Plain threads, not the daemon's: the
+//       property is the record's, and audio_playback's sound-fault phases grade the daemon's use of it.
+// CONTROL: control_run.sh 2026-10-11, reverted: `thread_local` (and its tls_model) dropped from t_blame in
+//       backend/daemon/crash_record.cpp -> "FAIL: with two threads guarded, a fault on the one guarded first
+//       names its own video" (names monitor 6) and "FAIL: and the same with the two videos the other way
+//       round" (names monitor 2).
+void runPlayingBothBlamedChecks() {
+    struct Case {
+        PlayingMode mode;
+        int monitor;
+        const char* path;
+        const char* what;
+    };
+    const Case cases[] = {
+        {PlayingMode::BothFirstFaults, kPlayingMonitor, kPlayingPath,
+         "with two threads guarded, a fault on the one guarded first names its own video"},
+        {PlayingMode::BothOtherFirstFaults, kOtherPlayingMonitor, kOtherPlayingPath,
+         "and the same with the two videos the other way round"},
+    };
+    for (const Case& c : cases) {
+        ScratchDir scratch("playingboth");
+        if (!scratch.ok()) {
+            notVerified("S15.514", "no scratch state directory could be created");
+            return;
+        }
+        bool ok = false;
+        const ChildResult result = runPlayingChild(c.mode, scratch.path(), ok);
+        if (!ok) continue;
+        if (kDeathSignalObservable) {
+            check(diedOf(result, SIGSEGV), std::string(c.what) + " -- the child died of SIGSEGV");
+        }
+        const std::optional<wallpaperx::PlayingHistory> history = wallpaperx::readPlayingRecord(scratch.path());
+        const bool own = history && history->died && history->died->monitorId == c.monitor && history->died->path == c.path;
+        check(own, c.what);
+        if (!own) std::fprintf(stderr, "  the record %s\n", describeDied(history).c_str());
     }
 }
 
@@ -1481,6 +1557,7 @@ int main() {
         if (phaseSelected("onDisk")) runOnDiskChecks();
         if (phaseSelected("playingBlame")) runPlayingBlameChecks();
         if (phaseSelected("playingNamesNothing")) runPlayingNamesNothingChecks();
+        if (phaseSelected("playingBothBlamed")) runPlayingBothBlamedChecks();
         if (phaseSelected("playingRecordRules")) runPlayingRecordRules();
     } catch (const std::exception& e) {
         harnessFailure(std::string("the run ended in an unhandled exception: ") + e.what());

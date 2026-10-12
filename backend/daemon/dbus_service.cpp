@@ -582,7 +582,11 @@ void DbusService::setSound(bool on) {
         std::fprintf(stderr, "wallpaperx-daemon: SetSound failed: %s\n", e.what());
         throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
     }
-    if (changed) announceConfigChanged();
+    if (changed) {
+        announceConfigChanged();
+        // The round this runs starts or stops the heard screen's sound.
+        m_worker.wake();
+    }
 }
 
 void DbusService::setMonitorSound(int32_t monitorId, bool on) {
@@ -599,7 +603,10 @@ void DbusService::setMonitorSound(int32_t monitorId, bool on) {
         std::fprintf(stderr, "wallpaperx-daemon: SetMonitorSound failed (monitor=%d): %s\n", monitorId, e.what());
         throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
     }
-    if (changed) announceConfigChanged();
+    if (changed) {
+        announceConfigChanged();
+        m_worker.wake();
+    }
 }
 
 void DbusService::setOutputFocus(const std::string& client, const std::string& outputName, ScreenFocus focus,
