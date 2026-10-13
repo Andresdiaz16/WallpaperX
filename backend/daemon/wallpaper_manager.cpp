@@ -2490,9 +2490,11 @@ WallpaperManager::SoundPace WallpaperManager::steerSoundLocked(int monitorId, Vi
         // A new pass the sound was not asked onto: it still plays the pass before, and is handed to
         // this one where its pictures start it. Not before kHandOverLead: a track acts on one play at a
         // time, and an earlier one may not have been taken up yet. A sound handed on early sits off this
-        // pass's pictures by what they trail it; past half of kShortestHandedPass, only in a catch-up
-        // hold, which this then ends by moving the sound to them.
-        const std::chrono::nanoseconds passAway = session.pass ? kShortestHandedPass / 2 : kSoundDrift;
+        // pass's pictures by what they trail it, and is left for them to drop to rather than played from
+        // the pass's start again; past half of kShortestHandedPass, only in a catch-up hold, which this
+        // then ends by moving the sound to them. A file that cannot keep up drops nothing to reach it.
+        const bool cannotKeepUp = session.decodeLoad.state == VideoSession::DecodeLoad::State::Behind;
+        const std::chrono::nanoseconds passAway = session.pass && !cannotKeepUp ? kShortestHandedPass / 2 : kSoundDrift;
         if (next.startsPass && std::chrono::abs(ahead(asked, std::chrono::nanoseconds::zero())) > passAway) {
             if (planned.timeline - now > kHandOverLead) return {.roundAt = planned.timeline - kHandOverLead};
             track->play({*next.presentation, drawnAt});
@@ -2508,12 +2510,13 @@ WallpaperManager::SoundPace WallpaperManager::steerSoundLocked(int monitorId, Vi
         if (clock) session.heard = VideoSession::Heard{track->request(), clock->file, clock->at};
         // A file that cannot decode in real time even skipping cannot keep up with its sound: its pictures
         // keep their own clock, and the sound plays on until the next pass hands it to them.
-        if (session.decodeLoad.state == VideoSession::DecodeLoad::State::Behind) return {};
+        if (cannotKeepUp) return {};
         // Where the sound is known to be: as last heard on the latest request; else, once that request
         // is taken up and its time has come, where it was asked to be. Nothing before that, when it
         // still plays what came before.
+        const bool heardOnRequest = session.heard && session.heard->request == track->request();
         std::optional<AudioTrack::Anchor> known;
-        if (session.heard && session.heard->request == track->request()) {
+        if (heardOnRequest) {
             known = AudioTrack::Anchor{session.heard->file, session.heard->at};
         } else if (track->taken() && asked.at <= now) {
             known = asked;
@@ -2523,10 +2526,17 @@ WallpaperManager::SoundPace WallpaperManager::steerSoundLocked(int monitorId, Vi
         // is past the pictures: past the waiting one's time, and past where it is shown too once that
         // is later. The pictures follow a live clock, waiting for it no longer than kSoundDrift and
         // dropping pictures to reach it for as long as the hold lasts. A sound further behind, or more
-        // than kSoundDrift ahead once they cannot chase it, is moved to where the picture is shown.
+        // than kSoundDrift ahead once they cannot chase it, is moved to where the picture is shown. A
+        // sound handed to this pass's start and not heard yet is theirs to chase while it sits inside the
+        // margin, through the pass's first kCatchUpHold of pictures; a clock still missing past that is
+        // taken for one that will not come.
         const std::chrono::nanoseconds behind = -ahead(*known, shift);
         const std::chrono::nanoseconds overdue = drawnAt - planned.timeline;
-        const bool chased = clock && catchUp == CatchUp::Chasing;
+        const bool handedUnheard = passAway > kSoundDrift && shift == std::chrono::nanoseconds::zero() &&
+                                   !heardOnRequest && asked.from == session.pass->first &&
+                                   *next.presentation - session.pass->first <= kCatchUpHold &&
+                                   std::chrono::abs(behind) <= passAway;
+        const bool chased = catchUp == CatchUp::Chasing && (clock || handedUnheard);
         if (behind > kSoundDrift || (!chased && overdue - behind > kSoundDrift)) {
             // Kept on the pass it was handed to, and from that pass's start: a play from before it would
             // be heard early.

@@ -960,6 +960,30 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         VERBATIM
     )
     list(APPEND WALLPAPERX_BACKEND_SOUND_ASSETS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_beeps_bframes.mp4)
+    # The beeps at 30 pictures a second up to 1.9 s, then pictures at 1.91 s and 1.92 s, the last shown
+    # 63 ms: a pass of 1.9833 s whose last picture is on screen longer than the one before. The short steps
+    # put the point 100 ms before the pass's end before the 1.91 s picture is decoded, which on a constant
+    # rate it would follow (audio_playback_test's longLastLoop). MP4 keeps the last sample's duration only
+    # as the step to a following picture, so one more picture is encoded and cut off by a stream copy,
+    # which keeps it; the sound is muxed after, since the cut also shortens a stream copied beside it. The
+    # encoder is given the filter's 1/600 s time base, or the steps are rounded to a 30th of a second.
+    set(_wx_last_long_video ${CMAKE_CURRENT_BINARY_DIR}/beeps_last_long_video.mp4)
+    set(_wx_last_long_cut ${CMAKE_CURRENT_BINARY_DIR}/beeps_last_long_cut.mp4)
+    add_custom_command(
+        OUTPUT ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_beeps_last_long.mp4
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error
+                -f lavfi -i "color=c=gray:size=160x120:rate=30:duration=2.0333,settb=1/600,setpts='if(lt(N,58),20*N,if(eq(N,58),1146,if(eq(N,59),1152,1190)))'"
+                -fps_mode passthrough -enc_time_base 1/600 -frames:v 61
+                -c:v libx264 -profile:v baseline -g 30 -pix_fmt yuv420p ${_wx_last_long_video}
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error -i ${_wx_last_long_video} -c copy -frames:v 60 ${_wx_last_long_cut}
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error -i ${_wx_last_long_cut}
+                -f lavfi -i "aevalsrc=exprs='0.5*sin(2*PI*1000*t)*lt(mod(t,0.5),0.04)':s=48000:d=1.9833"
+                -map 0:v -map 1:a -c:v copy -c:a aac -b:a 128k -ar 48000 -ac 2
+                ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_beeps_last_long.mp4
+        COMMENT "Generating video wallpaper fixture wallpaper_beeps_last_long.mp4"
+        VERBATIM
+    )
+    list(APPEND WALLPAPERX_BACKEND_SOUND_ASSETS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_beeps_last_long.mp4)
     # Two seconds of the tone in the other containers a wallpaper's sound may come in, for
     # audio_playback_test's seek to the start. Fields, '@'-separated: name, picture codec, sound codec.
     foreach(container

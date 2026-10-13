@@ -180,8 +180,10 @@ std::atomic<double> g_streamRate{0.0};
 // under t_inRecord, which is not counted.
 std::atomic<bool> g_hideStreamTime{false};
 std::atomic<int> g_streamTimesHidden{0};
-// Set: the next sound seek to under 50 ms of the file (a hand-over to a new pass) sets g_hideStreamTime.
+// Set: the next sound seek to under 50 ms of the file (a hand-over to a new pass) sets g_hideStreamTime,
+// and records when.
 std::atomic<bool> g_hideAtHandOver{false};
+std::atomic<int64_t> g_hiddenAtHandOverAt{0};
 thread_local bool t_inRecord = false;
 
 // Every picture a picture decoder returns for a file whose name holds g_costFile costs g_costMs more,
@@ -204,6 +206,16 @@ std::atomic<int64_t> g_holdStartedAt{0};
 std::atomic<int64_t> g_holdEndedAt{0};
 // Set: the hold fires every time that picture is returned, not once (each pass's first picture, say).
 std::atomic<bool> g_holdRepeats{false};
+// Non-zero: when a hold above ends, the next pass's first picture (presentation 0) of the same file is held
+// this long, once, as it is returned; and when that hold ended.
+std::atomic<int> g_thenStartHoldMs{0};
+std::atomic<bool> g_startHoldArmed{false};
+std::atomic<int64_t> g_startHoldEndedAt{0};
+// Non-negative: when that start hold ends, the same file's picture at this presentation time unhides the
+// stream time (g_hideStreamTime) as it is returned, once, then is held 50 ms; and when it was unhidden.
+std::atomic<int64_t> g_unhideAtNs{-1};
+std::atomic<bool> g_unhideArmed{false};
+std::atomic<int64_t> g_unhiddenAt{0};
 
 // Draws of three vertices and one instance: FrameConverter's conversion pass, and nothing else this
 // binary runs.
@@ -404,7 +416,10 @@ extern "C" int avformat_seek_file(AVFormatContext* s, int index, int64_t min, in
     if (s != nullptr && index >= 0 && static_cast<unsigned>(index) < s->nb_streams &&
         s->streams[index]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
         const int64_t target = av_rescale_q(ts, s->streams[index]->time_base, AVRational{1, 1'000'000'000});
-        if (target < 50'000'000 && probe::g_hideAtHandOver.exchange(false)) probe::g_hideStreamTime.store(true);
+        if (target < 50'000'000 && probe::g_hideAtHandOver.exchange(false)) {
+            probe::g_hideStreamTime.store(true);
+            probe::g_hiddenAtHandOverAt.store(probe::nowNs());
+        }
         std::lock_guard<std::mutex> lock(probe::g_seekMutex);
         probe::g_soundSeeks.push_back({probe::nowNs(), target});
     }
@@ -500,22 +515,35 @@ extern "C" int avcodec_receive_frame(AVCodecContext* avctx, AVFrame* frame) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(ms));
             }
         }
-        if (probe::g_holdMs.load() > 0 && frame != nullptr && frame->best_effort_timestamp != AV_NOPTS_VALUE &&
-            avctx->pkt_timebase.num > 0) {
+        if ((probe::g_holdMs.load() > 0 || probe::g_startHoldArmed.load() || probe::g_unhideArmed.load()) &&
+            frame != nullptr && frame->best_effort_timestamp != AV_NOPTS_VALUE && avctx->pkt_timebase.num > 0) {
             const int64_t at = av_rescale_q(frame->best_effort_timestamp, avctx->pkt_timebase, AVRational{1, 1'000'000'000});
-            bool held = std::llabs(at - probe::g_holdAtNs.load()) < 2'000'000;
-            if (held) {
+            const bool atHold = probe::g_holdMs.load() > 0 && std::llabs(at - probe::g_holdAtNs.load()) < 2'000'000;
+            const bool atStart = probe::g_startHoldArmed.load() && std::llabs(at) < 2'000'000;
+            const bool atUnhide = probe::g_unhideArmed.load() && std::llabs(at - probe::g_unhideAtNs.load()) < 2'000'000;
+            bool ofFile = false;
+            if (atHold || atStart || atUnhide) {
                 std::lock_guard<std::mutex> lock(probe::g_pictureMutex);
                 const auto it = probe::g_contextFile.find(avctx);
                 std::lock_guard<std::mutex> holdLock(probe::g_holdMutex);
-                held = it != probe::g_contextFile.end() && !probe::g_holdFile.empty() &&
-                       it->second.find(probe::g_holdFile) != std::string::npos;
+                ofFile = it != probe::g_contextFile.end() && !probe::g_holdFile.empty() &&
+                         it->second.find(probe::g_holdFile) != std::string::npos;
             }
+            const bool held = atHold && ofFile;
             if (const int ms = !held ? 0 : probe::g_holdRepeats.load() ? probe::g_holdMs.load() : probe::g_holdMs.exchange(0);
                 ms > 0) {
                 probe::g_holdStartedAt.store(probe::nowNs());
                 std::this_thread::sleep_for(std::chrono::milliseconds(ms));
                 probe::g_holdEndedAt.store(probe::nowNs());
+                if (probe::g_thenStartHoldMs.load() > 0) probe::g_startHoldArmed.store(true);
+            } else if (atStart && ofFile && probe::g_startHoldArmed.exchange(false)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(probe::g_thenStartHoldMs.load()));
+                probe::g_startHoldEndedAt.store(probe::nowNs());
+                if (probe::g_unhideAtNs.load() >= 0) probe::g_unhideArmed.store(true);
+            } else if (atUnhide && ofFile && probe::g_unhideArmed.exchange(false)) {
+                probe::g_hideStreamTime.store(false);
+                probe::g_unhiddenAt.store(probe::nowNs());
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
         }
     }
@@ -3922,6 +3950,10 @@ struct StallReset {
         probe::g_costMs.store(0);
         probe::g_holdMs.store(0);
         probe::g_holdRepeats.store(false);
+        probe::g_thenStartHoldMs.store(0);
+        probe::g_startHoldArmed.store(false);
+        probe::g_unhideAtNs.store(-1);
+        probe::g_unhideArmed.store(false);
         probe::g_blitHoldMs.store(0);
         probe::g_hideAtHandOver.store(false);
         {
@@ -4350,12 +4382,13 @@ void runDropSliceChecks() {
 //       mid-pass, so a late server earns it no seek. The two-second file loops inside the window.
 // COVERAGE-ASSERT: at least ten pictures decoded and ten committed in the window, a decode costing more
 //       than its interval (else not verified), and a loop crossed.
-// CONTROL: control_batch.sh 2026-10-13, reverted, steerSoundLocked, backend/daemon/wallpaper_manager.cpp: its return
-//       for a file in State::Behind deleted -> "FAIL: catch-up cap rule: a file that cannot keep up draws every
-//       picture it decodes" (56 skipped), "... each update ... costs one decode" (4 hand-offs before one commit) and
-//       "... its sound is moved only at the loop" (17 seeks); the same return tested on State::Skips -> the same three;
-//       a copy of that return placed before the pass-start branch -> "... its sound is moved only at the loop" (0
-//       seeks). Green on both entries: 0 skipped, at most 1 hand-off, one seek at the loop.
+// CONTROL: control_run.sh 2026-10-13, reverted, steerSoundLocked, backend/daemon/wallpaper_manager.cpp: its
+//       `if (cannotKeepUp) return {};` deleted -> "FAIL: catch-up cap rule: a file that cannot keep up draws every
+//       picture it decodes" (55-57 skipped), "... each update ... costs one decode" (4 hand-offs before one commit)
+//       and "... its sound is moved only at the loop" (18 seeks); `cannotKeepUp` read as State::Skips (which also
+//       moves the pass-start cut-off) -> the same three; a copy of that return placed before the pass-start branch
+//       -> "... its sound is moved only at the loop" (0 seeks). Green on both entries: 0 skipped, at most 1
+//       hand-off, one seek at the loop.
 void runCatchUpCapChecks() {
     const char* kGoals = "S15.561 (a file that cannot keep up, with nothing to skip, plays unpaced)";
     SoundServer sound(kGoals);
@@ -4714,9 +4747,9 @@ void runLeadLimitChecks() {
 //       counted from the stall, 300 ms after the clock was hidden, so the hiding itself is not counted.
 // COVERAGE-ASSERT: the stall was reached, and at least 20 of AudioOutput's own timing reads were hidden while
 //       it played out; the recorder's reads, made under t_inRecord, are not counted.
-// CONTROL: control_batch.sh 2026-10-13, reverted: steerSoundLocked's `chased` without `clock &&` (the move waits for
-//       a hold with no clock too), backend/daemon/wallpaper_manager.cpp -> "FAIL: no clock rule: a sound left off its
-//       pictures with no clock is moved back to them once" (0 seeks; green 1); the stored reading and the taken anchor
+// CONTROL: control_batch.sh 2026-10-13, reverted: steerSoundLocked's `chased` made `catchUp == CatchUp::Chasing` (the
+//       move waits for a hold with no clock too), backend/daemon/wallpaper_manager.cpp -> "FAIL: no clock rule: a sound
+//       left off its pictures with no clock is moved back to them once" (0 seeks, both entries; green 1); the stored reading and the taken anchor
 //       both ignored -> the same line (0). timingOfNextBuffer in renderer/audio/audio_output.cpp answering "not timed"
 //       without asking pw_stream_get_time_n -> "FAIL: no clock rule: the stall was reached while the server's timing
 //       was hidden" (0 reported); with the t_inRecord test taken out as well it stays green (70 counted, the
@@ -5238,9 +5271,9 @@ void runSkipChecks() {
 //       rule: a late picture at a loop moves the handed-on sound once more, and no more" (1 seek a loop); the
 //       move anchored at `schedule.from` with no shift -> "FAIL: late at loop rule: the handed-on sound is
 //       never sent back to the old pass" (3 seeks a loop, the second to 1866.7 ms; green 2 a loop, both to
-//       -100 ms, on both entries). `passAway` made kSoundDrift with the pass known stays green (2 seeks a loop):
-//       the move lines the sound up before the pass start, so the margin it gives is not reached here (GOALS.md,
-//       Not graded).
+//       -100 ms, on both entries). `passAway` made kSoundDrift stays green (2 seeks a loop, both entries,
+//       re-run 2026-10-13): the move lines the sound up before the pass start, so the margin is not reached here;
+//       it is graded by S15.587 (behindAtLoop) and S15.588 (longLastLoop).
 void runLateAtLoopChecks() {
     const char* kGoals = "S15.577, S15.586 (a late picture at a loop moves the handed-on sound once, on its new pass)";
     SoundServer sound(kGoals);
@@ -5731,6 +5764,359 @@ void runLateHandOnChecks() {
     check(seeks.size() == 1 && seeks[0].targetNs < 50 * kMs && dropped == 0,
           "late hand-on rule: a late pass start moves the sound once, onto its first picture, and drops nothing",
           fmt("%.0f sound seeks, %.0f pictures dropped", static_cast<double>(seeks.size()), dropped));
+}
+
+// The commit time of the first commit in (from, to] that showed the picture at `presentation`.
+std::optional<int64_t> commitShowing(const std::vector<Shown>& shown, int64_t presentation, int64_t from, int64_t to) {
+    for (const Shown& s : shown) {
+        if (s.commit.at > from && s.commit.at <= to && s.presentation && std::llabs(*s.presentation - presentation) < 2 * kMs) {
+            return s.commit.at;
+        }
+    }
+    return std::nullopt;
+}
+
+// GOAL: S15.587 -- a heard file that turns "cannot keep up" after its sound was handed to the next pass early
+//       is handed on again at that pass's start: on the two-second beeps file at 29 ms a picture (0.9 of its
+//       interval), with the pass's last picture held 100 ms as the decoder returns it, a sound seek to the
+//       pass's start (target under 50 ms) comes within 300 ms after the hold. False if the pass-start test
+//       keeps the half-kShortestHandedPass margin for such a file: its pictures, about 95 ms behind and never
+//       steered, keep the sound off them until a mid-pass move.
+// WHY-THIS-SHAPE: the held decode is one capped sample, which lifts an average of about 0.9 past 1, so the
+//       file turns Behind on the last picture, after the early hand-over. An attempt is graded only when the
+//       hand-over seek came before the hold and the held picture was drawn: a file still keeping up drops
+//       it, and one Behind before the hand-over is never handed on early. Those attempts are printed, not
+//       counted, and no graded attempt at all is not verified. 3 s at no cost before each lets the file keep
+//       up again. Under S15.538's sound-server guard.
+// COVERAGE-ASSERT: the hold reached in every attempt, and at least one attempt graded.
+// CONTROL: control_run.sh 2026-10-13, reverted, steerSoundLocked, backend/daemon/wallpaper_manager.cpp: `passAway`'s
+//       `session.pass && !cannotKeepUp` made `session.pass` -> "FAIL: behind at loop rule: a file that turns
+//       cannot-keep-up after the early hand-over is handed on at the pass start" (3 of 3 attempts, both entries: only
+//       the hand-over, 162 ms before the hold's end). Green: a seek to the pass's start 29-30 ms after it. Test-side:
+//       29 ms made 20 -> "NOT VERIFIED -- S15.587 ...: the held picture was dropped", not a FAIL.
+void runBehindAtLoopChecks() {
+    const char* kGoals = "S15.587 (a file that turns cannot-keep-up after the early hand-over is handed on at the pass start)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    StallReset reset;
+    const std::string heard = asset("wallpaper_beeps.mp4");
+    const int64_t last = 59 * 1'000'000'000LL / 30;
+    {
+        std::lock_guard<std::mutex> lock(probe::g_holdMutex);
+        probe::g_holdFile = std::filesystem::path(heard).filename().string();
+    }
+    probe::g_holdAtNs.store(last);
+    Daemon d(smallConfig());
+    if (!startHeard(d, heard, kGoals)) return;
+    costFile(heard);
+    int graded = 0;
+    std::string skipped;
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+        probe::g_costMs.store(0);
+        std::this_thread::sleep_for(3000ms);
+        probe::g_costMs.store(29);
+        std::this_thread::sleep_for(1500ms);
+        probe::g_holdStartedAt.store(0);
+        probe::g_holdEndedAt.store(0);
+        probe::g_holdMs.store(100);
+        if (!waitFor(3000ms, [] { return probe::g_holdEndedAt.load() != 0; })) {
+            probe::g_holdMs.store(0);
+            check(false, "behind at loop rule: the staged hold of the pass's last picture was reached within 3 s");
+            return;
+        }
+        const int64_t started = probe::g_holdStartedAt.load(), ended = probe::g_holdEndedAt.load();
+        std::this_thread::sleep_for(500ms);
+        probe::g_costMs.store(0);
+        const std::vector<probe::SoundSeek> seeks = soundSeeksSince(started - 300 * kMs, ended + 400 * kMs);
+        const int64_t serverGap = longestBufferGap(takeCapture(), started - 300 * kMs, ended + 300 * kMs);
+        const std::optional<int64_t> lastDrawn =
+            commitShowing(shownPictures(d.takeCommits(), heard), last, started, ended + 300 * kMs);
+        bool handedOver = false;
+        std::optional<int64_t> atPassStart;
+        std::printf("audio_playback_test: behind at loop rule: attempt %d: %zu sound seeks around the hold, the held "
+                    "picture drawn %.1f ms after it; the server at most %.1f ms between cycles\n",
+                    attempt, seeks.size(), lastDrawn ? (*lastDrawn - ended) / 1e6 : -1.0, serverGap / 1e6);
+        for (const probe::SoundSeek& s : seeks) {
+            std::printf("  a seek %+.1f ms from the hold's end, to %.1f ms of the file\n", (s.at - ended) / 1e6, s.targetNs / 1e6);
+            if (s.targetNs >= 50 * kMs) continue;
+            if (s.at < started) {
+                handedOver = true;
+            } else if (s.at > ended && s.at <= ended + 300 * kMs && !atPassStart) {
+                atPassStart = s.at;
+            }
+        }
+        std::string why;
+        if (!handedOver) {
+            why = "no hand-over seek before the hold: the file was not handed on early";
+        } else if (!lastDrawn) {
+            why = "the held picture was dropped: the file still kept up";
+        } else if (serverGap > kServerLateBound) {
+            why = fmt("the sound server went %.1f ms between cycles", serverGap / 1e6);
+        }
+        if (!why.empty()) {
+            std::printf("audio_playback_test: behind at loop rule: attempt %d not graded: %s\n", attempt, why.c_str());
+            skipped += (skipped.empty() ? "" : "; ") + why;
+            continue;
+        }
+        ++graded;
+        check(atPassStart.has_value(),
+              "behind at loop rule: a file that turns cannot-keep-up after the early hand-over is handed on at the pass start",
+              fmt("attempt %.0f: no seek to the pass's start within 300 ms after the hold", attempt));
+    }
+    if (graded == 0) notVerified(kGoals, "no attempt was staged: " + skipped);
+}
+
+// Frames above `level` heard in [from, to), on the left channel: how long a beep sounded there.
+uint64_t loudFrames(const Capture& c, int64_t from, int64_t to, float level) {
+    uint64_t n = 0;
+    for (const probe::BufferRecord& b : c.buffers) {
+        for (uint64_t i = b.first; i < b.first + b.frames; ++i) {
+            const int64_t at = c.heardAt(b, i);
+            if (at >= from && at < to && std::fabs(c.left[i]) > level) ++n;
+        }
+    }
+    return n;
+}
+
+// One graded attempt of stageLongLastLoop's staging, as the grading sees it.
+struct LongLastAttempt {
+    int number = 0;
+    int64_t ended = 0;  // when the hold of the picture before the last ended
+    std::vector<probe::SoundSeek> seeks;  // around the loop
+    std::vector<Shown> shown;
+    int64_t unhiddenAt = 0;
+    uint64_t opening = 0, next = 0;  // loud frames of the pass's opening beep and of its 0.5 s one
+};
+
+// S15.588's staging, up to four attempts: beeps_last_long with the picture before the last held 50 ms and the
+// new pass's first picture 60 ms as the decoder returns them. With `unhideAt`, the clock is also hidden from the
+// hand-over seek on and unhidden as the new pass's picture at that time is returned, after the first-picture
+// hold. An attempt that passes the staging gates is handed to `grade`, which grades it or returns why it is not
+// graded. Under S15.538's sound-server guard; no attempt graded is not verified.
+void stageLongLastLoop(const char* kGoals, const char* rule, std::optional<int64_t> unhideAt,
+                       const std::function<std::string(const LongLastAttempt&)>& grade) {
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    StallReset reset;
+    const std::string heard = asset("wallpaper_beeps_last_long.mp4");
+    // The fixture's pictures at 1.9 s, 1.91 s (held) and 1.92 s; its pass ends at 1.9833 s.
+    const int64_t twoBefore = 1900 * kMs, beforeLast = 1910 * kMs, step = 10 * kMs;
+    {
+        std::lock_guard<std::mutex> lock(probe::g_holdMutex);
+        probe::g_holdFile = std::filesystem::path(heard).filename().string();
+    }
+    probe::g_holdAtNs.store(beforeLast);
+    Daemon d(smallConfig());
+    if (!startHeard(d, heard, kGoals)) return;
+    // The first loop learns the pass; the hand-over is early from the second on.
+    if (!waitFor(5000ms, [&] {
+            const std::vector<Shown> shown = shownPictures(d.takeCommits(), heard);
+            for (size_t i = 1; i < shown.size(); ++i) {
+                if (shown[i].presentation && shown[i - 1].presentation && *shown[i].presentation < *shown[i - 1].presentation) {
+                    return true;
+                }
+            }
+            return false;
+        })) {
+        notVerified(kGoals, "the file did not loop within 5 s");
+        return;
+    }
+    int graded = 0;
+    std::string skipped;
+    for (int attempt = 1; attempt <= 4; ++attempt) {
+        probe::g_holdStartedAt.store(0);
+        probe::g_holdEndedAt.store(0);
+        probe::g_startHoldEndedAt.store(0);
+        probe::g_startHoldArmed.store(false);
+        probe::g_hiddenAtHandOverAt.store(0);
+        probe::g_unhiddenAt.store(0);
+        probe::g_unhideArmed.store(false);
+        probe::g_unhideAtNs.store(unhideAt.value_or(-1));
+        const int hiddenBefore = probe::g_streamTimesHidden.load();
+        probe::g_hideAtHandOver.store(unhideAt.has_value());
+        probe::g_thenStartHoldMs.store(60);
+        probe::g_holdMs.store(50);
+        if (!waitFor(3000ms, [] { return probe::g_holdEndedAt.load() != 0; })) {
+            probe::g_holdMs.store(0);
+            check(false, std::string(rule) + ": the staged hold of the picture before the last was reached within 3 s");
+            return;
+        }
+        const int64_t started = probe::g_holdStartedAt.load(), ended = probe::g_holdEndedAt.load();
+        std::this_thread::sleep_for(1000ms);
+        probe::g_startHoldArmed.store(false);
+        probe::g_unhideArmed.store(false);
+        probe::g_hideAtHandOver.store(false);
+        probe::g_hideStreamTime.store(false);
+        const int64_t startHeldTo = probe::g_startHoldEndedAt.load();
+        const int64_t hiddenFrom = probe::g_hiddenAtHandOverAt.load(), unhiddenAt = probe::g_unhiddenAt.load();
+        const int hidden = probe::g_streamTimesHidden.load() - hiddenBefore;
+        const std::vector<probe::SoundSeek> seeks = soundSeeksSince(started - 300 * kMs, ended + 700 * kMs);
+        const Capture cap = takeCapture();
+        const int64_t serverGap = longestBufferGap(cap, started - 300 * kMs, ended + 700 * kMs);
+        const std::vector<Shown> shown = shownPictures(d.takeCommits(), heard);
+        std::optional<int64_t> before;
+        for (const Shown& s : shown) {
+            if (s.commit.at > started - 200 * kMs && s.commit.at <= started && s.presentation &&
+                std::llabs(*s.presentation - twoBefore) < 2 * kMs) {
+                before = s.commit.at;
+            }
+        }
+        const std::optional<int64_t> held = commitShowing(shown, beforeLast, ended, ended + 200 * kMs);
+        const int64_t late = before && held ? *held - *before - step : -1;
+        bool handedOver = false;
+        for (const probe::SoundSeek& s : seeks) {
+            if (s.targetNs < 50 * kMs && s.at < started) handedOver = true;
+        }
+        // The new pass's sound starts about 35 ms after the hold ends, its 0.5 s beep about 535 ms after.
+        const uint64_t opening = loudFrames(cap, ended - 150 * kMs, ended + 300 * kMs, 0.1f);
+        const uint64_t next = loudFrames(cap, ended + 400 * kMs, ended + 700 * kMs, 0.1f);
+        std::printf("audio_playback_test: %s: attempt %d: %zu sound seeks around the loop, the held "
+                    "picture drawn %.1f ms late, the pass's first picture held %s; the opening beep loud %.1f ms, the "
+                    "next %.1f ms; the server at most %.1f ms between cycles\n",
+                    rule, attempt, seeks.size(), late / 1e6, startHeldTo > ended ? "yes" : "no", opening * 1e3 / kRate,
+                    next * 1e3 / kRate, serverGap / 1e6);
+        if (unhideAt) {
+            std::printf("  the clock hidden %+.1f ms from the hold's end, unhidden %+.1f ms; %d timing reads hidden\n",
+                        hiddenFrom ? (hiddenFrom - ended) / 1e6 : 0.0, unhiddenAt ? (unhiddenAt - ended) / 1e6 : 0.0,
+                        hidden);
+        }
+        for (const probe::SoundSeek& s : seeks) {
+            std::printf("  a seek %+.1f ms from the hold's end, to %.1f ms of the file\n", (s.at - ended) / 1e6, s.targetNs / 1e6);
+        }
+        std::string why;
+        if (!handedOver) {
+            why = "no hand-over seek before the held decode";
+        } else if (startHeldTo <= ended) {
+            why = "the new pass's first picture was not held";
+        } else if (!before || !held) {
+            why = "the held picture or the one before it was not drawn";
+        } else if (late < 30 * kMs || late > 55 * kMs) {
+            why = fmt("the held picture was drawn %.1f ms late, outside 30-55 ms", late / 1e6);
+        } else if (next < static_cast<uint64_t>(kRate) / 50) {
+            why = fmt("the pass's 0.5 s beep sounded only %.1f ms", next * 1e3 / kRate);
+        } else if (serverGap > kServerLateBound) {
+            why = fmt("the sound server went %.1f ms between cycles", serverGap / 1e6);
+        } else if (unhideAt && (hiddenFrom == 0 || hiddenFrom >= started || hidden <= 0)) {
+            why = "the clock was not hidden from the hand-over seek on";
+        } else if (unhideAt && unhiddenAt <= startHeldTo) {
+            why = fmt("the clock was not unhidden at the pass's %.1f ms picture", *unhideAt / 1e6);
+        } else {
+            why = grade(LongLastAttempt{attempt, ended, seeks, shown, unhiddenAt, opening, next});
+        }
+        if (!why.empty()) {
+            std::printf("audio_playback_test: %s: attempt %d not graded: %s\n", rule, attempt, why.c_str());
+            skipped += (skipped.empty() ? "" : "; ") + why;
+            continue;
+        }
+        ++graded;
+    }
+    if (graded == 0) notVerified(kGoals, "no attempt was staged: " + skipped);
+}
+
+// GOAL: S15.588 -- a heard file that keeps up is not handed on again at a pass start whose pictures trail its
+//       early-handed sound by under half of kShortestHandedPass: on beeps_last_long (30 a second to 1.9 s,
+//       then pictures 10 ms apart, the last shown 63 ms), with the picture before the last held 50 ms and
+//       the new pass's first picture held 60 ms as the decoder returns them, exactly one sound seek around
+//       the loop -- the hand-over -- and the beep that opens the pass sounds at most 1.25 times as long as the
+//       next. False if the pass start is tested against kSoundDrift: the new pass's sound, already playing, is
+//       played from its start again (a second seek), and the opening is heard twice.
+// WHY-THIS-SHAPE: the trail needs a picture drawn more than its interval late while nothing steers it: after
+//       the hand-over, before the handed-on sound is heard. The short steps put the hand-over before the held
+//       decode (on a constant 30 a second it lands in the same steer, which drops the late picture); the long
+//       last picture keeps the next draw before the pass's end, so nothing chases it; the held first picture
+//       puts the pass start's first steer after the new sound has started. Graded only when the hand-over came
+//       first, both holds ran and the held picture was 30-55 ms late (its commit against the one before);
+//       else printed, and none graded is not verified. Loud frames against the 0.5 s beep, not onsets: the
+//       restart lands at the 40 ms beep's end, so the two run together. Under S15.538's sound-server guard.
+// COVERAGE-ASSERT: the first hold reached in every attempt, and at least one attempt graded.
+// CONTROL: control_run.sh 2026-10-13, reverted, steerSoundLocked, backend/daemon/wallpaper_manager.cpp: `passAway`
+//       made `kSoundDrift` -> "FAIL: long last picture rule: a file that keeps up is not handed on again at a pass
+//       start ..." (2 seeks, the second 70 ms after the hold) and "... the pass's opening beep is heard once" (loud
+//       42.5-57.2 ms against 31.7), 4 of 4 attempts on both entries (re-run on the shared staging helper). Green: 1 seek,
+//       30.3 ms against 31.7. Test-side:
+//       the 50 ms hold made 20 -> "NOT VERIFIED -- S15.588 ...: drawn 10.1 ms late, outside 30-55 ms", not a FAIL.
+void runLongLastChecks() {
+    const char* kGoals = "S15.588 (a file that keeps up is not handed on again under the margin at a pass start)";
+    stageLongLastLoop(kGoals, "long last picture rule", std::nullopt, [](const LongLastAttempt& a) {
+        check(a.seeks.size() == 1,
+              "long last picture rule: a file that keeps up is not handed on again at a pass start trailing its sound "
+              "by under half of kShortestHandedPass",
+              fmt("attempt %.0f: %.0f sound seeks around the loop", a.number, static_cast<double>(a.seeks.size())));
+        check(a.opening * 4 <= a.next * 5, "long last picture rule: the pass's opening beep is heard once",
+              fmt("attempt %.0f: loud %.1f ms, the next beep %.1f ms", a.number, a.opening * 1e3 / kRate,
+                  a.next * 1e3 / kRate));
+        return std::string();
+    });
+}
+
+// GOAL: S15.589 -- a file that keeps up, whose early-handed sound has no clock yet, is not moved by the no-clock
+//       rule through the pass's first kCatchUpHold of pictures: S15.588's staging with the clock hidden from the
+//       hand-over seek on and unhidden as the new pass's 66.7 ms picture is returned (held 50 ms after), exactly one
+//       sound seek around the loop and the opening beep at most 1.25 times the next. False if the protection
+//       ends after the pass's first picture: its second picture's steer, still with no clock, moves the sound
+//       back to the pass's start.
+// WHY-THIS-SHAPE: S15.588 unhides nothing, so its pass start is steered with a clock; this one keeps the clock
+//       away past the second picture, which only a no-clock pass start reaches. The 50 ms hold after unhiding lets
+//       a clock be published before the 66.7 ms picture is steered, so the case is "no clock inside the cap",
+//       not "no clock past it" (noClockPastCap). Graded only on S15.588's gates plus: the hide began at the
+//       hand-over, before the held decode, and the unhiding ran; else printed, none graded is not verified.
+// COVERAGE-ASSERT: as S15.588's, and at least one of AudioOutput's timing reads hidden in a graded attempt.
+// CONTROL: control_batch.sh 2026-10-13, reverted, steerSoundLocked, backend/daemon/wallpaper_manager.cpp: `chased` set
+//       back to the first-picture-only `clock || (next.startsPass && passAway > kSoundDrift)` -> "FAIL: no clock at a
+//       pass start rule: an early-handed sound with no clock is not moved ..." (2 seeks, the second +73.5 ms from the
+//       hold's end) and "... the pass's opening beep is heard once" (43.8-51.4 ms against 31.7), 4 of 4 attempts on
+//       both entries. Green: 1 seek, 30.3 ms. Test-side: the clock never hidden -> "NOT VERIFIED -- S15.589 ...: the
+//       clock was not hidden from the hand-over seek on" (entry skipped), not a FAIL.
+void runNoClockPassStartChecks() {
+    const char* kGoals = "S15.589 (an early-handed sound with no clock is not moved inside the pass's first kCatchUpHold)";
+    stageLongLastLoop(kGoals, "no clock at a pass start rule", 2'000'000'000LL / 30, [](const LongLastAttempt& a) {
+        check(a.seeks.size() == 1,
+              "no clock at a pass start rule: an early-handed sound with no clock is not moved inside the pass's "
+              "first kCatchUpHold",
+              fmt("attempt %.0f: %.0f sound seeks around the loop", a.number, static_cast<double>(a.seeks.size())));
+        check(a.opening * 4 <= a.next * 5, "no clock at a pass start rule: the pass's opening beep is heard once",
+              fmt("attempt %.0f: loud %.1f ms, the next beep %.1f ms", a.number, a.opening * 1e3 / kRate,
+                  a.next * 1e3 / kRate));
+        return std::string();
+    });
+}
+
+// GOAL: S15.589 -- past the pass's first kCatchUpHold of pictures the no-clock rule moves an early-handed sound
+//       that still has no clock: the staging above with the clock unhidden only at the 200 ms picture, exactly two
+//       sound seeks around the loop, the second after the pass's 100 ms picture is shown and before the unhiding.
+//       False if the protection lasts until a clock arrives however late (a missing clock never ends it).
+// WHY-THIS-SHAPE: two seeks, not "at least one more": the hand-over plus one move is what the rule makes; a
+//       second move would be a separate defect. The second seek is placed between the 100 ms picture's commit
+//       and the unhiding so that it is the no-clock rule acting past the cap, not an earlier steer inside it, nor a
+//       clock rule after it. The commit is recorded on the render thread before it steers the next picture, and
+//       the seek follows that steer, so "after" is causal; the unhiding (at the 200 ms picture's decode) came
+//       about 66 ms after the move in every run. Graded on the gates above plus the 100 ms picture shown first.
+// COVERAGE-ASSERT: as above.
+// CONTROL: control_batch.sh / control_run.sh 2026-10-13, reverted, steerSoundLocked, backend/daemon/wallpaper_manager.cpp:
+//       the `<= kCatchUpHold` clause of `handedUnheard` deleted -> "FAIL: no clock past the cap rule: an early-handed
+//       sound still with no clock is moved once ..." (1 seek); the cap made zero (first picture only) -> "FAIL: ...
+//       the move comes after the pass's 100 ms picture and before a clock" (the move +73.5 ms, the 100 ms picture
+//       +173.5 ms); 4 of 4 attempts on both entries. Green: 2 seeks, the second +173.5 ms, the unhiding +240 ms.
+void runNoClockPastCapChecks() {
+    const char* kGoals = "S15.589 (an early-handed sound with no clock is moved past the pass's first kCatchUpHold)";
+    stageLongLastLoop(kGoals, "no clock past the cap rule", 200 * kMs, [](const LongLastAttempt& a) {
+        const std::optional<int64_t> cap = commitShowing(a.shown, 100 * kMs, a.ended, a.unhiddenAt);
+        if (!cap) return std::string("the pass's 100 ms picture was not shown before the unhiding");
+        std::printf("audio_playback_test: no clock past the cap rule: attempt %d: the 100 ms picture shown %+.1f ms "
+                    "from the hold's end, the clock unhidden %+.1f ms\n",
+                    a.number, (*cap - a.ended) / 1e6, (a.unhiddenAt - a.ended) / 1e6);
+        check(a.seeks.size() == 2,
+              "no clock past the cap rule: an early-handed sound still with no clock is moved once past the pass's "
+              "first kCatchUpHold",
+              fmt("attempt %.0f: %.0f sound seeks around the loop", a.number, static_cast<double>(a.seeks.size())));
+        if (a.seeks.size() == 2) {
+            check(a.seeks[1].at > *cap && a.seeks[1].at < a.unhiddenAt,
+                  "no clock past the cap rule: the move comes after the pass's 100 ms picture and before a clock",
+                  fmt("attempt %.0f: the move %+.1f ms from the 100 ms picture's commit, %+.1f ms from the unhiding",
+                      a.number, (a.seeks[1].at - *cap) / 1e6, (a.seeks[1].at - a.unhiddenAt) / 1e6));
+        }
+        return std::string();
+    });
 }
 
 // GOAL: S15.583 -- a few slow decodes as a session starts do not make a file count as one that cannot
@@ -7230,6 +7616,10 @@ int main(int argc, char** argv) {
         {"speedLoad", &runSpeedLoadChecks},
         {"holdRunOut", &runHoldRunOutChecks},
         {"lateHandOn", &runLateHandOnChecks},
+        {"behindAtLoop", &runBehindAtLoopChecks},
+        {"longLastLoop", &runLongLastChecks},
+        {"noClockPassStart", &runNoClockPassStartChecks},
+        {"noClockPastCap", &runNoClockPastCapChecks},
         {"firstSlowDecodes", &runFirstSlowDecodesChecks},
         {"noClockLead", &runNoClockLeadChecks},
         {"loopRestartLoad", &runLoopRestartLoadChecks},
