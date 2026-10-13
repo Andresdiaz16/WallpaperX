@@ -4,6 +4,7 @@
 
 #include "../vulkan/device.h"
 #include "ffmpeg_file.h"
+#include "picture_skip.h"
 #include "stream_position.h"
 
 extern "C" {
@@ -214,7 +215,9 @@ public:
     VideoDecoder& operator=(const VideoDecoder&) = delete;
 
     // The next picture in output order, or nothing once the stream is exhausted. A packet the
-    // decoder cannot parse is skipped, not reported.
+    // decoder cannot parse is skipped, not reported. Pictures `skip` names are left out, except
+    // while a start or resume drops its way to a picture, which it matches against pictures
+    // returned unskipped.
     //
     // When hardware decoding fails part way through, software continues from the picture after
     // the last one returned; none is returned twice. While every picture returned has carried a
@@ -238,14 +241,14 @@ public:
     // Throws GpuFailure for a hardware fault, WallpaperContentError for a container that cannot be
     // read or a stream that cannot be decoded, and std::runtime_error when out of memory. After a
     // throw the decoder is not usable.
-    std::optional<DecodedFrame> next();
+    std::optional<DecodedFrame> next(PictureSkip skip = PictureSkip::Nothing);
 
     // next() that gives up for now once it has decoded and dropped `dropLimit` pictures on the way to
     // the one it returns -- what a start part way in and a software resume both decode through. It
     // drops at least one before giving up. Dropping then: nothing is lost, and the next call of either
     // form carries on from there.
     struct Dropping {};
-    std::variant<std::optional<DecodedFrame>, Dropping> next(uint32_t dropLimit);
+    std::variant<std::optional<DecodedFrame>, Dropping> next(uint32_t dropLimit, PictureSkip skip = PictureSkip::Nothing);
 
     // Starts the stream again: the next picture is its first, and a later hardware failure resumes
     // among the pictures returned since, never earlier ones. The path is kept, so a decoder that fell
@@ -269,7 +272,7 @@ public:
     Path path() const { return m_path; }
 
 private:
-    std::variant<std::optional<DecodedFrame>, Dropping> decode(std::optional<uint32_t> dropLimit);
+    std::variant<std::optional<DecodedFrame>, Dropping> decode(std::optional<uint32_t> dropLimit, PictureSkip skip);
     // ffmpeg's format negotiation. A software codec's frame threads call it off the GPU thread, so on
     // that path it reads nothing of the decoder and writes only m_softwareFormatRefused.
     static AVPixelFormat chooseFormat(AVCodecContext* codec, const AVPixelFormat* offered);

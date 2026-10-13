@@ -29,52 +29,62 @@ bool VideoPipeline::renderNext(OffscreenTargetManager& targets, const OffscreenT
 
 bool VideoPipeline::decodeNext() {
     m_device.assertGpuThread("VideoPipeline::decodeNext");
-    return decode(std::nullopt) == Decode::Converted;
+    if (decode(std::nullopt, PictureSkip::Nothing) != Decode::Decoded) return false;
+    convert();
+    return true;
 }
 
-VideoPipeline::Decode VideoPipeline::decodeWithin(uint32_t dropLimit) {
+VideoPipeline::Decode VideoPipeline::decodeWithin(uint32_t dropLimit, PictureSkip skip) {
     m_device.assertGpuThread("VideoPipeline::decodeWithin");
-    return decode(dropLimit);
+    return decode(dropLimit, skip);
 }
 
-VideoPipeline::Decode VideoPipeline::decode(std::optional<uint32_t> dropLimit) {
+void VideoPipeline::convert() {
+    m_device.assertGpuThread("VideoPipeline::convert");
+    if (!m_unconverted) return;
+    // The new stage is complete before the old one is freed, so a picture it refuses leaves the
+    // old stage and the target as they were. The old converter's destructor then finds its
+    // readers finished: the new one's constructor waited for a batch submitted after them.
+    if (!m_stage || FrameConverter::pictureOf(*m_unconverted) != m_stage->converter.picture()) {
+        m_stage = std::make_unique<Stage>(m_device, *m_unconverted, m_shaderDir);
+    }
+    static_cast<void>(m_stage->converter.convert(*m_unconverted));
+    m_convertedPosition = m_unconverted->position();
+    m_unconverted.reset();
+}
+
+VideoPipeline::Decode VideoPipeline::decode(std::optional<uint32_t> dropLimit, PictureSkip skip) {
     std::optional<DecodedFrame> frame;
     if (dropLimit) {
-        auto step = m_decoder.next(*dropLimit);
+        auto step = m_decoder.next(*dropLimit, skip);
         if (std::holds_alternative<VideoDecoder::Dropping>(step)) return Decode::Dropping;
         frame = std::move(std::get<std::optional<DecodedFrame>>(step));
     } else {
-        frame = m_decoder.next();
+        frame = m_decoder.next(skip);
     }
-    bool startsPass = !m_stage && !m_decoder.startedMidStream();
-    // No stage means nothing was ever shown, and a stream with nothing to show must not spin here.
-    if (!frame && m_playback == Playback::Loop && m_stage) {
+    bool startsPass = !m_timing && !m_decoder.startedMidStream();
+    // No timing means nothing was ever decoded, and a stream with nothing to show must not spin here.
+    if (!frame && m_playback == Playback::Loop && m_timing) {
         m_decoder.restart();
         // Unbounded: a restarted pass has returned nothing to resume after, so it drops nothing.
-        frame = m_decoder.next();
+        frame = m_decoder.next(skip);
         startsPass = true;
     }
     if (!frame) return Decode::Exhausted;
 
-    // The new stage is complete before the old one is freed, so a picture it refuses leaves the
-    // old stage and the target as they were. The old converter's destructor then finds its
-    // readers finished: the new one's constructor waited for a batch submitted after them.
-    if (!m_stage || FrameConverter::pictureOf(*frame) != m_stage->converter.picture()) {
-        m_stage = std::make_unique<Stage>(m_device, *frame, m_shaderDir);
-    }
-    static_cast<void>(m_stage->converter.convert(*frame));
     m_timing = PictureTiming{frame->presentationTime(), frame->duration(), startsPass};
-    m_convertedPosition = frame->position();
-    return Decode::Converted;
+    m_unconverted = std::move(*frame);
+    return Decode::Decoded;
 }
 
 VideoPipeline::PictureTiming VideoPipeline::timing() const {
-    if (!m_stage) throw std::logic_error("VideoPipeline::timing: no picture has been decoded");
-    return m_timing;
+    if (!m_timing) throw std::logic_error("VideoPipeline::timing: no picture has been decoded");
+    return *m_timing;
 }
 
 void VideoPipeline::draw(OffscreenTargetManager& targets, const OffscreenTarget& target) {
     m_device.assertGpuThread("VideoPipeline::draw");
+    convert();
     // A stage exists exactly once a picture has been converted into it, so this is the one state
     // that has nothing to show.
     if (!m_stage) throw std::logic_error("VideoPipeline::draw: no picture has been decoded");

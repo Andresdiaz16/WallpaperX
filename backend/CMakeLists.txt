@@ -944,6 +944,22 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         )
         list(APPEND WALLPAPERX_BACKEND_SOUND_ASSETS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/${sound_name})
     endforeach()
+    # beeps_long's sound under twelve seconds of a moving pattern in main-profile H.264 with two B-frames
+    # between references, never themselves referenced (b-pyramid none, no adaptive placement): two of every
+    # three pictures are ones a decoder may skip, for audio_playback_test's picture-skipping phases.
+    add_custom_command(
+        OUTPUT ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_beeps_bframes.mp4
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error
+                -f lavfi -i testsrc2=size=160x120:rate=30:duration=12
+                -f lavfi -i "aevalsrc=exprs='0.5*sin(2*PI*1000*t)*lt(mod(t,0.5),0.04)|0.3*sin(2*PI*440*t)':s=48000:d=12"
+                -c:v libx264 -profile:v main -preset veryfast -g 30 -sc_threshold 0 -bf 2
+                -x264-params b-pyramid=none:b-adapt=0 -pix_fmt yuv420p
+                -c:a aac -b:a 128k -ar 48000 -ac 2
+                ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_beeps_bframes.mp4
+        COMMENT "Generating video wallpaper fixture wallpaper_beeps_bframes.mp4"
+        VERBATIM
+    )
+    list(APPEND WALLPAPERX_BACKEND_SOUND_ASSETS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_beeps_bframes.mp4)
     # Two seconds of the tone in the other containers a wallpaper's sound may come in, for
     # audio_playback_test's seek to the start. Fields, '@'-separated: name, picture codec, sound codec.
     foreach(container

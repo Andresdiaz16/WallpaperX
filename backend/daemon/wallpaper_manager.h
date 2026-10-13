@@ -13,6 +13,7 @@
 // kTargetDepth and the two numbers behind it: separate because the KDE plugin sizes its import
 // cache against them and cannot include this header.
 #include "ring_depth.h"
+#include "video/picture_skip.h"
 #include "video/stream_position.h"
 #include "vulkan/frame_export.h"
 #include "wallpaper_properties.h"
@@ -1536,6 +1537,10 @@ private:
             // waiting picture's own time when that picture starts a new pass. Empty when the picture
             // on screen has no time.
             std::optional<std::chrono::nanoseconds> reaches;
+            // When a round first left a picture the sound had played past still held, its slice
+            // spent: the screen has been kept on its picture since, to land on the sound rather than
+            // run through late ones. Ends when the picture is no longer behind, or is drawn.
+            std::optional<std::chrono::steady_clock::time_point> catchingUpSince;
 
             // Re-times the rest of the wait from `now` when `speed` differs. A picture already
             // due stays due where it was.
@@ -1556,6 +1561,57 @@ private:
         // The file's sound, made the first time its screen is heard and kept, silent, while it is
         // not. Its anchor is the one record of where the sound was told to be.
         std::unique_ptr<AudioTrack> audio;
+        // Where every pass through the file starts and ends in its own time, from the first loop on,
+        // for a pass long enough that its sound is handed to the next ahead of time.
+        struct Pass {
+            std::chrono::nanoseconds first{};
+            std::chrono::nanoseconds end{};
+        };
+        std::optional<Pass> pass;
+        // The sound's last clock reading -- the file's time `file` heard at `at` -- and the track
+        // request it was read for: where the sound is known to be while its clock is missing. A newer
+        // request makes it no one's.
+        struct Heard {
+            uint64_t request = 0;
+            std::chrono::nanoseconds file{};
+            std::chrono::steady_clock::time_point at;
+        };
+        std::optional<Heard> heard;
+
+        // How long pictures take to decode against the time they are shown for, averaged over several so
+        // that one slow decode -- a key picture, a wait on the GPU queue, a stalled read -- is not taken
+        // for a file that cannot keep up; no state is entered before its average holds kSettled samples.
+        // Each is entered at 1 and left under kKeepsUp, so a file decoding at about its own rate does
+        // not flip between two every few pictures.
+        struct DecodeLoad {
+            struct Average {
+                double value = 0;
+                uint32_t samples = 0;  // up to kSettled
+                void add(double load);
+            };
+            // Against how long each picture is shown: decoding every picture, a skipped one taken to cost
+            // what a decoded one does.
+            Average everyPicture;
+            // Against the time shown since the picture before: the decoder as it runs, restarted when it
+            // starts skipping.
+            Average asRun;
+            enum class State {
+                Keeps,   // every picture decodes in real time
+                Skips,   // only with unreferenced pictures skipped, and then keeps pace
+                Behind,  // skipping, and not yet shown to keep pace: the pictures keep their own clock
+            };
+            State state = State::Keeps;
+            static constexpr double kKeepsUp = 0.9;
+            // One averaging window: the samples an average holds before it moves the state.
+            static constexpr uint32_t kSettled = 8;
+            void add(std::chrono::nanoseconds took, std::chrono::nanoseconds shownFor, std::chrono::nanoseconds covered);
+        };
+        DecodeLoad decodeLoad;
+        // What the decoder may leave out: the pictures nothing references while decoding them all
+        // cannot keep up.
+        PictureSkip skip() const {
+            return decodeLoad.state == DecodeLoad::State::Keeps ? PictureSkip::Nothing : PictureSkip::Unreferenced;
+        }
 
         // The file's average rate is above the picture-rate cap, so its pictures play slower than its
         // sound would: it plays silent until sound can be stretched. Set once, at the open.
@@ -1590,12 +1646,26 @@ private:
     // -- when its sound is not to be heard. Throws only on making a track. Caller holds m_gpuMutex
     // and not m_stateMutex.
     AudioTrack* heardTrackLocked(int monitorId, VideoSession& session, const SoundWanted& wanted);
-    // Points a playing session's sound at the picture schedule `waiting` belongs to, or silences it.
-    // A sound already playing that the pictures trail by little is kept, and `waiting` moved to it
-    // instead. Never fails the session: sound is lost before a picture is. Caller holds m_gpuMutex
-    // and not m_stateMutex.
-    void steerSoundLocked(int monitorId, VideoSession& session, VideoSession::Waiting& waiting,
-                          const SoundWanted& wanted, std::chrono::steady_clock::time_point now) noexcept;
+    // What steering the sound made of the waiting picture.
+    struct SoundPace {
+        // The sound's clock timed it this round, so once the sound has played past it, it is dropped.
+        bool timesPicture = false;
+        // A round wanted before the picture is due, to hand the sound to the next pass.
+        std::optional<std::chrono::steady_clock::time_point> roundAt;
+    };
+    // Whether the waiting picture's catch-up hold has run out with the pictures still behind the sound.
+    enum class CatchUp { Chasing, HoldRunOut };
+    // Starts a playing session's sound on the picture schedule `waiting` belongs to, hands it to each
+    // new pass, or silences it. While the sound is heard playing, `waiting` is moved to it, so the
+    // pictures follow the sound card; a sound that falls behind the pictures is moved to them instead,
+    // as is one too far ahead of them once `catchUp` says they failed to reach it or no clock lets
+    // them chase it, judged while it is not heard playing from where it was last heard. A file that
+    // cannot decode in real time even skipping is left to drift until its next pass.
+    // Never fails the session: sound is lost before a picture is. Caller holds m_gpuMutex and not
+    // m_stateMutex.
+    SoundPace steerSoundLocked(int monitorId, VideoSession& session, VideoSession::Waiting& waiting,
+                               const SoundWanted& wanted, std::chrono::steady_clock::time_point now,
+                               CatchUp catchUp) noexcept;
     // Plays a parked session's sound on its own, looping, when it would be heard, and returns its
     // track; null, with the sound stopped, otherwise. Caller holds m_gpuMutex and not m_stateMutex.
     AudioTrack* loopParkedSoundLocked(int monitorId, VideoSession& session, const SoundWanted& wanted,

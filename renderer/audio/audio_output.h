@@ -57,6 +57,26 @@ public:
     // What the last play() asked for; nothing before the first and after stop().
     const std::optional<Anchor>& anchor() const { return m_anchor; }
 
+    // Where the sound of the last play() actually is: the file's time `file` is heard at `at`, as the
+    // sound server timed its latest cycle, and runs on at the sound card's own rate from there.
+    struct Clock {
+        std::chrono::nanoseconds file{};
+        std::chrono::steady_clock::time_point at;
+        std::chrono::steady_clock::time_point heardAt(std::chrono::nanoseconds fileTime) const {
+            return at + (fileTime - file);
+        }
+    };
+    // Nothing unless that sound is being played out as of `now`: not before it starts or after its
+    // last frame, not after stop(), not for a looping anchor, and not once the server has stopped
+    // asking for it for a few cycles -- a stall, a loss, a failed track. Reads a few atomics.
+    std::optional<Clock> clock(std::chrono::steady_clock::time_point now) const noexcept;
+
+    // Names the latest play() or stop() that changed anything; each such call gives a new value.
+    uint64_t request() const noexcept;
+    // Whether the output's thread has taken up that request. A play() taken up still leaves the
+    // sound before it playing until its `at`.
+    bool taken() const noexcept;
+
     // Whether the file has sound this output can play: Unknown until a play() has had it opened.
     // None and Failed are for good on this track. None is the file's answer: it holds no audio
     // stream this output can decode. Failed is anything that may not happen again on a new track:
@@ -78,7 +98,8 @@ private:
 // The daemon's sound: one thread that opens each track's file, decodes it a fraction of a second
 // ahead of the sound server and starts and stops its stream, and one PipeWire connection, made
 // when a track first has something to play. One stream per track, 48 kHz float stereo, fed from a
-// ring the stream's realtime callback reads without a lock.
+// ring the stream's realtime callback reads without a lock, and which publishes, each cycle, the
+// file time it plays and when that is heard.
 //
 // Nothing here can stop a picture: a file with no audio or unreadable sound leaves that track
 // silent; a sound server that is missing or goes away, or refuses a track's stream, leaves it silent

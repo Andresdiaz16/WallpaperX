@@ -256,6 +256,85 @@ void waitReporting(Device& device, Device::SubmitTicket ticket, const char* what
 // S13.38 / S13.40 / S13.41 -- the hardware path
 // ------------------------------------------------------------------------- //
 
+// What a decode of `file` to its end returns when every call names `skip`: how many pictures, whether each
+// carried a presentation time and those times rose, and the path it took.
+struct SkipDecode {
+    int pictures = 0;
+    bool timed = true;
+    bool rising = true;
+    VideoDecoder::Path path = VideoDecoder::Path::Undecided;
+};
+SkipDecode decodeSkipping(Device& device, const std::string& file, wallpaperx::PictureSkip skip) {
+    SkipDecode out;
+    VideoDecoder decoder(device, file);
+    std::optional<std::chrono::nanoseconds> last;
+    while (std::optional<DecodedFrame> frame = decoder.next(skip)) {
+        ++out.pictures;
+        const std::optional<std::chrono::nanoseconds> at = frame->presentationTime();
+        if (!at) {
+            out.timed = false;
+            continue;
+        }
+        if (last && *at <= *last) out.rising = false;
+        last = at;
+    }
+    out.path = decoder.path();
+    return out;
+}
+
+// GOAL: S15.576 -- VideoDecoder::next(PictureSkip::Unreferenced) leaves out the pictures nothing references:
+//       counter_long.mp4 (H.264, three B-frames between references, the middle one referenced) decodes to
+//       fewer than three quarters of its 321 pictures, each with a presentation time and those rising;
+//       next(PictureSkip::Nothing) returns all 321; and counter_av1.mp4, whose decoders ignore the request,
+//       returns the same count under both. On the device here (`hardware`), in software in `content`.
+//       False if the request never reaches the codec, reaches it always, or drops pictures out of order.
+// WHY-THIS-SHAPE: counts against the same decoder unskipped, so the fixture's own count is not assumed
+//       beyond the 321 it is generated with. The AV1 half pins a documented limit (picture_skip.h) rather
+//       than a behaviour the decoder chooses: it is red only if an AV1 decode starts skipping.
+// CONTROL: control_batch.sh 2026-10-13, reverted, video_decoder_content_lavapipe, renderer/video/video_decoder.cpp:
+//       `skip_frame` always AVDISCARD_DEFAULT -> "FAIL: content, software: asked to skip unreferenced pictures, the
+//       decoder returns fewer (321 of 321)"; skipping whatever `skip` asks -> "... asked to skip nothing, the decoder
+//       returns every picture (217 of 321)". Test-side: the AV1 half pointed at counter_long.mp4 -> "... an AV1 file
+//       returns every picture asked to skip ... (217 of 120)". The first break on video_decoder_hardware (RTX,
+//       control_batch.sh 2026-10-13) -> "FAIL: hardware: asked to skip unreferenced pictures, the decoder returns
+//       fewer (321 of 321)".
+void runPictureSkipChecks(Device& device, const char* label, bool hardware) {
+    using wallpaperx::PictureSkip;
+    if (!haveAssets({"counter_long.mp4"})) {
+        g_notVerified = true;
+        return;
+    }
+    const SkipDecode all = decodeSkipping(device, asset("counter_long.mp4"), PictureSkip::Nothing);
+    const SkipDecode some = decodeSkipping(device, asset("counter_long.mp4"), PictureSkip::Unreferenced);
+    std::printf("video_decoder_probe (%s): counter_long.mp4 decodes to %d pictures (%s), %d skipping unreferenced ones\n",
+                label, all.pictures, pathName(all.path), some.pictures);
+    if (hardware && all.path != VideoDecoder::Path::Hardware) {
+        std::printf("video_decoder_probe (%s): counter_long.mp4 did not decode on the device, so skipping there is not "
+                    "answerable\n",
+                    label);
+        g_notVerified = true;
+        return;
+    }
+    check(all.pictures == 321, std::string(label) + ": asked to skip nothing, the decoder returns every picture (" +
+                                   std::to_string(all.pictures) + " of 321)");
+    check(some.pictures < all.pictures * 3 / 4 && some.pictures > 0,
+          std::string(label) + ": asked to skip unreferenced pictures, the decoder returns fewer (" +
+              std::to_string(some.pictures) + " of " + std::to_string(all.pictures) + ")");
+    check(some.timed && some.rising,
+          std::string(label) + ": the pictures a skipping decode returns carry presentation times, and they rise");
+    if (!haveAssets({"counter_av1.mp4"})) {
+        g_notVerified = true;
+        return;
+    }
+    const SkipDecode av1All = decodeSkipping(device, asset("counter_av1.mp4"), PictureSkip::Nothing);
+    const SkipDecode av1Some = decodeSkipping(device, asset("counter_av1.mp4"), PictureSkip::Unreferenced);
+    std::printf("video_decoder_probe (%s): counter_av1.mp4 decodes to %d pictures (%s), %d asked to skip\n", label,
+                av1All.pictures, pathName(av1All.path), av1Some.pictures);
+    check(av1All.pictures > 0 && av1Some.pictures == av1All.pictures,
+          std::string(label) + ": an AV1 file returns every picture asked to skip, as its decoders ignore the request (" +
+              std::to_string(av1Some.pictures) + " of " + std::to_string(av1All.pictures) + ")");
+}
+
 void runHardwareChecks(Device& device) {
     if (!haveAssets({"h264_crop.mp4"})) {
         g_notVerified = true;
@@ -492,6 +571,7 @@ void runHardwareChecks(Device& device) {
                 static_cast<unsigned long long>(firstSubmit.waitValues[0]),
                 static_cast<unsigned long long>(secondSubmit.waitValues[0]),
                 static_cast<unsigned long long>(afterFailure.waitValues[0]));
+    runPictureSkipChecks(device, "hardware", true);
 }
 
 // ------------------------------------------------------------------------- //
@@ -1227,6 +1307,7 @@ void runContentChecks(Device& device) {
         } else {
             g_notVerified = true;
         }
+        runPictureSkipChecks(software, "content, software", false);
     }
     g_hideVideoExtensions = false;
 }

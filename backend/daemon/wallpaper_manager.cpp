@@ -157,18 +157,27 @@ std::chrono::nanoseconds intervalAtSpeed(const PictureTiming& picture, double sp
 // the round and every request queued behind it get their turn. Shared by every session in the round,
 // and each still drops one picture per round, so none stalls. Well under a 60 Hz frame.
 constexpr std::chrono::milliseconds kCatchUpSlice{4};
+// How long a heard screen keeps its picture while dropping, a slice a round, to reach its sound; past
+// it the picture held is drawn late, so a decode only just faster than the file still moves.
+constexpr std::chrono::milliseconds kCatchUpHold{100};
 
-// How far a heard video's sound may stray from its pictures before it is moved back to them. Well
-// inside what anyone notices, and far above the rounding in the picture schedule.
+// How far a heard video's sound may sit from its pictures before it is moved to them, where they cannot
+// follow it -- it is behind them, no clock lets them chase it, or a whole kCatchUpHold of dropping did
+// not reach it -- and how far it may sit from a pass's pictures and still be that pass's. Well inside
+// what anyone notices, and far above the rounding in the picture schedule.
 constexpr std::chrono::milliseconds kSoundDrift{20};
-// The most pictures that catch a heard video up to its sound, shown at the rate cap: about a tenth of
-// a second. Pictures further behind move the sound instead.
-constexpr int kSoundCatchUpPictures = 12;
+// How far ahead of a pass's start its sound is asked for, where the daemon can choose: past a stream's
+// own lookahead -- the server's delay and a cycle -- at a desktop's usual 1024-frame quantum, so the
+// switch lands on time.
+constexpr std::chrono::milliseconds kHandOverLead{100};
+// The shortest pass whose sound is handed to the next one that early: long enough that a sound a pass
+// away is never mistaken for one handed on early or a catch-up hold off its own pass.
+constexpr std::chrono::milliseconds kShortestHandedPass = 2 * (kHandOverLead + kCatchUpHold);
 
 // The pipeline's next picture, dropping one picture at a time on the way until `until`, and at least one.
-VideoPipeline::Decode decodeUntil(VideoPipeline& pipeline, SteadyTime until) {
+VideoPipeline::Decode decodeUntil(VideoPipeline& pipeline, SteadyTime until, PictureSkip skip) {
     for (;;) {
-        const VideoPipeline::Decode step = pipeline.decodeWithin(1);
+        const VideoPipeline::Decode step = pipeline.decodeWithin(1, skip);
         if (step != VideoPipeline::Decode::Dropping || std::chrono::steady_clock::now() >= until) return step;
     }
 }
@@ -2364,6 +2373,35 @@ WallpaperManager::VideoSession::OnScreen WallpaperManager::VideoSession::Waiting
     return {now, now};
 }
 
+void WallpaperManager::VideoSession::DecodeLoad::Average::add(double load) {
+    // The mean of the first kSettled decodes, then an eighth of each new one, and none counted past
+    // twice its time: one decode, however slow, cannot make a file that keeps up look slow for long.
+    if (samples < kSettled) ++samples;
+    value += (std::min(load, 2.0) - value) / samples;
+}
+
+void WallpaperManager::VideoSession::DecodeLoad::add(std::chrono::nanoseconds took, std::chrono::nanoseconds shownFor,
+                                                     std::chrono::nanoseconds covered) {
+    const auto against = [&](std::chrono::nanoseconds span) {
+        return static_cast<double>(took.count()) / static_cast<double>(span.count());
+    };
+    everyPicture.add(against(shownFor));
+    asRun.add(against(covered));
+    // Skipping starts unpaced: its samples so far measured decoding every picture.
+    if (state == State::Keeps) {
+        if (everyPicture.samples >= kSettled && everyPicture.value >= 1.0) {
+            state = State::Behind;
+            asRun = {};
+        }
+    } else if (everyPicture.value < kKeepsUp) {
+        state = State::Keeps;
+    } else if (state == State::Skips && asRun.value >= 1.0) {
+        state = State::Behind;
+    } else if (state == State::Behind && asRun.samples >= kSettled && asRun.value < kKeepsUp) {
+        state = State::Skips;
+    }
+}
+
 void WallpaperManager::markShown(VideoSession& session, SteadyTime now, double speed) {
     using Session = VideoSession;
     // Terminal for the schedule: what is on screen is what the session holds.
@@ -2402,63 +2440,116 @@ AudioTrack* WallpaperManager::heardTrackLocked(int monitorId, VideoSession& sess
     return session.audio.get();
 }
 
-void WallpaperManager::steerSoundLocked(int monitorId, VideoSession& session, VideoSession::Waiting& waiting,
-                                        const SoundWanted& wanted, SteadyTime now) noexcept {
+WallpaperManager::SoundPace WallpaperManager::steerSoundLocked(int monitorId, VideoSession& session,
+                                                               VideoSession::Waiting& waiting,
+                                                               const SoundWanted& wanted, SteadyTime now,
+                                                               CatchUp catchUp) noexcept {
     try {
         const PictureTiming next = session.pipeline->timing();
+        if (next.startsPass && next.presentation && waiting.reaches &&
+            *waiting.reaches - *next.presentation >= kShortestHandedPass) {
+            session.pass = VideoSession::Pass{*next.presentation, *waiting.reaches};
+        }
         AudioTrack* track = heardTrackLocked(monitorId, session, wanted);
-        if (track == nullptr) return;
+        if (track == nullptr) return {};
         if (!next.presentation) {
             track->stop();
-            return;
+            return {};
         }
         const VideoSession::OnScreen planned = waiting.planned();
+        // Where markShown() puts the waiting picture if drawn now: on its plan up to an interval late,
+        // at `now` past that.
+        const SteadyTime drawnAt = waiting.shownAt(now, intervalAtSpeed(next, 1.0)).timeline;
         if (!track->anchor()) {
             if (planned.due <= now) {
-                // Drawn this round, so heard from where markShown() puts it rather than on a schedule
-                // that stood still while play was stopped.
-                track->play({*next.presentation, waiting.shownAt(now, intervalAtSpeed(next, 1.0)).timeline});
+                // Drawn this round, so heard from where it is shown rather than on a schedule that stood
+                // still while play was stopped.
+                track->play({*next.presentation, drawnAt});
             } else if (!next.startsPass) {
                 track->play({*next.presentation - waiting.left, waiting.from});
-            } else if (waiting.reaches) {
-                // Sound starting on a pass's last picture plays the rest of that pass; the next round
-                // finds it off the new pass's schedule and hands it over.
+            } else if (waiting.reaches && planned.timeline - now > kHandOverLead) {
+                // Sound starting on a pass's last picture plays the rest of that pass, and a round of its
+                // own hands it to the next pass in time: a track acts on one play at a time.
                 track->play({*waiting.reaches - waiting.left, waiting.from});
+                return {.roundAt = planned.timeline - kHandOverLead};
             } else {
                 track->play({*next.presentation, planned.timeline});
             }
-            return;
+            return {};
         }
 
         // Where the picture schedule has the file: the waiting picture is `left` of the file's time
         // after the moment `from`.
         const AudioTrack::Anchor schedule{*next.presentation - waiting.left, waiting.from};
-        const AudioTrack::Anchor playing = *track->anchor();
-        // How far ahead of the pictures the sound is, in the file's time.
-        const std::chrono::nanoseconds lead = playing.from + (schedule.at - playing.at) - schedule.from;
-        if (std::chrono::abs(lead) <= kSoundDrift) return;
-        if (!next.startsPass) {
-            // Pictures held up, as markShown() lets a late one be, catch the sound up at the rate cap
-            // rather than have it play again what it has played -- while that takes few pictures.
-            if (lead > std::chrono::nanoseconds::zero() &&
-                lead <= kSoundCatchUpPictures * (ownInterval(next) - kMinPictureInterval)) {
-                waiting.from -= lead;
-                return;
+        const AudioTrack::Anchor asked = *track->anchor();
+        // How far ahead of the schedule `sound` has the file, the schedule's file time moved by `shift`
+        // onto the pass that sound plays.
+        const auto ahead = [&](const AudioTrack::Anchor& sound, std::chrono::nanoseconds shift) {
+            return sound.from + (schedule.at - sound.at) - (schedule.from + shift);
+        };
+        // A new pass the sound was not asked onto: it still plays the pass before, and is handed to
+        // this one where its pictures start it. Not before kHandOverLead: a track acts on one play at a
+        // time, and an earlier one may not have been taken up yet. A sound handed on early sits off this
+        // pass's pictures by what they trail it; past half of kShortestHandedPass, only in a catch-up
+        // hold, which this then ends by moving the sound to them.
+        const std::chrono::nanoseconds passAway = session.pass ? kShortestHandedPass / 2 : kSoundDrift;
+        if (next.startsPass && std::chrono::abs(ahead(asked, std::chrono::nanoseconds::zero())) > passAway) {
+            if (planned.timeline - now > kHandOverLead) return {.roundAt = planned.timeline - kHandOverLead};
+            track->play({*next.presentation, drawnAt});
+            return {};
+        }
+        // The sound already handed to the next pass while this one's last pictures play out.
+        std::chrono::nanoseconds shift{};
+        if (session.pass && !next.startsPass) {
+            const std::chrono::nanoseconds onward = session.pass->first - session.pass->end;
+            if (std::chrono::abs(ahead(asked, onward)) < std::chrono::abs(ahead(asked, shift))) shift = onward;
+        }
+        const std::optional<AudioTrack::Clock> clock = track->clock(now);
+        if (clock) session.heard = VideoSession::Heard{track->request(), clock->file, clock->at};
+        // A file that cannot decode in real time even skipping cannot keep up with its sound: its pictures
+        // keep their own clock, and the sound plays on until the next pass hands it to them.
+        if (session.decodeLoad.state == VideoSession::DecodeLoad::State::Behind) return {};
+        // Where the sound is known to be: as last heard on the latest request; else, once that request
+        // is taken up and its time has come, where it was asked to be. Nothing before that, when it
+        // still plays what came before.
+        std::optional<AudioTrack::Anchor> known;
+        if (session.heard && session.heard->request == track->request()) {
+            known = AudioTrack::Anchor{session.heard->file, session.heard->at};
+        } else if (track->taken() && asked.at <= now) {
+            known = asked;
+        }
+        if (!known) return {};
+        // When the sound reaches the waiting picture against when the schedule has it, and how far it
+        // is past the pictures: past the waiting one's time, and past where it is shown too once that
+        // is later. The pictures follow a live clock, waiting for it no longer than kSoundDrift and
+        // dropping pictures to reach it for as long as the hold lasts. A sound further behind, or more
+        // than kSoundDrift ahead once they cannot chase it, is moved to where the picture is shown.
+        const std::chrono::nanoseconds behind = -ahead(*known, shift);
+        const std::chrono::nanoseconds overdue = drawnAt - planned.timeline;
+        const bool chased = clock && catchUp == CatchUp::Chasing;
+        if (behind > kSoundDrift || (!chased && overdue - behind > kSoundDrift)) {
+            // Kept on the pass it was handed to, and from that pass's start: a play from before it would
+            // be heard early.
+            AudioTrack::Anchor moved{schedule.from + shift, schedule.at + overdue};
+            if (shift != std::chrono::nanoseconds::zero() && moved.from < session.pass->first) {
+                moved = {session.pass->first, moved.at + (session.pass->first - moved.from)};
             }
-            track->play(schedule);
-            return;
+            track->play(moved);
+            return {};
         }
-        // A new pass keeps the last one's sound until its own first picture is due, or until that
-        // sound reaches the pass's end where the two agree, so the loop does not move the sound.
-        SteadyTime passStarts = planned.timeline;
-        if (waiting.reaches) {
-            const SteadyTime soundReaches = playing.at + (*waiting.reaches - playing.from);
-            if (std::chrono::abs(soundReaches - planned.timeline) <= kSoundDrift) passStarts = soundReaches;
-        }
-        track->play({*next.presentation, passStarts});
+        if (!clock) return {};
+        waiting.from += behind;
+        if (!session.pass || shift != std::chrono::nanoseconds::zero()) return {.timesPicture = true};
+        // From the second pass on, the next one's sound is asked for kHandOverLead before this one's
+        // ends, wherever the pictures are, so the switch lands on time.
+        const SteadyTime passEnds = clock->heardAt(session.pass->end);
+        if (passEnds - now > kHandOverLead) return {.timesPicture = true, .roundAt = passEnds - kHandOverLead};
+        track->play({session.pass->first, passEnds});
+        return {.timesPicture = true};
     } catch (const std::exception&) {
         // Only making the track allocates. Without one the picture plays on silent, and the next
         // round tries again.
+        return {};
     }
 }
 
@@ -2739,6 +2830,13 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
         return std::nullopt;
     }
     session.idleSince.reset();
+    // One decode's sample, against the time on screen at this round's speed. None for a picture that
+    // starts a pass: its decode holds the loop's seek and key picture, paid once a pass.
+    const auto measureDecode = [&](SteadyTime started, const PictureTiming& after, std::chrono::nanoseconds gap) {
+        if (after.startsPass) return;
+        session.decodeLoad.add(std::chrono::steady_clock::now() - started, intervalAtSpeed(after, speed),
+                               std::max(atSpeed(gap, speed), kMinPictureInterval));
+    };
 
     try {
         // Inside the try, so it is withdrawn before the failure path frees the session it names.
@@ -2746,7 +2844,7 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
         // A decode that is still dropping pictures on the way to its own gets the next round: the picture
         // on screen stays, and the rounds between let every other screen and request have the GPU.
         if (resuming) {
-            const Decode step = decodeUntil(*session.pipeline, catchUpUntil);
+            const Decode step = decodeUntil(*session.pipeline, catchUpUntil, session.skip());
             if (step == Decode::Dropping) return now;
             if (step == Decode::Exhausted) {
                 throw WallpaperContentError(describeRejection("VideoPipeline", "no picture could be decoded", session.path));
@@ -2764,7 +2862,8 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
             // single slot cannot name every playing file at once. The guard above names it instead.
             const Session::OnScreen shown = *onScreen;
             const PictureTiming before = session.pipeline->timing();
-            const Decode step = decodeUntil(*session.pipeline, catchUpUntil);
+            const SteadyTime decodeStarted = std::chrono::steady_clock::now();
+            const Decode step = decodeUntil(*session.pipeline, catchUpUntil, session.skip());
             if (step == Decode::Dropping) return now;
             if (step == Decode::Exhausted) {
                 throw WallpaperContentError(
@@ -2793,14 +2892,56 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
             const std::chrono::nanoseconds gap = gapBetween(before, after);
             std::optional<std::chrono::nanoseconds> reaches;
             if (before.presentation) reaches = *before.presentation + gap;
+            measureDecode(decodeStarted, after, gap);
             session.clock = Session::Waiting{shown, shown.timeline, gap, speed, reaches};
         }
         // Every draw below passes here first, so what it reads is timed at this round's speed.
+        SoundPace pace;
+        std::optional<SteadyTime> waitUntil;
         if (auto* waiting = std::get_if<Session::Waiting>(&session.clock)) {
             waiting->retime(now, speed);
-            steerSoundLocked(monitorId, session, *waiting, sound, now);
-            if (const SteadyTime due = waiting->planned().due; due > now) return due;
+            pace = steerSoundLocked(monitorId, session, *waiting, sound, now, CatchUp::Chasing);
+            // A picture whose time the sound has already played through is dropped, not drawn: at least
+            // one a round, then while the round's catch-up slice lasts. One still behind when the slice
+            // runs out is held for the next round rather than drawn, until kCatchUpHold, so a file slow
+            // to decode lands on the sound instead of running through late pictures; then it is drawn,
+            // the sound moved to it if past kSoundDrift. A file that cannot decode in real time even
+            // skipping is not timed by its sound, so its late pictures are drawn.
+            for (bool dropped = false;; dropped = true) {
+                const PictureTiming held = session.pipeline->timing();
+                if (!pace.timesPicture || held.startsPass || waiting->planned().timeline + ownInterval(held) > now) {
+                    waiting->catchingUpSince.reset();
+                    break;
+                }
+                const SteadyTime checked = std::chrono::steady_clock::now();
+                if (waiting->catchingUpSince && checked - *waiting->catchingUpSince >= kCatchUpHold) {
+                    pace = steerSoundLocked(monitorId, session, *waiting, sound, now, CatchUp::HoldRunOut);
+                    break;
+                }
+                // One drop a round whatever the slice holds, as the screens before this one may have
+                // spent it; more only within it.
+                if (dropped && checked >= catchUpUntil) {
+                    if (!waiting->catchingUpSince) waiting->catchingUpSince = checked;
+                    return now;
+                }
+                const Decode step = decodeUntil(*session.pipeline, catchUpUntil, session.skip());
+                if (step == Decode::Dropping) return now;
+                if (step == Decode::Exhausted) {
+                    throw WallpaperContentError(describeRejection("VideoPipeline", "no picture could be decoded", session.path));
+                }
+                const PictureTiming after = session.pipeline->timing();
+                const std::chrono::nanoseconds gap = gapBetween(held, after);
+                measureDecode(checked, after, gap);
+                waiting->left += gap;
+                waiting->reaches = held.presentation ? std::optional(*held.presentation + gap) : std::nullopt;
+                pace = steerSoundLocked(monitorId, session, *waiting, sound, now, CatchUp::Chasing);
+            }
+            if (const SteadyTime due = waiting->planned().due; due > now) waitUntil = std::min(due, pace.roundAt.value_or(due));
         }
+        // Converted once chosen, so the draw when due is a blit. A picture dropped in the round that
+        // decodes it never is; one converted while it waits is still dropped if the sound passes it.
+        session.pipeline->convert();
+        if (waitUntil) return *waitUntil;
 
         const OffscreenTarget* target = nullptr;
         {
@@ -2827,8 +2968,9 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
                 if (it != m_monitors.end()) it->second.cleanPlay.lastShown.reset();
                 return now;
             }
-            // Drawn more than an interval past its time, it was held up by a stop nothing reported.
-            // Never more than the file's own interval: slowing playback does not make a stop clean.
+            // Drawn more than an interval past its time, it was held up by a stop nothing reported, or
+            // by a hold or a decode too slow to play: none is clean play. Never more than the file's own
+            // interval: slowing playback does not make a stop clean.
             const auto* waiting = std::get_if<Session::Waiting>(&session.clock);
             const PictureTiming timing = session.pipeline->timing();
             const bool onTime = waiting != nullptr && now - waiting->planned().due <=
@@ -3062,7 +3204,11 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
                     target = m_targets->nextUnheld(monitorId, heldBuffersLocked(monitorId));
                 }
                 deferred = target == nullptr;
-                if (!deferred) applying.emplace(m_config.stateDir, monitorId, type, path);
+                if (!deferred) {
+                    applying.emplace(m_config.stateDir, monitorId, type, path);
+                    // A picture the clock decoded and has not converted, so the draw below is a blit.
+                    if (clip != nullptr) clip->pipeline->convert();
+                }
             }
         }
     } catch (const std::exception&) {

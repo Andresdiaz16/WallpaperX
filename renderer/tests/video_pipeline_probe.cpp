@@ -1398,8 +1398,9 @@ void runStartAtChecks(Device& device, const std::string& label, bool onDevice, S
     //       (the resume state set, `m_path = Path::SoftwareRefused`, and a reopen in software required) ->
     //       "counter_long.mp4 opened at picture 290, its first seek landing late: 0 device and 55 host
     //       picture(s)". In
-    //       renderer/video/video_pipeline.cpp, decodeNext()'s `startsPass` made `!m_stage` -> on
-    //       start-at-device "its first picture is marked as starting a pass" at every point.
+    //       renderer/video/video_pipeline.cpp, decode()'s `startsPass` made `!m_timing` (re-run via
+    //       control_batch.sh 2026-10-12) -> on start-at-device "its first picture is marked as starting a
+    //       pass" at every point.
     // COVERAGE-ASSERT: the late-landing run must show a second seek aimed further back, or the late landing
     //       was never exercised -- red with the shift set to 0 (test-side, by hand, 2026-09-30, start-at-device),
     //       "seeks to 148479" and "a start whose seek landed late was not retried further back"; and the
@@ -2749,11 +2750,11 @@ void runShapeChecks(Device& device, const std::string& label) {
     // WHY-THIS-SHAPE: a counter drawn at both sizes and read back after every call. Black reads as
     //       unreadable, so "never black" needs no separate check. This entry is the software path; the
     //       hardware path is the shape-device entry's, S13.80 onwards.
-    // CONTROL: renderer/video/video_pipeline.cpp, each reverted. The stage build moved to decodeNext();
-    //       built only for the first picture there, re-observed on this entry 2026-09-15: "the pipeline
-    //       threw after 30 pictures: FrameConverter: the frame's picture differs from the one this
-    //       converter was built for". The rendering-before-converting mutation is now renderNext()
-    //       drawing before it decodes, which throws on the FIRST call rather than showing black; that was
+    // CONTROL: renderer/video/video_pipeline.cpp, each reverted. The stage built only for the first picture
+    //       in convert() (`if (!m_stage)`), re-observed on the Lavapipe entry via control_batch.sh
+    //       2026-10-12: "the pipeline threw after 30 pictures: FrameConverter: the frame's picture differs
+    //       from the one this converter was built for". The rendering-before-converting mutation is now
+    //       renderNext() drawing before it decodes, which throws on the FIRST call rather than showing black; that was
     //       re-observed on the sequence entry, not re-run here.
     // COVERAGE-ASSERT: the independent decode shows two picture widths -- red with a single-size stream
     //       substituted, "the resize fixture does not change size".
@@ -5280,10 +5281,9 @@ void runPlayOnceChecks(Device& device, const std::string& label) {
     // WHY-THIS-SHAPE: every packet is refused as damaged, which the decoder skips, so the stream ends
     //       with nothing shown. What is graded is that no seek or open follows: returning false is not
     //       enough, since a restarted empty stream returns false too.
-    // CONTROL: the restart moved to renderer/video/video_pipeline.cpp decodeNext(); with its `&& m_stage`
-    //       dropped there, re-observed 2026-09-15: "a looping pipeline that has shown nothing started its
-    //       stream again instead of reporting the end", printing "first call decoded 0 picture(s), seeks
-    //       to -2048". Reverted.
+    // CONTROL: renderer/video/video_pipeline.cpp decode(), its restart's `&& m_timing` dropped, re-observed
+    //       on the Lavapipe loop-host entry via control_batch.sh 2026-10-12: "a looping pipeline that has
+    //       shown nothing started its stream again instead of reporting the end". Reverted.
     // COVERAGE-ASSERT: packets were refused -- red with the refusal never switched on.
     g_packetsRefused = 0;
     LoopPlan plan;

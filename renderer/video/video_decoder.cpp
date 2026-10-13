@@ -1174,20 +1174,20 @@ void VideoDecoder::failDecode(const char* what, int err) {
     throwFileFailure(failed, err, m_file);
 }
 
-std::optional<DecodedFrame> VideoDecoder::next() {
+std::optional<DecodedFrame> VideoDecoder::next(PictureSkip skip) {
     m_device.assertGpuThread("VideoDecoder::next");
-    return std::get<std::optional<DecodedFrame>>(decode(std::nullopt));
+    return std::get<std::optional<DecodedFrame>>(decode(std::nullopt, skip));
 }
 
-std::variant<std::optional<DecodedFrame>, VideoDecoder::Dropping> VideoDecoder::next(uint32_t dropLimit) {
+std::variant<std::optional<DecodedFrame>, VideoDecoder::Dropping> VideoDecoder::next(uint32_t dropLimit, PictureSkip skip) {
     m_device.assertGpuThread("VideoDecoder::next");
-    return decode(dropLimit);
+    return decode(dropLimit, skip);
 }
 
 // Every state a drop can stop in is one the loop's head already resumes from: a dropped picture is
 // gone, and what admit() decided about it is in m_resume and m_pending.
 std::variant<std::optional<DecodedFrame>, VideoDecoder::Dropping> VideoDecoder::decode(
-    std::optional<uint32_t> dropLimit) {
+    std::optional<uint32_t> dropLimit, PictureSkip skip) {
     releaseRetiredCodec();
     releaseIdleFramesContexts();
     uint32_t dropped = 0;
@@ -1272,6 +1272,9 @@ std::variant<std::optional<DecodedFrame>, VideoDecoder::Dropping> VideoDecoder::
                 recordLanding();
             }
         }
+        // Read by ffmpeg per packet.
+        const bool skipping = skip == PictureSkip::Unreferenced && std::holds_alternative<std::monostate>(m_resume);
+        m_codec->skip_frame = skipping ? AVDISCARD_NONREF : AVDISCARD_DEFAULT;
         err = avcodec_send_packet(m_codec, m_flushed ? nullptr : m_packet);
         // EAGAIN is "read the output first, then send this one again", and ffmpeg promises the
         // receive that follows will not ask for input; a second EAGAIN for the same packet is

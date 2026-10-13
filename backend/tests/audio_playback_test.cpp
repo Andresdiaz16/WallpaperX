@@ -10,7 +10,7 @@
 // here links each stream to the server's null sink. What the code under test hands PipeWire is
 // recorded by interposing pw_stream_queue_buffer: every buffer, with the time PipeWire reports it will
 // be heard. That time is read from pw_stream_get_time_n by the same formula production uses
-// (heardAtOfNextBuffer in renderer/audio/audio_output.cpp), so every timing check here assumes
+// (timingOfNextBuffer in renderer/audio/audio_output.cpp), so every timing check here assumes
 // production reads that report correctly: a misreading of its units or latency terms moves both sides
 // alike and is not detected. Nothing here measures when a frame really leaves the sink.
 
@@ -35,10 +35,12 @@
 #include <spa/param/param.h>
 #include <spa/param/port-config.h>
 #include <spa/pod/builder.h>
+#include <vulkan/vulkan.h>
 
 #include <sdbus-c++/sdbus-c++.h>
 
 extern "C" {
+#include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/error.h>
 #include <libavutil/mathematics.h>
@@ -143,6 +145,74 @@ std::vector<SoundSeek> g_soundSeeks;
 std::atomic<int> g_stallPictureMs{0};
 std::atomic<int> g_slowPictureReads{0};
 std::atomic<int> g_slowPictureMs{0};
+// The next av_read_frame of a picture decoder reading a file whose name holds g_stallFile sleeps
+// g_stallFileMs, once, and says when it slept. With g_slowFile set, the slow reads above are that
+// file's alone.
+std::mutex g_stallFileMutex;
+std::string g_stallFile;
+std::string g_slowFile;
+std::atomic<int> g_stallFileMs{0};
+std::atomic<int64_t> g_fileStallStartedAt{0};
+std::atomic<int64_t> g_fileStallEndedAt{0};
+
+// Every picture a picture decoder handed on, in order: when, from which file, and its presentation
+// time. A picture is handed on where VideoDecoder moves an admitted frame out of its decoding frame
+// (av_frame_move_ref), the frame avcodec_receive_frame last filled on that thread for a video codec;
+// the file is the one whose packets that codec was sent.
+struct PictureRecord {
+    int64_t at = 0;
+    std::string file;
+    std::optional<int64_t> presentationNs;
+};
+std::mutex g_pictureMutex;
+std::vector<PictureRecord> g_pictures;
+std::map<const AVPacket*, std::string> g_packetFile;
+std::map<const AVCodecContext*, std::string> g_contextFile;
+thread_local AVCodecContext* t_videoContext = nullptr;
+thread_local const AVFrame* t_videoFrame = nullptr;
+
+// Non-zero: every stream of the engine's is given this rate correction (pw_stream_set_rate), so the
+// server takes its frames at 48000 / rate a second, as a sound card off its nominal rate would.
+std::atomic<double> g_streamRate{0.0};
+
+// Set: pw_stream_get_time_n reports `now` as 0, as for a stream the server has not timed yet, so no
+// stream has a clock; and how many of production's reports were hidden. record() reads the time too,
+// under t_inRecord, which is not counted.
+std::atomic<bool> g_hideStreamTime{false};
+std::atomic<int> g_streamTimesHidden{0};
+// Set: the next sound seek to under 50 ms of the file (a hand-over to a new pass) sets g_hideStreamTime.
+std::atomic<bool> g_hideAtHandOver{false};
+thread_local bool t_inRecord = false;
+
+// Every picture a picture decoder returns for a file whose name holds g_costFile costs g_costMs more,
+// spent where avcodec_receive_frame returns it, so a picture skipped undecoded costs nothing. While
+// g_costCycle holds entries, each such picture takes the next one instead, round and round.
+std::mutex g_costMutex;
+std::string g_costFile;
+std::vector<int> g_costCycle;
+size_t g_costCycleAt = 0;
+std::atomic<int> g_costMs{0};
+
+// The picture of a file whose name holds g_holdFile, at presentation time g_holdAtNs, is held g_holdMs
+// once as the decoder returns it, and when that hold ran is recorded; unlike a stalled read, which a
+// decoder with frame threads may have made pictures earlier, this lands on that picture's hand-off.
+std::mutex g_holdMutex;
+std::string g_holdFile;
+std::atomic<int64_t> g_holdAtNs{-1};
+std::atomic<int> g_holdMs{0};
+std::atomic<int64_t> g_holdStartedAt{0};
+std::atomic<int64_t> g_holdEndedAt{0};
+// Set: the hold fires every time that picture is returned, not once (each pass's first picture, say).
+std::atomic<bool> g_holdRepeats{false};
+
+// Draws of three vertices and one instance: FrameConverter's conversion pass, and nothing else this
+// binary runs.
+std::atomic<int> g_conversions{0};
+// When each vkCmdBlitImage was recorded: VideoRenderer showing a converted picture, the one blit here.
+std::mutex g_blitMutex;
+std::vector<int64_t> g_blits;
+// The next vkCmdBlitImage sleeps this long first, once: a draw held up outside any decode.
+std::atomic<int> g_blitHoldMs{0};
 
 // swr_convert and swr_free are called by AudioDecoder alone, which runs on AudioOutput's thread alone.
 enum SwrMode : int { kSwrPass = 0, kSwrFault, kSwrFailThenFaultFree, kSwrStallOnce, kSwrFail };
@@ -222,8 +292,44 @@ void record(pw_stream* stream, pw_buffer* buffer) {
 extern "C" int pw_stream_queue_buffer(pw_stream* stream, pw_buffer* buffer) {
     using Fn = int (*)(pw_stream*, pw_buffer*);
     static const Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "pw_stream_queue_buffer"));
+    probe::t_inRecord = true;
     probe::record(stream, buffer);
+    probe::t_inRecord = false;
+    // From the stream's own process callback, where pw_stream_set_rate may be called. Every cycle: it only
+    // stores the value, and a new stream gets it on its first buffer.
+    if (const double rate = probe::g_streamRate.load(); rate != 0.0) pw_stream_set_rate(stream, rate);
     return real(stream, buffer);
+}
+
+extern "C" int pw_stream_get_time_n(pw_stream* stream, pw_time* time, size_t size) {
+    using Fn = int (*)(pw_stream*, pw_time*, size_t);
+    static const Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "pw_stream_get_time_n"));
+    const int r = real(stream, time, size);
+    if (r == 0 && time != nullptr && probe::g_hideStreamTime.load()) {
+        time->now = 0;
+        if (!probe::t_inRecord) probe::g_streamTimesHidden.fetch_add(1);
+    }
+    return r;
+}
+
+extern "C" void vkCmdDraw(VkCommandBuffer cmd, uint32_t vertices, uint32_t instances, uint32_t firstVertex,
+                          uint32_t firstInstance) {
+    using Fn = void (*)(VkCommandBuffer, uint32_t, uint32_t, uint32_t, uint32_t);
+    static const Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "vkCmdDraw"));
+    if (vertices == 3 && instances == 1) probe::g_conversions.fetch_add(1);
+    real(cmd, vertices, instances, firstVertex, firstInstance);
+}
+
+extern "C" void vkCmdBlitImage(VkCommandBuffer cmd, VkImage source, VkImageLayout sourceLayout, VkImage target,
+                               VkImageLayout targetLayout, uint32_t regions, const VkImageBlit* region, VkFilter filter) {
+    using Fn = void (*)(VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout, uint32_t, const VkImageBlit*, VkFilter);
+    static const Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "vkCmdBlitImage"));
+    {
+        std::lock_guard<std::mutex> lock(probe::g_blitMutex);
+        probe::g_blits.push_back(probe::nowNs());
+    }
+    if (const int ms = probe::g_blitHoldMs.exchange(0); ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    real(cmd, source, sourceLayout, target, targetLayout, regions, region, filter);
 }
 
 extern "C" pw_stream* pw_stream_new(pw_core* core, const char* name, pw_properties* props) {
@@ -298,6 +404,7 @@ extern "C" int avformat_seek_file(AVFormatContext* s, int index, int64_t min, in
     if (s != nullptr && index >= 0 && static_cast<unsigned>(index) < s->nb_streams &&
         s->streams[index]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
         const int64_t target = av_rescale_q(ts, s->streams[index]->time_base, AVRational{1, 1'000'000'000});
+        if (target < 50'000'000 && probe::g_hideAtHandOver.exchange(false)) probe::g_hideStreamTime.store(true);
         std::lock_guard<std::mutex> lock(probe::g_seekMutex);
         probe::g_soundSeeks.push_back({probe::nowNs(), target});
     }
@@ -308,24 +415,129 @@ extern "C" int avformat_seek_file(AVFormatContext* s, int index, int64_t min, in
 extern "C" int av_read_frame(AVFormatContext* s, AVPacket* pkt) {
     using Fn = int (*)(AVFormatContext*, AVPacket*);
     static const Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "av_read_frame"));
-    if ((probe::g_stallPictureMs.load() > 0 || probe::g_slowPictureReads.load() > 0) && s != nullptr) {
-        bool pictures = false;
-        for (unsigned i = 0; i < s->nb_streams; ++i) {
-            const AVStream& st = *s->streams[i];
-            if (st.codecpar->codec_type == AVMEDIA_TYPE_VIDEO && st.discard != AVDISCARD_ALL) pictures = true;
+    bool pictures = false;
+    for (unsigned i = 0; s != nullptr && i < s->nb_streams; ++i) {
+        const AVStream& st = *s->streams[i];
+        if (st.codecpar->codec_type == AVMEDIA_TYPE_VIDEO && st.discard != AVDISCARD_ALL) pictures = true;
+    }
+    if (pictures) {
+        if (const int ms = probe::g_stallPictureMs.exchange(0); ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
         }
-        if (pictures) {
-            if (const int ms = probe::g_stallPictureMs.exchange(0); ms > 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-            }
+        bool slowed = probe::g_slowPictureReads.load() > 0;
+        if (slowed) {
+            std::lock_guard<std::mutex> lock(probe::g_stallFileMutex);
+            slowed = probe::g_slowFile.empty() || (s->url != nullptr && std::strstr(s->url, probe::g_slowFile.c_str()) != nullptr);
+        }
+        if (slowed) {
             if (probe::g_slowPictureReads.fetch_sub(1) > 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(probe::g_slowPictureMs.load()));
             } else {
                 probe::g_slowPictureReads.store(0);
             }
         }
+        if (probe::g_stallFileMs.load() > 0 && s->url != nullptr) {
+            int ms = 0;
+            {
+                std::lock_guard<std::mutex> lock(probe::g_stallFileMutex);
+                if (!probe::g_stallFile.empty() && std::strstr(s->url, probe::g_stallFile.c_str()) != nullptr) {
+                    ms = probe::g_stallFileMs.exchange(0);
+                }
+            }
+            if (ms > 0) {
+                probe::g_fileStallStartedAt.store(probe::nowNs());
+                std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+                probe::g_fileStallEndedAt.store(probe::nowNs());
+            }
+        }
     }
-    return real(s, pkt);
+    const int r = real(s, pkt);
+    if (pictures && r >= 0 && pkt != nullptr && s->url != nullptr) {
+        std::lock_guard<std::mutex> lock(probe::g_pictureMutex);
+        probe::g_packetFile[pkt] = s->url;
+    }
+    return r;
+}
+
+extern "C" int avcodec_send_packet(AVCodecContext* avctx, const AVPacket* avpkt) {
+    using Fn = int (*)(AVCodecContext*, const AVPacket*);
+    static const Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "avcodec_send_packet"));
+    if (avctx != nullptr && avpkt != nullptr && avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
+        std::lock_guard<std::mutex> lock(probe::g_pictureMutex);
+        if (const auto it = probe::g_packetFile.find(avpkt); it != probe::g_packetFile.end()) {
+            probe::g_contextFile[avctx] = it->second;
+        }
+    }
+    return real(avctx, avpkt);
+}
+
+extern "C" int avcodec_receive_frame(AVCodecContext* avctx, AVFrame* frame) {
+    using Fn = int (*)(AVCodecContext*, AVFrame*);
+    static const Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "avcodec_receive_frame"));
+    // Cleared first: libavcodec's own moves inside the call must not count as a picture handed on.
+    probe::t_videoFrame = nullptr;
+    const int r = real(avctx, frame);
+    if (r == 0 && avctx != nullptr && avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
+        probe::t_videoContext = avctx;
+        probe::t_videoFrame = frame;
+        if (probe::g_costMs.load() > 0) {
+            bool costed = false;
+            {
+                std::lock_guard<std::mutex> lock(probe::g_pictureMutex);
+                const auto it = probe::g_contextFile.find(avctx);
+                std::lock_guard<std::mutex> costLock(probe::g_costMutex);
+                costed = it != probe::g_contextFile.end() && !probe::g_costFile.empty() &&
+                         it->second.find(probe::g_costFile) != std::string::npos;
+            }
+            if (costed) {
+                int ms = probe::g_costMs.load();
+                {
+                    std::lock_guard<std::mutex> lock(probe::g_costMutex);
+                    if (!probe::g_costCycle.empty()) {
+                        ms = probe::g_costCycle[probe::g_costCycleAt++ % probe::g_costCycle.size()];
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+            }
+        }
+        if (probe::g_holdMs.load() > 0 && frame != nullptr && frame->best_effort_timestamp != AV_NOPTS_VALUE &&
+            avctx->pkt_timebase.num > 0) {
+            const int64_t at = av_rescale_q(frame->best_effort_timestamp, avctx->pkt_timebase, AVRational{1, 1'000'000'000});
+            bool held = std::llabs(at - probe::g_holdAtNs.load()) < 2'000'000;
+            if (held) {
+                std::lock_guard<std::mutex> lock(probe::g_pictureMutex);
+                const auto it = probe::g_contextFile.find(avctx);
+                std::lock_guard<std::mutex> holdLock(probe::g_holdMutex);
+                held = it != probe::g_contextFile.end() && !probe::g_holdFile.empty() &&
+                       it->second.find(probe::g_holdFile) != std::string::npos;
+            }
+            if (const int ms = !held ? 0 : probe::g_holdRepeats.load() ? probe::g_holdMs.load() : probe::g_holdMs.exchange(0);
+                ms > 0) {
+                probe::g_holdStartedAt.store(probe::nowNs());
+                std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+                probe::g_holdEndedAt.store(probe::nowNs());
+            }
+        }
+    }
+    return r;
+}
+
+extern "C" void av_frame_move_ref(AVFrame* dst, AVFrame* src) {
+    using Fn = void (*)(AVFrame*, AVFrame*);
+    static const Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "av_frame_move_ref"));
+    if (src != nullptr && src == probe::t_videoFrame) {
+        probe::t_videoFrame = nullptr;
+        const AVCodecContext& ctx = *probe::t_videoContext;
+        probe::PictureRecord r;
+        r.at = probe::nowNs();
+        if (src->best_effort_timestamp != AV_NOPTS_VALUE && ctx.pkt_timebase.num > 0) {
+            r.presentationNs = av_rescale_q(src->best_effort_timestamp, ctx.pkt_timebase, AVRational{1, 1'000'000'000});
+        }
+        std::lock_guard<std::mutex> lock(probe::g_pictureMutex);
+        if (const auto it = probe::g_contextFile.find(&ctx); it != probe::g_contextFile.end()) r.file = it->second;
+        probe::g_pictures.push_back(std::move(r));
+    }
+    real(dst, src);
 }
 
 extern "C" int swr_convert(struct SwrContext* s, uint8_t* const* out, int out_count, const uint8_t* const* in,
@@ -457,6 +669,9 @@ using Clock = std::chrono::steady_clock;
 
 constexpr int kRate = 48000;
 constexpr int64_t kMs = 1'000'000;
+// One sound-server cycle (1024 frames) plus kSoundDrift (20 ms, backend/daemon/wallpaper_manager.cpp, copied
+// by hand): a server later than this between two buffers can leave a heard sound behind enough to be moved.
+constexpr int64_t kServerLateBound = 1024 * 1'000'000'000LL / kRate + 20 * kMs;
 
 void check(bool condition, const std::string& what, const std::string& detail = {}) {
     wallpaperx::testing::check(condition, what.c_str());
@@ -489,6 +704,10 @@ struct Capture {
 };
 
 void resetCapture() {
+    {
+        std::lock_guard<std::mutex> lock(probe::g_pictureMutex);
+        probe::g_pictures.clear();
+    }
     std::lock_guard<std::mutex> lock(probe::g_recordMutex);
     probe::g_recordCount = 0;
     probe::g_frameCount = 0;
@@ -623,13 +842,33 @@ std::pair<uint64_t, uint64_t> longestSilence(const Capture& c, int64_t from, int
     return {longest, heard};
 }
 
-std::vector<probe::SoundSeek> soundSeeksSince(int64_t from) {
+// Sound seeks made in [from, to).
+std::vector<probe::SoundSeek> soundSeeksSince(int64_t from, int64_t to = INT64_MAX) {
     std::lock_guard<std::mutex> lock(probe::g_seekMutex);
     std::vector<probe::SoundSeek> out;
     for (const probe::SoundSeek& s : probe::g_soundSeeks) {
-        if (s.at >= from) out.push_back(s);
+        if (s.at >= from && s.at < to) out.push_back(s);
     }
     return out;
+}
+
+// The longest the sound server went between two buffers of the engine's, over every gap that overlaps
+// [from, to): the gaps across both edges count, and so does the time from the last buffer to `to` when
+// none came after it, so a stall that straddles an edge is seen whole. A cycle is 1024 frames, 21.3 ms.
+int64_t longestBufferGap(const Capture& cap, int64_t from, int64_t to) {
+    std::optional<int64_t> previous;
+    int64_t longest = 0;
+    for (const probe::BufferRecord& b : cap.buffers) {
+        if (b.queuedAt < from) {
+            previous = b.queuedAt;
+            continue;
+        }
+        if (previous) longest = std::max(longest, b.queuedAt - *previous);
+        previous = b.queuedAt;
+        if (b.queuedAt >= to) return longest;
+    }
+    if (previous) longest = std::max(longest, to - *previous);
+    return longest;
 }
 
 // ---------------------------------------------------------------------------------------------- //
@@ -704,6 +943,9 @@ public:
     enum class Start { Running, Unavailable, Refused };
 
     ~PrivatePipeWire() { stop(); }
+
+    // The running server's process, or -1.
+    pid_t pid() const { return m_pid; }
 
     Start start(std::string& why) {
         why = soundIsolationFault();
@@ -1038,6 +1280,7 @@ struct SoundServer {
 struct Commit {
     uint64_t generation = 0;
     int64_t at = 0;
+    int monitor = 0;
 };
 
 WallpaperManager::Config smallConfig() {
@@ -1053,19 +1296,36 @@ WallpaperManager::Config smallConfig() {
 
 struct Daemon {
     explicit Daemon(WallpaperManager::Config config)
-        : manager(std::move(config)), worker(manager, [this](int, uint64_t generation) {
-              std::lock_guard<std::mutex> lock(commitMutex);
-              commits.push_back({generation, probe::nowNs()});
+        : manager(std::move(config)), worker(manager, [this](int monitor, uint64_t generation) {
+              const Commit c{generation, probe::nowNs(), monitor};
+              {
+                  std::lock_guard<std::mutex> lock(commitMutex);
+                  commits.push_back(c);
+              }
+              if (onCommit) onCommit(c);
           }) {}
     ~Daemon() { worker.stop(); }
 
-    std::vector<Commit> takeCommits() {
+    // Monitor 0's commits; every monitor's with `all`.
+    std::vector<Commit> takeCommits(bool all = false) {
         std::lock_guard<std::mutex> lock(commitMutex);
-        return commits;
+        if (all) return commits;
+        std::vector<Commit> out;
+        for (const Commit& c : commits) {
+            if (c.monitor == 0) out.push_back(c);
+        }
+        return out;
     }
     size_t commitCount() {
         std::lock_guard<std::mutex> lock(commitMutex);
-        return commits.size();
+        return static_cast<size_t>(std::count_if(commits.begin(), commits.end(), [](const Commit& c) { return c.monitor == 0; }));
+    }
+    // A second screen, DP-2, playing `file` with no focus report, so it is never heard.
+    void playOther(const std::string& file) {
+        std::vector<int> redraw;
+        manager.setMonitorOutput(1, "DP-2", redraw);
+        manager.requestWallpaper("video", file, 1);
+        worker.post(1);
     }
     // Monitor 0 on DP-1 playing `file`, with `focus` reported first when there is one.
     void play(const std::string& file, std::optional<ScreenFocus> focus) {
@@ -1094,6 +1354,9 @@ struct Daemon {
 
     std::mutex commitMutex;
     std::vector<Commit> commits;
+    // Called on the render thread after each commit is recorded. Set it before the first play():
+    // the post that starts the playing orders the write before the thread's reads.
+    std::function<void(const Commit&)> onCommit;
     WallpaperManager manager;
     RenderWorker worker;
 };
@@ -1366,8 +1629,13 @@ void runVolumeChecks() {
 // The Theil-Sen line through (n, at) -- the median of every pairwise slope, then the median
 // intercept -- so up to about a quarter of the points can be far off it without moving it, where one
 // late commit among six would drag a least-squares line by a third of its lateness. The fitted time of
-// each point, and the largest distance of any point from it (printed, never graded).
-std::pair<std::vector<int64_t>, int64_t> fitLine(const std::vector<std::pair<int64_t, int64_t>>& points) {
+// each point, the largest distance of any point from it (printed, never graded), and the slope.
+struct Line {
+    std::vector<int64_t> fitted;
+    int64_t worst = 0;
+    double slope = 0;
+};
+Line fitLine(const std::vector<std::pair<int64_t, int64_t>>& points) {
     const auto median = [](std::vector<double>& v) {
         std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(v.size() / 2), v.end());
         return v[v.size() / 2];
@@ -1391,111 +1659,219 @@ std::pair<std::vector<int64_t>, int64_t> fitLine(const std::vector<std::pair<int
         fitted.push_back(base + static_cast<int64_t>(std::llround(intercept + slope * n)));
         worst = std::max<int64_t>(worst, std::llabs(at - fitted.back()));
     }
-    return {fitted, worst};
+    return {fitted, worst, slope};
 }
 
-// Whether `commits` came one at a time, each generation the last plus one: what lets a generation
-// say which picture it is. At least 30 of them; `why` says otherwise.
-bool consecutiveCommits(const std::vector<Commit>& commits, std::string& why) {
-    if (commits.size() < 30) {
-        why = "only " + std::to_string(commits.size()) + " pictures were committed";
-        return false;
-    }
-    for (size_t i = 1; i < commits.size(); ++i) {
-        if (commits[i].generation != commits[i - 1].generation + 1) {
-            why = fmt("generation %.0f followed %.0f, so a generation no longer says which picture it is",
-                      static_cast<double>(commits[i].generation), static_cast<double>(commits[i - 1].generation));
-            return false;
-        }
-    }
-    return true;
-}
+// A commit and the picture it showed, by that picture's presentation time in the file.
+struct Shown {
+    Commit commit;
+    std::optional<int64_t> presentation;
+};
 
-// For every commit, the time its picture was scheduled for and its index in the pass, when the
-// pictures came one at a time at about 30 a second from the first one. The scheduled time is the
-// commit's place on the robust line through all of them, so a late wake of the render thread moves no
-// picture's time. Empty, with `why`, otherwise.
-std::map<uint64_t, std::pair<int64_t, int>> pictureIndex(const std::vector<Commit>& commits, int picturesPerPass,
-                                                         std::string& why) {
-    std::map<uint64_t, std::pair<int64_t, int>> out;
-    if (!consecutiveCommits(commits, why)) return out;
-    for (size_t i = 1; i < commits.size(); ++i) {
-        const int64_t gap = commits[i].at - commits[i - 1].at;
-        if (gap < 15 * kMs || gap > 55 * kMs) {
-            why = fmt("the pictures were not committed at about 30 a second (generation %.0f came %.1f ms after the one "
-                      "before), so a generation's place in time is not known",
-                      static_cast<double>(commits[i].generation), gap / 1e6);
-            return out;
-        }
-    }
-    const uint64_t first = commits.front().generation;
-    std::vector<std::pair<int64_t, int64_t>> points;
-    for (const Commit& c : commits) points.push_back({static_cast<int64_t>(c.generation - first), c.at});
-    const auto [fitted, worst] = fitLine(points);
-    std::printf("audio_playback_test: the %zu commits sit at most %.1f ms from the line through them\n", commits.size(),
-                worst / 1e6);
-    for (size_t i = 0; i < commits.size(); ++i) {
-        out[commits[i].generation] = {fitted[i], static_cast<int>(points[i].first % picturesPerPass)};
+// Every picture `file`'s decoder handed on, in order, dropped ones included.
+std::vector<probe::PictureRecord> picturesOf(const std::string& file) {
+    const std::string name = std::filesystem::path(file).filename().string();
+    std::vector<probe::PictureRecord> out;
+    std::lock_guard<std::mutex> lock(probe::g_pictureMutex);
+    for (const probe::PictureRecord& p : probe::g_pictures) {
+        if (p.file.find(name) != std::string::npos) out.push_back(p);
     }
     return out;
 }
 
-// Each beep heard after `from` set against the scheduled time of the picture at its timestamp: the
-// nearest picture whose index is a multiple of `picturesPerBeep`. Returns how many were graded, -1
-// when the run cannot be graded.
-int gradeBeepsAgainstPictures(const std::string& rule, const Capture& cap, const std::vector<Commit>& commits,
-                              int picturesPerPass, int picturesPerBeep, int64_t from, double toleranceMs,
-                              int& passStartsGraded) {
+// One picture's interval in `file`: the smallest step between two presentation times its decoder
+// handed on. Pictures dropped or skipped undecoded only lengthen steps, so this holds for a decoder
+// that skips, where the median step of the commits is several pictures. 0 with fewer than two.
+int64_t fileInterval(const std::string& file) {
+    std::vector<int64_t> times;
+    for (const probe::PictureRecord& p : picturesOf(file)) {
+        if (p.presentationNs) times.push_back(*p.presentationNs);
+    }
+    std::sort(times.begin(), times.end());
+    times.erase(std::unique(times.begin(), times.end()), times.end());
+    int64_t best = 0;
+    for (size_t i = 1; i < times.size(); ++i) {
+        if (const int64_t step = times[i] - times[i - 1]; step > 0 && (best == 0 || step < best)) best = step;
+    }
+    return best;
+}
+
+// The picture each of `commits` showed: the last one the picture decoder of `file` handed on before
+// it. A round draws the picture decoded last and the render thread announces the commit before the
+// next round decodes another (advanceSessionLocked, RenderWorker::runClock); the record is made on
+// that same thread. Nothing, for a commit no picture of `file` came before.
+std::vector<Shown> shownPictures(const std::vector<Commit>& commits, const std::string& file) {
+    const std::vector<probe::PictureRecord> pictures = picturesOf(file);
+    std::vector<Shown> out;
+    size_t next = 0;
+    std::optional<int64_t> last;
+    bool any = false;
+    for (const Commit& c : commits) {
+        while (next < pictures.size() && pictures[next].at <= c.at) {
+            last = pictures[next++].presentationNs;
+            any = true;
+        }
+        out.push_back({c, any ? last : std::nullopt});
+    }
+    return out;
+}
+
+// The presentation time of the picture `file`'s decoder handed on last.
+std::optional<int64_t> lastPictureOf(const std::string& file) {
+    const std::vector<probe::PictureRecord> pictures = picturesOf(file);
+    if (pictures.empty()) return std::nullopt;
+    return pictures.back().presentationNs;
+}
+
+// One picture's interval in `shown`: the median step of two commits in a row whose pictures go forward,
+// which a minority of dropped pictures does not move. 0 when no such step was committed.
+int64_t pictureInterval(const std::vector<Shown>& shown) {
+    std::vector<int64_t> steps;
+    for (size_t i = 1; i < shown.size(); ++i) {
+        if (shown[i].presentation && shown[i - 1].presentation && *shown[i].presentation > *shown[i - 1].presentation) {
+            steps.push_back(*shown[i].presentation - *shown[i - 1].presentation);
+        }
+    }
+    if (steps.empty()) return 0;
+    std::nth_element(steps.begin(), steps.begin() + static_cast<std::ptrdiff_t>(steps.size() / 2), steps.end());
+    return steps[steps.size() / 2];
+}
+
+// How many pictures a pass skipped between two shown in a row, `before` then `after`.
+int skippedBetween(int64_t before, int64_t after, int64_t interval) {
+    if (after <= before || interval <= 0) return 0;
+    return static_cast<int>(std::llround(static_cast<double>(after - before) / static_cast<double>(interval))) - 1;
+}
+
+// Where each shown picture falls in the run: its presentation time, run on across loops, with
+// `passes[i]` the pass it belongs to. Nothing, with `why`, when a commit's picture is not known.
+struct FilePlace {
+    std::vector<int64_t> at;
+    std::vector<int> passes;
+    int dropped = 0;  // pictures the presentation times skip over within a pass: dropped, or never decoded
+};
+std::optional<FilePlace> filePlaces(const std::vector<Shown>& shown, const std::string& file, std::string& why) {
+    if (shown.size() < 2) {
+        why = fmt("only %.0f pictures were committed", static_cast<double>(shown.size()));
+        return std::nullopt;
+    }
+    for (size_t i = 0; i < shown.size(); ++i) {
+        if (!shown[i].presentation) {
+            why = fmt("which picture commit %.0f showed is not known: no picture of its file was seen handed on before it",
+                      static_cast<double>(i));
+            return std::nullopt;
+        }
+    }
+    // GOAL: S15.570 -- the skip count and the pass length hold for a file whose decoder skips pictures:
+    //       never negative, and each pass one file long. False when the interval is the commits' median
+    //       step, which on a skipping file is several pictures, so a one-picture step counts -1.
+    // CONTROL: in phase graderSelfTest; see S15.568's block there.
+    const int64_t interval = fileInterval(file);
+    if (interval == 0) {
+        why = "the file's decoder handed on fewer than two distinct pictures";
+        return std::nullopt;
+    }
+    // A pass is as long as the file's pictures, from the decoder's own record, which holds the pictures
+    // dropped too: the latest committed one falls short whenever the file's last picture was dropped.
+    std::optional<int64_t> last;
+    for (const probe::PictureRecord& p : picturesOf(file)) {
+        if (p.presentationNs && (!last || *p.presentationNs > *last)) last = p.presentationNs;
+    }
+    if (!last) {
+        why = "the file's decoder handed on no picture with a presentation time";
+        return std::nullopt;
+    }
+    const int64_t passLength = *last + interval;
+    FilePlace out;
+    int pass = 0;
+    for (size_t i = 0; i < shown.size(); ++i) {
+        const int64_t p = *shown[i].presentation;
+        if (i > 0) {
+            // Only a time that goes back starts a pass: the same picture committed again stays in its own.
+            const int64_t before = *shown[i - 1].presentation;
+            if (p < before) {
+                ++pass;
+            } else {
+                out.dropped += skippedBetween(before, p, interval);
+            }
+        }
+        out.at.push_back(pass * passLength + p);
+        out.passes.push_back(pass);
+    }
+    return out;
+}
+
+// Each committed picture that starts a beep -- one at a multiple of half a second in the file, and
+// scheduled after `from` -- set against the beep heard nearest its scheduled time: its place on the
+// robust line through every commit against where its picture falls in the run. A picture committed
+// again is graded once. Returns how many were graded, -1 when the run cannot be graded; `line` is that
+// line's, when graded.
+int gradeBeepsAgainstPictures(const std::string& rule, const Capture& cap, const std::vector<Shown>& shown,
+                              const std::string& file, int64_t from, double toleranceMs, int& passStartsGraded,
+                              Line* line = nullptr) {
+    passStartsGraded = 0;
     std::string why;
-    const auto index = pictureIndex(commits, picturesPerPass, why);
-    if (index.empty()) {
+    const std::optional<FilePlace> places = filePlaces(shown, file, why);
+    if (!places) {
         notVerified(rule.c_str(), why);
         return -1;
     }
+    std::vector<std::pair<int64_t, int64_t>> points;
+    for (size_t i = 0; i < shown.size(); ++i) points.push_back({places->at[i], shown[i].commit.at});
+    const Line fitted = fitLine(points);
+    if (line != nullptr) *line = fitted;
+    std::printf("audio_playback_test: %s: %zu commits over %d passes, %d pictures not shown, at most %.1f ms from the line "
+                "through them\n",
+                rule.c_str(), shown.size(), places->passes.back() + 1, places->dropped, fitted.worst / 1e6);
+    const int64_t recordEnd =
+        cap.buffers.empty() ? 0 : cap.heardAt(cap.buffers.back(), cap.buffers.back().first + cap.buffers.back().frames);
+    const std::vector<int64_t> heard = onsets(cap, 0.1f, 480);
     int graded = 0;
-    passStartsGraded = 0;
-    for (const int64_t heard : onsets(cap, 0.1f, 480)) {
-        if (heard < from) continue;
-        std::optional<std::pair<uint64_t, std::pair<int64_t, int>>> best;
-        for (const auto& [generation, picture] : index) {
-            if (picture.second % picturesPerBeep != 0) continue;
-            if (!best || std::llabs(heard - picture.first) < std::llabs(heard - best->second.first)) {
-                best = {generation, picture};
-            }
+    for (size_t i = 0; i < shown.size(); ++i) {
+        const int64_t p = *shown[i].presentation;
+        if (i > 0 && p == *shown[i - 1].presentation && places->passes[i] == places->passes[i - 1]) continue;
+        if (std::llabs(p - (p + 250 * kMs) / (500 * kMs) * (500 * kMs)) > 2 * kMs) continue;
+        const int64_t scheduled = fitted.fitted[i];
+        if (scheduled < from || scheduled + 250 * kMs > recordEnd) continue;
+        std::optional<int64_t> nearest;
+        for (const int64_t h : heard) {
+            if (!nearest || std::llabs(h - scheduled) < std::llabs(*nearest - scheduled)) nearest = h;
         }
-        if (!best) continue;
-        const int bestIndex = best->second.second;
-        const double error = (heard - best->second.first) / 1e6;
-        std::printf("audio_playback_test: %s: beep at picture %d heard %+.2f ms from its picture's scheduled time\n",
-                    rule.c_str(), bestIndex, error);
+        const double error = nearest ? (*nearest - scheduled) / 1e6 : 1e9;
+        std::printf("audio_playback_test: %s: the beep at %.1f s of pass %d heard %+.2f ms from its picture's scheduled "
+                    "time\n",
+                    rule.c_str(), p / 1e9, places->passes[i], error);
         check(std::fabs(error) <= toleranceMs, rule + ": each beep is heard with the picture at its timestamp",
-              fmt("picture %.0f: %+.2f ms", bestIndex, error));
+              fmt("the beep at %.1f s of pass %.0f: %+.2f ms", p / 1e9, places->passes[i], error));
         ++graded;
-        if (bestIndex == 0 && best->first != commits.front().generation) ++passStartsGraded;
+        if (p < 2 * kMs && i != 0) ++passStartsGraded;
     }
     return graded;
 }
 
 // GOAL: S15.497 -- with the beeps fixture, each beep is heard within 12 ms of the scheduled time of the
-//       picture at that beep's timestamp -- its place on the line through the run's commits -- across
-//       loops. False for sound anchored a picture early or late (33 ms at 30 a second).
-// WHY-THIS-SHAPE: which picture a commit is comes from its generation, valid only while pictures come
-//       one by one at about 30 a second -- checked, and a run that dropped one is not graded rather than
-//       mis-graded. Each beep is set against a robust (Theil-Sen) line through every commit, not its
-//       picture's own commit, which carries the render thread's wake-up delay; a run is graded however
-//       far single commits sit from that line, which is printed. Commit jitter itself is graded nowhere:
-//       S13.183 and S15.109 grade pacing over a run, not one commit's distance from its schedule. The
-//       nearest commit of ANY picture would not do: a beep a picture early sits on the one before.
-// COVERAGE-ASSERT: at least eight beeps graded, and at least one at a pass start after a loop.
-// CONTROL: control_run.sh 2026-10-11, reverted: ` - waiting.left` deleted from both the start anchor and the
-//       schedule anchor in steerSoundLocked, backend/daemon/wallpaper_manager.cpp -> "FAIL: sync rule: each
-//       beep is heard with the picture at its timestamp" (pictures 15, 30, 45: -33.33 ms).
+//       picture showing that beep's timestamp, across loops. False if the pictures follow a clock that
+//       misplaces the sound, or the steering puts them anywhere but on the sound.
+// WHY-THIS-SHAPE: which picture a commit showed is read from the decoder's own output (shownPictures),
+//       not from its generation: production drops pictures the sound has passed, so the n-th commit
+//       need not show the n-th picture. A dropped beep picture is simply not graded. Each picture's time
+//       is its place on a robust (Theil-Sen) line through every commit against where it falls in the
+//       file, so a late wake of the render thread moves no picture's time; how far commits sit from it
+//       is printed, not graded.
+// COVERAGE-ASSERT: at least eight beeps graded, one at a pass start after a loop; every commit's
+//       picture known, or not verified.
+// CONTROL: control_run.sh 2026-10-12, reverted: AudioTrack::clock() reporting the file 33 ms ahead
+//       (renderer/audio/audio_output.cpp) -> "FAIL: sync rule: each beep is heard with the picture at its
+//       timestamp" (+20.7 to +44.9 ms). ` - waiting.left` deleted from both anchors in steerSoundLocked
+//       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: sync rule: each beep is heard with the picture at its
+//       timestamp" (-31.7 to -33.3 ms, the third pass).
 void runSyncChecks() {
     const char* kGoals = "S15.497 (sound with its pictures)";
     SoundServer sound(kGoals);
     if (!sound.ready) return;
     Daemon d(smallConfig());
-    if (!startHeard(d, asset("wallpaper_beeps.mp4"), kGoals)) return;
+    const std::string file = asset("wallpaper_beeps.mp4");
+    if (!startHeard(d, file, kGoals)) return;
     std::this_thread::sleep_for(5500ms);
     const std::vector<Commit> commits = d.takeCommits();
     const Capture cap = takeCapture();
@@ -1505,7 +1881,8 @@ void runSyncChecks() {
         return;
     }
     int passStarts = 0;
-    const int graded = gradeBeepsAgainstPictures("sync rule", cap, commits, 60, 15, *first + 60 * kMs, 12.0, passStarts);
+    const int graded =
+        gradeBeepsAgainstPictures("sync rule", cap, shownPictures(commits, file), file, *first + 60 * kMs, 12.0, passStarts);
     if (graded < 0) return;
     check(graded >= 8 && passStarts >= 1, "sync rule: at least eight beeps were graded, one at a pass start after a loop",
           fmt("%.0f graded, %.0f at a pass start", graded, passStarts));
@@ -1513,36 +1890,36 @@ void runSyncChecks() {
 
 // GOAL: S15.498 -- a continuous tone plays through every loop with no silence longer than 10 ms, and
 //       with no dip in level except the one switch fade at each loop: the sound is not moved while it
-//       agrees with the pictures. False for a new pass anchored as a schedule restart (silence at the
-//       loop) or a sound re-anchored every round (a dip at every picture).
+//       agrees with the pictures. False for a new pass's sound anchored anywhere but where the last
+//       pass's sound ends (silence at the loop) or a sound re-anchored every round (a dip at every picture).
 // WHY-THIS-SHAPE: a dip is 24+ frames under 0.05 between louder frames -- a 440 Hz tone at 0.5 crosses
 //       zero in two frames, and a 5 ms fade spends about 24 frames down there. One fade per loop is
-//       allowed, plus two for a re-anchor a stall could earn. Loops are counted from the generations of
-//       consecutive commits (60 pictures a pass), not from the timing line: counting needs no timing, so
-//       a jittery run is still graded; only commits that skipped a generation leave it not verified.
-//       The silence rule needs no pictures and is always graded.
-// COVERAGE-ASSERT: at least six seconds of sound analysed; with consecutive commits, two loops crossed.
-// CONTROL: control_run.sh 2026-10-11, reverted, in steerSoundLocked, backend/daemon/wallpaper_manager.cpp:
-//       the drift path's `if (!next.startsPass) {` made `if (true) {` -> "FAIL: loop rule: no silence longer
-//       than 10 ms inside the tone" (2 gaps; not re-run this round, its line untouched); `if
-//       (std::chrono::abs(lead) <= kSoundDrift) return;` made `if (false) return;` -> "FAIL: loop rule: no
-//       dip in the tone but one fade per loop" (219 dips, at most 5 allowed). Test-side, control_run.sh,
-//       reverted: the pass counted as 600 pictures -> "FAIL: loop rule: the analysed sound crossed two loops"
-//       (0 loops).
+//       allowed, plus two for a re-anchor a stall could earn. Loops are counted from the pictures the
+//       commits showed (a pass starts where the presentation time goes back), not from a timing line or
+//       a count of commits, which dropped pictures would throw off; a run whose pictures are not known
+//       leaves the dip half not verified. The silence rule needs no pictures and is always graded.
+// COVERAGE-ASSERT: at least six seconds of sound analysed; with the pictures known, two loops crossed.
+// CONTROL: control_run.sh 2026-10-12, reverted, in steerSoundLocked, backend/daemon/wallpaper_manager.cpp:
+//       the hand-over to a new pass anchored at `planned.timeline + kSoundDrift` -> "FAIL: loop rule: no
+//       silence longer than 10 ms inside the tone"; the behind-test `if (behind > kSoundDrift)` made
+//       `if (true)` (the sound moved every round) -> "FAIL: loop rule: no dip in the tone but one fade per
+//       loop". Test-side, control_run.sh, reverted: a new pass counted only where the presentation time
+//       goes back by more than the file -> "FAIL: loop rule: the analysed sound crossed two loops" (0 loops).
 void runLoopChecks() {
     const char* kGoals = "S15.498 (a loop plays through)";
     SoundServer sound(kGoals);
     if (!sound.ready) return;
     Daemon d(smallConfig());
-    if (!startHeard(d, asset("wallpaper_tone.mp4"), kGoals)) return;
+    const std::string file = asset("wallpaper_tone.mp4");
+    if (!startHeard(d, file, kGoals)) return;
     std::this_thread::sleep_for(7000ms);
     const std::vector<Commit> commits = d.takeCommits();
     const Capture cap = takeCapture();
     const Continuity c = continuity(cap, 480, 0.05f, 24);
-    constexpr uint64_t kPicturesPerPass = 60;
     std::string why;
-    const bool counted = consecutiveCommits(commits, why);
-    const int loops = counted ? static_cast<int>((commits.back().generation - commits.front().generation) / kPicturesPerPass) : 0;
+    const std::optional<FilePlace> places = filePlaces(shownPictures(commits, file), file, why);
+    const bool counted = places.has_value();
+    const int loops = counted ? places->passes.back() - places->passes.front() : 0;
     std::printf("audio_playback_test: loop rule: %.1f s analysed, %zu gaps over 10 ms, %zu dips, %d loops\n",
                 c.analysed / double(kRate), c.gaps.size(), c.dips, loops);
     for (const auto& [at, frames] : c.gaps) std::printf("  a gap of %.2f ms\n", frames * 1000.0 / kRate);
@@ -1857,13 +2234,15 @@ void runBusWakeChecks() {
 //       seconds later falls well before the loop that would re-anchor the sound anyway; on a short
 //       fixture a track that never retried would still come back at the loop and pass. "Back" alone is
 //       fooled by the stale frames, which is why the steady right-channel tone must also play on.
-// CONTROL: control_run.sh 2026-10-11, reverted, in renderer/audio/audio_output.cpp: loseOutput's
-//       `dropStream(*t, now)` given a retry at the end of time -> "FAIL: reconnect rule: the sound comes back by
-//       itself ..." (not back); its m_log deleted -> "... losing the sound server is said in one line" (0);
-//       connect()'s "can be reached again" line deleted -> "... its return is said in one line" (0).
-//       "The pictures go on" has no control: no sound-thread break short of a crash stops them.
-//       S15.513: control_run.sh 2026-10-11, reverted: destroyStream's `t.playhead = {};` deleted -> "FAIL:
-//       reconnect rule: once back, the sound plays on" (silent again for 1792 ms).
+// CONTROL: control_run.sh 2026-10-11, reverted, in renderer/audio/audio_output.cpp: loseOutput's `dropStream(*t,
+//       now)` given a retry at the end of time -> "FAIL: reconnect rule: the sound comes back by itself ..." (not
+//       back); its m_log deleted -> "... losing the sound server is said in one line" (0); connect()'s "can be
+//       reached again" line deleted -> "... its return is said in one line" (0). "The pictures go on" has no control:
+//       no sound-thread break short of a crash stops them. S15.513: destroyStream's `t.playhead = {};` deleted stays
+//       green in this phase (control_run.sh 2026-10-12, reverted): the daemon moves a sound left behind its pictures
+//       with a new play(), which covers for the stale playhead. Phase engineReconnect grades that half on AudioOutput
+//       alone. The beep line here shares S15.497's check: AudioTrack::clock() reporting the file 33 ms ahead ->
+//       "FAIL: reconnect rule: each beep is heard with the picture at its timestamp" (+32.97 ms).
 // Phase `reconnect` grades S15.501 and phase `reconnectPlaysOn` S15.513, each on its own run of the
 // same scenario, so a break of one leaves the other's controls gradable.
 void runReconnect(bool playsOn) {
@@ -1871,7 +2250,8 @@ void runReconnect(bool playsOn) {
     auto sound = std::make_unique<SoundServer>(kGoals);
     if (!sound->ready) return;
     Daemon d(smallConfig());
-    if (!startHeard(d, asset("wallpaper_beeps_long.mp4"), kGoals)) return;
+    const std::string file = asset("wallpaper_beeps_long.mp4");
+    if (!startHeard(d, file, kGoals)) return;
     wallpaperx::testing::StreamCapture log(STDERR_FILENO);
     std::this_thread::sleep_for(1500ms);
     sound.reset();
@@ -1947,8 +2327,8 @@ void runReconnect(bool playsOn) {
     check(silentAfter == 0, "reconnect rule: once back, the sound plays on",
           fmt("it fell silent again for %.0f ms within the two seconds after its return", silentAfter * 1000.0 / kRate));
     int passStarts = 0;
-    const int graded = gradeBeepsAgainstPictures("reconnect rule", cap, commits, 360, 15, backAt + 100 * kMs, 12.0,
-                                                 passStarts);
+    const int graded =
+        gradeBeepsAgainstPictures("reconnect rule", cap, shownPictures(commits, file), file, backAt + 100 * kMs, 12.0, passStarts);
     if (graded >= 0) {
         check(graded >= 2, "reconnect rule: at least two beeps after the return were graded", fmt("%.0f", graded));
     }
@@ -2237,36 +2617,94 @@ void runEngineLongUnderrunChecks() {
     runUnderrun("long underrun rule", "S15.512 (sound back after a long underrun)", 1000);
 }
 
-// GOAL: S15.519 -- sound turned on while the file's last picture is on screen is heard within 150 ms, in
-//       step with that picture (each beep left in the pass within 12 ms of the last picture's scheduled
-//       time on the line through the commits, plus its distance from it), and after the loop is in step
-//       with the new pass (its beeps at 0.5 and 1 s within 12 ms of the new pass's first scheduled time
-//       plus their time). False if sound started there waits for the loop, plays the rest of the pass off
-//       its schedule, or is never handed to the new pass.
+// GOAL: S15.513, the engine's half -- a track whose sound server is lost and comes back plays on from its
+//       anchor with no new play(): once back, the right channel's tone is not silent again. False if the
+//       new stream inherits the old one's playhead, which holds the request serial the track is begun
+//       again under, so the callback never switches to the new segment and falls silent.
+// WHY-THIS-SHAPE: AudioOutput alone. Phase reconnectPlaysOn drives the same loss through the daemon, which
+//       moves a sound that fell behind its pictures with a new play() -- a new serial -- and so covers for
+//       this defect: that phase stays green with the playhead kept.
+// CONTROL: control_run.sh 2026-10-12, reverted: destroyStream's `t.playhead = {};` deleted,
+//       renderer/audio/audio_output.cpp -> "FAIL: engine reconnect rule: once back, the track plays on".
+void runEngineReconnectChecks() {
+    const char* kGoals = "S15.513 (a track plays on after its server returns)";
+    auto sound = std::make_unique<SoundServer>(kGoals);
+    if (!sound->ready) return;
+    resetCapture();
+    Engine engine(kGoals);
+    if (!engine.output) return;
+    std::unique_ptr<AudioTrack> track = engine.output->track(asset("wallpaper_beeps_long.mp4"), "engine");
+    const int64_t t0 = probe::nowNs() + 300 * kMs;
+    track->play(anchorAt(0, t0));
+    sleepUntil(t0 + 1500 * kMs);
+    sound.reset();
+    std::this_thread::sleep_for(1000ms);
+    sound = std::make_unique<SoundServer>(kGoals);
+    if (!sound->ready) return;
+    const int64_t restartedAt = probe::nowNs();
+    int64_t backAt = 0;
+    if (waitFor(8000ms, [&] { return probe::g_lastLoudQueuedAt.load() > restartedAt; })) backAt = probe::g_lastLoudQueuedAt.load();
+    std::this_thread::sleep_for(2000ms);
+    track->stop();
+    std::this_thread::sleep_for(200ms);
+    const Capture cap = takeCapture();
+    if (backAt == 0) {
+        check(false, "engine reconnect rule: the track's sound comes back within 8 s of its server");
+        return;
+    }
+    Continuity tone = continuity(cap, 480, 0.05f, 24, true);
+    tone.gaps.push_back(tone.trailing);
+    uint64_t silentAfter = 0;
+    for (const auto& [at, frames] : tone.gaps) {
+        if (at > backAt && at < backAt + 1800 * kMs) silentAfter = std::max(silentAfter, frames);
+    }
+    std::printf("audio_playback_test: engine reconnect rule: back %.2f s after the server; silent again for %.1f ms after\n",
+                (backAt - restartedAt) / 1e9, silentAfter * 1000.0 / kRate);
+    check(silentAfter == 0, "engine reconnect rule: once back, the track plays on",
+          fmt("it fell silent again for %.0f ms within the 1.8 s after its return", silentAfter * 1000.0 / kRate));
+}
+
+// GOAL: S15.519 -- sound turned on while the file's last picture is on screen, on a screen whose track
+//       already exists (heard, then turned off), is heard within 150 ms, in step with that picture (each
+//       beep left in the pass within 12 ms of the last picture's scheduled time plus its distance from
+//       it), and is handed to the new pass on time: that pass's first beep within 5 ms of its first
+//       scheduled time, its beeps at 0.5 and 1 s within 12 ms. False if such sound waits for the loop,
+//       plays off the picture schedule, is never handed over, or is handed over late.
 // WHY-THIS-SHAPE: one picture every two seconds and the call 100 ms after the last one's commit, so only
-//       the call's own round can start the sound inside the window graded "heard", and no commit may
-//       land in it. Beeps, not tone_slow's steady tone: a tone sounds the same at any offset, so it can
-//       say the sound is there but not that it is in step. The new pass's first beep is only held to
-//       "not early, heard within 100 ms": the hand-over runs in the round at that picture's due time and
-//       the late-start skip cuts its head by however late that round woke, a scheduler figure (+8.6 to +17.5 ms over four runs).
-// COVERAGE-ASSERT: every expected beep graded, at least two before the loop and three after it.
-// CONTROL: control_run.sh 2026-10-11, reverted, in steerSoundLocked, backend/daemon/wallpaper_manager.cpp:
-//       `} else if (waiting.reaches) {` made `false && ...` -> "FAIL: last picture rule: sound turned on during
-//       the last picture is heard within 150 ms" (peak 0.0000); 33 ms added to that branch's anchor time ->
-//       "FAIL: last picture rule, rest of the pass: each beep is heard on time" (+32.97 ms, three beeps); the
-//       kSoundDrift return made unconditional -> "FAIL: last picture rule, after the loop: every expected beep
-//       is heard within 100 ms of its time" (no sound after the loop). The 33 ms control re-run with the
-//       robust line -> the same line (+32.97 ms, three beeps); the other two not re-run, their lines
-//       untouched. Graded against the robust line through the six commits, which one late commit cannot
-//       move; how far commits sit from it is printed, not graded (see S15.497 for where pacing is).
+//       the call's own round can start the sound inside the window graded "heard", and no commit may land
+//       in it. Beeps, not a steady tone, which sounds the same at any offset. The track is made first:
+//       for a new one, the notice of its file's opening happens to wake an early round that hands over in
+//       time, so only an existing track shows a hand-over left to the pass's own round (its head then cut
+//       by the late-start skip). +-5 ms covers the onset threshold meeting the 5 ms ramp (about +1 ms).
+//       Graded against the robust line through the six commits; their distance from it is printed. Not
+//       skipped when the hand-over's seek came late: a round woken over 80 ms late looks exactly like the
+//       defect graded here, a hand-over left to the pass's own round, so a skip would hide it. The seek's
+//       lead on the pass is printed instead.
+// COVERAGE-ASSERT: the sound was heard before it was turned off, so the track existed; every expected beep
+//       graded, at least two before the loop and three after it.
+// CONTROL: control_run.sh 2026-10-12, reverted, in steerSoundLocked, backend/daemon/wallpaper_manager.cpp:
+//       `} else if (waiting.reaches && planned.timeline - now > kHandOverLead) {` made `false && ...` ->
+//       "FAIL: last picture rule: sound turned on during the last picture is heard within 150 ms"; 33 ms
+//       added to that branch's anchor time -> "FAIL: last picture rule, rest of the pass: each beep is heard
+//       on time"; the hand-over condition made `false && next.startsPass && ...` -> "FAIL: last picture rule,
+//       after the loop: every expected beep is heard within 100 ms of its time"; that branch's
+//       `return {.roundAt = planned.timeline - kHandOverLead};` made `return {};` -> "FAIL: last picture
+//       rule, the new pass's first beep: each beep is heard on time".
 void runLastPictureChecks() {
     const char* kGoals = "S15.519 (sound started on a pass's last picture)";
     SoundServer sound(kGoals);
     if (!sound.ready) return;
     Daemon d(smallConfig());
     resetCapture();
-    d.manager.setSound(false);
+    const int64_t started = probe::nowNs();
     d.play(asset("wallpaper_beeps_slow.mp4"), ScreenFocus::Desktop);
+    if (!d.waitForCommits(1, 15s) ||
+        !waitFor(kSoundArrivalDeadline, [&] { return probe::g_lastLoudQueuedAt.load() > started; })) {
+        notVerified(kGoals, "the slow video was not heard at its start, so its screen's track is not known to exist");
+        return;
+    }
+    d.manager.setSound(false);
+    d.worker.wake();
     // Five pictures a pass: the fifth commit is the file's last picture, the sixth the next pass's first.
     if (!d.waitForCommits(5, 15s)) {
         notVerified(kGoals, "the slow video did not reach its last picture within 15 s");
@@ -2297,10 +2735,10 @@ void runLastPictureChecks() {
     }
     // The pictures' scheduled times, from the line through all six commits: one late wake of the render
     // thread moves its own commit, not the time the sound is graded against.
-    const auto [fitted, worst] = fitLine(points);
+    const Line line = fitLine(points);
     std::printf("audio_playback_test: last picture rule: the six commits sit at most %.1f ms from their line\n",
-                worst / 1e6);
-    const int64_t last = fitted[4], next = fitted[5];
+                line.worst / 1e6);
+    const int64_t last = line.fitted[4], next = line.fitted[5];
     if (onAt < commits[4].at || onAt + 450 * kMs > commits[5].at) {
         notVerified(kGoals, "the call did not fall inside the last picture with 450 ms to spare");
         return;
@@ -2317,8 +2755,14 @@ void runLastPictureChecks() {
         if (last + k * 500 * kMs > onAt + 150 * kMs) rest.push_back({fmt("the beep at %.1f s", 8 + 0.5 * k), last + k * 500 * kMs});
     }
     const int restGraded = gradeBeepTimes("last picture rule, rest of the pass", cap, rest, -12.0, 12.0);
+    std::optional<int64_t> handedAt;
+    for (const probe::SoundSeek& s : soundSeeksSince(onAt)) {
+        if (s.targetNs < 50 * kMs && s.at < next + 100 * kMs) handedAt = s.at;
+    }
+    std::printf("audio_playback_test: last picture rule: the hand-over's seek came %.1f ms before the new pass\n",
+                handedAt ? (next - *handedAt) / 1e6 : -1.0);
     const int firstGraded =
-        gradeBeepTimes("last picture rule, the new pass's first beep", cap, {{"pass 1 beep 0", next}}, -12.0, 100.0);
+        gradeBeepTimes("last picture rule, the new pass's first beep", cap, {{"pass 1 beep 0", next}}, -5.0, 5.0);
     const int afterGraded =
         gradeBeepTimes("last picture rule, after the loop", cap, beepsOf(1, next, 1.01, 1), -12.0, 12.0);
     check(restGraded == static_cast<int>(rest.size()) && restGraded >= 2 && firstGraded == 1 && afterGraded == 2,
@@ -3257,72 +3701,191 @@ void runParkedChecks() {
     check(open == 0, "parked rule: a heard one-picture file with no sound is still released", fmt("%.0f descriptors", open));
 }
 
-// The daemon's catch-up allowance for the long fixture's 30 pictures a second: a sound ahead of its
-// pictures by up to 12 pictures' worth of (1/30 - 1/120) s is caught up, beyond that re-anchored.
-constexpr int64_t kLongFixtureInterval = 1'000'000'000 / 30;
-constexpr int64_t kCatchUpAllowance = 12 * (kLongFixtureInterval - 1'000'000'000 / 120);
+// Pictures drawn late after `from`: of `shown`'s commits in [from, to], those that came more than `slack`
+// after the robust line through the commits before `from` (their picture's presentation against their
+// commit) puts them. Both sides stop at a pass boundary. Nothing, with `why`, when fewer than ten commits
+// before `from` place the line.
+struct Lateness {
+    int late = 0;
+    int graded = 0;
+    // The latest and the second latest any graded commit came against the line, either negative.
+    int64_t worst = 0, second = 0;
+};
+std::optional<Lateness> lateAfter(const std::vector<Shown>& shown, int64_t from, int64_t to, int64_t slack, std::string& why) {
+    size_t first = shown.size();
+    for (size_t i = 0; i < shown.size(); ++i) {
+        if (shown[i].commit.at >= from) {
+            first = i;
+            break;
+        }
+    }
+    std::vector<std::pair<int64_t, int64_t>> points;
+    for (size_t i = first; i-- > 0;) {
+        if (!shown[i].presentation) break;
+        if (!points.empty() && *shown[i].presentation >= points.back().first) break;
+        points.push_back({*shown[i].presentation, shown[i].commit.at});
+    }
+    if (points.size() < 10) {
+        why = fmt("only %.0f commits of the pass before the stall place the line", static_cast<double>(points.size()));
+        return std::nullopt;
+    }
+    std::reverse(points.begin(), points.end());
+    const Line line = fitLine(points);
+    const int64_t base = points.front().second;
+    // fitLine's own intercept, recovered from a fitted point and its slope.
+    const double intercept = static_cast<double>(line.fitted.front() - base) - line.slope * points.front().first;
+    Lateness out;
+    out.worst = out.second = INT64_MIN;
+    std::optional<int64_t> previous;
+    for (size_t i = first; i < shown.size() && shown[i].commit.at <= to; ++i) {
+        if (!shown[i].presentation || (previous && *shown[i].presentation < *previous)) break;
+        previous = shown[i].presentation;
+        const int64_t onLine = base + static_cast<int64_t>(std::llround(intercept + line.slope * *shown[i].presentation));
+        const int64_t lateBy = shown[i].commit.at - onLine;
+        out.second = std::max(out.second, std::min(out.worst, lateBy));
+        out.worst = std::max(out.worst, lateBy);
+        ++out.graded;
+        if (lateBy > slack) ++out.late;
+    }
+    return out;
+}
+
+// What runSoundUndisturbed saw: whether it graded, when `disturb` ran, every commit and the picture each
+// showed.
+struct Undisturbed {
+    bool graded = false;
+    int64_t at = 0;
+    std::vector<Commit> commits;
+    std::vector<Shown> shown;
+};
 
 // Plays the long fixture heard, does `disturb` 1.5 s in, and grades the next 1.4 s: heard throughout,
-// and, while no round in it waited longer than the catch-up allowance plus a picture, no sound seek
-// and no silence in the right channel's tone. False when nothing was graded.
-bool runSoundUndisturbed(const char* rule, const char* goals, const std::function<bool(Daemon&)>& disturb) {
+// no sound seek and no silence in the right channel's tone -- unless the sound server itself fell
+// behind there, which is the one thing that earns a heard sound a seek it is not otherwise owed.
+Undisturbed runSoundUndisturbed(const char* rule, const char* goals, const std::function<bool(Daemon&)>& disturb) {
+    Undisturbed out;
     SoundServer sound(goals);
-    if (!sound.ready) return false;
+    if (!sound.ready) return out;
     Daemon d(smallConfig());
-    if (!startHeard(d, asset("wallpaper_beeps_long.mp4"), goals)) return false;
+    const std::string file = asset("wallpaper_beeps_long.mp4");
+    if (!startHeard(d, file, goals)) return out;
     std::this_thread::sleep_for(1500ms);
-    const int64_t at = probe::nowNs();
-    if (!disturb(d)) return false;
+    out.at = probe::nowNs();
+    if (!disturb(d)) return out;
     std::this_thread::sleep_for(1500ms);
-    const size_t seeks = soundSeeksSince(at).size();
+    // The seeks and the server's gaps over the same span: from the disturbance to this reading.
+    const int64_t seekEnd = probe::nowNs();
+    const size_t seeks = soundSeeksSince(out.at, seekEnd).size();
     const Capture cap = takeCapture();
-    const std::vector<Commit> commits = d.takeCommits();
-    const int64_t end = at + 1400 * kMs;
-    // The window's edges count as commits, so a stall across either edge, or one with no commit at all, is a long wait.
-    int64_t previous = at, longest = 0;
-    for (const Commit& c : commits) {
-        if (c.at < at || c.at >= end) continue;
-        longest = std::max(longest, c.at - previous);
-        previous = c.at;
-    }
-    longest = std::max(longest, end - previous);
-    const auto [silent, heard] = longestSilence(cap, at, end, true);
-    std::printf("audio_playback_test: %s: %zu sound seeks; longest silence %llu frames of %llu heard; longest wait "
-                "between commits %.1f ms\n",
-                rule, seeks, static_cast<unsigned long long>(silent), static_cast<unsigned long long>(heard), longest / 1e6);
+    out.commits = d.takeCommits();
+    out.shown = shownPictures(out.commits, file);
+    const int64_t end = out.at + 1400 * kMs;
+    const auto [silent, heard] = longestSilence(cap, out.at, end, true);
+    const int64_t serverGap = longestBufferGap(cap, out.at, seekEnd);
+    std::printf("audio_playback_test: %s: %zu sound seeks; longest silence %llu frames of %llu heard; the sound server "
+                "went at most %.1f ms between cycles\n",
+                rule, seeks, static_cast<unsigned long long>(silent), static_cast<unsigned long long>(heard), serverGap / 1e6);
     check(heard >= 48000ULL * 1400 / 1000 * 9 / 10, std::string(rule) + ": the sound was heard through the window",
           fmt("%.0f frames", static_cast<double>(heard)));
-    if (longest > kCatchUpAllowance + kLongFixtureInterval) {
-        notVerified(goals, fmt("a round waited %.0f ms between commits, past the %.0f ms catch-up allowance plus a "
-                               "picture, so a re-anchor would be correct",
-                               longest / 1e6, (kCatchUpAllowance + kLongFixtureInterval) / 1e6));
-        return true;
+    // Not graded when the server ran a cycle over 20 ms late: that can leave the sound more than
+    // kSoundDrift behind its pictures, which earns it a seek.
+    if (serverGap > kServerLateBound) {
+        notVerified(goals, fmt("the sound server went %.1f ms between cycles, more than a cycle plus the 20 ms the pictures "
+                               "wait for a sound behind them, so moving the sound would be correct",
+                               serverGap / 1e6));
+        return out;
     }
     check(silent <= 48, std::string(rule) + ": the sound plays on", fmt("%.0f frames silent", static_cast<double>(silent)));
     check(seeks == 0, std::string(rule) + ": the sound is not moved", fmt("%.0f seeks", static_cast<double>(seeks)));
-    return true;
+    out.graded = true;
+    return out;
 }
 
-// GOAL: S15.538 -- a picture held up once, by up to a dozen pictures at the rate cap, is caught up to
-//       its playing sound: the sound is not moved and plays on. False if a late picture re-anchors the
-//       sound, which jumps back by the delay.
-// WHY-THIS-SHAPE: the picture decoder's next av_read_frame sleeps 70 ms, once. Zero seeks are asserted
-//       because the only seek a playing sound gets is a re-anchor, and after a stall inside the catch-up
-//       allowance a re-anchor is the defect; seeks and silence are graded only when no round in the
-//       window waited past that allowance plus a picture (a scheduler stall, not the staged 70 ms) --
-//       otherwise not verified, as S15.536 notes a late round can earn a legitimate re-anchor.
-// COVERAGE-ASSERT: the stall was consumed by a picture read.
-// CONTROL: control_run.sh 2026-10-11, reverted: steerSoundLocked's catch-up branch disabled,
-//       backend/daemon/wallpaper_manager.cpp -> "FAIL: late picture rule: the sound is not moved"
-//       (1 seek). Test-side, by hand, earlier: the stall never applied -> "the staged picture stall
-//       was reached"; the window moved before the sound -> "the sound was heard through the window".
+// GOAL: S15.538 -- a picture held up once, by a 110 ms stall a file that decodes quickly closes by dropping
+//       inside kCatchUpHold, does not move a playing sound, which plays on with no silence. False if a late
+//       picture re-anchors the sound, which then jumps back by the delay.
+// WHY-THIS-SHAPE: the picture decoder's next av_read_frame sleeps 110 ms, once, leaving the sound about
+//       77 ms (110 less one 33 ms interval) ahead. With a clock, a sound ahead is moved only once a hold
+//       has run out, and this file drops the two pictures in two decodes of a millisecond, so however far
+//       a scheduler stretches the stall, no margin to a threshold is graded. Zero seeks because the only
+//       seek a playing sound gets is a re-anchor. A hold that runs out: leadLimit and holdRunOut.
+// COVERAGE-ASSERT: the stall was consumed by a picture read, and held the pictures up 100 ms or more.
+// CONTROL: control_batch.sh 2026-10-13, reverted, backend/daemon/wallpaper_manager.cpp steerSoundLocked: the
+//       move rule `(!chased && overdue - behind > kSoundDrift)` made `(overdue - behind > kSoundDrift)` (a
+//       late picture re-anchors at once) -> "FAIL: late picture rule: the sound is not moved" (1 seek; the drop
+//       and lateness lines below go red with it, 0 skipped and 38 of 38 late). "The sound plays on" has no
+//       production control: a stop added to the drop loop is played again within the round.
+//       Test-side, control_run.sh 2026-10-12, reverted: the sound decoder stalled 1 s in the window -> "FAIL:
+//       late picture rule: the sound plays on" (41984 frames silent); the av_read_frame stand-in never
+//       consuming the stall -> "the staged picture stall was reached" (110 ms unused); a 30 ms stall -> "the
+//       stall held the pictures up"; the window moved 3 s before the disturbance -> "the sound was heard
+//       through the window". A stall never armed (0 ms) leaves "was reached" green: only "held up" sees it.
+// GOAL: S15.557 -- the whole lead that stall leaves is closed by dropping, not by drawing: at least as many
+//       pictures skipped after it as whole intervals the staged 110 ms leaves past one (two), and at most one
+//       commit after the stall more than an interval past the line the commits before it set. False for
+//       pictures caught up by drawing each one, or by dropping one and drawing the rest late.
+// WHY-THIS-SHAPE: skips are read from the presentation times shown (shownPictures) at the file's own
+//       interval; commit gaps cannot tell a drop from a late draw. The skips owed come from the staged stall,
+//       not the measured wait, which the scheduler lengthens. Lateness is graded against a line through the
+//       pre-stall commits, as the sound is not moved and the pictures stay on it; one late commit is allowed
+//       (the picture the stall held up), and a correct draw is at most an interval and a decode late. A
+//       burst test on commit spacing cannot be used: the first picture after the drops is drawn as the
+//       stall ends and the next on time, about 20 ms apart, against an interval/2 threshold of 16.7 ms.
+// CONTROL: control_batch.sh 2026-10-13, reverted, advanceSessionLocked, backend/daemon/wallpaper_manager.cpp: the
+//       drop loop disabled (`!pace.timesPicture ||` made `true ||`) -> "FAIL: late picture rule: the whole lead
+//       the stall left is closed by dropping" (0 skipped, 2 owed) and "... no picture after the stall is drawn
+//       late, but the one it held up" (2 of 41 over an interval late); the loop left after its first drop
+//       (`if (dropped) break;` at its head) -> "... closed by dropping" (1 skipped), its late check green (one
+//       commit 43.5 ms late). Green: 2 skipped, the latest commit +10.2 ms against the line.
 void runLatePictureChecks() {
-    const bool graded = runSoundUndisturbed("late picture rule", "S15.538 (a late picture does not move the sound)", [](Daemon&) {
-        probe::g_stallPictureMs.store(70);
-        return true;
-    });
+    constexpr int kStallMs = 110;
+    const Undisturbed run =
+        runSoundUndisturbed("late picture rule", "S15.538, S15.557 (a late picture does not move the sound)", [](Daemon&) {
+            probe::g_stallPictureMs.store(kStallMs);
+            return true;
+        });
     const int left = probe::g_stallPictureMs.exchange(0);
-    if (graded) check(left == 0, "late picture rule: the staged picture stall was reached", fmt("%.0f ms left unused", left));
+    if (!run.graded) return;
+    check(left == 0, "late picture rule: the staged picture stall was reached", fmt("%.0f ms left unused", left));
+    if (left != 0) return;
+    const int64_t end = run.at + 1400 * kMs;
+    int64_t longest = 0, stallEnd = 0;
+    for (size_t i = 1; i < run.commits.size(); ++i) {
+        if (run.commits[i].at < run.at || run.commits[i].at > end) continue;
+        const int64_t gap = run.commits[i].at - std::max(run.commits[i - 1].at, run.at);
+        if (gap > longest) {
+            longest = gap;
+            stallEnd = run.commits[i].at;
+        }
+    }
+    const int64_t interval = fileInterval(asset("wallpaper_beeps_long.mp4"));
+    int after = 0, dropped = 0;
+    for (size_t i = 1; i < run.shown.size(); ++i) {
+        const Shown &a = run.shown[i - 1], &b = run.shown[i];
+        if (b.commit.at < stallEnd || b.commit.at > end) continue;
+        ++after;
+        if (a.presentation && b.presentation) dropped += skippedBetween(*a.presentation, *b.presentation, interval);
+    }
+    const int owed = interval > 0 ? static_cast<int>((kStallMs * kMs - interval) / interval) : 0;
+    std::printf("audio_playback_test: late picture rule: the pictures waited %.1f ms; %d commits after, %d pictures skipped "
+                "at %.2f ms a picture, %d owed\n",
+                longest / 1e6, after, dropped, interval / 1e6, owed);
+    check(longest >= 100 * kMs && after >= 10, "late picture rule: the stall held the pictures up, and they went on after it",
+          fmt("a %.1f ms wait, %.0f commits after", longest / 1e6, after));
+    if (longest < 100 * kMs || interval == 0) return;
+    check(dropped >= owed, "late picture rule: the whole lead the stall left is closed by dropping",
+          fmt("%.0f pictures skipped, %.0f owed", dropped, owed));
+    std::string why;
+    const std::optional<Lateness> late = lateAfter(run.shown, stallEnd - 1, end, interval, why);
+    if (!late) {
+        notVerified("S15.557 (no picture after the stall is drawn late)", why);
+        return;
+    }
+    std::printf("audio_playback_test: late picture rule: %d of %d commits after the stall over an interval late, the "
+                "latest %+.1f ms against the line before it, the next %+.1f ms\n",
+                late->late, late->graded, late->worst / 1e6, late->second / 1e6);
+    check(late->late <= 1, "late picture rule: no picture after the stall is drawn late, but the one it held up",
+          fmt("%.0f of %.0f commits over an interval late", late->late, late->graded));
 }
 
 // GOAL: S15.539 -- a render owed for the same video (a resize) leaves its sound playing: no seek and
@@ -3330,13 +3893,13 @@ void runLatePictureChecks() {
 //       round starts again.
 // WHY-THIS-SHAPE: another monitor's job is queued first, so one clock round runs while this monitor's
 //       render is owed, which is the round that would stop the sound. Seeks and silence are graded under
-//       the same catch-up-allowance guard as S15.538's.
+//       the same sound-server guard as S15.538's.
 // COVERAGE-ASSERT: the size change posted a render.
-// CONTROL: control_run.sh 2026-10-11, reverted: advanceSessionLocked stopping the sound on any stopped
-//       round, backend/daemon/wallpaper_manager.cpp -> "FAIL: render owed rule: the sound is not moved"
-//       (1 seek), and "the sound plays on" (1494 frames silent). Test-side, by hand, earlier: no size change
-//       -> "FAIL: render owed rule: the size
-//       change posted a render".
+// CONTROL: control_run.sh 2026-10-12, reverted: advanceSessionLocked stopping the sound on any stopped
+//       round (`soundPlays` made false), backend/daemon/wallpaper_manager.cpp -> "FAIL: render owed rule: the
+//       sound is not moved" (1 seek) and "FAIL: render owed rule: the sound plays on" (1608 frames silent).
+//       Test-side, control_run.sh 2026-10-12, reverted: the size change taken out -> "FAIL: render owed
+//       rule: the size change posted a render".
 void runRenderOwedChecks() {
     runSoundUndisturbed("render owed rule", "S15.539 (a render owed keeps the sound)", [](Daemon& d) {
         std::vector<int> redraw;
@@ -3346,6 +3909,2186 @@ void runRenderOwedChecks() {
         check(!redraw.empty(), "render owed rule: the size change posted a render");
         return !redraw.empty();
     });
+}
+
+// Puts the staged stalls and the simulated card rate back on scope exit.
+struct StallReset {
+    ~StallReset() {
+        probe::g_stallPictureMs.store(0);
+        probe::g_slowPictureReads.store(0);
+        probe::g_stallFileMs.store(0);
+        probe::g_streamRate.store(0.0);
+        probe::g_hideStreamTime.store(false);
+        probe::g_costMs.store(0);
+        probe::g_holdMs.store(0);
+        probe::g_holdRepeats.store(false);
+        probe::g_blitHoldMs.store(0);
+        probe::g_hideAtHandOver.store(false);
+        {
+            std::lock_guard<std::mutex> lock(probe::g_costMutex);
+            probe::g_costFile.clear();
+            probe::g_costCycle.clear();
+            probe::g_costCycleAt = 0;
+        }
+        std::lock_guard<std::mutex> lock(probe::g_stallFileMutex);
+        probe::g_slowFile.clear();
+        probe::g_stallFile.clear();
+    }
+};
+
+// GOAL: S15.555 -- a heard screen's pictures follow its sound card: with the card 0.5 % slow or 0.5 % fast,
+//       each beep over ten seconds is heard within 6 ms of its picture's scheduled time, and the pictures
+//       come at the card's pace (1/30 s of the card's time apart: 33.50 or 33.17 ms). False if the
+//       pictures keep the system clock's time, which leaves the beeps drifting 5 ms a second from them.
+// WHY-THIS-SHAPE: the null sink runs on the monotonic clock and never drifts, so the drift is simulated:
+//       pw_stream_set_rate on the engine's stream, from its own process callback, has the server take its
+//       frames at 48000 / rate a second, as an off-rate card would. A run whose server did not take frames
+//       at that rate is not verified, never passed. The pace is the slope of the robust line through each
+//       picture's place in the file and its commit, against the rate the record shows the server took.
+// COVERAGE-ASSERT: the measured rate within 0.1 % of the simulated one; at least 15 beeps graded.
+// CONTROL: control_run.sh 2026-10-12, reverted: `waiting.from += behind;` deleted from steerSoundLocked,
+//       backend/daemon/wallpaper_manager.cpp -> phase driftFastCard "FAIL: drift rule, card fast: each beep is
+//       heard with the picture at its timestamp" and "the pictures come at the sound card's pace"; phase
+//       driftSlowCard the same two lines.
+void runDrift(const std::string& rule, const char* goals, double rate) {
+    SoundServer sound(goals);
+    if (!sound.ready) return;
+    StallReset reset;
+    probe::g_streamRate.store(rate);
+    Daemon d(smallConfig());
+    const std::string file = asset("wallpaper_beeps_long.mp4");
+    if (!startHeard(d, file, goals)) return;
+    // The file is twelve seconds: the run ends before its loop.
+    std::this_thread::sleep_for(10500ms);
+    const std::vector<Commit> commits = d.takeCommits();
+    const Capture cap = takeCapture();
+    if (cap.buffers.size() < 200) {
+        notVerified(goals, fmt("only %.0f buffers were queued, too few to measure the rate", static_cast<double>(cap.buffers.size())));
+        return;
+    }
+    const probe::BufferRecord &a = cap.buffers[20], &b = cap.buffers.back();
+    const double taken = static_cast<double>(b.first - a.first) * 1e9 / static_cast<double>(b.queuedAt - a.queuedAt);
+    const double asked = kRate / rate;
+    std::printf("audio_playback_test: %s: the server took %.1f frames a second (asked %.1f) over %.1f s\n", rule.c_str(),
+                taken, asked, (b.queuedAt - a.queuedAt) / 1e9);
+    if (std::fabs(taken / asked - 1.0) > 0.001) {
+        notVerified(goals, fmt("the private server took %.1f frames a second, not the %.1f the rate correction asks for, so "
+                               "no drift was simulated",
+                               taken, asked));
+        return;
+    }
+    const std::optional<int64_t> first = firstSound(cap, 0, 1e-3f);
+    if (!first) {
+        check(false, rule + ": the sound heard at the start is still in the record");
+        return;
+    }
+    int passStarts = 0;
+    Line line;
+    const int graded =
+        gradeBeepsAgainstPictures(rule, cap, shownPictures(commits, file), file, *first + 1000 * kMs, 6.0, passStarts, &line);
+    if (graded < 0) return;
+    check(graded >= 15, rule + ": at least 15 beeps were graded", fmt("%.0f", graded));
+    // Seconds of commits per second of the file: the card's seconds, in the monotonic clock's.
+    const double pace = kRate / taken;
+    std::printf("audio_playback_test: %s: %.4f ms a picture; the card's pace is %.4f\n", rule.c_str(), line.slope * 1000 / 30,
+                pace * 1000 / 30);
+    check(std::fabs(line.slope / pace - 1.0) <= 0.001, rule + ": the pictures come at the sound card's pace",
+          fmt("%.4f ms a picture, the card's pace %.4f", line.slope * 1000 / 30, pace * 1000 / 30));
+}
+
+void runDriftSlowCardChecks() { runDrift("drift rule, card slow", "S15.555 (pictures follow a slow card)", 1.005); }
+void runDriftFastCardChecks() { runDrift("drift rule, card fast", "S15.555 (pictures follow a fast card)", 0.995); }
+
+// GOAL: S15.556 -- when the sound stops being played out (the private server stopped 400 ms while heard),
+//       the pictures do not wait for it -- no gap over 200 ms between commits from 100 ms before the stop to
+//       600 ms after it ends, the window's edges counted -- and the sound, behind its pictures once back, is
+//       moved to them: one to three sound seeks after the stop, and the beeps from 1 s after the return
+//       within 6 ms of their pictures. False if the pictures follow a stalled sound, or a sound left behind
+//       is never moved.
+// WHY-THIS-SHAPE: SIGSTOP on the server this phase started stalls the sound without touching the engine.
+//       Pictures that follow the stalled sound wait about as long as it stopped, so the bound is half the
+//       400 ms stop; one interval plus slack (50 ms) would grade the render thread's wake-ups too. Both
+//       edges of the window are gaps, so a screen frozen past either end still shows. How many pictures
+//       came during the stop is printed, not graded: the clock runs on from its last cycle, so no break
+//       short of freezing it makes the pictures wait inside the stop. Seeks are bounded, not counted to
+//       one: a re-anchored segment starting a cycle late may earn a second.
+// COVERAGE-ASSERT: the record shows the server went over 300 ms without a cycle; at least three beeps
+//       graded after the return.
+// CONTROL: control_run.sh 2026-10-12, reverted: steerSoundLocked's `behind > kSoundDrift ||` made `false ||`,
+//       backend/daemon/wallpaper_manager.cpp -> "FAIL: server stop rule: the pictures do not wait for a stopped sound
+//       server" (332.0 ms; 33.3 ms green) and "FAIL: server stop rule: a sound behind its pictures once back is moved
+//       to them" (0).
+void runServerStopChecks() {
+    const char* kGoals = "S15.556 (pictures do not wait for a stalled sound)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    Daemon d(smallConfig());
+    const std::string file = asset("wallpaper_beeps_long.mp4");
+    if (!startHeard(d, file, kGoals)) return;
+    std::this_thread::sleep_for(1500ms);
+    const pid_t server = sound.server.pid();
+    if (server <= 0) {
+        harnessFailure("server stop rule: the private server this phase started has no process to stop");
+        return;
+    }
+    const int64_t stopAt = probe::nowNs();
+    int64_t contAt = 0;
+    {
+        struct Resume {
+            pid_t pid;
+            ~Resume() { ::kill(pid, SIGCONT); }
+        } resume{server};
+        ::kill(server, SIGSTOP);
+        std::this_thread::sleep_for(400ms);
+    }
+    contAt = probe::nowNs();
+    std::this_thread::sleep_for(3000ms);
+    const std::vector<Commit> commits = d.takeCommits();
+    const Capture cap = takeCapture();
+    const size_t seeks = soundSeeksSince(stopAt).size();
+    const int64_t serverGap = longestBufferGap(cap, stopAt - 100 * kMs, contAt + 100 * kMs);
+    const int64_t from = stopAt - 100 * kMs, to = contAt + 600 * kMs;
+    int64_t longest = 0, previous = from;
+    int duringStop = 0;
+    for (const Commit& c : commits) {
+        if (c.at <= from || c.at > to) continue;
+        longest = std::max(longest, c.at - previous);
+        previous = c.at;
+        if (c.at >= stopAt && c.at <= contAt) ++duringStop;
+    }
+    longest = std::max(longest, to - previous);
+    std::printf("audio_playback_test: server stop rule: the server went %.1f ms without a cycle; the pictures at most %.1f "
+                "ms apart, %d of them during the stop; %zu sound seeks\n",
+                serverGap / 1e6, longest / 1e6, duringStop, seeks);
+    if (serverGap < 300 * kMs) {
+        notVerified(kGoals, fmt("the stopped server went only %.1f ms without a cycle", serverGap / 1e6));
+        return;
+    }
+    check(longest <= 200 * kMs, "server stop rule: the pictures do not wait for a stopped sound server",
+          fmt("%.1f ms between commits", longest / 1e6));
+    check(seeks >= 1 && seeks <= 3, "server stop rule: a sound behind its pictures once back is moved to them",
+          fmt("%.0f sound seeks", static_cast<double>(seeks)));
+    int passStarts = 0;
+    const int graded = gradeBeepsAgainstPictures("server stop rule", cap, shownPictures(commits, file), file,
+                                                 contAt + 1000 * kMs, 6.0, passStarts);
+    if (graded >= 0) check(graded >= 3, "server stop rule: at least three beeps after the return were graded", fmt("%.0f", graded));
+}
+
+// GOAL: S15.558 -- the sound's clock speaks for the latest play only: a heard file of one picture every two
+//       seconds, with the render thread woken every 30 ms across a loop, moves its sound once there (the
+//       hand-over), brings neither picture either side of the loop over 20 ms before the robust line through
+//       every commit (against the picture's place in the file) puts it, and has the new pass's first beep
+//       heard within 5 ms of the line's time for its picture. False if the last pass's sound, still playing
+//       after the hand-over to the next, times the new pass's pictures: they then come at once, or the
+//       sound is moved again to meet them.
+// WHY-THIS-SHAPE: after the hand-over the track holds the new pass's play while the old segment still
+//       plays out; only a round between the two reads that clock, and with two-second pictures none runs
+//       then unless something wakes the thread, as other screens' pictures would. The defect makes pictures
+//       early, which is graded at 20 ms; lateness is graded too, at the same 20 ms the pictures' two-second
+//       spacing held before this rework, since a picture held back across the loop stutters as visibly. The
+//       beep is graded against the line, not a commit. The seek count is not graded when the sound server
+//       ran a cycle over 20 ms late in its window, which earns a seek of its own (as S15.538).
+// COVERAGE-ASSERT: the new pass's first picture found by its presentation time with a picture on each
+//       side, every commit's picture known.
+// CONTROL: control_batch.sh 2026-10-13, reverted: `serial != s.requestSerial ||` deleted from AudioTrack::clock(),
+//       renderer/audio/audio_output.cpp -> "FAIL: slow loop rule: the sound is moved once across the loop, to hand it
+//       over" (239 seeks) beside the early and beep lines. In advanceSessionLocked, backend/daemon/wallpaper_manager.cpp:
+//       a pass's first picture's wait cut 300 ms -> "FAIL: slow loop rule: no picture across the loop comes early"
+//       (-299.86 ms); a pass's first picture held 150 ms past its due time before its draw -> "FAIL: slow loop rule:
+//       no picture across the loop comes late" (+149.96 ms; green within 0.1 ms).
+// GOAL: S15.565 -- a hand-over made in the new pass's own wait (the first loop, before any pass is learned)
+//       is asked for kHandOverLead (100 ms) before that pass, not at once: the seek to the pass's start
+//       comes no more than 200 ms before the line's time for its first picture. False if the play is made
+//       as soon as that picture is decoded, two seconds ahead, where it can overwrite a play the sound
+//       output has not taken up yet.
+// WHY-THIS-SHAPE: the overwrite itself is a race no hook here can stage, so what is graded is when the
+//       request is made, which is what the daemon decides. The output starts a far-off request about
+//       341 ms early, so an ungated play shows as a seek that far ahead.
+// CONTROL: control_run.sh 2026-10-12, reverted: the `if (planned.timeline - now > kHandOverLead) return {.roundAt
+//       ...};` line in steerSoundLocked's startsPass branch deleted, backend/daemon/wallpaper_manager.cpp -> "FAIL:
+//       slow loop rule: the first loop's hand-over waits for a round kHandOverLead ahead" (340.6 ms; 100.0 green).
+void runSlowLoopWakeChecks() {
+    const char* kGoals = "S15.558, S15.565 (the clock is the latest play's)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    Daemon d(smallConfig());
+    const std::string file = asset("wallpaper_beeps_slow.mp4");
+    if (!startHeard(d, file, kGoals)) return;
+    if (!d.waitForCommits(5, 15s)) {
+        notVerified(kGoals, "the slow video did not reach its last picture within 15 s");
+        return;
+    }
+    const auto deadline = Clock::now() + 6s;
+    while (d.commitCount() < 7 && Clock::now() < deadline) {
+        d.worker.wake();
+        std::this_thread::sleep_for(30ms);
+    }
+    std::this_thread::sleep_for(300ms);
+    const std::vector<Commit> commits = d.takeCommits();
+    const Capture cap = takeCapture();
+    const std::vector<Shown> shown = shownPictures(commits, file);
+    size_t start = 0;
+    for (size_t i = 1; i + 1 < shown.size(); ++i) {
+        if (shown[i].presentation && shown[i - 1].presentation && *shown[i].presentation < *shown[i - 1].presentation) {
+            start = i;
+            break;
+        }
+    }
+    if (start == 0) {
+        notVerified(kGoals, fmt("no new pass with a picture on each side was found among %.0f commits",
+                                static_cast<double>(commits.size())));
+        return;
+    }
+    std::string why;
+    const std::optional<FilePlace> places = filePlaces(shown, file, why);
+    if (!places) {
+        notVerified(kGoals, why);
+        return;
+    }
+    std::vector<std::pair<int64_t, int64_t>> points;
+    for (size_t i = 0; i < shown.size(); ++i) points.push_back({places->at[i], commits[i].at});
+    const Line line = fitLine(points);
+    std::printf("audio_playback_test: slow loop rule: %zu commits, the line through them at slope %.5f, at most %.1f ms "
+                "from it\n",
+                commits.size(), line.slope, line.worst / 1e6);
+    for (size_t i = start; i <= start + 1; ++i) {
+        const double off = (commits[i].at - line.fitted[i]) / 1e6;
+        std::printf("audio_playback_test: slow loop rule: commit %zu came %+.2f ms from its time on the line\n", i, off);
+        check(commits[i].at >= line.fitted[i] - 20 * kMs, "slow loop rule: no picture across the loop comes early",
+              fmt("commit %.0f came %+.2f ms from its time on the line", static_cast<double>(i), off));
+        check(commits[i].at <= line.fitted[i] + 20 * kMs, "slow loop rule: no picture across the loop comes late",
+              fmt("commit %.0f came %+.2f ms from its time on the line", static_cast<double>(i), off));
+    }
+    const int graded = gradeBeepTimes("slow loop rule, the new pass's first beep", cap,
+                                      {{"pass 1 beep 0", line.fitted[start]}}, -5.0, 5.0);
+    check(graded == 1, "slow loop rule: the new pass's first beep was graded");
+    const int64_t seeksFrom = line.fitted[start] - 1500 * kMs, seeksTo = line.fitted[start + 1];
+    const size_t acrossLoop = soundSeeksSince(seeksFrom, seeksTo).size();
+    const int64_t serverGap = longestBufferGap(cap, seeksFrom, seeksTo);
+    std::printf("audio_playback_test: slow loop rule: %zu sound seeks from 1.5 s before the new pass to its second picture; "
+                "the server at most %.1f ms between cycles\n",
+                acrossLoop, serverGap / 1e6);
+    if (serverGap > kServerLateBound) {
+        notVerified("S15.558 (the sound is moved once across the loop)",
+                    fmt("the sound server went %.1f ms between cycles, which earns a seek of its own", serverGap / 1e6));
+    } else {
+        check(acrossLoop == 1, "slow loop rule: the sound is moved once across the loop, to hand it over",
+              fmt("%.0f sound seeks", static_cast<double>(acrossLoop)));
+    }
+    std::optional<int64_t> handedAt;
+    for (const probe::SoundSeek& s : soundSeeksSince(line.fitted[start] - 1500 * kMs, line.fitted[start])) {
+        if (s.targetNs < 50 * kMs) handedAt = s.at;
+    }
+    const double lead = handedAt ? (line.fitted[start] - *handedAt) / 1e6 : -1.0;
+    std::printf("audio_playback_test: slow loop rule: the hand-over's seek came %.1f ms before the new pass\n", lead);
+    check(handedAt && lead <= 200.0, "slow loop rule: the first loop's hand-over waits for a round kHandOverLead ahead",
+          handedAt ? fmt("the seek came %.1f ms before the new pass", lead) : "no seek to the pass's start was seen");
+}
+
+// GOAL: S15.559 -- catching one screen up to its sound leaves the other screens on time: after an 80 ms
+//       stall of a heard 120-a-second screen whose picture reads cost 3 ms, a second, unheard screen
+//       playing at the 120-a-second cap draws with no gap over 28 ms, the stall's end counted as
+//       an edge. False if the heard screen drops the pictures the sound has passed for as long as that
+//       takes in one round, instead of within the round's 4 ms catch-up slice.
+// WHY-THIS-SHAPE: 3 ms reads make each drop cost about a slice, so dropping the 9 or so pictures an 80 ms
+//       stall leaves behind in one round takes about 40 ms. The other screen at the 120-a-second cap is due
+//       every 8.3 ms, so one long round shows as one long gap; at 30 a second it would mostly hide inside
+//       the interval. 28 ms sits between a correct run's worst gap (about 16 ms) and the about 40 ms the
+//       slice's absence adds. A run whose other screen already went over 20 ms between pictures in the
+//       250 ms before the stall, the slow reads on, is not verified: the machine was too busy to tell.
+// COVERAGE-ASSERT: the heard screen drew after the stall and had five or more pictures to drop; at least
+//       twenty of the other screen's gaps graded.
+// CONTROL: control_batch.sh 2026-10-13, reverted, Lavapipe: the slice test in the drop loop made `if (false &&
+//       dropped && …`, backend/daemon/wallpaper_manager.cpp -> "FAIL: drop slice rule: the other screen's
+//       pictures stay on time while the heard one catches up" (40.0 ms; 15.3 green, 15.5 on the RTX), and the
+//       held-pictures line below (2 of 55 late). Test-side, by hand: the render thread held 40 ms by one blit in
+//       the window before the stall -> "NOT VERIFIED -- S15.559 ..." (the other screen 48.4 ms apart before it).
+void runDropSliceChecks() {
+    const char* kGoals = "S15.559 (catching one screen up leaves the others on time)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    StallReset reset;
+    Daemon d(smallConfig());
+    const std::string heard = asset("wallpaper_tone_rate120.mp4"), other = asset("wallpaper_tone_rate240.mp4");
+    if (!startHeard(d, heard, kGoals)) return;
+    d.playOther(other);
+    std::this_thread::sleep_for(1000ms);
+    {
+        std::lock_guard<std::mutex> lock(probe::g_stallFileMutex);
+        probe::g_slowFile = std::filesystem::path(heard).filename().string();
+        probe::g_stallFile = probe::g_slowFile;
+    }
+    probe::g_slowPictureMs.store(3);
+    probe::g_slowPictureReads.store(1'000'000);
+    std::this_thread::sleep_for(300ms);
+    const int64_t baselineTo = probe::nowNs();
+    probe::g_fileStallStartedAt.store(0);
+    probe::g_fileStallEndedAt.store(0);
+    probe::g_stallFileMs.store(80);
+    std::this_thread::sleep_for(1000ms);
+    const int64_t seekEnd = probe::nowNs();
+    probe::g_slowPictureReads.store(0);
+    const int64_t stallStart = probe::g_fileStallStartedAt.load(), stallEnd = probe::g_fileStallEndedAt.load();
+    if (stallEnd == 0) {
+        check(false, "drop slice rule: the staged stall of the heard file's pictures was reached");
+        return;
+    }
+    const size_t seeks = soundSeeksSince(stallStart, seekEnd).size();
+    const int64_t serverGap = longestBufferGap(takeCapture(), stallStart, seekEnd);
+    const std::vector<Commit> all = d.takeCommits(true);
+    std::vector<Commit> mine, others;
+    for (const Commit& c : all) (c.monitor == 0 ? mine : others).push_back(c);
+    const int64_t to = stallEnd + 500 * kMs;
+    const std::vector<Shown> shown = shownPictures(mine, heard);
+    const int64_t interval = pictureInterval(shown);
+    int dropped = 0, heardAfter = 0;
+    for (size_t i = 1; i < shown.size(); ++i) {
+        if (shown[i].commit.at < stallEnd || shown[i].commit.at > to) continue;
+        ++heardAfter;
+        if (shown[i].presentation && shown[i - 1].presentation) {
+            dropped += skippedBetween(*shown[i - 1].presentation, *shown[i].presentation, interval);
+        }
+    }
+    int64_t worst = 0, previous = stallEnd;
+    int gaps = 0;
+    for (const Commit& c : others) {
+        if (c.at <= stallEnd || c.at > to) continue;
+        worst = std::max(worst, c.at - previous);
+        previous = c.at;
+        ++gaps;
+    }
+    worst = std::max(worst, to - previous);
+    // The other screen's own spacing just before the stall, the slow reads already on: how late this
+    // machine is drawing it with no catch-up running.
+    int64_t baselineWorst = 0;
+    std::optional<int64_t> before;
+    for (const Commit& c : others) {
+        if (c.at < baselineTo - 250 * kMs || c.at > std::min(baselineTo, stallStart)) continue;
+        if (before) baselineWorst = std::max(baselineWorst, c.at - *before);
+        before = c.at;
+    }
+    std::printf("audio_playback_test: drop slice rule: after the stall the heard screen drew %d pictures and skipped %d "
+                "(%.2f ms a picture); the other screen drew %d, at most %.1f ms apart (%.1f ms before the stall); %zu sound "
+                "seeks, the server at most %.1f ms between cycles\n",
+                heardAfter, dropped, interval / 1e6, gaps, worst / 1e6, baselineWorst / 1e6, seeks, serverGap / 1e6);
+    check(heardAfter >= 1, "drop slice rule: the heard screen drew again after its stall");
+    if (heardAfter == 0) return;
+    if (interval == 0) {
+        notVerified(kGoals, "no two of the heard screen's commits in a row showed later and later pictures");
+        return;
+    }
+    // GOAL: S15.557 on a heavy file -- with every picture read of the heard file at 3 ms, the pictures an
+    //       80 ms stall left behind the sound are dropped, not drawn: at least five skipped among the commits
+    //       in the 500 ms after it, and at most one of those commits more than two intervals past the line
+    //       the commits before the stall set. False if a round whose slice is spent draws the late picture
+    //       instead of dropping at least one and holding the rest.
+    // WHY-THIS-SHAPE: the skips are read from presentation times (shownPictures), at the file's interval;
+    //       a 3 ms read alone nearly spends the round's 4 ms slice, so a drop loop bounded only by the slice
+    //       would rarely run. Holding is graded as lateness against the pre-stall line, not commit spacing,
+    //       which at 120 a second cannot tell a held picture from a drawn one. A correct draw comes when its
+    //       picture is under an interval overdue, plus the draw; two intervals (16.7 ms) leave that a margin.
+    // CONTROL: control_batch.sh 2026-10-13, reverted, backend/daemon/wallpaper_manager.cpp: the hold's `return
+    //       now;` in advanceSessionLocked's drop loop made `break;` (a spent slice draws the held picture) -> "FAIL:
+    //       drop slice rule: a heavy file's held pictures are not drawn late" (7 of 59 over two intervals, the
+    //       latest +70.5 ms; green at most +6.8 ms on Lavapipe, +13.4 on the RTX); steerSoundLocked's move rule made
+    //       `(overdue - behind > kSoundDrift)`, without `!chased &&` (the sound moved to the pictures instead) ->
+    //       "FAIL: drop slice rule: a heavy file's pictures the stall left behind the sound are dropped" (0 skipped;
+    //       green 16-17).
+    check(dropped >= 5, "drop slice rule: a heavy file's pictures the stall left behind the sound are dropped",
+          fmt("%.0f skipped", dropped));
+    std::string why;
+    if (const std::optional<Lateness> late = lateAfter(shown, stallEnd, to, 2 * interval, why); !late) {
+        notVerified("S15.557 (a heavy file's held pictures are not drawn late)", why);
+    } else {
+        std::printf("audio_playback_test: drop slice rule: %d of %d heard commits after the stall over two intervals late, "
+                    "the latest %+.1f ms against the line before it, the next %+.1f ms\n",
+                    late->late, late->graded, late->worst / 1e6, late->second / 1e6);
+        check(late->late <= 1, "drop slice rule: a heavy file's held pictures are not drawn late",
+              fmt("%.0f of %.0f commits over two intervals late", late->late, late->graded));
+    }
+    if (dropped < 5) {
+        notVerified(kGoals, fmt("the heard screen skipped only %.0f pictures, so there was no catch-up to share", dropped));
+    } else if (baselineWorst > 20 * kMs) {
+        notVerified(kGoals, fmt("the other screen already went %.1f ms between pictures before the stall, too busy a "
+                                "machine to grade a 28 ms bound",
+                                baselineWorst / 1e6));
+    } else {
+        check(gaps >= 20, "drop slice rule: the other screen's pictures after the stall were graded", fmt("%.0f gaps", gaps));
+        check(worst <= 28 * kMs, "drop slice rule: the other screen's pictures stay on time while the heard one catches up",
+              fmt("at most %.1f ms between two of its pictures", worst / 1e6));
+    }
+    // GOAL: S15.557 -- catching a heavy file up inside kCatchUpHold does not move its sound.
+    // WHY-THIS-SHAPE: seeks and the server's gaps over one span, from the stall to the reading; not graded
+    //       when the server itself went a cycle plus 20 ms between buffers, which earns a seek (as S15.538).
+    // CONTROL: control_batch.sh 2026-10-13, reverted: steerSoundLocked's `(!chased && overdue - behind >
+    //       kSoundDrift)` made `(overdue - behind > kSoundDrift)`, backend/daemon/wallpaper_manager.cpp ->
+    //       "FAIL: drop slice rule: a heavy file's catch-up does not move the sound" (1 seek).
+    if (serverGap > kServerLateBound) {
+        notVerified("S15.557 (a heavy file's catch-up does not move the sound)",
+                    fmt("the sound server went %.1f ms between cycles, so moving the sound would be correct", serverGap / 1e6));
+    } else {
+        check(seeks == 0, "drop slice rule: a heavy file's catch-up does not move the sound",
+              fmt("%.0f sound seeks", static_cast<double>(seeks)));
+    }
+}
+
+// GOAL: S15.561 -- a heard file that cannot decode in real time and has no picture to skip plays its
+//       pictures as fast as it decodes them once the daemon has seen it cannot keep up: from the eighth
+//       picture decoded after the slowdown, none of its decoded pictures is dropped, no commit waits on more
+//       than two decoder hand-offs, and the sound is not moved mid-pass -- the one seek in the window hands
+//       it to the next pass at the loop. False if such a file is still steered by its sound (it drops
+//       pictures it can never reach, so each update costs several decodes, and the sound is moved), or its
+//       sound is never put back on the pictures at a loop.
+// WHY-THIS-SHAPE: the slowdown is 83 ms (2.5 intervals) spent in avcodec_receive_frame on each picture the
+//       decoder returns: a cost per decoded picture, as heavy decoding is, where slowed packet reads made the
+//       cost of a picture depend on how many sound packets sat beside it. Baseline H.264 has no unreferenced
+//       picture, so skipping cannot help. The daemon's averaged load reaches 1 within five such decodes; the
+//       grading starts at the eighth, so the stutter before that (pictures dropped while the file still
+//       counted as keeping up) is accepted. "One decode an update" is graded as hand-offs counted between two
+//       commits, never as a wall-clock gap, which would grade the scheduler; two allows for one picture
+//       handed on just as a round starts. No sound-server guard: a file that cannot keep up is never steered
+//       mid-pass, so a late server earns it no seek. The two-second file loops inside the window.
+// COVERAGE-ASSERT: at least ten pictures decoded and ten committed in the window, a decode costing more
+//       than its interval (else not verified), and a loop crossed.
+// CONTROL: control_batch.sh 2026-10-13, reverted, steerSoundLocked, backend/daemon/wallpaper_manager.cpp: its return
+//       for a file in State::Behind deleted -> "FAIL: catch-up cap rule: a file that cannot keep up draws every
+//       picture it decodes" (56 skipped), "... each update ... costs one decode" (4 hand-offs before one commit) and
+//       "... its sound is moved only at the loop" (17 seeks); the same return tested on State::Skips -> the same three;
+//       a copy of that return placed before the pass-start branch -> "... its sound is moved only at the loop" (0
+//       seeks). Green on both entries: 0 skipped, at most 1 hand-off, one seek at the loop.
+void runCatchUpCapChecks() {
+    const char* kGoals = "S15.561 (a file that cannot keep up, with nothing to skip, plays unpaced)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    StallReset reset;
+    Daemon d(smallConfig());
+    const std::string heard = asset("wallpaper_beeps.mp4");
+    if (!startHeard(d, heard, kGoals)) return;
+    {
+        std::lock_guard<std::mutex> lock(probe::g_costMutex);
+        probe::g_costFile = std::filesystem::path(heard).filename().string();
+    }
+    const int64_t costFrom = probe::nowNs();
+    probe::g_costMs.store(83);
+    std::this_thread::sleep_for(8000ms);
+    const int64_t to = probe::nowNs();
+    probe::g_costMs.store(0);
+    std::vector<int64_t> decodedAt;
+    for (const probe::PictureRecord& p : picturesOf(heard)) {
+        if (p.at > costFrom && p.at <= to) decodedAt.push_back(p.at);
+    }
+    if (decodedAt.size() < 18) {
+        check(false, "catch-up cap rule: the slowed file went on decoding pictures",
+              fmt("%.0f pictures decoded in 8 s of the slowdown", static_cast<double>(decodedAt.size())));
+        return;
+    }
+    const int64_t from = decodedAt[7];
+    const int64_t perPicture = (decodedAt.back() - from) / static_cast<int64_t>(decodedAt.size() - 8);
+    const int64_t interval = fileInterval(heard);
+    const std::vector<Shown> shown = shownPictures(d.takeCommits(), heard);
+    int inWindow = 0, dropped = 0, worstHandOffs = 0;
+    std::optional<size_t> loopAt;
+    int64_t previous = from;
+    size_t next = 0;
+    const auto handOffsUntil = [&](int64_t until) {
+        int n = 0;
+        while (next < decodedAt.size() && decodedAt[next] <= until) {
+            if (decodedAt[next] > previous) ++n;
+            ++next;
+        }
+        return n;
+    };
+    for (size_t i = 0; i < shown.size(); ++i) {
+        const Shown& s = shown[i];
+        if (s.commit.at <= from || s.commit.at > to) continue;
+        ++inWindow;
+        worstHandOffs = std::max(worstHandOffs, handOffsUntil(s.commit.at));
+        previous = s.commit.at;
+        if (i == 0 || !s.presentation || !shown[i - 1].presentation) continue;
+        if (*s.presentation < *shown[i - 1].presentation) {
+            if (!loopAt) loopAt = i;
+        } else {
+            dropped += skippedBetween(*shown[i - 1].presentation, *s.presentation, interval);
+        }
+    }
+    worstHandOffs = std::max(worstHandOffs, handOffsUntil(to));
+    const std::vector<probe::SoundSeek> seeks = soundSeeksSince(from, to);
+    std::printf("audio_playback_test: catch-up cap rule: graded from the eighth picture decoded, %.0f ms after the slowdown "
+                "began: %zu pictures decoded at %.1f ms each (interval %.1f ms); %d commits, %d pictures skipped, at most "
+                "%d decoder hand-offs before a commit; %zu sound seeks\n",
+                (from - costFrom) / 1e6, decodedAt.size() - 7, perPicture / 1e6, interval / 1e6, inWindow, dropped,
+                worstHandOffs, seeks.size());
+    for (const probe::SoundSeek& s : seeks) {
+        std::printf("  a seek to %.1f ms of the file, %+.1f ms from the new pass's first commit\n", s.targetNs / 1e6,
+                    loopAt ? (s.at - shown[*loopAt].commit.at) / 1e6 : 0.0);
+    }
+    check(inWindow >= 10 && decodedAt.size() >= 18 && loopAt.has_value(),
+          "catch-up cap rule: the slowed file decoded and drew ten pictures, and crossed a loop, in the graded window",
+          fmt("%.0f commits, a loop %.0f", inWindow, loopAt ? 1.0 : 0.0));
+    if (inWindow < 10 || !loopAt) return;
+    if (interval == 0 || perPicture <= interval) {
+        notVerified(kGoals, fmt("a picture cost %.1f ms to decode, inside its %.1f ms interval, so there was nothing to "
+                                "fall behind",
+                                perPicture / 1e6, interval / 1e6));
+        return;
+    }
+    check(dropped == 0, "catch-up cap rule: a file that cannot keep up draws every picture it decodes",
+          fmt("%.0f pictures skipped", dropped));
+    check(worstHandOffs <= 2, "catch-up cap rule: each update of a file that cannot keep up costs one decode",
+          fmt("%.0f pictures handed on before one commit", worstHandOffs));
+    const bool atLoop = seeks.size() == 1 && seeks[0].targetNs < 50 * kMs &&
+                        std::llabs(seeks[0].at - shown[*loopAt].commit.at) <= 500 * kMs;
+    check(atLoop, "catch-up cap rule: its sound is moved only at the loop, onto the new pass",
+          fmt("%.0f sound seeks in the window", static_cast<double>(seeks.size())));
+}
+
+// GOAL: S15.560 -- a pass's first picture is never dropped: held up past its time while the sound already
+//       plays the new pass, it is still drawn. False if the pictures the sound has passed are dropped
+//       across a loop, so the new pass opens on a later picture.
+// WHY-THIS-SHAPE: only another screen can hold the first picture up after it is decoded, so a second,
+//       unheard screen's next read is stalled 600 ms, armed from the heard screen's last-picture commit.
+//       A commit is stamped when its round ends, after every screen in it, so the heard screen drawing
+//       on time in the very round whose later screen stalls looks held up; that round is told by a blit
+//       (the one draw call) recorded after the last commit announced before the stall and before the
+//       stall began. Such an attempt, or one drawn before the stall, proves nothing and is tried again, at
+//       most three times, then not verified. No heard commit at all after the stall is a failure: the
+//       screen stopped.
+// COVERAGE-ASSERT: the graded picture was drawn in a round after the stall's own.
+// CONTROL: control_batch.sh 2026-10-13, reverted, Lavapipe, backend/daemon/wallpaper_manager.cpp: `held.startsPass ||`
+//       deleted from the drop loop -> "FAIL: first picture rule: a pass's first picture held up past its time is
+//       drawn, not dropped" (0.567 s); advanceSessionLocked returning 10 s ahead instead of drawing a waiting pass's
+//       first picture -> "FAIL: first picture rule: the heard screen drew again after the other screen's stall".
+void runLoopFirstPictureChecks() {
+    const char* kGoals = "S15.560 (a pass's first picture is never dropped)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    StallReset reset;
+    const std::string heard = asset("wallpaper_beeps.mp4"), other = asset("wallpaper_tone.mp4");
+    std::atomic<bool> arm{false};
+    std::atomic<int64_t> armedAt{0};
+    Daemon d(smallConfig());
+    d.onCommit = [&](const Commit& c) {
+        if (c.monitor != 0 || !arm.load()) return;
+        const std::optional<int64_t> p = lastPictureOf(heard);
+        // The file's last picture, at 59/30 s.
+        if (!p || *p < 1950 * kMs) return;
+        arm.store(false);
+        armedAt.store(c.at);
+        {
+            std::lock_guard<std::mutex> lock(probe::g_stallFileMutex);
+            probe::g_stallFile = std::filesystem::path(other).filename().string();
+        }
+        probe::g_stallFileMs.store(600);
+    };
+    if (!startHeard(d, heard, kGoals)) return;
+    d.playOther(other);
+    std::this_thread::sleep_for(1000ms);
+    bool reached = false;
+    for (int attempt = 1; attempt <= 3 && !reached; ++attempt) {
+        probe::g_fileStallStartedAt.store(0);
+        probe::g_fileStallEndedAt.store(0);
+        armedAt.store(0);
+        arm.store(true);
+        if (!waitFor(5000ms, [] { return probe::g_fileStallEndedAt.load() != 0; })) {
+            arm.store(false);
+            probe::g_stallFileMs.store(0);
+            check(false, "first picture rule: the other screen's staged stall was reached within 5 s");
+            return;
+        }
+        const int64_t started = probe::g_fileStallStartedAt.load(), ended = probe::g_fileStallEndedAt.load();
+        const auto drewAfterArm = [&] {
+            for (const Commit& c : d.takeCommits()) {
+                if (c.at > armedAt.load()) return true;
+            }
+            return false;
+        };
+        if (!waitFor(3000ms, drewAfterArm)) {
+            check(false, "first picture rule: the heard screen drew again after the other screen's stall");
+            return;
+        }
+        const std::vector<Shown> shown = shownPictures(d.takeCommits(), heard);
+        const Shown* firstAfter = nullptr;
+        for (const Shown& s : shown) {
+            if (s.commit.at > armedAt.load()) {
+                firstAfter = &s;
+                break;
+            }
+        }
+        if (firstAfter->commit.at < started) {
+            std::printf("audio_playback_test: first picture rule: attempt %d: the heard screen drew its next picture before "
+                        "the stall began; trying again\n",
+                        attempt);
+            continue;
+        }
+        int64_t announced = 0;
+        for (const Commit& c : d.takeCommits(true)) {
+            if (c.at < started) announced = std::max(announced, c.at);
+        }
+        bool drawnInStallRound = false;
+        {
+            std::lock_guard<std::mutex> lock(probe::g_blitMutex);
+            for (const int64_t b : probe::g_blits) drawnInStallRound = drawnInStallRound || (b > announced && b < started);
+        }
+        if (drawnInStallRound) {
+            std::printf("audio_playback_test: first picture rule: attempt %d: the heard screen drew in the stall's own round, "
+                        "before the stall; trying again\n",
+                        attempt);
+            continue;
+        }
+        reached = true;
+        const double p = firstAfter->presentation ? *firstAfter->presentation / 1e9 : -1.0;
+        std::printf("audio_playback_test: first picture rule: attempt %d: after a %.0f ms stall the heard screen drew the "
+                    "picture at %.3f s, %.1f ms after the stall ended\n",
+                    attempt, (ended - started) / 1e6, p, (firstAfter->commit.at - ended) / 1e6);
+        check(firstAfter->presentation && *firstAfter->presentation < 2 * kMs,
+              "first picture rule: a pass's first picture held up past its time is drawn, not dropped",
+              fmt("the first picture drawn after the stall is at %.3f s of the file", p));
+    }
+    if (!reached) notVerified(kGoals, "in three loops the stall never held the new pass's first picture up");
+}
+
+// One stall of `ms` on `file`'s next picture read, then 1.5 s: when it began and ended (0 if never
+// reached), and the sound seeks and the server's longest gap from the moment it was armed to the end.
+struct StallRun {
+    int64_t armed = 0, started = 0, ended = 0, end = 0, serverGap = 0;
+    std::vector<probe::SoundSeek> seeks;
+};
+StallRun stallOnce(const std::string& file, int ms) {
+    StallRun r;
+    {
+        std::lock_guard<std::mutex> lock(probe::g_stallFileMutex);
+        probe::g_stallFile = std::filesystem::path(file).filename().string();
+    }
+    probe::g_fileStallStartedAt.store(0);
+    probe::g_fileStallEndedAt.store(0);
+    r.armed = probe::nowNs();
+    probe::g_stallFileMs.store(ms);
+    std::this_thread::sleep_for(1500ms);
+    r.end = probe::nowNs();
+    probe::g_stallFileMs.store(0);
+    r.started = probe::g_fileStallStartedAt.load();
+    r.ended = probe::g_fileStallEndedAt.load();
+    r.seeks = soundSeeksSince(r.armed, r.end);
+    r.serverGap = longestBufferGap(takeCapture(), r.armed, r.end);
+    return r;
+}
+
+// GOAL: S15.562 -- a heard sound ahead of its pictures is left alone while dropping can close the lead, and
+//       moved back to them once when it cannot: on a file that decodes quickly, one picture read stalled
+//       160 ms and later one stalled 600 ms each earn no sound seek, and the sound plays on through them;
+//       with every picture read slowed 10 ms (a decode then takes most of an interval, so each drop gains
+//       little), a 600 ms stall earns exactly one seek, no sooner than kCatchUpHold (100 ms) after the stall
+//       ends. False if a fast file's stall moves the sound (moved for a lead before any hold), if the slow
+//       one's never does (the pictures chase a sound however far ahead), or one stall moves it twice.
+// WHY-THIS-SHAPE: each stall is on the heard file's own read (g_stallFile), which says when it slept, and its
+//       seeks are counted until the next, under S15.538's sound-server guard. 10 ms reads keep the file
+//       under the daemon's "cannot keep up" mark (14 ms crosses it on Lavapipe); a run that dropped no
+//       picture after the slowed stall was taken for a file that cannot keep up, which is never steered, so
+//       it is not verified rather than graded on its zero seeks. Where a seek lands is printed, not graded.
+// COVERAGE-ASSERT: each stall consumed by a picture read; the slowed run dropped pictures to chase.
+// GOAL: S15.569 -- one long stall does not make a file that decodes quickly count as one that cannot keep
+//       up: after the fast file's 600 ms stall, at most one commit comes before the first picture skipped.
+//       False if the stall's decode time, counted whole, tips the averaged load, so the pictures after it
+//       are drawn late one by one instead of dropped.
+// WHY-THIS-SHAPE: a file taken for one that cannot keep up draws each picture as it is decoded; one being
+//       caught up drops before it draws. The first skip in the presentation times shown is where catching
+//       up began, so the commits before it are the pictures drawn unpaced.
+// CONTROL: control_batch.sh 2026-10-13, reverted, backend/daemon/wallpaper_manager.cpp: steerSoundLocked's `chased`
+//       made `false` (moved for a lead before any hold) -> "FAIL: lead limit rule, a 160 ms stall on a file that
+//       decodes quickly: the sound is not moved" (1 seek), the 600 ms line
+//       (1 seek) and S15.569's line (27 drawn unpaced, the sound moved to them); the drop loop's
+//       steerSoundLocked(..., CatchUp::HoldRunOut) call deleted -> "FAIL: lead limit rule, a stall the hold cannot
+//       close: the sound is moved back once, after the hold" (0 seeks, 25 dropped); DecodeLoad::Average::add
+//       without the cap of 2 on a sample -> "FAIL: lead limit rule: one long stall does not make a quick file count
+//       as one that cannot keep up" (7 drawn unpaced); the hold's run-out at kCatchUpHold / 4 -> "... a stall the hold
+//       cannot close: ..., after the hold" (the seek 70.5 ms after the stall). Test-side, 2026-10-13 (not re-run since): the sound
+//       decoder stalled 1 s in the 160 ms run -> "... a 160 ms stall ...: the sound plays on through it" (41984
+//       frames silent). Green on both entries: no seek for either fast
+//       stall, 0 drawn unpaced, one seek 141 ms after the slowed stall ended.
+void runLeadLimitChecks() {
+    const char* kGoals = "S15.562, S15.569 (a sound ahead is moved only once a hold runs out)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    StallReset reset;
+    Daemon d(smallConfig());
+    const std::string file = asset("wallpaper_beeps_long.mp4");
+    if (!startHeard(d, file, kGoals)) return;
+    std::this_thread::sleep_for(1500ms);
+    const int64_t interval = fileInterval(file);
+    const auto printSeeks = [&](const StallRun& r) {
+        const std::vector<Shown> shown = shownPictures(d.takeCommits(), file);
+        for (const probe::SoundSeek& s : r.seeks) {
+            std::optional<int64_t> onScreen;
+            for (const Shown& c : shown) {
+                if (c.commit.at <= s.at) onScreen = c.presentation;
+            }
+            std::printf("  a seek %.1f ms after the stall ended, to %.1f ms of the file, with the picture at %.1f ms on "
+                        "screen\n",
+                        (s.at - r.ended) / 1e6, s.targetNs / 1e6, onScreen ? *onScreen / 1e6 : -1.0);
+        }
+    };
+    for (const int ms : {160, 600}) {
+        const StallRun r = stallOnce(file, ms);
+        std::printf("audio_playback_test: lead limit rule: a %d ms stall on a file that decodes quickly: %zu sound seeks; the "
+                    "server at most %.1f ms between cycles\n",
+                    ms, r.seeks.size(), r.serverGap / 1e6);
+        printSeeks(r);
+        if (r.ended == 0) {
+            check(false, "lead limit rule: the staged picture stall was reached", fmt("the %.0f ms stall", ms));
+            return;
+        }
+        const auto [silent, heardFrames] = longestSilence(takeCapture(), r.started, r.started + 1400 * kMs, true);
+        check(heardFrames >= 48000ULL * 1400 / 1000 * 9 / 10 && silent <= 48,
+              fmt("lead limit rule, a %.0f ms stall on a file that decodes quickly: the sound plays on through it", ms),
+              fmt("%.0f frames heard, %.0f silent in a row", static_cast<double>(heardFrames), static_cast<double>(silent)));
+        if (r.serverGap > kServerLateBound) {
+            notVerified(kGoals, fmt("the sound server went %.1f ms between cycles, which earns a seek of its own", r.serverGap / 1e6));
+        } else {
+            check(r.seeks.empty(), fmt("lead limit rule, a %.0f ms stall on a file that decodes quickly: the sound is not moved", ms),
+                  fmt("%.0f sound seeks", static_cast<double>(r.seeks.size())));
+        }
+        if (ms != 600) continue;
+        int unpaced = 0;
+        bool skipped = false;
+        std::optional<int64_t> before;
+        for (const Shown& s : shownPictures(d.takeCommits(), file)) {
+            if (!s.presentation) continue;
+            if (s.commit.at > r.ended && !skipped) {
+                if (before && skippedBetween(*before, *s.presentation, interval) > 0) {
+                    skipped = true;
+                } else {
+                    ++unpaced;
+                }
+            }
+            before = s.presentation;
+        }
+        std::printf("audio_playback_test: lead limit rule: %d commits after the 600 ms stall before the first skip\n", unpaced);
+        check(skipped && unpaced <= 1, "lead limit rule: one long stall does not make a quick file count as one that cannot keep up",
+              fmt("%.0f pictures drawn unpaced before the first skip", unpaced));
+    }
+    {
+        std::lock_guard<std::mutex> lock(probe::g_stallFileMutex);
+        probe::g_slowFile = std::filesystem::path(file).filename().string();
+    }
+    probe::g_slowPictureMs.store(10);
+    probe::g_slowPictureReads.store(1'000'000);
+    std::this_thread::sleep_for(1500ms);
+    const StallRun r = stallOnce(file, 600);
+    probe::g_slowPictureReads.store(0);
+    int dropped = 0;
+    std::optional<int64_t> before;
+    for (const Shown& s : shownPictures(d.takeCommits(), file)) {
+        if (!s.presentation) continue;
+        if (before && s.commit.at > r.ended && s.commit.at <= r.end) dropped += skippedBetween(*before, *s.presentation, interval);
+        before = s.presentation;
+    }
+    std::printf("audio_playback_test: lead limit rule: a 600 ms stall with 10 ms reads: %zu sound seeks, %d pictures dropped "
+                "after it; the server at most %.1f ms between cycles\n",
+                r.seeks.size(), dropped, r.serverGap / 1e6);
+    printSeeks(r);
+    if (r.ended == 0) {
+        check(false, "lead limit rule: the staged picture stall was reached", "the 600 ms stall with 10 ms reads");
+        return;
+    }
+    if (dropped == 0) {
+        notVerified(kGoals, "no picture was dropped after the slowed stall: the file was taken for one that cannot keep up, "
+                            "which is never steered");
+    } else if (r.serverGap > kServerLateBound) {
+        notVerified(kGoals, fmt("the sound server went %.1f ms between cycles, which earns a seek of its own", r.serverGap / 1e6));
+    } else {
+        const bool afterHold = r.seeks.size() == 1 && r.seeks[0].at - r.ended >= 100 * kMs;
+        check(afterHold, "lead limit rule, a stall the hold cannot close: the sound is moved back once, after the hold",
+              fmt("%.0f sound seeks, the first %.1f ms after the stall ended", static_cast<double>(r.seeks.size()),
+                  r.seeks.empty() ? 0.0 : (r.seeks[0].at - r.ended) / 1e6));
+    }
+}
+
+// GOAL: S15.563 -- with no clock from the sound server (it never times the stream), a heard sound left more than
+//       kSoundDrift off its pictures is still moved back to them: after a 600 ms picture stall, exactly one
+//       sound seek. False if a sound with no clock is never steered, and stays 600 ms ahead of its pictures
+//       for good. The 20 ms threshold itself, and lateness inside an interval: noClockLead.
+// WHY-THIS-SHAPE: pw_stream_get_time_n is interposed to report `now` as 0, which is how a server that has
+//       not timed a stream answers, so AudioOutput publishes no clock; the record's own heard times then
+//       fall back to the queue time, which nothing here grades. With a clock the same stall earns no seek
+//       (S15.562: dropping closes it), so the one seek can only come from the no-clock rule. Seeks are
+//       counted from the stall, 300 ms after the clock was hidden, so the hiding itself is not counted.
+// COVERAGE-ASSERT: the stall was reached, and at least 20 of AudioOutput's own timing reads were hidden while
+//       it played out; the recorder's reads, made under t_inRecord, are not counted.
+// CONTROL: control_batch.sh 2026-10-13, reverted: steerSoundLocked's `chased` without `clock &&` (the move waits for
+//       a hold with no clock too), backend/daemon/wallpaper_manager.cpp -> "FAIL: no clock rule: a sound left off its
+//       pictures with no clock is moved back to them once" (0 seeks; green 1); the stored reading and the taken anchor
+//       both ignored -> the same line (0). timingOfNextBuffer in renderer/audio/audio_output.cpp answering "not timed"
+//       without asking pw_stream_get_time_n -> "FAIL: no clock rule: the stall was reached while the server's timing
+//       was hidden" (0 reported); with the t_inRecord test taken out as well it stays green (70 counted, the
+//       recorder's), which is the hollowing this count now sees.
+void runNoClockChecks() {
+    const char* kGoals = "S15.563 (a sound with no clock is kept with its pictures)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    StallReset reset;
+    Daemon d(smallConfig());
+    if (!startHeard(d, asset("wallpaper_beeps_long.mp4"), kGoals)) return;
+    std::this_thread::sleep_for(1500ms);
+    probe::g_hideStreamTime.store(true);
+    std::this_thread::sleep_for(300ms);
+    const int hiddenBefore = probe::g_streamTimesHidden.load();
+    const int64_t at = probe::nowNs();
+    probe::g_stallPictureMs.store(600);
+    std::this_thread::sleep_for(1500ms);
+    const int64_t end = probe::nowNs();
+    const int hidden = probe::g_streamTimesHidden.load() - hiddenBefore;
+    const int left = probe::g_stallPictureMs.exchange(0);
+    probe::g_hideStreamTime.store(false);
+    const size_t seeks = soundSeeksSince(at, end).size();
+    std::printf("audio_playback_test: no clock rule: %zu sound seeks after the stall; %d of AudioOutput's timing reads hidden\n",
+                seeks, hidden);
+    check(left == 0 && hidden >= 20, "no clock rule: the stall was reached while the server's timing was hidden",
+          fmt("%.0f ms of the stall unused, %.0f reports hidden", left, hidden));
+    if (left != 0 || hidden < 20) return;
+    check(seeks == 1, "no clock rule: a sound left off its pictures with no clock is moved back to them once",
+          fmt("%.0f sound seeks", static_cast<double>(seeks)));
+}
+
+// GOAL: S15.564 -- from the second loop on, a heard file's sound is asked for the next pass ahead of time:
+//       the sound decoder's seek to the pass's start comes before the old pass's last picture is committed.
+//       False if every loop is handed over in the new pass's own wait, after that last commit, as the first
+//       loop still is.
+// WHY-THIS-SHAPE: an order, not a lead in milliseconds: the seek is made on the sound output's thread once it
+//       takes the request up, so a fixed lead bound charges that thread's wake-up to the daemon. Asked
+//       kHandOverLead (100 ms) before the pass, the seek comes about 67 ms before the old pass's last commit
+//       at 30 a second, which the output's take-up would have to eat whole; asked in the pass's own wait it
+//       comes after that commit by construction. Weaker than a lead bound against a partial regression: a
+//       hand-over asked 40 ms ahead still comes first and passes. The seek is matched to a pass by its target
+//       (under 50 ms) and by being the last such seek in the 500 ms before the pass's first commit; the lead
+//       is printed. The first loop is printed, not graded: with no pass learned it hands over late by design.
+// COVERAGE-ASSERT: two loops after the first graded.
+// CONTROL: control_batch.sh 2026-10-13, reverted: `if (!session.pass || shift != …) return {.timesPicture = true};`
+//       made `if (true)` in steerSoundLocked, backend/daemon/wallpaper_manager.cpp -> "FAIL: hand-over rule: from the
+//       second loop on, the next pass's sound is asked for ahead" (each seek 0.6-0.7 ms after the last commit; 66.7 ms
+//       before it green on both entries).
+void runHandOverLeadChecks() {
+    const char* kGoals = "S15.564 (each later loop's sound is asked for ahead)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    Daemon d(smallConfig());
+    const std::string file = asset("wallpaper_tone.mp4");
+    if (!startHeard(d, file, kGoals)) return;
+    std::this_thread::sleep_for(7500ms);
+    const std::vector<Shown> shown = shownPictures(d.takeCommits(), file);
+    const std::vector<probe::SoundSeek> seeks = soundSeeksSince(0);
+    int loop = 0, graded = 0;
+    for (size_t i = 1; i < shown.size(); ++i) {
+        if (!shown[i].presentation || !shown[i - 1].presentation) {
+            notVerified(kGoals, fmt("which picture commit %.0f showed is not known", static_cast<double>(i)));
+            return;
+        }
+        if (*shown[i].presentation >= *shown[i - 1].presentation) continue;
+        ++loop;
+        const int64_t at = shown[i].commit.at, lastOld = shown[i - 1].commit.at;
+        std::optional<int64_t> seekAt;
+        for (const probe::SoundSeek& s : seeks) {
+            if (s.targetNs < 50 * kMs && s.at <= at && s.at > at - 500 * kMs) seekAt = s.at;
+        }
+        const double lead = seekAt ? (at - *seekAt) / 1e6 : -1.0;
+        const double beforeLast = seekAt ? (lastOld - *seekAt) / 1e6 : -1.0;
+        std::printf("audio_playback_test: hand-over rule: loop %d: the seek to the pass's start came %.1f ms before its "
+                    "first commit, %.1f ms before the old pass's last\n",
+                    loop, lead, beforeLast);
+        if (loop == 1) continue;
+        ++graded;
+        check(seekAt && *seekAt < lastOld, "hand-over rule: from the second loop on, the next pass's sound is asked for ahead",
+              fmt("loop %.0f: the seek %.1f ms before the old pass's last commit", loop, beforeLast));
+    }
+    check(graded >= 2, "hand-over rule: two loops after the first were graded", fmt("%.0f", graded));
+}
+
+// One run of the heard file restored carrying one death, slowed (83 ms spent in each picture returned) or
+// not: the deaths on record before and after, the commits, whether its own sound was heard, and whether the
+// death was cleared within `waitMs` -- `untilCleared` ends the wait as soon as it is.
+struct CleanRun {
+    int before = -1, after = -1;
+    size_t commits = 0;
+    bool loud = false, cleared = false;
+};
+CleanRun runRestoredWithDeath(const std::string& heard, bool slow, std::chrono::milliseconds waitMs, bool untilCleared) {
+    CleanRun out;
+    const char* tmp = std::getenv("TMPDIR");
+    const std::filesystem::path dir = std::filesystem::path(tmp != nullptr ? tmp : "/tmp") /
+                                      ("wallpaperx-clean-credit." + std::to_string(::getpid()) + (slow ? ".slow" : ".fast"));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir / "state");
+    struct Remove {
+        std::filesystem::path dir;
+        ~Remove() {
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+            probe::g_costMs.store(0);
+        }
+    } remove{dir};
+    std::ofstream(dir / "config.json")
+        << nlohmann::json{{"version", 1},
+                          {"monitors", nlohmann::json::array({{{"monitor_id", 0}, {"type", "video"}, {"path", heard}}})}}
+               .dump();
+    std::ofstream(dir / "state" / "playing.json")
+        << nlohmann::json{{"run", "earlier"},
+                          {"videos", nlohmann::json::array({{{"monitor_id", 0}, {"path", heard}, {"deaths", 1}}})}}
+               .dump()
+        << "\n";
+    WallpaperManager::Config config = smallConfig();
+    config.configFile = dir / "config.json";
+    config.stateDir = dir / "state";
+    config.cleanPlayAfter = 1s;
+    const auto deaths = [&] {
+        const std::optional<wallpaperx::PlayingHistory> h = wallpaperx::readPlayingRecord(config.stateDir);
+        if (!h) return -1;
+        for (const wallpaperx::PlayingVideo& v : h->videos) {
+            if (v.monitorId == 0) return v.deaths;
+        }
+        return 0;
+    };
+    {
+        std::lock_guard<std::mutex> lock(probe::g_costMutex);
+        probe::g_costFile = std::filesystem::path(heard).filename().string();
+    }
+    if (slow) probe::g_costMs.store(83);
+    resetCapture();
+    const int64_t started = probe::nowNs();
+    Daemon d(config);
+    const std::vector<int> restored = d.manager.restoreSaved();
+    d.manager.recordStartingVideos();
+    out.before = deaths();
+    std::vector<int> redraw;
+    d.manager.setMonitorOutput(0, "DP-1", redraw);
+    d.manager.setOutputFocus(":1.5", "DP-1", ScreenFocus::Desktop, false);
+    for (const int id : restored) d.worker.post(id);
+    for (const int id : redraw) d.worker.post(id);
+    if (untilCleared) {
+        out.cleared = waitFor(waitMs, [&] { return deaths() == 0; });
+    } else {
+        std::this_thread::sleep_for(waitMs);
+        out.cleared = deaths() == 0;
+    }
+    out.after = deaths();
+    out.commits = d.takeCommits().size();
+    out.loud = probe::g_lastLoudQueuedAt.load() > started;
+    return out;
+}
+
+// GOAL: S15.566 -- only pictures drawn on time count as clean play: a heard file that cannot decode in real
+//       time, restored with one death on record and cleanPlayAfter 1 s, still carries the death after 3 s of
+//       play, every picture drawn late; the same file decoding in real time has it cleared within 5 s, so the
+//       record and its clearing are live here. False if late draws count as clean, so a file this machine
+//       cannot play clears the deaths that would have quarantined it.
+// WHY-THIS-SHAPE: the record is written before the start, as a run that died would leave it, and the start
+//       goes through restoreSaved() and recordStartingVideos() as the daemon's does. 83 ms spent in each
+//       picture returned (2.5 intervals) makes every picture late; the file is soon marked unable to keep up
+//       and drawn as decoded. "Was heard" is sound queued after the run's own start: any earlier phase in
+//       the same process also made sound, and a bare "ever heard" counted that.
+// COVERAGE-ASSERT: each run started carrying the death, drew at least 10 pictures and was heard.
+// CONTROL: control_batch.sh 2026-10-13, reverted, advanceSessionLocked, backend/daemon/wallpaper_manager.cpp: `onTime`
+//       made `true` -> "FAIL: clean credit rule: a heard file drawn late does not play clean" (0 deaths after 3 s);
+//       creditCleanPlayLocked never adding to `played` -> "FAIL: clean credit rule: the same file drawn on time plays
+//       clean" (1 death after 5 s). Test-side: the slowed run focused "none" while phase sync ran first ->
+//       "FAIL: clean credit rule: the slowed run started carrying a death, drew and was heard" (heard 0); with the
+//       old `g_lastLoudQueuedAt > 0` it stays green, sync's sound counted.
+void runCleanCreditChecks() {
+    const char* kGoals = "S15.566 (only pictures drawn on time count as clean play)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    StallReset reset;
+    const std::string heard = asset("wallpaper_beeps_long.mp4");
+    const CleanRun slow = runRestoredWithDeath(heard, true, 3000ms, false);
+    std::printf("audio_playback_test: clean credit rule: slowed: %d deaths on record before, %d after 3 s; %zu commits; heard "
+                "%d\n",
+                slow.before, slow.after, slow.commits, slow.loud ? 1 : 0);
+    check(slow.before == 1 && slow.commits >= 10 && slow.loud,
+          "clean credit rule: the slowed run started carrying a death, drew and was heard",
+          fmt("%.0f deaths at the start, %.0f commits, heard %.0f", slow.before, static_cast<double>(slow.commits),
+              slow.loud ? 1.0 : 0.0));
+    if (slow.before == 1 && slow.commits >= 10 && slow.loud) {
+        check(!slow.cleared, "clean credit rule: a heard file drawn late does not play clean",
+              fmt("%.0f deaths on record after 3 s", slow.after));
+    }
+    const CleanRun fast = runRestoredWithDeath(heard, false, 5000ms, true);
+    std::printf("audio_playback_test: clean credit rule: real time: %d deaths on record before, %d after; %zu commits; heard "
+                "%d\n",
+                fast.before, fast.after, fast.commits, fast.loud ? 1 : 0);
+    check(fast.before == 1 && fast.commits >= 10 && fast.loud,
+          "clean credit rule: the real-time run started carrying a death, drew and was heard",
+          fmt("%.0f deaths at the start, %.0f commits, heard %.0f", fast.before, static_cast<double>(fast.commits),
+              fast.loud ? 1.0 : 0.0));
+    if (fast.before == 1 && fast.commits >= 10 && fast.loud) {
+        check(fast.cleared, "clean credit rule: the same file drawn on time plays clean",
+              fmt("%.0f deaths still on record after 5 s", fast.after));
+    }
+}
+
+// GOAL: S15.571 -- with the clock lost, a heard sound is measured from its last reading, not from where the
+//       daemon last asked it to be: with the sound card 0.5 % fast for 9 s (the sound then about 45 ms from
+//       the place it was asked to start, its pictures following it) and the sound server then stopped for
+//       400 ms, no sound seek during the stop. False if the no-clock steering measures the sound from the
+//       asked anchor, which the card has left 45 ms behind, and moves it.
+// WHY-THIS-SHAPE: the drift is simulated with S15.555's rate correction; nothing re-asks the sound while
+//       the pictures follow it, so the asked anchor stays the first play's. A run whose server did not take
+//       frames at the corrected rate, or whose sound was moved before the stop, left no drift between the
+//       reading and the anchor and is not verified. SIGSTOP stops the clock without touching the engine; the
+//       seeks after the stop ends are the return's (S15.556), not graded here.
+// COVERAGE-ASSERT: the server went over 300 ms without a cycle.
+// CONTROL: control_batch.sh 2026-10-13, reverted: steerSoundLocked's stored reading used only with a clock (`if (clock
+//       && session.heard && …`), backend/daemon/wallpaper_manager.cpp -> "FAIL: last reading rule: a sound with no
+//       clock is measured from its last reading, and not moved" (1 seek during the stop; 0 green).
+void runLastReadingChecks() {
+    const char* kGoals = "S15.571 (no clock: the last reading, not the asked anchor)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    StallReset reset;
+    probe::g_streamRate.store(0.995);
+    Daemon d(smallConfig());
+    const std::string file = asset("wallpaper_beeps_long.mp4");
+    if (!startHeard(d, file, kGoals)) return;
+    const int64_t playFrom = probe::nowNs();
+    std::this_thread::sleep_for(9000ms);
+    const size_t movedBefore = soundSeeksSince(playFrom).size();
+    const Capture before = takeCapture();
+    const pid_t server = sound.server.pid();
+    if (server <= 0) {
+        harnessFailure("last reading rule: the private server this phase started has no process to stop");
+        return;
+    }
+    const int64_t stopAt = probe::nowNs();
+    {
+        struct Resume {
+            pid_t pid;
+            ~Resume() { ::kill(pid, SIGCONT); }
+        } resume{server};
+        ::kill(server, SIGSTOP);
+        std::this_thread::sleep_for(400ms);
+    }
+    const int64_t contAt = probe::nowNs();
+    std::this_thread::sleep_for(500ms);
+    const size_t during = soundSeeksSince(stopAt, contAt).size();
+    const int64_t serverGap = longestBufferGap(takeCapture(), stopAt - 100 * kMs, contAt + 100 * kMs);
+    double taken = 0;
+    if (before.buffers.size() > 200) {
+        const probe::BufferRecord &a = before.buffers[20], &b = before.buffers.back();
+        taken = static_cast<double>(b.first - a.first) * 1e9 / static_cast<double>(b.queuedAt - a.queuedAt);
+    }
+    const double asked = kRate / 0.995;
+    std::printf("audio_playback_test: last reading rule: the server took %.1f frames a second (asked %.1f); %zu sound seeks "
+                "in the 9 s before the stop, %zu during it; the server went %.1f ms without a cycle\n",
+                taken, asked, movedBefore, during, serverGap / 1e6);
+    if (std::fabs(taken / asked - 1.0) > 0.001 || movedBefore != 0) {
+        notVerified(kGoals, fmt("no drift was set between the reading and the asked anchor: the server took %.1f frames a "
+                                "second, the sound was moved %.0f times before the stop",
+                                taken, static_cast<double>(movedBefore)));
+        return;
+    }
+    check(serverGap >= 300 * kMs, "last reading rule: the stopped server went over 300 ms without a cycle",
+          fmt("%.1f ms", serverGap / 1e6));
+    if (serverGap < 300 * kMs) return;
+    check(during == 0, "last reading rule: a sound with no clock is measured from its last reading, and not moved",
+          fmt("%.0f sound seeks during the stop", static_cast<double>(during)));
+}
+
+// `monitor`'s commits, from every screen's.
+std::vector<Commit> commitsOf(Daemon& d, int monitor) {
+    std::vector<Commit> out;
+    for (const Commit& c : d.takeCommits(true)) {
+        if (c.monitor == monitor) out.push_back(c);
+    }
+    return out;
+}
+
+// GOAL: S15.572 -- a heard screen catching up drops at least one picture every round, even in a round whose
+//       catch-up slice an earlier screen has spent: with the screen before it in every round resuming a file
+//       whose each picture read costs 10 ms, a 110 ms stall of the heard screen's read is closed by dropping,
+//       with no sound seek. False if a round whose slice is spent holds the picture without dropping, so the
+//       hold runs out still behind and the sound is moved back to it.
+// WHY-THIS-SHAPE: the slice is spent before the heard screen's turn only if the screen ahead of it decodes in
+//       every round; a playing screen decodes only after its draws, but a resuming one drops its way to its
+//       position every round, at least one picture each. The B-frame file without sound has a single key
+//       frame, so a resume 1.6 s in decodes about 48 pictures from its start: half a second at 10 ms a read.
+//       Its screen is monitor 0 and the heard one monitor 1, as a round runs screens in monitor order. Graded
+//       only when the resume began before the stall and was still running when the heard screen drew again.
+// COVERAGE-ASSERT: the released screen really released; the stall reached; the resume spanned the catch-up.
+// CONTROL: control_batch.sh 2026-10-13, reverted: the drop loop's slice test made the old `if ((dropped ||
+//       waiting->catchingUpSince) && checked >= catchUpUntil)`, backend/daemon/wallpaper_manager.cpp -> "FAIL: drop
+//       minimum rule: a heard screen behind its sound drops a picture each round though the slice is spent" (1
+//       dropped, 1 seek; green 3 dropped, no seek, drawn again 31 ms after the stall).
+void runDropMinimumChecks() {
+    const char* kGoals = "S15.572 (one drop a round, the slice spent or not)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    StallReset reset;
+    WallpaperManager::Config config = smallConfig();
+    config.idleSessionRelease = 1s;
+    Daemon d(config);
+    const std::string ahead = asset("wallpaper_reads_bframes.mp4"), heard = asset("wallpaper_beeps_long.mp4");
+    std::vector<int> redraw;
+    d.manager.setMonitorOutput(0, "DP-2", redraw);
+    d.manager.setMonitorOutput(1, "DP-1", redraw);
+    d.manager.setOutputFocus(":1.5", "DP-1", ScreenFocus::Desktop, false);
+    resetCapture();
+    const int64_t started = probe::nowNs();
+    d.manager.requestWallpaper("video", ahead, 0);
+    d.worker.post(0);
+    d.manager.requestWallpaper("video", heard, 1);
+    d.worker.post(1);
+    if (!waitFor(15000ms, [&] { return commitsOf(d, 1).size() >= 3 && probe::g_lastLoudQueuedAt.load() > started; })) {
+        notVerified(kGoals, "the heard screen did not draw and sound within 15 s");
+        return;
+    }
+    // Hidden once the screen ahead shows a picture 1.6 s or more into its file, so its resume is long.
+    if (!waitFor(5000ms, [&] {
+            const std::optional<int64_t> p = lastPictureOf(ahead);
+            return p && *p >= 1600 * kMs;
+        })) {
+        notVerified(kGoals, "the screen ahead never reached 1.6 s into its file");
+        return;
+    }
+    d.manager.setOutputVisible("DP-2", false);
+    d.worker.wake();
+    if (!waitFor(4000ms, [&] { return descriptorsOn(ahead) == 0; })) {
+        notVerified(kGoals, "the hidden screen ahead was not released within 4 s, so it would not resume");
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(probe::g_stallFileMutex);
+        probe::g_slowFile = std::filesystem::path(ahead).filename().string();
+    }
+    probe::g_slowPictureMs.store(10);
+    probe::g_slowPictureReads.store(1'000'000);
+    const int64_t shownAt = probe::nowNs();
+    d.manager.setOutputVisible("DP-2", true);
+    d.worker.wake();
+    // The resume's own drops hand nothing on; its slowed reads are what show it running.
+    if (!waitFor(3000ms, [] { return probe::g_slowPictureReads.load() <= 1'000'000 - 3; })) {
+        notVerified(kGoals, "the screen ahead did not start resuming within 3 s of being shown");
+        return;
+    }
+    const int64_t resumingAt = probe::nowNs();
+    // Past the screen ahead's open at its position, which holds one round up about 150 ms and leaves the
+    // heard screen behind on its own account, and past the heard screen's catch-up from that.
+    std::this_thread::sleep_for(300ms);
+    const StallRun r = stallOnce(heard, 110);
+    probe::g_slowPictureReads.store(0);
+    if (r.ended == 0) {
+        check(false, "drop minimum rule: the staged stall of the heard file's read was reached");
+        return;
+    }
+    std::optional<int64_t> aheadDrew, heardDrew;
+    for (const Commit& c : commitsOf(d, 0)) {
+        if (c.at > shownAt && !aheadDrew) aheadDrew = c.at;
+    }
+    const std::vector<Shown> shown = shownPictures(commitsOf(d, 1), heard);
+    const int64_t interval = fileInterval(heard);
+    int dropped = 0;
+    std::optional<int64_t> before;
+    for (const Shown& s : shown) {
+        if (!s.presentation) continue;
+        if (s.commit.at > r.ended && !heardDrew) heardDrew = s.commit.at;
+        if (before && s.commit.at > r.ended && s.commit.at <= r.ended + 500 * kMs) {
+            dropped += skippedBetween(*before, *s.presentation, interval);
+        }
+        before = s.presentation;
+    }
+    std::printf("audio_playback_test: drop minimum rule: the screen ahead was resuming at %+.1f ms and drew at %+.1f ms; the "
+                "heard stall %+.1f to %+.1f ms, the heard screen drew again at %+.1f ms, %d pictures dropped; %zu sound "
+                "seeks, the server at most %.1f ms between cycles\n",
+                (resumingAt - shownAt) / 1e6, aheadDrew ? (*aheadDrew - shownAt) / 1e6 : -1.0, (r.started - shownAt) / 1e6,
+                (r.ended - shownAt) / 1e6, heardDrew ? (*heardDrew - shownAt) / 1e6 : -1.0, dropped, r.seeks.size(),
+                r.serverGap / 1e6);
+    if (!heardDrew) {
+        check(false, "drop minimum rule: the heard screen drew again after its stall");
+        return;
+    }
+    if (!aheadDrew || *aheadDrew < *heardDrew) {
+        notVerified(kGoals, "the screen ahead was not resuming from the stall until the heard screen drew again, so no "
+                            "round's slice was known to be spent");
+        return;
+    }
+    if (r.serverGap > kServerLateBound) {
+        notVerified(kGoals, fmt("the sound server went %.1f ms between cycles, which earns a seek of its own", r.serverGap / 1e6));
+        return;
+    }
+    check(dropped >= 1 && r.seeks.empty(),
+          "drop minimum rule: a heard screen behind its sound drops a picture each round though the slice is spent",
+          fmt("%.0f pictures dropped, %.0f sound seeks", dropped, static_cast<double>(r.seeks.size())));
+}
+
+// GOAL: S15.573 -- skipping the pictures nothing references keeps a heard file that otherwise cannot keep up
+//       in step with its sound: with every picture the decoder returns of the B-frame fixture costing 45 ms
+//       (1.35 intervals), once settled (from 2.5 s after the slowdown to 7 s) no sound seek, and every beep
+//       within 12 ms of its picture's place on the line through the commits. False if the decoder is never
+//       told to skip (the file cannot keep up and drifts from its sound), or a skipping file is left
+//       unpaced (the lag built before skipping began never closes).
+// GOAL: S15.574 -- skipping removes pictures: in that window the decoder hands on under half the pictures
+//       of the file it passes (a third, with two B-frames in three skipped). False if every one is decoded.
+// GOAL: S15.575 -- skipping stops once decoding is cheap again: within 1.5 s of the slowdown's end the
+//       decoder hands on three pictures one interval apart, which only a decoder that is not skipping does
+//       here. False if skipping, once on, stays on.
+// WHY-THIS-SHAPE: the cost is spent in avcodec_receive_frame, so a skipped picture costs nothing, as with a
+//       real decode, where slowed packet reads would cost the same skipped or not. Skipping cuts a decoded
+//       picture to one every 100 ms of file, 45 ms of work: the file keeps pace once the daemon trusts it,
+//       after eight samples. The beeps are graded by gradeBeepsAgainstPictures, whose pass and skip
+//       reading take the interval from the decoder's own record (S15.570). No seek is graded when the
+//       sound server ran a cycle over 20 ms late in the window (as S15.538).
+// COVERAGE-ASSERT: at least eight beeps graded; at least 20 pictures handed on in the window.
+// CONTROL: control_batch.sh 2026-10-13, reverted: VideoSession::skip() returning PictureSkip::Nothing,
+//       backend/daemon/wallpaper_manager.h -> "FAIL: skip rule: a file that cannot keep up decodes under half its
+//       pictures" (100 of 100) and "... each beep is heard with the picture at its timestamp" (-205.1 to +204.6 ms);
+//       steerSoundLocked's early return taken in every state but Keeps (backend/daemon/wallpaper_manager.cpp) -> "...
+//       each beep is heard with the picture at its timestamp" (a steady -118.1 ms); DecodeLoad::add's return to Keeps
+//       deleted -> "FAIL: skip rule: skipping stops within 1.5 s of decoding getting cheap" (never, in 2 s). Green:
+//       50 of 133 handed on, no seek, beeps within 0.1 ms, skipping off 0.92 s after the slowdown (0.46 s on the RTX).
+void runSkipChecks() {
+    const char* kGoals = "S15.573-S15.575 (skipping pictures keeps a slow file in step)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    StallReset reset;
+    Daemon d(smallConfig());
+    const std::string file = asset("wallpaper_beeps_bframes.mp4");
+    if (!startHeard(d, file, kGoals)) return;
+    std::this_thread::sleep_for(1000ms);
+    {
+        std::lock_guard<std::mutex> lock(probe::g_costMutex);
+        probe::g_costFile = std::filesystem::path(file).filename().string();
+    }
+    probe::g_costMs.store(45);
+    std::this_thread::sleep_for(2500ms);
+    const int64_t from = probe::nowNs();
+    std::this_thread::sleep_for(4500ms);
+    const int64_t to = probe::nowNs();
+    probe::g_costMs.store(0);
+    const int64_t costEnd = probe::nowNs();
+    std::this_thread::sleep_for(2000ms);
+    const std::vector<Commit> commits = d.takeCommits();
+    const Capture cap = takeCapture();
+    const size_t seeks = soundSeeksSince(from, to).size();
+    const int64_t serverGap = longestBufferGap(cap, from, to);
+    const int64_t interval = fileInterval(file);
+    std::vector<int64_t> inWindow;
+    // Two one-interval steps in a row: an unreferenced picture decoded. One alone is no proof, as the
+    // reference picture before each key picture is one step from it.
+    std::optional<int64_t> offAt;
+    std::optional<int64_t> previous;
+    int singleSteps = 0;
+    for (const probe::PictureRecord& p : picturesOf(file)) {
+        if (!p.presentationNs) continue;
+        if (p.at >= from && p.at <= to) inWindow.push_back(*p.presentationNs);
+        if (p.at > costEnd && previous) {
+            const int64_t step = *p.presentationNs - *previous;
+            singleSteps = step > 0 && step < interval * 3 / 2 ? singleSteps + 1 : 0;
+            if (singleSteps >= 2 && !offAt) offAt = p.at;
+        }
+        previous = p.presentationNs;
+    }
+    std::sort(inWindow.begin(), inWindow.end());
+    for (const probe::PictureRecord& p : picturesOf(file)) {
+        if (p.at > costEnd && p.at < costEnd + 1100 * kMs && p.presentationNs) {
+            std::printf("  handed on %.1f ms after the slowdown ended: the picture at %.1f ms\n", (p.at - costEnd) / 1e6,
+                        *p.presentationNs / 1e6);
+        }
+    }
+    const double passed = inWindow.size() >= 2 && interval > 0
+                              ? static_cast<double>(inWindow.back() - inWindow.front()) / static_cast<double>(interval) + 1
+                              : 0.0;
+    const double share = passed > 0 ? static_cast<double>(inWindow.size()) / passed : 1.0;
+    std::printf("audio_playback_test: skip rule: %zu pictures handed on of %.0f passed in the settled window (%.2f); %zu sound "
+                "seeks, the server at most %.1f ms between cycles; a non-skipping step %.1f ms after the slowdown ended\n",
+                inWindow.size(), passed, share, seeks, serverGap / 1e6, offAt ? (*offAt - costEnd) / 1e6 : -1.0);
+    check(inWindow.size() >= 20, "skip rule: the slowed file went on decoding in the settled window",
+          fmt("%.0f pictures", static_cast<double>(inWindow.size())));
+    if (inWindow.size() < 20) return;
+    check(share < 0.5, "skip rule: a file that cannot keep up decodes under half its pictures",
+          fmt("%.0f of %.0f", static_cast<double>(inWindow.size()), passed));
+    check(offAt && *offAt - costEnd <= 1500 * kMs, "skip rule: skipping stops within 1.5 s of decoding getting cheap",
+          offAt ? fmt("%.1f ms after", (*offAt - costEnd) / 1e6) : std::string("never, in 2 s"));
+    if (serverGap > kServerLateBound) {
+        notVerified("S15.573 (no seek once settled)",
+                    fmt("the sound server went %.1f ms between cycles, which earns a seek of its own", serverGap / 1e6));
+    } else {
+        check(seeks == 0, "skip rule: a skipping file keeps up with its sound without being moved",
+              fmt("%.0f sound seeks", static_cast<double>(seeks)));
+    }
+    int passStarts = 0;
+    const int graded = gradeBeepsAgainstPictures("skip rule", cap, shownPictures(commits, file), file, from, 12.0, passStarts);
+    if (graded >= 0) check(graded >= 8, "skip rule: at least eight beeps were graded once settled", fmt("%.0f", graded));
+}
+
+// GOAL: S15.577 -- a late last picture at a loop moves a sound already handed to the next pass once more,
+//       and nothing moves it again: from the second loop on, with no clock from the hand-over on and the
+//       pass's last picture held 100 ms as the decoder returns it (drawn about 67 ms late, past
+//       kSoundDrift), exactly two sound seeks around the loop -- the hand-over, then the move onto the
+//       picture. False if no-clock steering lets a 67 ms lead stand (one seek), or the pass start re-hands
+//       a sound the move already lined up (three).
+// GOAL: S15.586 -- that move keeps the sound on the pass it was handed to: no seek in the window targets
+//       the old pass (1 s or more into the two-second file). False if the move is anchored on the old
+//       pass's time, which plays the old pass's end again after the hand-over.
+// WHY-THIS-SHAPE: the clock is hidden from the hand-over's seek on (the seek interposer sets it), so the
+//       late picture is not dropped to chase the sound but drawn and the sound moved to it; with a live
+//       clock it is dropped and nothing is moved. The hold is on the picture's return from the decoder,
+//       since the software decoder's frame threads read the pass's last packets before a stalled read
+//       could reach them. Targets are read with the sound decoder's 100 ms pre-roll, so the new pass's
+//       start shows as -100 ms and the old pass's last picture as about 1867 ms. Seeks counted from 300 ms
+//       before the hold to 700 ms after, under S15.538's sound-server guard.
+// COVERAGE-ASSERT: a loop graded; in each, the hold reached and the clock hidden by the hand-over before it.
+// CONTROL: control_batch.sh 2026-10-13, reverted, steerSoundLocked, backend/daemon/wallpaper_manager.cpp: the
+//       no-clock move made `overdue - behind > (clock ? kSoundDrift : kCatchUpHold)` -> "FAIL: late at loop
+//       rule: a late picture at a loop moves the handed-on sound once more, and no more" (1 seek a loop); the
+//       move anchored at `schedule.from` with no shift -> "FAIL: late at loop rule: the handed-on sound is
+//       never sent back to the old pass" (3 seeks a loop, the second to 1866.7 ms; green 2 a loop, both to
+//       -100 ms, on both entries). `passAway` made kSoundDrift with the pass known stays green (2 seeks a loop):
+//       the move lines the sound up before the pass start, so the margin it gives is not reached here (GOALS.md,
+//       Not graded).
+void runLateAtLoopChecks() {
+    const char* kGoals = "S15.577, S15.586 (a late picture at a loop moves the handed-on sound once, on its new pass)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    StallReset reset;
+    const std::string heard = asset("wallpaper_beeps.mp4");
+    {
+        std::lock_guard<std::mutex> lock(probe::g_holdMutex);
+        probe::g_holdFile = std::filesystem::path(heard).filename().string();
+    }
+    // The file's last picture, at 59/30 s.
+    probe::g_holdAtNs.store(59 * 1'000'000'000LL / 30);
+    Daemon d(smallConfig());
+    if (!startHeard(d, heard, kGoals)) return;
+    // The first loop learns the pass; the hand-over is early from the second on.
+    if (!waitFor(5000ms, [&] {
+            const std::vector<Shown> shown = shownPictures(d.takeCommits(), heard);
+            for (size_t i = 1; i < shown.size(); ++i) {
+                if (shown[i].presentation && shown[i - 1].presentation && *shown[i].presentation < *shown[i - 1].presentation) {
+                    return true;
+                }
+            }
+            return false;
+        })) {
+        notVerified(kGoals, "the file did not loop within 5 s");
+        return;
+    }
+    int graded = 0;
+    for (int loop = 1; loop <= 2; ++loop) {
+        probe::g_holdStartedAt.store(0);
+        probe::g_holdEndedAt.store(0);
+        probe::g_hideStreamTime.store(false);
+        probe::g_hideAtHandOver.store(true);
+        probe::g_holdMs.store(100);
+        if (!waitFor(3000ms, [] { return probe::g_holdEndedAt.load() != 0; })) {
+            probe::g_holdMs.store(0);
+            probe::g_hideAtHandOver.store(false);
+            check(false, "late at loop rule: the staged hold of the pass's last picture was reached within 3 s");
+            return;
+        }
+        const int64_t started = probe::g_holdStartedAt.load();
+        const bool hidden = probe::g_hideStreamTime.load();
+        std::this_thread::sleep_for(300ms);
+        probe::g_hideStreamTime.store(false);
+        probe::g_hideAtHandOver.store(false);
+        std::this_thread::sleep_for(500ms);
+        const std::vector<probe::SoundSeek> seeks = soundSeeksSince(started - 300 * kMs, started + 700 * kMs);
+        const int64_t serverGap = longestBufferGap(takeCapture(), started - 300 * kMs, started + 700 * kMs);
+        std::printf("audio_playback_test: late at loop rule: loop %d: %zu sound seeks around the hold, the clock hidden from "
+                    "the hand-over %d; the server at most %.1f ms between cycles\n",
+                    loop, seeks.size(), hidden ? 1 : 0, serverGap / 1e6);
+        int onOldPass = 0;
+        for (const probe::SoundSeek& s : seeks) {
+            std::printf("  a seek %+.1f ms from the hold's start, to %.1f ms of the file\n", (s.at - started) / 1e6,
+                        s.targetNs / 1e6);
+            if (s.targetNs >= 1000 * kMs) ++onOldPass;
+        }
+        if (!hidden) {
+            notVerified(kGoals, "no hand-over hid the clock before the pass's last picture was held");
+            continue;
+        }
+        if (serverGap > kServerLateBound) {
+            notVerified(kGoals, fmt("the sound server went %.1f ms between cycles, which earns a seek of its own", serverGap / 1e6));
+            continue;
+        }
+        ++graded;
+        check(seeks.size() == 2 && seeks[0].targetNs < 50 * kMs,
+              "late at loop rule: a late picture at a loop moves the handed-on sound once more, and no more",
+              fmt("loop %.0f: %.0f sound seeks", loop, static_cast<double>(seeks.size())));
+        check(onOldPass == 0, "late at loop rule: the handed-on sound is never sent back to the old pass",
+              fmt("loop %.0f: %.0f seeks to 1 s or more into the file", loop, onOldPass));
+    }
+    check(graded >= 1, "late at loop rule: a loop was graded", fmt("%.0f", graded));
+}
+
+// GOAL: S15.578 -- a picture the sound times but draws late earns no clean-play credit: on the two-second
+//       heard beeps file, restored with one death and cleanPlayAfter 5 s, with every pass's last draw from
+//       the second loop on held 1.8 s (so each new pass's first picture, which is never dropped, is drawn
+//       about 1.8 s late while the sound, already handed on, times it), the death is still on record after
+//       10.5 s. False if late pictures the sound timed count as on time, which credits each late pass start.
+// WHY-THIS-SHAPE: once a catch-up hold runs out the sound is moved to the picture, so that draw is not timed
+//       by the sound; the one late draw the sound still times is a pass's first picture. The hold is in the
+//       draw (vkCmdBlitImage) of the old pass's last picture, armed when the picture before it is committed,
+//       so the decode load is untouched. Credit is the time between draws, counted when a draw is on time,
+//       so a short hold would be repaid by the on-time play after it: the hold is most of a pass, and the
+//       first two passes, about 3.9 s of credit, play unheld. A correct run then gains only the 0.1-0.2 s
+//       a pass between the catch-up and the next hold.
+// COVERAGE-ASSERT: the run started carrying the death, was heard, and at least three held draws were each
+//       followed by the new pass's first picture a second or more later.
+// CONTROL: control_batch.sh 2026-10-13, reverted: advanceSessionLocked's `onTime` given `pace.timesPicture ||`
+//       back, backend/daemon/wallpaper_manager.cpp -> "FAIL: late timed rule: a pass's first picture the sound
+//       timed but drew late earns no clean credit" (cleared 5841 ms in; green: kept after 10.5 s on both entries). Test-side: the holds
+//       taken out -> "FAIL: late timed rule: the run started ... drew three pass starts late" (0), the death then
+//       cleared 5123 ms in, so the record and its clearing are live here.
+void runLateTimedChecks() {
+    const char* kGoals = "S15.578 (late pictures the sound timed earn no clean credit)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    StallReset reset;
+    const std::string heard = asset("wallpaper_beeps.mp4");
+    const int64_t beforeLast = 58 * 1'000'000'000LL / 30;
+    const char* tmp = std::getenv("TMPDIR");
+    const std::filesystem::path dir = std::filesystem::path(tmp != nullptr ? tmp : "/tmp") /
+                                      ("wallpaperx-late-timed." + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir / "state");
+    struct Remove {
+        std::filesystem::path dir;
+        ~Remove() {
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+        }
+    } remove{dir};
+    std::ofstream(dir / "config.json")
+        << nlohmann::json{{"version", 1},
+                          {"monitors", nlohmann::json::array({{{"monitor_id", 0}, {"type", "video"}, {"path", heard}}})}}
+               .dump();
+    std::ofstream(dir / "state" / "playing.json")
+        << nlohmann::json{{"run", "earlier"},
+                          {"videos", nlohmann::json::array({{{"monitor_id", 0}, {"path", heard}, {"deaths", 1}}})}}
+               .dump()
+        << "\n";
+    WallpaperManager::Config config = smallConfig();
+    config.configFile = dir / "config.json";
+    config.stateDir = dir / "state";
+    config.cleanPlayAfter = 5s;
+    const auto deaths = [&] {
+        const std::optional<wallpaperx::PlayingHistory> h = wallpaperx::readPlayingRecord(config.stateDir);
+        if (!h) return -1;
+        for (const wallpaperx::PlayingVideo& v : h->videos) {
+            if (v.monitorId == 0) return v.deaths;
+        }
+        return 0;
+    };
+    // Each held draw: when it was armed. Written on the render thread, read after the daemon stops.
+    std::mutex armedMutex;
+    std::vector<int64_t> armed;
+    std::atomic<bool> holding{true};
+    int passEnds = 0;  // render thread only
+    resetCapture();
+    const int64_t started = probe::nowNs();
+    Daemon d(config);
+    d.onCommit = [&](const Commit&) {
+        if (!holding.load()) return;
+        const std::optional<int64_t> p = lastPictureOf(heard);
+        if (!p || std::llabs(*p - beforeLast) >= 2 * kMs || ++passEnds < 2) return;
+        probe::g_blitHoldMs.store(1800);
+        std::lock_guard<std::mutex> lock(armedMutex);
+        armed.push_back(probe::nowNs());
+    };
+    const std::vector<int> restored = d.manager.restoreSaved();
+    d.manager.recordStartingVideos();
+    const int before = deaths();
+    std::vector<int> redraw;
+    d.manager.setMonitorOutput(0, "DP-1", redraw);
+    d.manager.setOutputFocus(":1.5", "DP-1", ScreenFocus::Desktop, false);
+    for (const int id : restored) d.worker.post(id);
+    for (const int id : redraw) d.worker.post(id);
+    int64_t clearedAt = 0;
+    constexpr int kWindowMs = 10500;
+    const auto until = Clock::now() + std::chrono::milliseconds(kWindowMs);
+    while (Clock::now() < until) {
+        if (clearedAt == 0 && deaths() == 0) clearedAt = probe::nowNs();
+        std::this_thread::sleep_for(20ms);
+    }
+    holding.store(false);
+    const int after = deaths();
+    const bool loud = probe::g_lastLoudQueuedAt.load() > started;
+    const std::vector<Shown> shown = shownPictures(d.takeCommits(), heard);
+    std::vector<int64_t> holds;
+    {
+        std::lock_guard<std::mutex> lock(armedMutex);
+        holds = armed;
+    }
+    // A held draw counts once the new pass's first picture came a second or more after it was armed.
+    int lateStarts = 0;
+    for (const int64_t at : holds) {
+        for (size_t i = 1; i < shown.size(); ++i) {
+            if (shown[i].commit.at <= at || !shown[i].presentation || !shown[i - 1].presentation) continue;
+            if (*shown[i].presentation < *shown[i - 1].presentation) {
+                if (shown[i].commit.at - at >= 1000 * kMs) ++lateStarts;
+                break;
+            }
+        }
+    }
+    const std::vector<probe::SoundSeek> seeks = soundSeeksSince(started);
+    std::printf("audio_playback_test: late timed rule: %d deaths on record before, %d after %.1f s (cleared %.0f ms in); "
+                "%zu draws held, %d late pass starts, %zu sound seeks; heard %d\n",
+                before, after, kWindowMs / 1000.0, clearedAt ? (clearedAt - started) / 1e6 : -1.0, holds.size(),
+                lateStarts, seeks.size(), loud ? 1 : 0);
+    for (const probe::SoundSeek& s : seeks) {
+        std::printf("  a seek %.1f ms in, to %.1f ms of the file\n", (s.at - started) / 1e6, s.targetNs / 1e6);
+    }
+    check(before == 1 && loud && lateStarts >= 3,
+          "late timed rule: the run started carrying a death, was heard, and drew three pass starts late",
+          fmt("%.0f deaths at the start, heard %.0f, %.0f late pass starts", before, loud ? 1.0 : 0.0, lateStarts));
+    if (before != 1 || !loud || lateStarts < 3) return;
+    check(after == 1, "late timed rule: a pass's first picture the sound timed but drew late earns no clean credit",
+          fmt("the death cleared %.0f ms after the start", clearedAt ? (clearedAt - started) / 1e6 : -1.0));
+}
+
+// GOAL: S15.579 -- a file whose decoding hovers about its own rate is not switched in and out of "cannot keep
+//       up": each picture of the heard baseline file costing 41 ms eight times then 27 ms eight times (on
+//       average just over its interval, so the averaged load wanders between about 0.92 and 1.12), from 2 s
+//       after the slowdown, no picture dropped and no sound seek mid-pass. False if the file counts as
+//       keeping up again as soon as the load dips under 1, so it is steered at each dip, its pictures far
+//       behind the sound it ran unpaced from, and drops them or moves the sound.
+// WHY-THIS-SHAPE: the file has no picture to skip, so skipping changes nothing and the two loads are the
+//       same samples. Once the load reaches 1 the file is unpaced, and only a load under kKeepsUp (0.9)
+//       steers it again; the pattern keeps it above that. Dropped pictures are read from the presentation
+//       times shown, at the file's interval.
+// COVERAGE-ASSERT: at least 40 pictures drawn in the window.
+// CONTROL: control_batch.sh 2026-10-13, reverted: DecodeLoad::kKeepsUp made 1.0, backend/daemon/wallpaper_manager.h ->
+//       "FAIL: hover rule: a file hovering at its own rate is not steered at each dip" (49 dropped, 1 seek; green 0
+//       and 0, 168-169 drawn).
+void runHoverChecks() {
+    const char* kGoals = "S15.579 (a file hovering at its own rate does not flip in and out of keeping up)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    StallReset reset;
+    Daemon d(smallConfig());
+    const std::string file = asset("wallpaper_beeps_long.mp4");
+    if (!startHeard(d, file, kGoals)) return;
+    std::this_thread::sleep_for(500ms);
+    {
+        std::lock_guard<std::mutex> lock(probe::g_costMutex);
+        probe::g_costFile = std::filesystem::path(file).filename().string();
+        probe::g_costCycle = {41, 41, 41, 41, 41, 41, 41, 41, 27, 27, 27, 27, 27, 27, 27, 27};
+        probe::g_costCycleAt = 0;
+    }
+    probe::g_costMs.store(1);
+    std::this_thread::sleep_for(2000ms);
+    const int64_t from = probe::nowNs();
+    std::this_thread::sleep_for(6000ms);
+    const int64_t to = probe::nowNs();
+    probe::g_costMs.store(0);
+    const size_t seeks = soundSeeksSince(from, to).size();
+    const std::vector<Shown> shown = shownPictures(d.takeCommits(), file);
+    const int64_t interval = fileInterval(file);
+    int drawn = 0, dropped = 0;
+    for (size_t i = 1; i < shown.size(); ++i) {
+        if (shown[i].commit.at < from || shown[i].commit.at > to || !shown[i].presentation || !shown[i - 1].presentation) continue;
+        if (*shown[i].presentation < *shown[i - 1].presentation) continue;
+        ++drawn;
+        dropped += skippedBetween(*shown[i - 1].presentation, *shown[i].presentation, interval);
+    }
+    std::printf("audio_playback_test: hover rule: %d pictures drawn, %d dropped, %zu sound seeks in 6 s\n", drawn, dropped,
+                seeks);
+    check(drawn >= 40, "hover rule: the hovering file went on drawing", fmt("%.0f pictures", drawn));
+    if (drawn < 40) return;
+    check(dropped == 0 && seeks == 0, "hover rule: a file hovering at its own rate is not steered at each dip",
+          fmt("%.0f pictures dropped, %.0f sound seeks", dropped, static_cast<double>(seeks)));
+}
+
+// What `file`'s picture decoder handed on in [from, to): how many pictures, and how many presentation
+// times they skip over within a pass, at the file's own interval (0 when it is not known yet).
+struct HandedOn {
+    int decoded = 0, skipped = 0;
+    int64_t interval = 0;
+};
+HandedOn handedOn(const std::string& file, int64_t from, int64_t to) {
+    HandedOn out;
+    out.interval = fileInterval(file);
+    std::optional<int64_t> before;
+    for (const probe::PictureRecord& p : picturesOf(file)) {
+        if (p.at < from || p.at >= to || !p.presentationNs) continue;
+        ++out.decoded;
+        if (before) out.skipped += skippedBetween(*before, *p.presentationNs, out.interval);
+        before = p.presentationNs;
+    }
+    return out;
+}
+
+void costFile(const std::string& file) {
+    std::lock_guard<std::mutex> lock(probe::g_costMutex);
+    probe::g_costFile = std::filesystem::path(file).filename().string();
+}
+
+// GOAL: S15.580 -- a picture's decode load is measured against the time it is on screen at the playback
+//       speed: the silent B-frame file at speed 0.5, each returned picture costing 43 ms (1.3 of its own
+//       33 ms interval, 0.65 of the 67 ms it is shown), decodes every picture; at speed 2, at 23 ms (0.7 of
+//       its interval, 1.4 of the 17 ms shown) it skips. False if the load is measured against the file's
+//       own interval, which keeps the slow speed's pictures from being decoded and lets the fast speed's
+//       fall behind with nothing skipped.
+// WHY-THIS-SHAPE: silent, so no sound steering and no catch-up dropping enters the count: every gap in the
+//       presentation times the decoder handed on is a picture it skipped. The cost is spent where
+//       avcodec_receive_frame returns a picture, so a skipped one costs nothing. Graded from 2 s after the
+//       cost starts, past the eight-sample settling, for 3 s. Each speed has a fresh daemon.
+// COVERAGE-ASSERT: at least 10 pictures handed on in each window (45 at speed 0.5 is every one; skipping
+//       lowers it, so no higher floor), and the file's interval known.
+// CONTROL: control_batch.sh 2026-10-13, reverted, measureDecode in advanceSessionLocked,
+//       backend/daemon/wallpaper_manager.cpp: `intervalAtSpeed(after, speed)` made `ownInterval(after)` and
+//       `atSpeed(gap, speed)` made `gap` -> "FAIL: speed load rule: at speed 0.5 a file that keeps up on screen decodes
+//       every picture" (16 handed on, 27 skipped) and "... at speed 2 ... skips pictures" (130 handed on, 0 skipped).
+//       Green on both entries: 45 handed on and 0 skipped; 66 and 112-114.
+void runSpeedLoadChecks() {
+    const char* kGoals = "S15.580 (decode load is measured at the playback speed)";
+    StallReset reset;
+    const std::string file = asset("wallpaper_beeps_bframes.mp4");
+    struct Case {
+        double speed;
+        int costMs;
+        bool keepsUp;
+    };
+    for (const Case c : {Case{0.5, 43, true}, Case{2.0, 23, false}}) {
+        probe::g_costMs.store(0);
+        Daemon d(smallConfig());
+        resetCapture();
+        d.play(file, std::nullopt);
+        if (!d.waitForCommits(3, 15s)) {
+            notVerified(kGoals, "the video drew no pictures within 15 s");
+            return;
+        }
+        d.properties({{"speed", c.speed}});
+        costFile(file);
+        probe::g_costMs.store(c.costMs);
+        std::this_thread::sleep_for(2000ms);
+        const int64_t from = probe::nowNs();
+        std::this_thread::sleep_for(3000ms);
+        const HandedOn h = handedOn(file, from, probe::nowNs());
+        probe::g_costMs.store(0);
+        std::printf("audio_playback_test: speed load rule: at speed %.1f, %d ms a picture: %d pictures handed on in 3 s, %d "
+                    "skipped over\n",
+                    c.speed, c.costMs, h.decoded, h.skipped);
+        // Skipping lowers the count, so this asks only that the window saw decoding.
+        const int least = 10;
+        check(h.decoded >= least && h.interval > 0, fmt("speed load rule: at speed %.1f the slowed file went on decoding", c.speed),
+              fmt("%.0f pictures, interval %.2f ms", h.decoded, h.interval / 1e6));
+        if (h.decoded < least || h.interval == 0) continue;
+        if (c.keepsUp) {
+            check(h.skipped == 0, "speed load rule: at speed 0.5 a file that keeps up on screen decodes every picture",
+                  fmt("%.0f skipped, %.0f handed on", h.skipped, h.decoded));
+        } else {
+            check(h.skipped > h.decoded, "speed load rule: at speed 2 a file that cannot keep up on screen skips pictures",
+                  fmt("%.0f skipped, %.0f handed on", h.skipped, h.decoded));
+        }
+    }
+}
+
+// GOAL: S15.581 -- with a clock, a catch-up hold that runs out ends with the sound moved to the pictures,
+//       once: the heard long beeps file at 28 ms a picture (each drop gains about 5 ms) with one draw held
+//       120 ms earns exactly one sound seek, at least kCatchUpHold after that draw. False if a lead the
+//       hold could not close is left standing because it is under some larger limit: the next picture then
+//       starts a fresh hold, and the screen stutters through hold after hold with no seek.
+// WHY-THIS-SHAPE: the hold is in the draw (vkCmdBlitImage), outside any decode, so the decode load stays
+//       about 0.9 and the file is still steered by its sound. A run that dropped no picture after the hold
+//       was taken for one that cannot keep up, which is never steered, so it is not verified rather than
+//       graded on its zero seeks. The held draw is the first blit after arming, as g_blits records it.
+//       Under S15.538's sound-server guard.
+// COVERAGE-ASSERT: the draw hold reached; pictures dropped after it.
+// CONTROL: control_batch.sh 2026-10-13, reverted, steerSoundLocked, backend/daemon/wallpaper_manager.cpp: the
+//       move made `overdue - behind > (clock ? kCatchUpHold : kSoundDrift)` (a 100 ms limit after the hold)
+//       -> "FAIL: hold run-out rule: a hold that runs out moves the sound once, after the hold" (0 seeks). Green on
+//       both entries: one seek 169 ms after the held draw, 5 dropped. Test-side: 45 ms a picture -> "NOT VERIFIED
+//       -- S15.581 ..." (0 dropped: taken for a file that cannot keep up), not a FAIL.
+void runHoldRunOutChecks() {
+    const char* kGoals = "S15.581 (a hold that runs out moves the sound once)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    StallReset reset;
+    Daemon d(smallConfig());
+    const std::string file = asset("wallpaper_beeps_long.mp4");
+    if (!startHeard(d, file, kGoals)) return;
+    costFile(file);
+    probe::g_costMs.store(28);
+    std::this_thread::sleep_for(1500ms);
+    const int64_t armed = probe::nowNs();
+    probe::g_blitHoldMs.store(120);
+    std::this_thread::sleep_for(1500ms);
+    const int64_t end = probe::nowNs();
+    probe::g_costMs.store(0);
+    const int left = probe::g_blitHoldMs.exchange(0);
+    std::optional<int64_t> heldAt;
+    {
+        std::lock_guard<std::mutex> lock(probe::g_blitMutex);
+        for (const int64_t b : probe::g_blits) {
+            if (b >= armed) {
+                heldAt = b;
+                break;
+            }
+        }
+    }
+    if (left != 0 || !heldAt) {
+        check(false, "hold run-out rule: the staged draw hold was reached", fmt("%.0f ms unused", left));
+        return;
+    }
+    const int64_t holdEnd = *heldAt + 120 * kMs;
+    const std::vector<probe::SoundSeek> seeks = soundSeeksSince(armed, end);
+    const int64_t serverGap = longestBufferGap(takeCapture(), armed, end);
+    const int64_t interval = fileInterval(file);
+    int dropped = 0;
+    std::optional<int64_t> before;
+    for (const Shown& c : shownPictures(d.takeCommits(), file)) {
+        if (!c.presentation) continue;
+        if (before && c.commit.at > holdEnd && c.commit.at <= end) dropped += skippedBetween(*before, *c.presentation, interval);
+        before = c.presentation;
+    }
+    std::printf("audio_playback_test: hold run-out rule: %zu sound seeks, %d pictures dropped after the held draw; the server "
+                "at most %.1f ms between cycles\n",
+                seeks.size(), dropped, serverGap / 1e6);
+    for (const probe::SoundSeek& s : seeks) std::printf("  a seek %+.1f ms after the held draw ended\n", (s.at - holdEnd) / 1e6);
+    if (dropped == 0) {
+        notVerified(kGoals, "no picture was dropped after the held draw: the file was not chasing its sound");
+    } else if (serverGap > kServerLateBound) {
+        notVerified(kGoals, fmt("the sound server went %.1f ms between cycles, which earns a seek of its own", serverGap / 1e6));
+    } else {
+        check(seeks.size() == 1 && seeks[0].at - holdEnd >= 100 * kMs,
+              "hold run-out rule: a hold that runs out moves the sound once, after the hold",
+              fmt("%.0f sound seeks, the first %+.1f ms after the held draw", static_cast<double>(seeks.size()),
+                  seeks.empty() ? 0.0 : (seeks[0].at - holdEnd) / 1e6));
+    }
+}
+
+// GOAL: S15.582 -- a pass that starts more than an interval late has its sound handed on where its first
+//       picture is drawn: on the heard two-second beeps file, the first loop's last draw held 150 ms (the
+//       new pass's first picture then about 117 ms overdue), exactly one sound seek around the loop -- the
+//       hand-on -- and no picture of the new pass's first 400 ms dropped. False if the hand-on anchors the
+//       sound at the picture's planned time: it is then about 117 ms ahead of a picture drawn now, and
+//       is moved a second time or chased by dropping.
+// WHY-THIS-SHAPE: the draw is held, not a decode: the steering works from the round's start time, so only a
+//       round that starts late makes the pass start late; a slow decode inside the round would not. The
+//       hold is armed from the commit callback, on the render thread, when the picture before the last is
+//       committed, so it lands on the last picture's draw. The first loop, because with no pass learned the
+//       sound is handed on in the new pass's own round, which is the branch this grades. Seeks counted from
+//       200 ms before arming to 1 s after, under S15.538's sound-server guard.
+// COVERAGE-ASSERT: the hold armed and spent, and the new pass's first picture drawn 150 ms or more after it.
+// CONTROL: control_batch.sh 2026-10-13, reverted, steerSoundLocked, backend/daemon/wallpaper_manager.cpp: the
+//       hand-on to a new pass anchored at `planned.timeline` instead of `drawnAt` -> "FAIL: late hand-on
+//       rule: a late pass start moves the sound once, onto its first picture, and drops nothing" (2 seeks: to
+//       17.4 ms, then -99.3 ms). Green on both entries: 1 seek to -99 ms, 0 dropped, the pass's first picture
+//       184 ms after arming. Test-side: the hold made 0 -> "FAIL: late hand-on rule: the held draw made the new
+//       pass start late" (66.7 ms).
+void runLateHandOnChecks() {
+    const char* kGoals = "S15.582 (a late pass start: the sound lands where its picture is drawn)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    StallReset reset;
+    const std::string file = asset("wallpaper_beeps.mp4");
+    const int64_t beforeLast = 58 * 1'000'000'000LL / 30;
+    std::atomic<int64_t> armedAt{0};
+    Daemon d(smallConfig());
+    d.onCommit = [&](const Commit&) {
+        if (armedAt.load() != 0) return;
+        const std::optional<int64_t> p = lastPictureOf(file);
+        if (!p || std::llabs(*p - beforeLast) >= 2 * kMs) return;
+        probe::g_blitHoldMs.store(150);
+        armedAt.store(probe::nowNs());
+    };
+    if (!startHeard(d, file, kGoals)) return;
+    if (!waitFor(4000ms, [&] { return armedAt.load() != 0; })) {
+        check(false, "late hand-on rule: the first loop's last draw was held within 4 s");
+        return;
+    }
+    const int64_t at = armedAt.load();
+    std::this_thread::sleep_for(1000ms);
+    const int left = probe::g_blitHoldMs.exchange(0);
+    const std::vector<probe::SoundSeek> seeks = soundSeeksSince(at - 200 * kMs, at + 1000 * kMs);
+    const int64_t serverGap = longestBufferGap(takeCapture(), at - 200 * kMs, at + 1000 * kMs);
+    const std::vector<Shown> shown = shownPictures(d.takeCommits(), file);
+    const int64_t interval = fileInterval(file);
+    std::optional<int64_t> passStart;
+    int dropped = 0;
+    for (size_t i = 1; i < shown.size(); ++i) {
+        if (shown[i].commit.at <= at || !shown[i].presentation || !shown[i - 1].presentation) continue;
+        if (!passStart) {
+            if (*shown[i].presentation < *shown[i - 1].presentation) passStart = shown[i].commit.at;
+            continue;
+        }
+        if (shown[i].commit.at > *passStart + 400 * kMs) break;
+        dropped += skippedBetween(*shown[i - 1].presentation, *shown[i].presentation, interval);
+    }
+    std::printf("audio_playback_test: late hand-on rule: the new pass's first picture drawn %.1f ms after the hold was "
+                "armed; %zu sound seeks around the loop, %d pictures dropped in its first 400 ms; the server at most "
+                "%.1f ms between cycles\n",
+                passStart ? (*passStart - at) / 1e6 : -1.0, seeks.size(), dropped, serverGap / 1e6);
+    for (const probe::SoundSeek& s : seeks) {
+        std::printf("  a seek %+.1f ms from arming, to %.1f ms of the file\n", (s.at - at) / 1e6, s.targetNs / 1e6);
+    }
+    const bool late = left == 0 && passStart && *passStart - at >= 150 * kMs;
+    check(late, "late hand-on rule: the held draw made the new pass start late",
+          fmt("%.0f ms of the hold unused, the pass's first picture %.1f ms after arming", left,
+              passStart ? (*passStart - at) / 1e6 : -1.0));
+    if (!late) return;
+    if (serverGap > kServerLateBound) {
+        notVerified(kGoals, fmt("the sound server went %.1f ms between cycles, which earns a seek of its own", serverGap / 1e6));
+        return;
+    }
+    check(seeks.size() == 1 && seeks[0].targetNs < 50 * kMs && dropped == 0,
+          "late hand-on rule: a late pass start moves the sound once, onto its first picture, and drops nothing",
+          fmt("%.0f sound seeks, %.0f pictures dropped", static_cast<double>(seeks.size()), dropped));
+}
+
+// GOAL: S15.583 -- a few slow decodes as a session starts do not make a file count as one that cannot
+//       keep up: the silent B-frame file whose first three returned pictures cost 70 ms each (twice their
+//       interval) and the rest nothing extra skips no picture in its first 2 s. False if the move from
+//       "keeps up" to "behind" trusts the average before it holds kSettled samples, so a first slow decode
+//       alone turns skipping on.
+// WHY-THIS-SHAPE: three, because the first picture is decoded outside the measured path and two capped
+//       samples of 2 among eight cheap ones average under 1, so a settled average stays at "keeps up"
+//       whatever the cheap decodes cost; a fourth slow one could make the correct average reach 1.
+//       Silent, so every presentation-time gap is a picture the decoder skipped.
+// COVERAGE-ASSERT: the three slow decodes spent, and at least 40 pictures handed on.
+// CONTROL: control_batch.sh 2026-10-13, reverted, DecodeLoad::add, backend/daemon/wallpaper_manager.cpp:
+//       `everyPicture.samples >= kSettled &&` deleted -> "FAIL: first slow rule: a few slow first decodes do not turn skipping on" (3 skipped; green 0
+//       of 64 on both entries). Test-side: no cost -> "FAIL: first slow rule: the slow first decodes were spent,
+//       and the file went on" (0 costed).
+void runFirstSlowDecodesChecks() {
+    const char* kGoals = "S15.583 (slow first decodes do not turn skipping on)";
+    StallReset reset;
+    const std::string file = asset("wallpaper_beeps_bframes.mp4");
+    costFile(file);
+    {
+        std::lock_guard<std::mutex> lock(probe::g_costMutex);
+        probe::g_costCycle.assign(1000, 0);
+        for (int i = 0; i < 3; ++i) probe::g_costCycle[static_cast<size_t>(i)] = 70;
+        probe::g_costCycleAt = 0;
+    }
+    probe::g_costMs.store(1);
+    Daemon d(smallConfig());
+    resetCapture();
+    const int64_t from = probe::nowNs();
+    d.play(file, std::nullopt);
+    if (!d.waitForCommits(3, 15s)) {
+        notVerified(kGoals, "the video drew no pictures within 15 s");
+        return;
+    }
+    std::this_thread::sleep_for(2000ms);
+    const HandedOn h = handedOn(file, from, probe::nowNs());
+    probe::g_costMs.store(0);
+    size_t spent = 0;
+    {
+        std::lock_guard<std::mutex> lock(probe::g_costMutex);
+        spent = probe::g_costCycleAt;
+    }
+    std::printf("audio_playback_test: first slow rule: %zu costed pictures, %d handed on, %d skipped over\n", spent, h.decoded,
+                h.skipped);
+    check(spent >= 3 && h.decoded >= 40 && h.interval > 0, "first slow rule: the slow first decodes were spent, and the file went on",
+          fmt("%.0f costed, %.0f handed on", static_cast<double>(spent), h.decoded));
+    if (spent < 3 || h.decoded < 40 || h.interval == 0) return;
+    check(h.skipped == 0, "first slow rule: a few slow first decodes do not turn skipping on", fmt("%.0f skipped", h.skipped));
+}
+
+// GOAL: S15.584 -- with no clock, the sound is moved to the pictures once they are more than kSoundDrift off,
+//       and measured against where the waiting picture will be shown: the heard long beeps file, its clock
+//       hidden, (a) one draw held 60 ms, so the next picture is drawn about 27 ms late, inside its interval,
+//       where it keeps its planned time: no sound seek; (b) one draw held 90 ms, the next about 57 ms late,
+//       shown where it is drawn: exactly one seek. False if a sound 20-100 ms off its pictures with no clock
+//       is left alone (b: no seek), or if lateness inside an interval is counted against the sound though the
+//       picture keeps its plan, which moves the sound and then moves it back (a: seeks).
+// WHY-THIS-SHAPE: draw holds, as the steering times a round from its start; each hold's seeks counted for
+//       700 ms. Whether (a) staged its case is read from the commits: the picture after the held one must
+//       come under an interval late against the line through the commits before, and over 20 ms, or (a) is
+//       not verified. No sound-server guard: with no clock, the server's timing reaches no decision.
+// COVERAGE-ASSERT: both holds spent; at least 20 of AudioOutput's own timing reads hidden while they ran.
+// CONTROL: control_batch.sh 2026-10-13, reverted, steerSoundLocked, backend/daemon/wallpaper_manager.cpp: the
+//       move made `overdue - behind > (clock ? kSoundDrift : kCatchUpHold)` (a 100 ms limit with no clock) ->
+//       "FAIL: no clock lead rule: a picture drawn more than an interval late moves the sound once" (0 seeks); `overdue` taken as `now - planned.timeline` -> "FAIL: no clock lead rule: a picture
+//       drawn late inside its interval does not move the sound" (2 seeks: moved, then moved back). Green on both
+//       entries: 0 and 1, the picture after the 60 ms hold +26.8 ms (+27.2 on the RTX). Test-side: the first hold
+//       made 100 ms -> "NOT VERIFIED -- S15.584 (a picture drawn inside its interval)" (66.8 ms), not a FAIL.
+void runNoClockLeadChecks() {
+    const char* kGoals = "S15.584 (no clock: moved past kSoundDrift, against where the picture is shown)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    StallReset reset;
+    Daemon d(smallConfig());
+    const std::string file = asset("wallpaper_beeps_long.mp4");
+    if (!startHeard(d, file, kGoals)) return;
+    std::this_thread::sleep_for(1500ms);
+    probe::g_hideStreamTime.store(true);
+    std::this_thread::sleep_for(300ms);
+    const int hiddenBefore = probe::g_streamTimesHidden.load();
+    struct Held {
+        int64_t at = 0;
+        bool spent = false;
+        std::vector<probe::SoundSeek> seeks;
+    };
+    const auto holdDraw = [](int ms) {
+        Held h;
+        h.at = probe::nowNs();
+        probe::g_blitHoldMs.store(ms);
+        std::this_thread::sleep_for(700ms);
+        h.spent = probe::g_blitHoldMs.exchange(0) == 0;
+        h.seeks = soundSeeksSince(h.at, probe::nowNs());
+        return h;
+    };
+    const Held within = holdDraw(60);
+    const Held past = holdDraw(90);
+    const int hidden = probe::g_streamTimesHidden.load() - hiddenBefore;
+    probe::g_hideStreamTime.store(false);
+    const std::vector<Shown> shown = shownPictures(d.takeCommits(), file);
+    const int64_t interval = fileInterval(file);
+    std::string why;
+    const std::optional<Lateness> late = lateAfter(shown, within.at, within.at + 300 * kMs, interval, why);
+    std::printf("audio_playback_test: no clock lead rule: a 60 ms held draw: %zu sound seeks, the picture after it %+.1f ms "
+                "against the line; a 90 ms held draw: %zu sound seeks; %d timing reads hidden\n",
+                within.seeks.size(), late ? late->second / 1e6 : -1.0, past.seeks.size(), hidden);
+    check(within.spent && past.spent && hidden >= 20, "no clock lead rule: both draw holds were reached with the timing hidden",
+          fmt("spent %.0f and %.0f, %.0f reads hidden", within.spent ? 1.0 : 0.0, past.spent ? 1.0 : 0.0, hidden));
+    if (!within.spent || !past.spent || hidden < 20) return;
+    check(past.seeks.size() == 1, "no clock lead rule: a picture drawn more than an interval late moves the sound once",
+          fmt("%.0f sound seeks", static_cast<double>(past.seeks.size())));
+    if (!late) {
+        notVerified("S15.584 (a picture drawn inside its interval)", why);
+    } else if (late->second >= interval || late->second <= 20 * kMs) {
+        notVerified("S15.584 (a picture drawn inside its interval)",
+                    fmt("the picture after the 60 ms hold came %.1f ms late, not between 20 ms and an interval", late->second / 1e6));
+    } else {
+        check(within.seeks.empty(), "no clock lead rule: a picture drawn late inside its interval does not move the sound",
+              fmt("%.0f sound seeks", static_cast<double>(within.seeks.size())));
+    }
+}
+
+// GOAL: S15.585 -- a loop's restart is not counted as decode load: the silent two-second B-frame file at
+//       29 ms a picture (about 0.9 of its interval), its first picture of each pass costing 120 ms (a restart's
+//       seek and key picture), never skips a picture over 7 s. False if a pass's first decode is sampled: one
+//       capped sample of 2 lifts an average of 0.9 past 1 at every loop, and the file skips after each.
+// WHY-THIS-SHAPE: the first picture's cost is a decode hold keyed on its presentation time, repeated each
+//       pass, so it lands on that picture however many the decoder returned before; a cycle of costs counted
+//       by picture would drift off it. Silent, so every gap the decoder leaves is a skip.
+// COVERAGE-ASSERT: at least 150 pictures handed on and three pass starts held in the window.
+// CONTROL: control_batch.sh 2026-10-13, reverted, measureDecode in advanceSessionLocked,
+//       backend/daemon/wallpaper_manager.cpp: `if (after.startsPass) return;` deleted -> "FAIL: loop
+//       restart rule: a slow restart at each loop does not turn skipping on" (18 skipped; green 0 of 202-203 on
+//       both entries). Test-side: no pass-start hold -> "FAIL: loop restart rule: the file looped and went on
+//       decoding" (0 held).
+void runLoopRestartLoadChecks() {
+    const char* kGoals = "S15.585 (a loop's restart is not decode load)";
+    StallReset reset;
+    const std::string file = asset("wallpaper_reads_bframes.mp4");
+    costFile(file);
+    Daemon d(smallConfig());
+    resetCapture();
+    d.play(file, std::nullopt);
+    if (!d.waitForCommits(3, 15s)) {
+        notVerified(kGoals, "the video drew no pictures within 15 s");
+        return;
+    }
+    std::optional<int64_t> first;
+    for (const probe::PictureRecord& p : picturesOf(file)) {
+        if (p.presentationNs && (!first || *p.presentationNs < *first)) first = p.presentationNs;
+    }
+    if (!first) {
+        notVerified(kGoals, "no picture of the file had a presentation time");
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(probe::g_holdMutex);
+        probe::g_holdFile = std::filesystem::path(file).filename().string();
+    }
+    probe::g_holdAtNs.store(*first);
+    probe::g_holdRepeats.store(true);
+    probe::g_holdMs.store(91);
+    probe::g_costMs.store(29);
+    std::this_thread::sleep_for(1000ms);
+    const int64_t from = probe::nowNs();
+    probe::g_holdStartedAt.store(0);
+    int holds = 0;
+    int64_t lastHold = 0;
+    const auto until = Clock::now() + 7000ms;
+    while (Clock::now() < until) {
+        if (const int64_t h = probe::g_holdStartedAt.load(); h != 0 && h != lastHold) {
+            lastHold = h;
+            ++holds;
+        }
+        std::this_thread::sleep_for(20ms);
+    }
+    const HandedOn h = handedOn(file, from, probe::nowNs());
+    probe::g_holdMs.store(0);
+    probe::g_costMs.store(0);
+    std::printf("audio_playback_test: loop restart rule: %d pictures handed on in 7 s, %d skipped over; %d pass starts held\n",
+                h.decoded, h.skipped, holds);
+    check(h.decoded >= 150 && holds >= 3 && h.interval > 0, "loop restart rule: the file looped and went on decoding",
+          fmt("%.0f handed on, %.0f pass starts held", h.decoded, holds));
+    if (h.decoded < 150 || holds < 3 || h.interval == 0) return;
+    check(h.skipped == 0, "loop restart rule: a slow restart at each loop does not turn skipping on",
+          fmt("%.0f skipped", h.skipped));
+}
+
+// GOAL: S15.567 -- a picture the daemon drops is never converted: over five 60 ms stalls of the heard
+//       120-a-second tone, conversions beyond the pictures committed stay under half the pictures
+//       dropped. False if every decoded picture is converted, dropped or not.
+// WHY-THIS-SHAPE: a conversion is FrameConverter's one draw, interposed at vkCmdDraw (three vertices, one
+//       instance), and nothing else here draws that. A picture converted while it waits and dropped once it
+//       falls behind is still converted, which the fixed code does for a few; so the bound is half the
+//       dropped count, not zero.
+// COVERAGE-ASSERT: at least five pictures dropped, and the conversions counted at least the commits (less
+//       two at the window's edges), so the counter sees every shown picture's conversion.
+// CONTROL: control_run.sh 2026-10-12, reverted: `convert();` added after `m_unconverted = std::move(*frame);` in
+//       renderer/video/video_pipeline.cpp -> "FAIL: convert rule: a dropped picture is not converted" (420
+//       conversions for 389 commits and 31 dropped; 394 for 389 green).
+void runConvertDroppedChecks() {
+    const char* kGoals = "S15.567 (a dropped picture is never converted)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    StallReset reset;
+    Daemon d(smallConfig());
+    const std::string file = asset("wallpaper_tone_rate120.mp4");
+    if (!startHeard(d, file, kGoals)) return;
+    std::this_thread::sleep_for(1500ms);
+    const size_t before = d.takeCommits().size();
+    const int conversionsBefore = probe::g_conversions.load();
+    for (int i = 0; i < 5; ++i) {
+        probe::g_stallPictureMs.store(60);
+        std::this_thread::sleep_for(700ms);
+    }
+    const std::vector<Commit> all = d.takeCommits();
+    const int conversions = probe::g_conversions.load() - conversionsBefore;
+    const int commits = static_cast<int>(all.size() - before);
+    const std::vector<Shown> shown = shownPictures(all, file);
+    const int64_t interval = pictureInterval(shown);
+    int dropped = 0;
+    for (size_t i = before + 1; i < shown.size(); ++i) {
+        if (shown[i].presentation && shown[i - 1].presentation) {
+            dropped += skippedBetween(*shown[i - 1].presentation, *shown[i].presentation, interval);
+        }
+    }
+    std::printf("audio_playback_test: convert rule: %d conversions, %d commits, %d pictures dropped\n", conversions, commits,
+                dropped);
+    check(dropped >= 5 && conversions + 2 >= commits,
+          "convert rule: the stalls left pictures to drop, and every picture shown was seen converted",
+          fmt("%.0f dropped, %.0f conversions for %.0f commits", dropped, conversions, commits));
+    if (dropped < 5 || conversions + 2 < commits) return;
+    check(conversions - commits < dropped / 2, "convert rule: a dropped picture is not converted",
+          fmt("%.0f conversions for %.0f commits and %.0f dropped", conversions, commits, dropped));
+}
+
+// GOAL: S15.568 -- the harness reads its records right: a picture committed twice in a row stays in its
+//       pass and counts no skip; a pass is as long as the file's pictures the decoder handed on, the last
+//       included though no commit showed it; the sound server's longest gap counts a gap across either edge
+//       of its window; and gradeBeepsAgainstPictures grades a beep picture committed twice in one pass once,
+//       and counts it as no pass start. False if these helpers misread the synthetic records below, which
+//       would mis-grade every phase built on them (the beep, loop, lead and catch-up rules).
+// GOAL: S15.570 -- on a file whose decoder skips pictures (every third handed on), the pictures not shown
+//       are counted as skipped, never negative, and a pass is still one file long. False with the interval
+//       taken as the commits' median step, three pictures there, which counts each one-picture step -1.
+// WHY-THIS-SHAPE: synthetic records, so each case is one the live phases cannot stage on demand: a repeat
+//       commit, a dropped last picture, a server stall straddling a window's edge, a repeated beep picture,
+//       a decoder that started skipping. The beep capture is step pulses at 0.5, far above the 0.1 onset
+//       level, at each beep picture's place on the line, so it tests the grader's pairing, not onset finding.
+// CONTROL: control_run.sh 2026-10-12, reverted, test-side, each alone: filePlaces' `p < before` made `p <= before` ->
+//       "...: a picture committed again stays in its pass ..."; the pass length taken from the commits' latest
+//       picture -> "...: a pass is as long as the file's pictures ..."; longestBufferGap skipping the buffer before
+//       `from` -> "...: a sound-server stall across a window's start is measured whole"; its trailing gap to `to`
+//       deleted -> "...: ... running past a window's end is measured to that end". control_batch.sh 2026-10-13,
+//       reverted, test-side: gradeBeepsAgainstPictures' skip of a picture committed again deleted -> "...: a beep
+//       picture committed twice in one pass is graded once, and is no pass start" (7 graded, 2 at a pass start);
+//       filePlaces' interval taken from pictureInterval(shown) -> "...: pictures a skipping decoder never handed on
+//       count as skipped" (-8) and "...: a skipping file's pass is one file long" (2066.7 ms).
+void runGraderSelfTestChecks() {
+    const std::string file = "/grader-self-test/pictures.mp4";
+    constexpr int64_t kPicture = 1'000'000'000 / 30;
+    {
+        std::lock_guard<std::mutex> lock(probe::g_pictureMutex);
+        for (int k = 0; k < 60; ++k) probe::g_pictures.push_back({0, file, k * kPicture});
+    }
+    std::vector<Shown> shown;
+    int64_t at = 0;
+    for (const int k : {0, 1, 2, 2, 3, 58, 0, 1}) shown.push_back({Commit{0, at += kPicture, 0}, k * kPicture});
+    std::string why;
+    const std::optional<FilePlace> places = filePlaces(shown, file, why);
+    {
+        std::lock_guard<std::mutex> lock(probe::g_pictureMutex);
+        std::erase_if(probe::g_pictures, [&](const probe::PictureRecord& p) { return p.file == file; });
+    }
+    check(places.has_value(), "grader self-test: the synthetic run is read", why);
+    if (places) {
+        check(places->passes == std::vector<int>{0, 0, 0, 0, 0, 0, 1, 1},
+              "grader self-test: a picture committed again stays in its pass; only a time going back starts one");
+        check(places->dropped == 54, "grader self-test: a picture committed again counts no skipped picture",
+              fmt("%.0f skipped, 54 wanted", places->dropped));
+        check(places->at[6] == 60 * kPicture,
+              "grader self-test: a pass is as long as the file's pictures, its last one included though never shown",
+              fmt("the second pass starts %.1f ms in, 2000 wanted", places->at[6] / 1e6));
+    }
+    const int64_t from = 1000 * kMs, to = from + 100 * kMs;
+    Capture across;
+    for (const int64_t t : {-50, 10, 31, 52, 73, 94, 115}) across.buffers.push_back({from + t * kMs});
+    check(longestBufferGap(across, from, to) == 60 * kMs,
+          "grader self-test: a sound-server stall across a window's start is measured whole",
+          fmt("%.1f ms, 60 wanted", longestBufferGap(across, from, to) / 1e6));
+    Capture ending;
+    for (const int64_t t : {0, 10, 20}) ending.buffers.push_back({from + t * kMs});
+    check(longestBufferGap(ending, from, to) == 80 * kMs,
+          "grader self-test: a sound-server stall running past a window's end is measured to that end",
+          fmt("%.1f ms, 80 wanted", longestBufferGap(ending, from, to) / 1e6));
+
+    // Two passes of a 60-picture file, picture 0 committed twice at the start of the first, a beep heard
+    // exactly where each beep picture falls: six beeps, one at a pass start after a loop.
+    const std::string beeps = "/grader-self-test/beeps.mp4";
+    {
+        std::lock_guard<std::mutex> lock(probe::g_pictureMutex);
+        for (int k = 0; k < 60; ++k) probe::g_pictures.push_back({0, beeps, k * kPicture});
+    }
+    constexpr int64_t kBase = 10'000 * kMs;
+    std::vector<Shown> run;
+    run.push_back({Commit{0, kBase, 0}, 0});
+    run.push_back({Commit{0, kBase + kPicture / 2, 0}, 0});
+    for (int k = 1; k < 60; ++k) run.push_back({Commit{0, kBase + k * kPicture, 0}, k * kPicture});
+    for (int k = 0; k <= 20; ++k) run.push_back({Commit{0, kBase + (60 + k) * kPicture, 0}, k * kPicture});
+    Capture heardBeeps;
+    constexpr uint32_t kFrames = 480;
+    for (int64_t heardAt = kBase - 500 * kMs; heardAt < kBase + 3500 * kMs; heardAt += 10 * kMs) {
+        const uint64_t first = heardBeeps.left.size();
+        heardBeeps.buffers.push_back({heardAt, heardAt, first, kFrames, 0.5f});
+        for (uint32_t f = 0; f < kFrames; ++f) {
+            const int64_t t = heardAt + static_cast<int64_t>(f) * 1'000'000'000 / kRate - kBase;
+            const float v = t >= 0 && t % (500 * kMs) < 40 * kMs ? 0.5f : 0.0f;
+            heardBeeps.left.push_back(v);
+            heardBeeps.right.push_back(v);
+        }
+    }
+    int passStarts = 0;
+    const int graded = gradeBeepsAgainstPictures("grader self-test", heardBeeps, run, beeps, kBase - kMs, 1.0, passStarts);
+    check(graded == 6 && passStarts == 1,
+          "grader self-test: a beep picture committed twice in one pass is graded once, and is no pass start",
+          fmt("%.0f graded (6 wanted), %.0f at a pass start (1 wanted)", graded, passStarts));
+
+    // A decoder that skips: pictures 0-8, then every third from 11, then a new pass at 0 and 3.
+    const std::string skips = "/grader-self-test/skips.mp4";
+    std::vector<int> handed;
+    for (int k = 0; k <= 8; ++k) handed.push_back(k);
+    for (int k = 11; k < 60; k += 3) handed.push_back(k);
+    handed.push_back(0);
+    handed.push_back(3);
+    std::vector<Shown> skipping;
+    {
+        std::lock_guard<std::mutex> lock(probe::g_pictureMutex);
+        int64_t t = 0;
+        for (const int k : handed) {
+            probe::g_pictures.push_back({t += kPicture, skips, k * kPicture});
+            skipping.push_back({Commit{0, t + 1, 0}, k * kPicture});
+        }
+    }
+    std::string skipWhy;
+    const std::optional<FilePlace> skipPlaces = filePlaces(skipping, skips, skipWhy);
+    {
+        std::lock_guard<std::mutex> lock(probe::g_pictureMutex);
+        std::erase_if(probe::g_pictures, [&](const probe::PictureRecord& p) { return p.file == beeps || p.file == skips; });
+    }
+    check(skipPlaces.has_value(), "grader self-test: the skipping run is read", skipWhy);
+    if (skipPlaces) {
+        check(skipPlaces->dropped == 36, "grader self-test: pictures a skipping decoder never handed on count as skipped",
+              fmt("%.0f skipped, 36 wanted", skipPlaces->dropped));
+        check(skipPlaces->at[handed.size() - 2] == 60 * kPicture,
+              "grader self-test: a skipping file's pass is one file long",
+              fmt("the second pass starts %.1f ms in, 2000 wanted", skipPlaces->at[handed.size() - 2] / 1e6));
+    }
 }
 
 // Puts back on scope exit what a phase broke on purpose.
@@ -4392,7 +7135,8 @@ int main(int argc, char** argv) {
                               "wallpaper_tone_rate120.mp4", "wallpaper_one_picture_tone.mp4", "wallpaper_seek_mp3.avi",
                               "wallpaper_seek_aac.flv", "wallpaper_seek_aac.mkv", "wallpaper_seek_aac.ts",
                               "wallpaper_seek_opus.webm", "wallpaper_seek_vorbis.webm", "wallpaper_seek_vorbis.ogv",
-                              "wallpaper_reads_bframes.mp4", "sound_16384_frames.wav"};
+                              "wallpaper_reads_bframes.mp4", "sound_16384_frames.wav",
+                              "wallpaper_beeps_bframes.mp4"};
     for (const char* f : fixtures) {
         if (!std::filesystem::exists(asset(f))) {
             notVerified("every goal in this file",
@@ -4435,6 +7179,7 @@ int main(int argc, char** argv) {
         {"engineRamp", &runEngineRampChecks},
         {"engineUnderrun", &runEngineUnderrunChecks},
         {"engineLongUnderrun", &runEngineLongUnderrunChecks},
+        {"engineReconnect", &runEngineReconnectChecks},
         {"engineQueuedSegments", &runQueuedSegmentChecks},
         {"engineFuturePlay", &runFuturePlayChecks},
         {"engineFadeIn", &runFadeInChecks},
@@ -4465,6 +7210,31 @@ int main(int argc, char** argv) {
         {"parked", &runParkedChecks},
         {"latePicture", &runLatePictureChecks},
         {"renderOwed", &runRenderOwedChecks},
+        {"driftSlowCard", &runDriftSlowCardChecks},
+        {"driftFastCard", &runDriftFastCardChecks},
+        {"serverStop", &runServerStopChecks},
+        {"slowLoopWakes", &runSlowLoopWakeChecks},
+        {"dropSlice", &runDropSliceChecks},
+        {"catchUpCap", &runCatchUpCapChecks},
+        {"firstPictureKept", &runLoopFirstPictureChecks},
+        {"leadLimit", &runLeadLimitChecks},
+        {"noClock", &runNoClockChecks},
+        {"handOverLead", &runHandOverLeadChecks},
+        {"cleanCredit", &runCleanCreditChecks},
+        {"lastReading", &runLastReadingChecks},
+        {"dropMinimum", &runDropMinimumChecks},
+        {"skip", &runSkipChecks},
+        {"lateAtLoop", &runLateAtLoopChecks},
+        {"lateTimed", &runLateTimedChecks},
+        {"hover", &runHoverChecks},
+        {"speedLoad", &runSpeedLoadChecks},
+        {"holdRunOut", &runHoldRunOutChecks},
+        {"lateHandOn", &runLateHandOnChecks},
+        {"firstSlowDecodes", &runFirstSlowDecodesChecks},
+        {"noClockLead", &runNoClockLeadChecks},
+        {"loopRestartLoad", &runLoopRestartLoadChecks},
+        {"convertDropped", &runConvertDroppedChecks},
+        {"graderSelfTest", &runGraderSelfTestChecks},
         {"parkedSoundFails", &runParkedSoundFailsChecks},
         {"parkedReopen", &runParkedReopenChecks},
         {"parkedSilentStays", &runParkedSilentStaysChecks},

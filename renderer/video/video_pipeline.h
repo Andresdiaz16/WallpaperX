@@ -31,7 +31,9 @@ struct OffscreenTarget;
 // goes from the last picture of one shape straight to the first of the next and is never shown
 // black. That rebuild waits for the GPU; a steady picture adds no wait beyond its parts' own.
 //
-// No decoded frame is held between calls. The conversion copies it out, and its batch is
+// A picture decodeWithin() returns is held as decoded until it is converted, by convert() or the
+// draw() that shows it, or until the next decode replaces it unconverted -- so a picture decoded
+// only to be passed over costs no conversion. The conversion copies it out, and its batch is
 // ordered against the decoder's next write of that image by the frame's semaphore. The blit
 // needs nothing beyond submission order: both batches go to the graphics queue, blit second.
 //
@@ -58,20 +60,25 @@ public:
 
     // The two halves of that call, for a caller that must decide between them whether this picture
     // may be shown at all: decodeNext() touches no target, so a caller holding a picture may still
-    // abandon it, and draw() is one blit.
+    // abandon it, and draw() of a converted picture is one blit.
     //
-    // decodeNext() answers as renderNext() does and throws as it does. draw() shows the picture
-    // decodeNext() last converted, throws std::logic_error when there is none, and otherwise throws
-    // as renderNext() does.
+    // decodeNext() decodes and converts, and answers as renderNext() does and throws as it does.
+    // draw() shows the picture decoded last, converting it first if it is not yet, throws
+    // std::logic_error when there is none, and otherwise throws as renderNext() does.
     bool decodeNext();
     void draw(OffscreenTargetManager& targets, const OffscreenTarget& target);
 
-    // decodeNext() that gives up for now once the decoder has dropped `dropLimit` pictures on its way
-    // to the next one it returns, as VideoDecoder::next(dropLimit) does. Dropping leaves the picture
-    // converted last, and its timing and position, as they were; the next call carries on. Throws as
-    // decodeNext() does.
-    enum class Decode { Converted, Exhausted, Dropping };
-    Decode decodeWithin(uint32_t dropLimit);
+    // decodeNext() without the conversion, that gives up for now once the decoder has dropped
+    // `dropLimit` pictures on its way to the next one it returns, as VideoDecoder::next(dropLimit)
+    // does. Dropping leaves the picture decoded last, and its timing and position, as they were; the
+    // next call carries on. Throws as decodeNext() does, but for the conversion. `skip` is as
+    // PictureSkip: a skipped picture is never returned, so the next one's timing spans it.
+    enum class Decode { Decoded, Exhausted, Dropping };
+    Decode decodeWithin(uint32_t dropLimit, PictureSkip skip = PictureSkip::Nothing);
+
+    // Converts the picture decoded last unless it already is. A caller that draws under a lock calls
+    // it first, so the lock waits on a blit alone. Throws as decodeNext() does.
+    void convert();
 
     // When the picture draw() shows belongs on screen, as the decoder reported it. What paces the
     // pictures is the caller's; this only says where each one falls.
@@ -94,7 +101,7 @@ public:
     std::optional<StreamPosition> shownPosition() const { return m_shownPosition; }
 
 private:
-    Decode decode(std::optional<uint32_t> dropLimit);
+    Decode decode(std::optional<uint32_t> dropLimit, PictureSkip skip);
 
     // Built and replaced together, so the renderer never outlives the image it shows.
     struct Stage {
@@ -107,10 +114,12 @@ private:
     std::string m_shaderDir;
     Playback m_playback;
     VideoDecoder m_decoder;
-    // Null until the first picture.
+    // Null until the first picture is converted.
     std::unique_ptr<Stage> m_stage;
-    // The converted picture's; meaningful once m_stage exists.
-    PictureTiming m_timing;
+    // The picture decoded last, while it is not converted yet.
+    std::optional<DecodedFrame> m_unconverted;
+    // The picture decoded last's; empty before the first.
+    std::optional<PictureTiming> m_timing;
     std::optional<StreamPosition> m_convertedPosition;
     std::optional<StreamPosition> m_shownPosition;
 };

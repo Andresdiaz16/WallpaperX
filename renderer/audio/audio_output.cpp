@@ -49,6 +49,9 @@ static_assert(kRampNs == 240LL * 1'000'000'000 / AudioDecoder::kRate);
 // How soon a track whose stream failed, or a server that refused while its socket was there, is
 // asked again.
 constexpr std::chrono::seconds kRetryAfter{5};
+// How late past its expected next cycle a stream's clock still counts as live: scheduling jitter,
+// not a stall.
+constexpr int64_t kClockSlackNs = 20'000'000;
 
 int64_t steadyNs(TimePoint at) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(at.time_since_epoch()).count();
@@ -108,6 +111,10 @@ struct Segment {
     // When the frame at ringStart is heard. Audible segments only.
     int64_t startsAt = 0;
     bool audible = false;
+    // The file's time at ringStart, frames running on from it one per frame: audible segments that
+    // do not loop, which are the ones with a clock.
+    int64_t fileAt = 0;
+    bool timed = false;
 };
 
 // Everything one track shares between its owner, the output's thread and its stream's realtime
@@ -131,6 +138,8 @@ struct AudioTrackState {
 
     // Output thread -> owner: whether the file has sound to play, known once it has been opened.
     std::atomic<AudioTrack::Content> content{AudioTrack::Content::Unknown};
+    // Output thread -> owner: the request last taken up.
+    std::atomic<uint64_t> takenSerial{0};
 
     // Output thread -> callback. Frames are written at writePos and read at readPos. A segment
     // starts one position past the last one written before it. playingEnd is the first start
@@ -152,6 +161,14 @@ struct AudioTrackState {
     std::atomic<uint64_t> playingStart{0};
     std::atomic<uint64_t> quietSerial{0};
     std::atomic<bool> streamFailed{false};
+
+    // Callback -> owner: the clock, under a sequence count the callback writes without waiting and
+    // the owner retries. Serial 0 is no clock. Also written by the output thread once no callback runs.
+    std::atomic<uint32_t> clockSeq{0};
+    std::atomic<uint64_t> clockSerial{0};
+    std::atomic<int64_t> clockFile{0};
+    std::atomic<int64_t> clockAt{0};
+    std::atomic<int64_t> clockUntil{0};
 
     // Callback only, and only for the stream it belongs to: a new stream has played nothing.
     struct Playhead {
@@ -201,20 +218,45 @@ void signalWake(int fd) noexcept {
     [[maybe_unused]] const ssize_t written = ::write(fd, &one, sizeof one);
 }
 
-// When the first frame of a buffer queued now is heard.
-int64_t heardAtOfNextBuffer(pw_stream* stream) {
+// When the first frame of a buffer queued now is heard, and when the server's cycle asking for it
+// began -- nothing when the server has not timed the stream yet, which then counts as heard now.
+struct BufferTiming {
+    int64_t heardAt = 0;
+    std::optional<int64_t> cycleAt;
+};
+BufferTiming timingOfNextBuffer(pw_stream* stream) {
     pw_time time{};
     if (pw_stream_get_time_n(stream, &time, sizeof time) < 0 || time.now == 0 || time.rate.denom == 0) {
-        return steadyNs(SteadyClock::now());
+        return {steadyNs(SteadyClock::now()), std::nullopt};
     }
     const int64_t delay = std::max<int64_t>(time.delay, 0) * 1'000'000'000 * time.rate.num / time.rate.denom;
     const auto queued = static_cast<int64_t>(time.buffered + time.queued);
-    return time.now + delay + queued * 1'000'000'000 / AudioDecoder::kRate;
+    return {time.now + delay + queued * 1'000'000'000 / AudioDecoder::kRate, time.now};
 }
 
-// The realtime half: fills `out` with `frames` frames heard from `heardAt` on. Touches nothing but
-// atomics, the ring and the callback's own fields, and only ever tries the segment lock.
-void render(AudioTrackState& t, float* out, uint32_t frames, int64_t heardAt) {
+void publishClock(AudioTrackState& t, uint64_t serial, int64_t file, int64_t at, int64_t until) noexcept {
+    const uint32_t seq = t.clockSeq.load(std::memory_order_relaxed);
+    t.clockSeq.store(seq + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    t.clockSerial.store(serial, std::memory_order_relaxed);
+    t.clockFile.store(file, std::memory_order_relaxed);
+    t.clockAt.store(at, std::memory_order_relaxed);
+    t.clockUntil.store(until, std::memory_order_relaxed);
+    t.clockSeq.store(seq + 2, std::memory_order_release);
+}
+
+// The realtime half: fills `out` with `frames` frames as `timing` places them, and publishes the
+// clock of the segment it ends in. Touches nothing but atomics, the ring and the callback's own
+// fields, and only ever tries the segment lock.
+void render(AudioTrackState& t, float* out, uint32_t frames, const BufferTiming& timing) {
+    const int64_t heardAt = timing.heardAt;
+    // The first frame played from the ring this cycle in the segment it was in: serial, position, heard at.
+    struct Sample {
+        uint64_t serial;
+        uint64_t position;
+        int64_t at;
+    };
+    std::optional<Sample> sample;
     AudioTrackState::Playhead& p = t.playhead;
     Segment candidate = p.current;
     if (t.segmentMutex.try_lock()) {
@@ -259,6 +301,7 @@ void render(AudioTrackState& t, float* out, uint32_t frames, int64_t heardAt) {
             } else {
                 if (position < p.skipTo) position = std::min(p.skipTo, end);
                 if (position >= p.skipTo && position < end) {
+                    if (!sample || sample->serial != p.current.serial) sample = Sample{p.current.serial, position, frameAt};
                     const float* frame = &t.ring[(position % kRingFrames) * kChannels];
                     left = frame[0];
                     right = frame[1];
@@ -274,6 +317,16 @@ void render(AudioTrackState& t, float* out, uint32_t frames, int64_t heardAt) {
         out[i * kChannels + 1] = right * p.gain;
     }
     t.readPos.store(position, std::memory_order_release);
+
+    // Live until two more cycles of this length have gone by unasked, and a little more.
+    if (timing.cycleAt && sample && sample->serial == p.current.serial && p.current.timed) {
+        const int64_t cycleNs = static_cast<int64_t>(frames) * 1'000'000'000 / AudioDecoder::kRate;
+        const auto played = static_cast<int64_t>(sample->position - p.current.ringStart);
+        publishClock(t, sample->serial, p.current.fileAt + played * 1'000'000'000 / AudioDecoder::kRate, sample->at,
+                     *timing.cycleAt + 2 * cycleNs + kClockSlackNs);
+    } else if (t.clockSerial.load(std::memory_order_relaxed) != 0) {
+        publishClock(t, 0, 0, 0, 0);
+    }
 
     bool wake = false;
     if (p.current.audible && newestStart == p.current.ringStart) {
@@ -301,7 +354,7 @@ void onProcess(void* data) {
     if (data0.data != nullptr && data0.chunk != nullptr) {
         uint32_t frames = data0.maxsize / kFrameBytes;
         if (buffer->requested != 0) frames = std::min<uint32_t>(frames, static_cast<uint32_t>(buffer->requested));
-        render(t, static_cast<float*>(data0.data), frames, heardAtOfNextBuffer(stream));
+        render(t, static_cast<float*>(data0.data), frames, timingOfNextBuffer(stream));
         data0.chunk->offset = 0;
         data0.chunk->stride = kFrameBytes;
         data0.chunk->size = frames * kFrameBytes;
@@ -361,6 +414,33 @@ void AudioTrack::stop() noexcept {
 void AudioTrack::setVolume(float gain) noexcept { m_state->volume.store(gain, std::memory_order_relaxed); }
 
 AudioTrack::Content AudioTrack::content() const noexcept { return m_state->content.load(std::memory_order_acquire); }
+
+std::optional<AudioTrack::Clock> AudioTrack::clock(std::chrono::steady_clock::time_point now) const noexcept {
+    if (!m_anchor) return std::nullopt;
+    const AudioTrackState& s = *m_state;
+    // Bounded: a reading that keeps meeting a write in progress is taken as no clock this time.
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const uint32_t before = s.clockSeq.load(std::memory_order_acquire);
+        if ((before & 1U) != 0) continue;
+        const uint64_t serial = s.clockSerial.load(std::memory_order_relaxed);
+        const int64_t file = s.clockFile.load(std::memory_order_relaxed);
+        const int64_t at = s.clockAt.load(std::memory_order_relaxed);
+        const int64_t until = s.clockUntil.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (s.clockSeq.load(std::memory_order_relaxed) != before) continue;
+        // requestSerial is written only on this thread, so it is read here without its lock.
+        if (serial == 0 || serial != s.requestSerial || steadyNs(now) > until) return std::nullopt;
+        return Clock{std::chrono::nanoseconds(file), TimePoint(std::chrono::nanoseconds(at))};
+    }
+    return std::nullopt;
+}
+
+// requestSerial is written only on this thread, so it is read here without its lock.
+uint64_t AudioTrack::request() const noexcept { return m_state->requestSerial; }
+
+bool AudioTrack::taken() const noexcept {
+    return m_state->takenSerial.load(std::memory_order_acquire) == m_state->requestSerial;
+}
 
 // noexcept is truthful: the anchor copies without allocating, and the lock is one this class never
 // misuses, which is the only way std::mutex::lock throws.
@@ -597,6 +677,7 @@ void AudioOutput::service(AudioTrackState& t, TimePoint now) {
     const bool later = play && t.filling && now < play->at - kBeginAhead;
     if (serial != t.serviced && !later) {
         t.serviced = serial;
+        t.takenSerial.store(serial, std::memory_order_release);
         t.retryAt.reset();
         if (play) {
             begin(t, serial, *play);
@@ -649,8 +730,9 @@ void AudioOutput::begin(AudioTrackState& t, uint64_t serial, const AudioTrack::A
     if (anchor.loop) at = std::max(at, steadyNs(SteadyClock::now()));
     // Decoding starts where the sound will be by now, not at `from`, which may be well past.
     const int64_t startsAt = std::max(at, steadyNs(SteadyClock::now()));
+    const std::chrono::nanoseconds fileAt = anchor.from + std::chrono::nanoseconds(startsAt - at);
     try {
-        onContent(t, [&] { t.decoder->seek(anchor.from + std::chrono::nanoseconds(startsAt - at)); });
+        onContent(t, [&] { t.decoder->seek(fileAt); });
     } catch (const std::exception& e) {
         closeAfterFailure(t);
         m_log(std::string("AudioOutput: no sound for a wallpaper: ") + e.what());
@@ -668,7 +750,7 @@ void AudioOutput::begin(AudioTrackState& t, uint64_t serial, const AudioTrack::A
     fill(t);
     {
         std::lock_guard<std::mutex> lock(t.segmentMutex);
-        t.newest = Segment{serial, ringStart, at, startsAt, true};
+        t.newest = Segment{serial, ringStart, at, startsAt, true, fileAt.count(), !anchor.loop};
     }
     if (!t.active) setActive(t, true);
 }
@@ -899,6 +981,7 @@ void AudioOutput::destroyStream(AudioTrackState& t) noexcept {
     t.playhead = {};
     t.playingStart.store(0, std::memory_order_release);
     t.playingEnd.store(0, std::memory_order_release);
+    publishClock(t, 0, 0, 0, 0);
     t.active = false;
     // The file goes with the stream; a play that makes a new stream opens it again.
     closeDecoder(t);
