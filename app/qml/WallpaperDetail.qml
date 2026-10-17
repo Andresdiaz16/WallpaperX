@@ -116,6 +116,9 @@ Item {
                                 // wallpaper.json calls them.
                                 readonly property bool isMute: row.modelData.key === "mute"
                                 readonly property bool isVolume: row.modelData.key === "volume"
+                                // A float that takes only a few values, the speed: one button for each.
+                                readonly property bool isChoice: row.modelData.choices.length > 0
+                                readonly property bool isSlider: row.modelData.type === "float" && !row.isChoice
 
                                 Layout.fillWidth: true
 
@@ -127,18 +130,37 @@ Item {
                                 }
                                 Slider {
                                     Layout.fillWidth: true
-                                    visible: row.modelData.type === "float"
+                                    visible: row.isSlider
                                     from: row.modelData.minimum
                                     to: row.modelData.maximum
-                                    value: row.modelData.type === "float" ? row.current : 0
+                                    value: row.isSlider ? row.current : 0
                                     onMoved: root.library.setPropertyValue(row.modelData.key, value)
                                 }
                                 Label {
-                                    visible: row.modelData.type === "float"
+                                    visible: row.isSlider
                                     textFormat: Text.PlainText
-                                    text: row.modelData.type !== "float" ? ""
+                                    text: !row.isSlider ? ""
                                         : row.isVolume ? qsTr("%1 %").arg(Math.round(Number(row.current) * 100))
                                         : Number(row.current).toFixed(2)
+                                }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    visible: row.isChoice
+
+                                    Repeater {
+                                        model: row.modelData.choices
+
+                                        delegate: Button {
+                                            required property real modelData
+
+                                            text: qsTr("%1×").arg(modelData)
+                                            checkable: true
+                                            // Exclusive, so a click on the speed already chosen leaves it chosen.
+                                            autoExclusive: true
+                                            checked: row.isChoice && Number(row.current) === modelData
+                                            onClicked: root.library.setPropertyValue(row.modelData.key, modelData)
+                                        }
+                                    }
                                 }
                                 Switch {
                                     visible: row.modelData.type === "bool"
@@ -163,7 +185,7 @@ Item {
                                     }
                                 }
                                 Item {
-                                    Layout.fillWidth: row.modelData.type !== "float"
+                                    Layout.fillWidth: !row.isSlider && !row.isChoice
                                 }
                             }
                         }

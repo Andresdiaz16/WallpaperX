@@ -19,6 +19,7 @@
 // plugin calls from updatePaintNode(). Everything else reports a named skip rather than a pass;
 // a dma_buf daemon is covered by daemon_system_lavapipe and by frame_import_probe_lavapipe.
 
+#include "test_image_dir.h"
 #include "frame_import.h"
 
 #include "support/forked_child.h"
@@ -259,7 +260,7 @@ bool kcmpUsable() {
 
 bool runChecks() {
     const std::string imagePath =
-        writeQuadrantPng(std::string(WALLPAPERX_TEST_IMAGE_DIR) + "/cross_process_quadrants.png", 640, 360);
+        writeQuadrantPng(wallpaperx::testing::testImageDir() + "/cross_process_quadrants.png", 640, 360);
 
     wallpaperx::testing::ScratchDir configHome("xproc");
     if (!configHome.ok()) {

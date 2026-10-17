@@ -63,8 +63,10 @@ VideoPipeline::Decode VideoPipeline::decode(std::optional<uint32_t> dropLimit, P
         frame = m_decoder.next(skip);
     }
     bool startsPass = !m_timing && !m_decoder.startedMidStream();
+    std::optional<std::chrono::nanoseconds> passEnded;
     // No timing means nothing was ever decoded, and a stream with nothing to show must not spin here.
     if (!frame && m_playback == Playback::Loop && m_timing) {
+        passEnded = m_decoder.readThrough();
         m_decoder.restart();
         // Unbounded: a restarted pass has returned nothing to resume after, so it drops nothing.
         frame = m_decoder.next(skip);
@@ -72,7 +74,8 @@ VideoPipeline::Decode VideoPipeline::decode(std::optional<uint32_t> dropLimit, P
     }
     if (!frame) return Decode::Exhausted;
 
-    m_timing = PictureTiming{frame->presentationTime(), frame->duration(), startsPass};
+    m_timing = PictureTiming{frame->presentationTime(), frame->duration(), startsPass, frame->skip(), passEnded,
+                             frame->keptThrough(), frame->readSince()};
     m_unconverted = std::move(*frame);
     return Decode::Decoded;
 }

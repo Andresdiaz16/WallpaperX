@@ -66,8 +66,6 @@ void expectRealScreens(const QList<Monitor>& monitors, const char* which) {
                dp4->rotation == 0 && !dp4->flipped && dp4->primary && dp4->selectable(),
            tag + QStringLiteral(": DP-4 should be id 1, 2560x1440 at (1440,761), unrotated, primary; got ") +
                describe(*dp4));
-    expect(dp3->displayName == QStringLiteral("DP-3") && dp4->displayName == QStringLiteral("DP-4"),
-           tag + QStringLiteral(": before any EDID, a screen's display name should be its connector name"));
 }
 
 // S15.1

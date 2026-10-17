@@ -893,8 +893,7 @@ std::string DbusService::getStatus() {
                              {"path_literal", literal ? nlohmann::json(*literal) : nlohmann::json(nullptr)},
                              {"generation", monitor.generation},
                              {"has_frame", monitor.hasFrame}};
-        // As set, not as applied: a speed below the playback range plays at its bottom. Keys
-        // need no escaping, since propertiesError() admits only ASCII letters, digits and "_-.".
+        // Keys need no escaping, since propertiesError() admits only ASCII letters, digits and "_-.".
         entry["properties"] = toJson(monitor.properties);
         if (monitor.hasFrame) {
             entry["width"] = monitor.width;

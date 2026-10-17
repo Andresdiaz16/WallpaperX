@@ -16,6 +16,7 @@
 // extensions, this reports NOT VERIFIED rather than failing: an unimportable pairing says
 // nothing about whether the importer is correct.
 
+#include "test_image_dir.h"
 #include "frame_import.h"
 
 #include "support/gpu_readback.h"
@@ -130,7 +131,7 @@ bool runImportChecks() {
     return wallpaperx::testing::gradedRun("frame_import_probe", [&](wallpaperx::testing::ValidationGrade& grade) {
         grade.reportUngradedTo(g_ungradedValidation);
         const std::string imagePath = wallpaperx::testing::writeGradientPng(
-            std::string(WALLPAPERX_TEST_IMAGE_DIR) + "/frame_import_gradient.png", 16, 16);
+            wallpaperx::testing::testImageDir() + "/frame_import_gradient.png", 16, 16);
 
         // Created BEFORE the GL context, because its UUID is what decides which GL device to
         // ask for. The other order forces a guess, and the guess is wrong on this machine.

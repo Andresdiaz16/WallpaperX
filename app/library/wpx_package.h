@@ -3,6 +3,7 @@
 #pragma once
 
 #include "audio_probe.h"
+#include "playback_speed.h"
 #include "unique_fd.h"
 
 #include <QByteArray>
@@ -30,6 +31,7 @@ struct WallpaperProperty {
     Q_PROPERTY(QVariant defaultValue MEMBER defaultValue CONSTANT)
     Q_PROPERTY(double minimum MEMBER minimum CONSTANT)
     Q_PROPERTY(double maximum MEMBER maximum CONSTANT)
+    Q_PROPERTY(QList<double> choices READ choices CONSTANT)
 
 public:
     enum class Type { Float, Bool, Color };
@@ -45,9 +47,12 @@ public:
 
     // The format's own name for `type`: "float", "bool" or "color".
     QString typeName() const;
-    // `value` as this property stores it, or nothing when it cannot hold it: a finite number in
-    // range for a float, a bool for a bool, "#rrggbb" for a color. A valid QColor is taken with its
-    // alpha dropped, since the format has none.
+    // The only values a float may take, when it has a fixed few: for "speed", the playback speeds
+    // inside its declared range. Empty for any other property.
+    QList<double> choices() const;
+    // `value` as this property stores it, or nothing when it cannot hold it: one of choices() for a
+    // float that has them, else a finite number in range for a float, a bool for a bool, "#rrggbb"
+    // for a color. A valid QColor is taken with its alpha dropped, since the format has none.
     std::optional<QVariant> accept(const QVariant& value) const;
 
     friend bool operator==(const WallpaperProperty&, const WallpaperProperty&) = default;
@@ -131,7 +136,6 @@ inline constexpr qint64 kMaxPreviewBytes = 32 << 20;
 // daemon_client.h: internal linkage keeps a copy from merging with a daemon variable of its name.
 constexpr qsizetype kMaxProperties = 64;
 constexpr qsizetype kMaxPropertyKeyBytes = 64;
-constexpr double kMaxPlaybackSpeed = 2.0;
 constexpr double kMaxVolume = 1.0;
 
 // The keys of a video's own sound: offered for every video with sound, declared or not, and

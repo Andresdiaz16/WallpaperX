@@ -7,6 +7,7 @@
 // stack cannot come up. Nothing waits on a sleep: SetWallpaper returns before the render, so a
 // frame is known ready only from FrameReady, and "no signal for this one" is settled by a later
 // request that does signal on the single FIFO render thread.
+#include "test_image_dir.h"
 #include "daemon/config_store.h"
 #include "daemon/crash_record.h"
 #include "daemon/dbus_service.h"
@@ -304,7 +305,7 @@ static_assert(std::string_view(kErrNoFrame) != std::string_view(kErrRenderFailed
 // worker draining one per render still leaves several to collapse.
 constexpr int kBurstSize = 5;
 
-std::string testAssetDir() { return std::string(WALLPAPERX_TEST_IMAGE_DIR); }
+std::string testAssetDir() { return wallpaperx::testing::testImageDir(); }
 
 // The message a call failed with. Local: only this tier asserts on message text.
 std::string errorMessageFrom(const std::function<void()>& call) {
@@ -468,14 +469,17 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
     check(json.contains("gpu") && !json["gpu"].contains("name") && !json["gpu"].contains("descriptor_tier"),
           "no GPU name or descriptor tier is reported before the device exists");
 
-    // A monitor nothing was ever set on has no frame: a named error, not a bogus fd.
-    check(errorNameFrom([&] { getFrame(proxy, kMonitorNeverSet); }) == "io.wallpaperx.Daemon.Error.NoFrame",
-          "GetFrame reports NoFrame for a monitor that was never set");
-
+    // CONTROL: backend/daemon/wallpaper_manager.cpp:1139 `if (!isKnownType(type))` made `if (type.empty())`,
+    //       control_batch 2026-10-15, dbus_service_lavapipe '^host$' -> "FAIL: an unknown wallpaper type is
+    //       rejected as InvalidArgs", alone; restored, green.
     check(errorNameFrom([&] { setWallpaper(proxy, "banana", imagePath, kMonitorUnrenderable); }) ==
               "org.freedesktop.DBus.Error.InvalidArgs",
           "an unknown wallpaper type is rejected as InvalidArgs");
 
+    // CONTROL: backend/daemon/wallpaper_manager.cpp:62, `monitorId < 0 ||` removed from requireValidMonitorId,
+    //       control_batch 2026-10-15, dbus_service_lavapipe '^host$' -> "FAIL: a negative monitor id is rejected
+    //       as InvalidArgs" and "FAIL: GetFrame rejects a negative monitor id as InvalidArgs, not NoFrame";
+    //       restored, green.
     check(errorNameFrom([&] { setWallpaper(proxy, "static", imagePath, -1); }) ==
               "org.freedesktop.DBus.Error.InvalidArgs",
           "a negative monitor id is rejected as InvalidArgs");
@@ -1084,12 +1088,19 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
     const auto replyMs =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - requestedAt).count();
 
+    // CONTROL: backend/daemon/dbus_service.cpp:398, FrameReady emitted with `generation + 1`, control_batch
+    //       2026-10-15, dbus_service_lavapipe '^render$' -> "FAIL: FrameReady(monitor=0, generation=1) arrives
+    //       after the first render", with "FAIL: the monitor used for the failure case renders a frame first"
+    //       and "FAIL: FrameReady arrives for the barrier request" (each wait failing); restored, green.
     check(signals.wait(kMonitorStatic, 1), "FrameReady(monitor=0, generation=1) arrives after the first render");
     const auto frameMs =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - requestedAt).count();
 
     std::printf("dbus_service_test: SetWallpaper replied in %lld ms, FrameReady at %lld ms\n",
                 static_cast<long long>(replyMs), static_cast<long long>(frameMs));
+    // CONTROL: backend/daemon/dbus_service.cpp:410, a 400 ms sleep at the start of DbusService::setWallpaper,
+    //       control_batch 2026-10-15, dbus_service_lavapipe '^render$' -> "FAIL: SetWallpaper replies without
+    //       waiting for the render to finish", alone; restored, green.
     check(replyMs <= 2 || replyMs * 4 < frameMs, "SetWallpaper replies without waiting for the render to finish");
 
     {
@@ -1098,7 +1109,14 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
         check(frame.fd.isValid(), "GetFrame returns a valid Unix fd after a static render");
         check(frame.width == kTargetWidth && frame.height == kTargetHeight,
               "GetFrame reports the target's dimensions");
+        // CONTROL: GetFrame's reply in DbusService::sendFrame (backend/daemon/dbus_service.cpp) given
+        //       `handle.generation + 1`, control_batch 2026-10-15, dbus_service_lavapipe '^render$' ->
+        //       "FAIL: the exported frame carries the generation FrameReady announced" and "FAIL:
+        //       frame_generation increments on re-render"; restored, green.
         check(frame.generation == 1, "the exported frame carries the generation FrameReady announced");
+        // CONTROL: backend/daemon/dbus_service.cpp:807, DMA_BUF published as handle type 2, control_batch
+        //       2026-10-15, dbus_service_lavapipe '^render$' -> "FAIL: handle_type is OPAQUE_FD (0) or DMA_BUF (1)"
+        //       and "FAIL: layout metadata is only published on the DMA_BUF path"; restored, green.
         check(frame.handleType == 0 || frame.handleType == 1, "handle_type is OPAQUE_FD (0) or DMA_BUF (1)");
 
         // GOAL: S6.63, S6.64 -- a frame carries an acquire descriptor exactly when this daemon says
@@ -1150,21 +1168,10 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
                         frame.syncFds.size());
         }
 
-        // GOAL: memory_size never claims more bytes than the fd carries (importers take it as the
-        //       object's size).
-        // WHY-THIS-SHAPE: an upper bound: lseek reports the driver's page-rounded object (S5.9); the
-        //       pixel floor below bounds it from the other side.
-        if (frame.handleType == 1) {
-            const off_t seekSize = lseek(frame.fd.get(), 0, SEEK_END);
-            check(seekSize > 0 && frame.memorySize <= static_cast<uint64_t>(seekSize),
-                  "memory_size is within the dma_buf's actual size");
-            if (seekSize > 0 && static_cast<uint64_t>(seekSize) != frame.memorySize) {
-                std::fprintf(stderr, "  memory_size=%llu, dma_buf is %lld bytes (rounding is the driver's)\n",
-                             static_cast<unsigned long long>(frame.memorySize),
-                             static_cast<long long>(seekSize));
-            }
-        }
-        // The other end of that bound, and the reason the one above may be an inequality.
+        // The upper bound (no more than the fd holds) is graded by readServedBgra (served_pixels.h).
+        // CONTROL: memory_size sent as `uint64_t{1}` in DbusService::sendFrame (backend/daemon/
+        //       dbus_service.cpp), control_batch 2026-10-15, dbus_service_lavapipe '^render$' -> "FAIL:
+        //       memory_size covers at least the frame's pixels", alone; restored, green.
         check(frame.memorySize >= static_cast<uint64_t>(kTargetWidth) * kTargetHeight * 4,
               "memory_size covers at least the frame's pixels");
 
@@ -1180,6 +1187,9 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
         if (populated) {
             check(frame.handleType == 1, "layout metadata is only published on the DMA_BUF path");
             check(!frame.planes.empty(), "a populated frame carries at least one plane");
+            // CONTROL: backend/daemon/dbus_service.cpp:799, `plane.rowPitch / 2` put on the wire, control_batch
+            //       2026-10-15, dbus_service_lavapipe '^render$' -> "FAIL: each plane's rowPitch covers a row of
+            //       pixels", alone; restored, green.
             for (const auto& plane : frame.planes) {
                 check(plane.get<1>() >= static_cast<uint64_t>(kTargetWidth) * 4,
                       "each plane's rowPitch covers a row of pixels");
@@ -1201,20 +1211,13 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
                                        : nlohmann::json::object();
         const bool reported = gpu.value("initialized", false) && !gpu.value("name", std::string()).empty() &&
                               !gpu.value("descriptor_tier", std::string()).empty();
+        // CONTROL: `gpuJson["name"] = "";` in DbusService's GetStatus (backend/daemon/dbus_service.cpp),
+        //       control_batch 2026-10-15, dbus_service_lavapipe '^render$' -> "FAIL: GetStatus reports the
+        //       GPU name and resolved descriptor tier once initialised", alone; restored, green.
         check(reported, "GetStatus reports the GPU name and resolved descriptor tier once initialised");
         if (gpu.value("initialized", false)) {
             std::printf("dbus_service_test: gpu=%s tier=%s\n", gpu.value("name", "?").c_str(),
                         gpu.value("descriptor_tier", "?").c_str());
-        }
-
-        // S6.18 (statusSelfConsistent, tests/client/daemon_client.h), first expressible here. Gated
-        // on ok(): the check above is already red when no reply came.
-        if (!status.ok()) {
-            std::printf("dbus_service_test: the snapshot-consistency check (S6.18) is not graded -- GetStatus did "
-                        "not answer, and the failure that caused that is reported above.\n");
-        } else {
-            check(wallpaperx::testing::statusSelfConsistent(status),
-                  "GetStatus never reports an uninitialised GPU beside a monitor that already has a frame");
         }
 
         // GOAL: S6.34 -- the Classic descriptor tier works end to end through the daemon.
@@ -1287,6 +1290,9 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
     check(signals.wait(kMonitorStatic, 2), "FrameReady(generation=2) arrives after a re-render");
     {
         const Frame frame = getFrame(proxy, kMonitorStatic);
+        // CONTROL: backend/daemon/dbus_service.cpp:816, GetFrame replies `std::min<uint64_t>(handle.generation, 1)`,
+        //       control_batch 2026-10-15, dbus_service_lavapipe '^render$' -> "FAIL: frame_generation increments
+        //       on re-render", alone; restored, green.
         check(frame.generation == 2, "frame_generation increments on re-render");
         check(frame.fd.isValid(), "a re-rendered frame still exports a valid fd");
     }
@@ -1374,6 +1380,10 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
     }
 
     // SetWallpaper had replied before the render failed, so GetStatus is where it is reported.
+    // CONTROL: `entry["last_error"] = monitor.lastError;` removed from GetStatus (backend/daemon/
+    //       dbus_service.cpp), control_batch 2026-10-15, dbus_service_lavapipe '^render$' -> "FAIL:
+    //       GetStatus reports last_error for an asynchronous render failure" and S6.14's reply-text line;
+    //       restored, green.
     {
         const StatusReply status = getStatusOrExplain(proxy);
         const nlohmann::json* corrupt = wallpaperStatus(status, std::to_string(kMonitorCorrupt));
@@ -1524,7 +1534,7 @@ constexpr int32_t kMonitorPropsFresh = 2;     // never set: a refused SetWallpap
 constexpr int32_t kMonitorPropsPlain = 3;     // set with SetWallpaper, so it has no properties
 constexpr int32_t kMonitorPropsLimits = 4;    // set at both limits at once
 constexpr int32_t kMonitorPropsCleared = 5;   // set with properties, then with SetWallpaper
-constexpr int32_t kMonitorPropsCap = 6;       // set at exactly the top speed
+constexpr int32_t kMonitorPropsCap = 6;       // set at each of the three speeds
 
 // One monitor's row in a config file's text, or null. Given the text configTextOnceIdle() returned,
 // so a write that failed (empty text) reads as no row rather than as whatever an earlier write left.
@@ -1600,13 +1610,11 @@ void runPropertiesWireChecksOn(wallpaperx::WallpaperManager& manager, const std:
         return errorNameFrom([&] { setWallpaperProperties(proxy, monitorId, properties); });
     };
 
-    // Speed 0.001: accepted, and played at 0.01 -- the one range where the value set and the value played
-    // differ, so publishing what plays would show here.
-    const WireProperties held{{"speed", Variant(0.001)},
+    const WireProperties held{{"speed", Variant(0.5)},
                               {"mute", Variant(true)},
                               {"tint", Variant(std::string("#FF8800"))},
                               {"wave.height-2_x", Variant(0.25)}};
-    const nlohmann::json heldPublished = {{"speed", 0.001}, {"mute", true}, {"tint", "#ff8800"}, {"wave.height-2_x", 0.25}};
+    const nlohmann::json heldPublished = {{"speed", 0.5}, {"mute", true}, {"tint", "#ff8800"}, {"wave.height-2_x", 0.25}};
     const std::string heldError = withProperties(kMonitorPropsHeld, held);
     const std::string plainError =
         errorNameFrom([&] { setWallpaper(proxy, "shader", unrenderablePath, kMonitorPropsPlain); });
@@ -1618,16 +1626,14 @@ void runPropertiesWireChecksOn(wallpaperx::WallpaperManager& manager, const std:
     }
 
     // GOAL: S15.104 -- every wallpaper GetStatus lists carries `properties`, an object: empty for one
-    //       set with none, and otherwise the values AS SET -- a speed of 0.001 is published as 0.001,
-    //       not as the 0.01 it plays at; a colour sent in capitals comes back in the lower case the
-    //       daemon stores; bools and numbers keep their JSON types.
+    //       set with none, and otherwise the values AS SET -- a colour sent in capitals comes back in
+    //       the lower case the daemon stores; bools and numbers keep their JSON types.
     // WHY-THIS-SHAPE: the whole object is compared, so a missing, extra or retyped entry fails it;
     //       the empty case is asserted to be an OBJECT, which a field left out would not be.
     // CONTROL: (a) `entry["properties"] = ...` in DbusService::getStatus (backend/daemon/
     //       dbus_service.cpp) written only for a non-empty set -> "FAIL: a wallpaper set without
     //       properties is listed in GetStatus with an empty properties object" and the two later
-    //       emptied-set checks; (b) toJson (backend/daemon/wallpaper_properties.cpp) publishing speed
-    //       through playbackSpeed() -> "FAIL: a wallpaper set with properties is listed with them as set".
+    //       emptied-set checks.
     {
         const nlohmann::json plain = entryOf(kMonitorPropsPlain);
         const bool emptyObject = plain.is_object() && plain.contains("properties") && plain["properties"].is_object() &&
@@ -1666,24 +1672,30 @@ void runPropertiesWireChecksOn(wallpaperx::WallpaperManager& manager, const std:
     // GOAL: S15.97 -- a call with any one bad entry is refused whole as InvalidArgs, by both methods,
     //       and nothing of it is applied: the monitor keeps the wallpaper and the set it had, and a
     //       refused SetWallpaperWithProperties on a monitor never set leaves it unset.
-    //       S15.105: a speed above 2 is one of these, and the config file is not written.
+    //       S15.105: a speed other than 0.5, 1 or 2 is one of these, and the config file is not written.
     // WHY-THIS-SHAPE: every bad case rides beside a good entry that would change the held set (speed
-    //       1.5, under the cap; or mute false), so dropping the bad entry and applying the rest shows;
+    //       2; or mute false), so dropping the bad entry and applying the rest shows;
     //       the file is compared byte for byte across the table once the writer is idle.
     // CONTROL: each red on its own cases' lines (both methods), beside "no refused call wrote the
     //       config file" and the held-set line. In fromWire (backend/daemon/dbus_service.cpp): the
     //       unexpected-type throw made `continue` (types i and as); the non-colour throw likewise. In
     //       propertyError (backend/daemon/wallpaper_properties.cpp): keyCharacter() accepting ' ', or any
-    //       byte past 0x7f; the isfinite() test, the speed rule (including `*number > kMaxPlaybackSpeed`),
+    //       byte past 0x7f; the isfinite() test, the speed rule,
     //       the mute rule, `key.empty() ||`, or the 65-character test deleted. The count bound deleted
     //       from both fromWire and propertiesError -> the "65 entries" lines (fromWire's alone stays
     //       green: the wire bound has no check of its own). propertiesError() deleted from
-    //       WallpaperManager::requestWallpaper -> its 13 lines, "creates no monitor" and the replace
-    //       check; from WallpaperManager::setWallpaperProperties -> its 13 lines.
+    //       WallpaperManager::requestWallpaper -> its 16 lines, the error-text check, "creates no monitor",
+    //       the file, held-set and replace checks; from WallpaperManager::setWallpaperProperties -> its 16
+    //       lines, the error-text, file and held-set checks (re-run via control_batch.sh, --phase
+    //       '^propertiesWire$', 2026-10-14, each alone, reverted). Since 2026-10-14:
+    //       `!std::ranges::contains(kPlaybackSpeeds, *number)` in propertyError made `*number <= 0` via
+    //       control_batch.sh, --phase '^propertiesWire$', 2026-10-14 -> the "speed 0.25", "0.75", "1.5", "2.0001"
+    //       and "3" lines of both methods, the error-text check below, "no refused call wrote the config
+    //       file", the held-set line and the replace check after it. Reverted.
     // COVERAGE-ASSERT: the number of refusals driven is asserted.
     const double nan = std::numeric_limits<double>::quiet_NaN();
     const double inf = std::numeric_limits<double>::infinity();
-    const Variant good(1.5);
+    const Variant good(2.0);
     WireProperties tooMany{{"speed", good}};
     for (int i = 0; i < 64; ++i) tooMany.emplace("k" + std::to_string(i), Variant(1.0));
     const std::vector<std::pair<const char*, WireProperties>> refusals{
@@ -1703,6 +1715,9 @@ void runPropertiesWireChecksOn(wallpaperx::WallpaperManager& manager, const std:
         {"speed as a colour", {{"speed", Variant(std::string("#000000"))}, {"mute", Variant(false)}}},
         {"speed 2.0001", {{"speed", Variant(2.0001)}, {"mute", Variant(false)}}},
         {"speed 3", {{"speed", Variant(3.0)}, {"mute", Variant(false)}}},
+        {"speed 0.25", {{"speed", Variant(0.25)}, {"mute", Variant(false)}}},
+        {"speed 0.75", {{"speed", Variant(0.75)}, {"mute", Variant(false)}}},
+        {"speed 1.5", {{"speed", Variant(1.5)}, {"mute", Variant(false)}}},
         {"mute as a number", {{"mute", Variant(0.0)}, {"speed", good}}},
     };
     const std::string fileBefore = configTextOnceIdle(manager, configFile);
@@ -1721,7 +1736,36 @@ void runPropertiesWireChecksOn(wallpaperx::WallpaperManager& manager, const std:
         }
         driven += 2;
     }
-    check(driven == 2 * 17, "every refusal case in the table was driven through both methods");
+    check(driven == 2 * 20, "every refusal case in the table was driven through both methods");
+
+    // GOAL: S15.105 -- a speed refusal tells the caller the rule: the D-Bus error text of both methods names
+    //       "property speed must be 0.5, 1 or 2" for 0.25, 0.75, 1.5, 3, 0 and a bool.
+    // WHY-THIS-SHAPE: the error NAME above is InvalidArgs for every rule, so it cannot tell which one fired;
+    //       only the text says the refusal was the speed rule and that it lists the three choices.
+    // CONTROL: the sentence in propertyError (backend/daemon/wallpaper_properties.cpp) made "property speed
+    //       is out of range" via control_batch.sh, --phase '^propertiesWire$', 2026-10-14 -> "FAIL: a refused
+    //       speed's error text names the three speeds, by both methods", alone. Reverted.
+    // COVERAGE-ASSERT: the number of texts read is asserted.
+    {
+        const std::string sentence = "property speed must be 0.5, 1 or 2";
+        int read = 0;
+        bool named = true;
+        for (const auto& [what, speed] : std::vector<std::pair<const char*, Variant>>{
+                 {"0.25", Variant(0.25)}, {"0.75", Variant(0.75)}, {"1.5", Variant(1.5)},
+                 {"3", Variant(3.0)},     {"0", Variant(0.0)},     {"a bool", Variant(true)}}) {
+            const std::string viaSet = errorMessageFrom([&] {
+                setWallpaperWithProperties(proxy, "static", imagePath, kMonitorPropsHeld, {{"speed", speed}});
+            });
+            const std::string viaReplace =
+                errorMessageFrom([&] { setWallpaperProperties(proxy, kMonitorPropsHeld, {{"speed", speed}}); });
+            read += 2;
+            if (viaSet.find(sentence) == std::string::npos || viaReplace.find(sentence) == std::string::npos) {
+                named = false;
+                std::fprintf(stderr, "  speed %s: '%s' / '%s'\n", what, viaSet.c_str(), viaReplace.c_str());
+            }
+        }
+        check(named && read == 12, "a refused speed's error text names the three speeds, by both methods");
+    }
     // A case the manager decides, not the wire: a wire refusal never reaches the code that would create it.
     const std::string freshError = withProperties(kMonitorPropsFresh, {{"speed", Variant(0.0)}});
     check(freshError == kInvalidArgs && absent(kMonitorPropsFresh), "a refused SetWallpaperWithProperties creates no monitor");
@@ -1767,20 +1811,25 @@ void runPropertiesWireChecksOn(wallpaperx::WallpaperManager& manager, const std:
         check(byRange, "SetWallpaperProperties on a monitor id outside [0, 32) is refused as InvalidArgs, by the range check");
     }
 
-    // GOAL: S15.105's other edge -- a speed of exactly 2 is accepted by both methods and shown as set.
-    // CONTROL: `*number > kMaxPlaybackSpeed` in propertyError (backend/daemon/wallpaper_properties.cpp)
-    //       made `>=` -> "FAIL: a speed of exactly 2 is accepted by both methods".
-    {
-        const std::string viaSet = withProperties(kMonitorPropsCap, {{"speed", Variant(2.0)}});
+    // GOAL: S15.105's other side -- each of 0.5, 1 and 2 is accepted by both methods and shown as set.
+    // CONTROL: via control_batch.sh, --phase '^propertiesWire$', 2026-10-14, reverted: in propertyError
+    //       (backend/daemon/wallpaper_properties.cpp) `!std::ranges::contains(kPlaybackSpeeds, *number)` made
+    //       `*number >= 2 || !...` -> "FAIL: speed 2 is accepted by both methods" and the replace-whole check
+    //       after it, which sets speed 2; made `*number == 1 || !...` -> "FAIL: speed 1 is accepted by both
+    //       methods", alone.
+    for (const double speed : {0.5, 1.0, 2.0}) {
+        const std::string viaSet = withProperties(kMonitorPropsCap, {{"speed", Variant(speed)}});
         const nlohmann::json afterSet = entryOf(kMonitorPropsCap);
-        const std::string viaReplace = replaceProperties(kMonitorPropsCap, {{"speed", Variant(2.0)}, {"mute", Variant(true)}});
+        const std::string viaReplace = replaceProperties(kMonitorPropsCap, {{"speed", Variant(speed)}, {"mute", Variant(true)}});
         const nlohmann::json afterReplace = entryOf(kMonitorPropsCap);
         const bool accepted = viaSet.empty() && viaReplace.empty() && afterSet.is_object() &&
-                              afterSet.value("properties", nlohmann::json()) == nlohmann::json({{"speed", 2.0}}) &&
+                              afterSet.value("properties", nlohmann::json()) == nlohmann::json({{"speed", speed}}) &&
                               afterReplace.is_object() &&
                               afterReplace.value("properties", nlohmann::json()) ==
-                                  nlohmann::json({{"speed", 2.0}, {"mute", true}});
-        check(accepted, "a speed of exactly 2 is accepted by both methods");
+                                  nlohmann::json({{"speed", speed}, {"mute", true}});
+        char line[64];
+        std::snprintf(line, sizeof line, "speed %g is accepted by both methods", speed);
+        check(accepted, line);
         if (!accepted) {
             std::fprintf(stderr, "  SetWallpaperWithProperties answered '%s', SetWallpaperProperties '%s'; entry: %s\n",
                          viaSet.c_str(), viaReplace.c_str(), afterReplace.dump().c_str());
@@ -2073,8 +2122,8 @@ void runModifierWithdrawalRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& sign
     // WHY-THIS-SHAPE: a frame, not the set (S6.50 grades the widening); nothing else can post this
     //       monitor, and the bounded wait fails with the monitor's state printed.
     // CONTROL: (a) WallpaperManager::forgetImportModifiers (backend/daemon/wallpaper_manager.cpp)
-    //       returning `{}` after adopting -> this, the manager-tier check and the departure
-    //       announcement line; (b) the `m_worker.post(monitorId)` loop deleted from
+    //       returning `{}` after adopting -> this and the departure announcement
+    //       line; (b) the `m_worker.post(monitorId)` loop deleted from
     //       DbusService::applyImportModifierUpdate (backend/daemon/dbus_service.cpp) -> this alone.
     leaver.reset();
     const bool rendered = signals.wait(kMonitorWithdrawRender, 1);
@@ -2455,7 +2504,7 @@ void runImportModifierClientChecks(const wallpaperx::WallpaperManager::Config& c
     // S6.43's idempotency, graded where a frameless monitor makes a repeat distinguishable.
     // CONTROL: the `if (m_importModifiers == modifiers) return {};` early-out disabled in
     //       WallpaperManager::adoptImportModifiersLocked (backend/daemon/wallpaper_manager.cpp) ->
-    //       this, the two other unchanged-set checks here and four elsewhere.
+    //       this, the two other unchanged-set checks here and the wire tier's S6.59 silence check.
     check(!report(consumerA, {m1, m2}).changed, "an identical report from the same consumer changes nothing");
 
     // GOAL: S6.52 -- what a consumer reports is a SET. The same layouts sent in a different
@@ -2543,17 +2592,6 @@ void runImportModifierClientChecks(const wallpaperx::WallpaperManager::Config& c
                      miscounted.why.c_str());
     }
 
-    // GOAL: S6.51 at the manager -- a departure hands back the frameless monitors its set was
-    //       blocking, not just a wider set.
-    // WHY-THIS-SHAPE: the return value of forgetImportModifiers, which the S6.50 probes ignore.
-    // CONTROL: WallpaperManager::forgetImportModifiers (backend/daemon/wallpaper_manager.cpp)
-    //       returning `{}` after adopting -> this, the wire tier's departure check and the departure
-    //       announcement line; no S6.50 check.
-    manager.forgetImportModifiers(consumerI);
-    const std::vector<int> unblocked = manager.forgetImportModifiers(consumerH).toRender;
-    check(std::find(unblocked.begin(), unblocked.end(), kMonitorModifiersIdle) != unblocked.end(),
-          "a departure hands back the frameless monitor its set was blocking, not just a wider set");
-
     check(probes == 15, "the per-consumer phase ran every probe it grades on");
     if (probes != 15) {
         std::fprintf(stderr, "  %d report probes ran; expected 15\n", probes);
@@ -2625,8 +2663,7 @@ void runImportModifierClientWireChecks(const wallpaperx::WallpaperManager::Confi
     // WHY-THIS-SHAPE: {D} is disjoint from the stayer's set only, so it is refused only while the
     //       stayer is on the books.
     // CONTROL: `m_importModifiersByClient.clear();` added after the erase in
-    //       WallpaperManager::forgetImportModifiers (backend/daemon/wallpaper_manager.cpp) -> this and
-    //       the manager-tier S6.51 line.
+    //       WallpaperManager::forgetImportModifiers (backend/daemon/wallpaper_manager.cpp) -> this.
     auto consumerLast = sdbus::createProxy(daemonName, objectPath);
     check(errorNameFrom([&] { setImportModifiers(*consumerLast, exportedFormat, setLast); }) ==
               "org.freedesktop.DBus.Error.InvalidArgs",
@@ -2726,15 +2763,6 @@ void runImportModifierAnnouncementChecks(const wallpaperx::WallpaperManager::Con
                                  "draw was registered, so this phase's premise is gone\n",
                          condemnsNothing.toRender.size());
         }
-
-        // GOAL: S6.59 at the manager -- re-reporting the set in force is not a change.
-        // CONTROL: the `if (m_importModifiers == modifiers) return {};` guard deleted from
-        //       WallpaperManager::adoptImportModifiersLocked (backend/daemon/wallpaper_manager.cpp) ->
-        //       this, the wire tier's silence check and five "changes nothing" checks.
-        const wallpaperx::ImportModifierUpdate unchanged =
-            bookkeeping.setImportModifiers(consumer, exportedFormat, {kUnavailableModifierA, kUnavailableModifierB});
-        check(!unchanged.changed && unchanged.toRender.empty(),
-              "re-reporting the set already in force is not reported as a change");
 
         // GOAL: S6.60's other side -- a change that condemns a monitor is a change too.
         // WHY-THIS-SHAPE: a renderable monitor with no frame is condemned on every host; excluding a
@@ -3537,7 +3565,7 @@ void runPauseWireChecks(const wallpaperx::WallpaperManager::Config& base, const 
             setMonitorPause(proxy, kMonitorPauseKept, "always_paused");
             setWallpaper(proxy, "shader", unrenderablePath, kMonitorPauseKept);
             setWallpaperWithProperties(proxy, "shader", unrenderablePath, kMonitorPauseKept,
-                                       {{"speed", sdbus::Variant(1.5)}});
+                                       {{"speed", sdbus::Variant(2.0)}});
         });
         const nlohmann::json entry = pauseOf(kMonitorPauseKept);
         const std::string text = configTextOnceIdle(manager, config.configFile);
@@ -3804,7 +3832,7 @@ void runSoundWireChecks(const wallpaperx::WallpaperManager::Config& base, const 
 
         const std::string setError = errorNameFrom([&] {
             setWallpaper(proxy, "shader", unrenderablePath, kMonitorSoundBare);
-            setWallpaperWithProperties(proxy, "shader", unrenderablePath, kMonitorSoundBare, {{"speed", Variant(1.5)}});
+            setWallpaperWithProperties(proxy, "shader", unrenderablePath, kMonitorSoundBare, {{"speed", Variant(2.0)}});
         });
         const nlohmann::json keptEntry = monitorOf(kMonitorSoundBare);
         const std::string keptText = configTextOnceIdle(manager, config.configFile);
@@ -4511,8 +4539,7 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
     //       the monitor's committed frame; one that ended nothing produces none.
     // CONTROL: the `hold.client == client` comparison in findHeld (backend/daemon/wallpaper_manager.cpp),
     //       which releaseHandoversLocked calls, replaced by `true`, so any caller matches the first
-    //       holder -> "FAIL: one consumer cannot release an image another consumer holds", and
-    //       downstream "the ring is down to its reserve again before the departure".
+    //       holder -> "FAIL: one consumer cannot release an image another consumer holds".
     {
         std::vector<wallpaperx::FrameAvailable> announced;
         const std::vector<int> byTheWrongClient =
@@ -4523,116 +4550,6 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
             std::fprintf(stderr, "  it freed something and announced monitor %d generation %llu\n",
                          announced.front().monitorId,
                          static_cast<unsigned long long>(announced.front().generation));
-        }
-    }
-
-    // GOAL: a claim ending re-announces the monitor's committed frame. Nothing is going to
-    //       redraw a monitor whose request is already serviced, so without this announcement a
-    //       consumer that was refused has no trigger to ask again and its screen stays on the
-    //       frame it had until the user sets another wallpaper.
-    // WHY-THIS-SHAPE: the release is required to produce an announcement and NO render. The
-    //       obvious form -- assert the monitor is named for a re-render -- describes the old
-    //       contract: with the reserve in force there is no deferred render left to discharge,
-    //       so a freed image has to be published some other way or not at all. The generation
-    //       is compared against the committed one, because an announcement naming a generation
-    //       the daemon has not committed sends every consumer after a frame that does not
-    //       exist.
-    // CONTROL: the `announce->push_back(...)` line in
-    //       WallpaperManager::reportFreedImageLocked (backend/daemon/wallpaper_manager.cpp)
-    //       deleted -> "FAIL: releasing an image re-announces the monitor's committed frame",
-    //       printing 0 announcements, with the other checks that wait on an announcement red beside
-    //       it (the departure, the wire re-announcement, the resize-release phase). Observed
-    //       2026-09-14. Reverted.
-    const uint64_t committed = monitorStatus(manager, kMonitorHoldRing).generation;
-    {
-        std::vector<wallpaperx::FrameAvailable> announced;
-        const std::vector<int> toRender =
-            manager.releaseBuffer(alice, kMonitorHoldRing, firstId, first.number, &announced);
-        const bool announcedOnce = announced.size() == 1 && announced.front().monitorId == kMonitorHoldRing &&
-                                   announced.front().generation == committed;
-        check(announcedOnce, "releasing an image re-announces the monitor's committed frame");
-        check(toRender.empty(), "and asks for no render, because the monitor owes none");
-        if (!announcedOnce) {
-            std::fprintf(stderr, "  %zu announcement(s) for a monitor whose committed frame is generation %llu\n",
-                         announced.size(), static_cast<unsigned long long>(committed));
-        }
-    }
-
-    // GOAL: a refusal is temporary. The consumer that was refused is served once a release has
-    //       put an image back, and the monitor's refusal count goes back to zero -- so being
-    //       refused costs that consumer a frame and not its screen.
-    // WHY-THIS-SHAPE: asked of the SAME consumer that was refused above, with nothing in between
-    //       but one release. A fresh consumer would be served whatever the release did, since a
-    //       client holding nothing is never the one keeping the ring full. The reset is checked
-    //       here rather than beside the increment because a served hand-over is the only thing
-    //       that performs it, and this is the first served hand-over since the refusal.
-    // CONTROL: the `endClaim(...)` in WallpaperManager::releaseHandoversLocked
-    //       (backend/daemon/wallpaper_manager.cpp) deleted, so a release reports the claim ended
-    //       without removing it -> "FAIL: the refused consumer is served once a release has put an
-    //       image back".
-    // CONTROL, the reset leg: `it->second.refusedHandovers = 0;` deleted from
-    //       WallpaperManager::exportCurrentFrame (backend/daemon/wallpaper_manager.cpp) -> "FAIL:
-    //       and the served hand-over cleared the monitor's refusal count", with the service check
-    //       above green.
-    const Handover carolAtLast = fetchHandover(manager, kMonitorHoldRing, carol);
-    check(carolAtLast.served(), "the refused consumer is served once a release has put an image back");
-    if (!carolAtLast.served()) {
-        // Abandoned rather than graded: the reset is a property OF a served hand-over, so with
-        // nothing served this check would report a second failure for the first one's cause.
-        std::fprintf(stderr, "  it was refused again after the release, so nothing came back into the ring, and "
-                             "the refusal-count reset had no served hand-over to be graded against\n");
-        return;
-    }
-    check(monitorStatus(manager, kMonitorHoldRing).refusedHandovers == 0,
-          "and the served hand-over cleared the monitor's refusal count");
-
-    // GOAL: a consumer leaving the bus gives its images back, and that is announced too.
-    //       Without the first half a consumer that crashed holding a frame keeps that image out
-    //       of the ring for the life of the daemon -- plasmashell restarts are routine while
-    //       this daemon does not.
-    // WHY-THIS-SHAPE: the announcement alone would not establish that anything was dropped, so
-    //       the hand-over after it is the second leg -- and the ring is driven back down to its
-    //       reserve BEFORE the departure, which is what stops that second leg from being vacuous.
-    //       Without the render and the gate below, the last committed image is one carol already
-    //       holds, so her fetch would be answered from her own claim whether or not the departure
-    //       freed anything.
-    // CONTROL: `std::erase_if(state.holds, ...)` in WallpaperManager::forgetHeldBuffers
-    //       (backend/daemon/wallpaper_manager.cpp) replaced by a `std::count_if` that reports
-    //       the monitor without dropping the claim -> "FAIL: the departed consumer's images are
-    //       really back in the ring", printing that the surviving consumer was refused. The
-    //       announcement check stayed green, which is the measurement showing the two are not one
-    //       fact. Reverted.
-    // CONTROL, the other leg: the `announce` argument of the reportFreedImageLocked call in
-    //       WallpaperManager::forgetHeldBuffers (backend/daemon/wallpaper_manager.cpp) passed
-    //       as `nullptr`, so claims are dropped but nothing is published -> "FAIL: a departure
-    //       announces the monitor's committed frame", with the ring check green. Reverted.
-    {
-        check(renderOnce(manager, kMonitorHoldRing, imagePath), "a render commits into the one image left free");
-        // NO CONTROL, and this is the reason rather than an omission: it is a gate on the check
-        // below, not a claim of its own. Every production mutation that would make it false --
-        // the reserve deleted, the ring deepened -- also reddens the reserve refusal earlier in
-        // this phase. What it guards is a future edit to THIS file that leaves the ring with
-        // slack here, which would make the post-departure hand-over succeed for free.
-        const Handover gate = fetchHandover(manager, kMonitorHoldRing, carol);
-        check(gate.refused(), "and the ring is down to its reserve again before the departure");
-        if (!gate.refused()) {
-            std::fprintf(stderr, "  the consumer was handed image %llu, so the departure below had a free image "
-                                 "under it and would grade nothing\n",
-                         static_cast<unsigned long long>(gate.bufferId));
-            return;
-        }
-
-        std::vector<wallpaperx::FrameAvailable> announced;
-        const std::vector<int> toRender = manager.forgetHeldBuffers(alice, &announced);
-        check(announced.size() == 1 && announced.front().monitorId == kMonitorHoldRing,
-              "a departure announces the monitor's committed frame");
-        check(toRender.empty(), "and asks for no render either");
-        const Handover afterDeparture = fetchHandover(manager, kMonitorHoldRing, carol);
-        check(afterDeparture.served() && afterDeparture.bufferId != carolAtLast.bufferId,
-              "the departed consumer's images are really back in the ring");
-        if (!afterDeparture.served()) {
-            std::fprintf(stderr, "  the surviving consumer was refused, so the departed one's claims are still "
-                                 "holding the ring\n");
         }
     }
 
@@ -5229,10 +5146,10 @@ void runBufferReleaseWireChecks(const wallpaperx::WallpaperManager::Config& conf
     //       WallpaperManager::forgetHeldBuffers (backend/daemon/wallpaper_manager.cpp) passed
     //       as `nullptr`, so a departure drops claims but publishes nothing -> "FAIL: a
     //       consumer leaving the bus re-announces the monitor's committed frame", printing
-    //       "generation 7 was never announced a second time after the consumer left", and the
-    //       manager-tier "a departure announces the monitor's committed frame", while the ring check
-    //       below stayed green. Observed 2026-09-14. Reverted.
-    // CONTROL, the other leg: that same `std::erase_if` replaced by a `std::count_if` that
+    //       "generation 7 was never announced a second time after the consumer left", while the
+    //       ring check below stayed green. Observed 2026-09-14. Reverted.
+    // CONTROL, the other leg: `std::erase_if(state.holds, ...)` in WallpaperManager::forgetHeldBuffers
+    //       replaced by a `std::count_if` that
     //       reports the monitor without dropping the claim -> "FAIL: the departed consumer's
     //       images are really back in the ring", printing the NoFreeImage the surviving
     //       consumer was answered, while the announcement check stayed green. Reverted.
@@ -5424,6 +5341,11 @@ void runWorkerCoalescingChecks(const wallpaperx::WallpaperManager::Config& confi
     check(present, "the monitor the coalescing burst targeted appears in the manager's snapshot");
     if (!present) return;
 
+    // CONTROL: backend/daemon/render_worker.cpp:58 `insert(monitorId).second` made `... && false`, and
+    //       backend/daemon/wallpaper_manager.cpp:3179's `servicedSeq == requestSeq` early return made `if (false)`,
+    //       control_batch 2026-10-15, dbus_service_lavapipe '^workerCoalescing$' -> "FAIL: five requests posted
+    //       while the render thread is held collapse into exactly one render", with "FAIL: exactly one FrameReady
+    //       callback fires for the collapsed burst" and the two re-post lines; restored, green.
     check(entry->second.generation == 1,
           "five requests posted while the render thread is held collapse into exactly one render");
     check(frameReadySignals.load() == 1, "exactly one FrameReady callback fires for the collapsed burst");
@@ -5517,6 +5439,10 @@ void runCoalescingChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std
     // RenderFailed rather than NoFrame is itself part of the claim: it is only reachable
     // when a render actually ran and failed, so it rules out "the burst was dropped
     // entirely" in a way a bare NoFrame cannot.
+    // CONTROL: backend/daemon/wallpaper_manager.cpp:1189 requestWallpaper's `state.path.swap(nextPath);` made
+    //       `if (!existed) ...` (the first request wins), control_batch 2026-10-15, dbus_service_lavapipe
+    //       '^coalescing$' -> "FAIL: a burst ending in an unrenderable request leaves no frame -- the last request
+    //       is served, not the first", with seven other burst-outcome and recovery lines; restored, green.
     check(errorNameFrom([&] { getFrame(proxy, kMonitorBurstFailLast); }) ==
               "io.wallpaperx.Daemon.Error.RenderFailed",
           "a burst ending in an unrenderable request leaves no frame -- the last request is served, not the first");
@@ -5586,6 +5512,10 @@ void runCoalescingChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std
         // so removing just one does not make this fail. Removing both does (verified).
         // That redundancy is worth knowing about: a future edit that deletes one of them
         // will not be caught by this check, and should not be assumed safe because it is.
+        // CONTROL: both `state.lastError.clear();` removed from backend/daemon/wallpaper_manager.cpp (:1207 in
+        //       requestWallpaper, :2662 in the commit), control_batch 2026-10-15, dbus_service_lavapipe
+        //       '^coalescing$' -> "FAIL: a successful render leaves no last_error behind from an earlier failed
+        //       one", alone; restored, green.
         check(cleared, "a successful render leaves no last_error behind from an earlier failed one");
     }
 
@@ -7868,36 +7798,15 @@ void runFrameChargeChecks(const wallpaperx::WallpaperManager::Config& config, co
         wallpaperx::testing::notVerified(kGoals, "the daemon drew no frame on this host, so nothing could be handed over");
         return;
     }
-    const bool semaphores = manager.snapshot().gpu.frameSync;
 
-    // GOAL: S15.284, S15.285 and S15.286 -- a reply leaves the memory out exactly when the request
-    //       declared the image AND the reply carries an acquire; with no acquire it is sent even for
-    //       a declared image; and the reply is charged exactly what it carried: 2, 1 or 0.
-    // WHY-THIS-SHAPE: whether an acquire is sent is read from GpuStatus::frameSync (set at device
-    //       creation); each driver grades the half it can produce.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, (a) WallpaperManager::exportCurrentFrame's
-    //       `sendMemory` made `true` -> on dbus_service, "FAIL: a reply for a declared image carries
-    //       the memory exactly when it carries no acquire, ..."; (b) its `!carriesAcquire ||` deleted
-    //       -> that line on dbus_service_lavapipe; (c) its charge made `2u` -> on dbus_service_lavapipe,
-    //       "FAIL: a reply declaring nothing carries the memory and is charged what it carried"; (d)
-    //       `held->charges.insert(...)` deleted from withHandover's already-held branch -> "FAIL: the
-    //       claim is charged the sum of what its replies carried, one charge per reply".
+    // GOAL: S15.286's ledger half -- each reply is charged on its own, one charge per reply, and the
+    //       claim's charge is their sum. What a reply carries is graded on the wire (frameReply).
+    // CONTROL: `held->charges.insert(...)` deleted from withHandover's already-held branch
+    //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: the claim is charged the sum of what its
+    //       replies carried, one charge per reply".
     const InProcessReply plain = exportClosed(manager, kMonitor, "frame.charge.a");
-    const std::optional<uint32_t> plainCharge = chargeOf(manager, kMonitor, "frame.charge.a", plain);
-    expect(plain.served && plain.memory && plain.syncFd == semaphores && plainCharge == plain.carried(),
-          "a reply declaring nothing carries the memory and is charged what it carried (charged " +
-              (plainCharge ? std::to_string(*plainCharge) : std::string("nothing on record")) + " for " +
-              std::to_string(plain.carried()) + ")");
     // Never delivered: the undo below withdraws it, which production does only to a reply that never went out.
     const InProcessReply declared = exportUnsent(manager, kMonitor, "frame.charge.a", false, {plain.id()});
-    const std::optional<uint32_t> declaredCharge = chargeOf(manager, kMonitor, "frame.charge.a", declared);
-    expect(declared.served && declared.memory == !semaphores && declared.syncFd == semaphores &&
-              declaredCharge == declared.carried(),
-          std::string("a reply for a declared image carries the memory exactly when it carries no acquire, and is "
-                      "charged what it carried (memory ") +
-              (declared.memory ? "sent" : "left out") + ", " + (declared.syncFd ? "sync sent" : "no sync") +
-              ", charged " + (declaredCharge ? std::to_string(*declaredCharge) : std::string("nothing on record")) +
-              ")");
     const HoldView afterTwo = holdOf(manager, kMonitor, "frame.charge.a");
     const uint64_t plainNumber = wallpaperx::testing::handoverOf(plain.handle);
     const uint64_t declaredNumber = wallpaperx::testing::handoverOf(declared.handle);

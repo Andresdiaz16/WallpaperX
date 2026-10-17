@@ -134,7 +134,9 @@ int main(int argc, char** argv) {
     // CONTROL: observed 2026-10-01 on scratch copies of renderer/tests/support/isolated_run.sh.
     //       Both unshare steps and the wrapper's own namespace check removed -> "FAIL: this entry's
     //       network namespace is not the caller's". `ip link set lo up` replaced by `true` -> "FAIL:
-    //       127.0.0.1 accepts a connection inside the entry's network".
+    //       127.0.0.1 accepts a connection inside the entry's network". 2026-10-15, scratch copy:
+    //       `export WALLPAPERX_CALLER_NET_NS=""` -> "FAIL: the wrapper recorded the caller's network
+    //       namespace", alone; the unmodified wrapper green.
     const std::string callerNet = env("WALLPAPERX_CALLER_NET_NS");
     std::error_code netError;
     const std::string ownNet = std::filesystem::read_symlink("/proc/self/ns/net", netError).string();
@@ -218,7 +220,11 @@ int main(int argc, char** argv) {
     //       from its `unset`, caller WAYLAND_DISPLAY=wayland-0 -> "FAIL: WAYLAND_DISPLAY is unset in
     //       an entry with no display of its own". Display mode, the nested KWin started on the
     //       caller's runtime directory and named by absolute path -> "FAIL: the Wayland socket is
-    //       the nested compositor's, inside the private runtime directory".
+    //       the nested compositor's, inside the private runtime directory". 2026-10-15, scratch
+    //       copies of renderer/tests/support/isolated_run.sh: WAYLAND_SOCKET dropped from its `unset`,
+    //       caller WAYLAND_SOCKET=99 -> "FAIL: WAYLAND_SOCKET is unset", alone (the unmodified wrapper
+    //       green with the same caller); display mode, `export WAYLAND_DISPLAY="$socket-gone"` ->
+    //       "FAIL: WAYLAND_DISPLAY names a socket that exists".
     check(env("DISPLAY").empty(), "DISPLAY is unset, so no X server of the caller's is reachable");
     check(std::getenv("WAYLAND_SOCKET") == nullptr, "WAYLAND_SOCKET is unset");
     const std::string wayland = env("WAYLAND_DISPLAY");
@@ -258,6 +264,10 @@ int main(int argc, char** argv) {
     //       one inert .service file -> "FAIL: nothing can be activated on this entry's bus", listing
     //       org.wallpaperx.InertControlService. A scratch isolated_run.sh keeping the caller's
     //       DBUS_SESSION_BUS_ADDRESS (a private bus standing in) -> "FAIL: the entry's bus is not the caller's".
+    //       2026-10-15, scratch copies: the test run under `env -u DBUS_SESSION_BUS_ADDRESS` inside
+    //       private_bus.sh -> "FAIL: DBUS_SESSION_BUS_ADDRESS is set, ..." and "...private bus answers";
+    //       under `env DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/...` -> "FAIL: the entry's
+    //       private bus answers", alone.
     const std::string bus = env("DBUS_SESSION_BUS_ADDRESS");
     check(!bus.empty(), "DBUS_SESSION_BUS_ADDRESS is set, so no client goes looking for a bus of its own");
     check(bus.empty() || (bus != callerBus && bus.find(accountRuntime + "/") == std::string::npos &&

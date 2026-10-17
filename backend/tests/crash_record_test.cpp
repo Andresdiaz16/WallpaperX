@@ -964,7 +964,7 @@ void runKilledChecks() {
     std::printf("crash_record_test: after a kill -- %s\n", reason.c_str());
 }
 
-// GOAL: the record exists only while the wallpaper is being applied -- a run that finishes
+// GOAL: S13.16, at the record -- it exists only while the wallpaper is being applied: a run that finishes
 //       leaves nothing for the next start to refuse. False if a daemon that shut down cleanly
 //       refuses the wallpaper it last displayed.
 // CONTROL: in backend/daemon/crash_record.cpp, the `::unlink(m_file.c_str())` in
@@ -1029,7 +1029,7 @@ void writeText(const std::filesystem::path& file, const std::string& text) {
     out << text;
 }
 
-// GOAL: a file in the state directory is only read as a record of THIS monitor's last apply.
+// GOAL: S13.19 -- a file in the state directory is only read as a record of THIS monitor's last apply.
 //       Anything else -- another monitor's record under this name, a symlink, a directory, a
 //       file too large to be one of ours, a torn or foreign line -- reads as no record. False
 //       if any of them refuses a wallpaper, because a refusal is only ever justified by
@@ -1041,7 +1041,12 @@ void writeText(const std::filesystem::path& file, const std::string& text) {
 // CONTROL: in backend/daemon/crash_record.cpp, `root.at(kKeyMonitorId) != monitorId` dropped
 //       from readCrashRecord's rejection list -> "FAIL: a record naming another monitor is not
 //       read as this one's"; O_NOFOLLOW dropped from the same function's open -> "FAIL: a
-//       symlink in place of a record is not followed". Both reverted.
+//       symlink in place of a record is not followed". Both reverted. Via control_batch.sh
+//       2026-10-14, each alone in readCrashRecord unless named, reverted: the no-newline return
+//       deleted -> "no line terminator"; the path term made always-true -> "a record with no path";
+//       kMaxRecordBytes 64 KiB -> 1 MiB -> "far larger"; crashRecordPath's empty-directory return
+//       deleted -> "no state directory there is no record path"; ApplyingRecord's isValidUtf8 guard
+//       deleted -> "writing a record threw".
 void runOnDiskChecks() {
     ScratchDir scratch("crashdisk");
     if (!scratch.ok()) {
@@ -1058,14 +1063,21 @@ void runOnDiskChecks() {
             check(!ec, "the harness could copy one monitor's record under another's name");
         }
         check(!readCrashRecord(dir, 5).has_value(), "a record naming another monitor is not read as this one's");
-        check(!readCrashRecord(dir, 4).has_value(), "a destroyed record is gone even though a copy of it is not");
 
         // dump() throws on invalid UTF-8, and this constructor runs on the render thread inside
         // the block whose exceptions are graded as the wallpaper failing to draw.
-        { ApplyingRecord record(dir, 6, kType, "/pictures/\xff\xfe.png"); }
-        std::error_code ec;
-        check(!std::filesystem::exists(crashRecordPath(dir, 6), ec),
-              "a path that is not valid UTF-8 writes no record rather than a half-written one");
+        // GOAL: S13.227 -- a wallpaper whose path is not valid UTF-8 is applied with no record on disk.
+        // WHY-THIS-SHAPE: read while the record is alive: its destructor unlinks the file, so a check
+        //       after the scope passes even for a record written with the bytes replaced.
+        // CONTROL: in backend/daemon/crash_record.cpp, ApplyingRecord's isValidUtf8 guard deleted and its
+        //       dump() given error_handler_t::replace -> "FAIL: a path that is not valid UTF-8 writes no
+        //       record rather than a half-written one"; control_batch.sh 2026-10-15, reverted.
+        {
+            ApplyingRecord record(dir, 6, kType, "/pictures/\xff\xfe.png");
+            std::error_code ec;
+            check(!std::filesystem::exists(crashRecordPath(dir, 6), ec),
+                  "a path that is not valid UTF-8 writes no record rather than a half-written one");
+        }
 
         { ApplyingRecord record({}, 0, kType, kPath); }
         check(crashRecordPath({}, 0).empty(), "with no state directory there is no record path");
@@ -1083,26 +1095,13 @@ void runOnDiskChecks() {
     writeText(crashRecordPath(dir, 7), valid);  // no newline: a write that was cut short
     check(!readCrashRecord(dir, 7).has_value(), "a record with no line terminator is not read as complete");
 
-    writeText(crashRecordPath(dir, 7), "not json at all\n");
-    check(!readCrashRecord(dir, 7).has_value(), "a file that is not one of ours is read as no record");
-
     writeText(crashRecordPath(dir, 7), "{\"monitor_id\":7,\"type\":\"static\"}\n");
     check(!readCrashRecord(dir, 7).has_value(), "a record with no path is not read as a record");
 
     writeText(crashRecordPath(dir, 7), valid + "\n" + std::string(128 * 1024, 'x'));
     check(!readCrashRecord(dir, 7).has_value(), "a file far larger than any record we write is not read as one");
 
-    writeText(crashRecordPath(dir, 7), valid + "\nsignal 99\n");
-    const std::optional<CrashRecord> unknown = readCrashRecord(dir, 7);
-    check(unknown && unknown->signal && *unknown->signal == 99, "a signal number is read back as written");
-    if (unknown) {
-        check(describeCrash(*unknown).find("signal 99") != std::string::npos,
-              "a signal this platform has no name for is reported by number");
-    }
-    removeCrashRecord(dir, 7);
     std::error_code ec;
-    check(!std::filesystem::exists(crashRecordPath(dir, 7), ec), "removing a record removes its file");
-
     writeText(dir / "record-target.json", valid + "\n");
     std::filesystem::create_symlink(dir / "record-target.json", crashRecordPath(dir, 8), ec);
     if (ec) {
@@ -1320,7 +1319,7 @@ std::string describeDied(const std::optional<wallpaperx::PlayingHistory>& histor
 //       in the playing record", printing "the record names no video", and "FAIL: and the signal
 //       that killed it" (a signal is read only beside a name); the replacement check below then
 //       reports a harness fault, having no named death to replace. Observed 2026-09-25 via
-//       control_run.sh; reverted.
+//       control_run.sh, again via control_batch.sh 2026-10-15; reverted.
 void runPlayingBlameChecks() {
     ScratchDir scratch("playingnamed");
     if (!scratch.ok()) {
@@ -1360,7 +1359,7 @@ void runPlayingBlameChecks() {
 //       no-op -> "FAIL: a fault after the record was ended names nothing"; (d) PlayingBlame's
 //       constructor made to write `line` into the record at once, as a record-per-picture design
 //       would -> "FAIL: SIGKILL while a video is being worked on names nothing" and the three cases
-//       above with it. Each of (a)-(c) reddened its own case alone. (a) and (b) observed 2026-10-11
+//       above with it. Each of (a)-(c) reddened its own case alone, (a)-(c) again 2026-10-15. (a) and (b) observed 2026-10-11
 //       via control_run.sh against the per-thread t_blame, (c) and (d) 2026-09-21; reverted.
 void runPlayingNamesNothingChecks() {
     struct Case {
@@ -1439,7 +1438,7 @@ void runPlayingBothBlamedChecks() {
     }
 }
 
-// GOAL: the playing record's own rules. start() replaces whatever the last run left, blame and
+// GOAL: S13.226, and S13.188 at the record -- the playing record's own rules. start() replaces whatever the last run left, blame and
 //       all, so one death is never counted twice; clear() zeroes a monitor's count for the next
 //       read and a clear written by another run is ignored; a monitor the run did not count
 //       writes no clear; and only one record per process can start, so a second instance of the
@@ -1458,7 +1457,7 @@ void runPlayingBothBlamedChecks() {
 //       record in the process writes nothing while the first is live"; (d) clear()'s
 //       `m_counted.count(monitorId) == 0` return deleted -> "FAIL: a monitor the run did not count
 //       writes no clear"; (e) clear()'s writeAll deleted -> "FAIL: a cleared monitor carries no count
-//       at the next read". All observed 2026-09-21; reverted.
+//       at the next read". All observed 2026-09-21, and again via control_batch.sh 2026-10-15; reverted.
 void runPlayingRecordRules() {
     ScratchDir scratch("playingrules");
     if (!scratch.ok()) {

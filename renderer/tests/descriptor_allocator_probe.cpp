@@ -37,6 +37,15 @@ std::optional<bool> heapTierGuard(wallpaperx::Device& device, const char* label)
     return result;
 }
 
+// GOAL: S2.8/S2.10 on the Classic and Buffer tiers (one image slot each): a second live allocate
+//       throws, allocate after free succeeds with a valid handle, and a double free throws.
+// CONTROL: each reverted, on descriptor_allocator_probe_lavapipe. renderer/vulkan/descriptor_slots.cpp
+//       acquire() returning slot 0 instead of throwing when full -> "descriptor_allocator_probe (classic):
+//       second allocate() should have thrown but silently succeeded", the same for (buffer), and "(heap
+//       exhaustion): allocate() past kMaxDescriptorSlots should have thrown". releaseTo()'s Issued-state
+//       test removed -> "(classic): second free() should have thrown", the same for (buffer) and (heap
+//       double-free). renderer/vulkan/descriptor_classic.cpp allocate() returning an empty handle, with
+//       free() accepting one -> "(classic): allocate() after free() should succeed".
 bool testTierRejectsDoubleAllocate(const char* forceTier) {
     setenv("WALLPAPERX_FORCE_TIER", forceTier, 1);
 
@@ -127,6 +136,10 @@ bool testHeapTierUniformSlotsDoNotCollideWithImageSlots() {
             std::cerr << "descriptor_allocator_probe (heap uniform): expected both handles valid" << std::endl;
             ok = false;
         }
+        // CONTROL: renderer/vulkan/descriptor_heap.cpp, each reverted, on descriptor_allocator_probe_lavapipe:
+        //       allocateUniform returning the bare slot -> "(heap uniform): uniform index collides with image
+        //       range"; allocate returning slot + kMaxDescriptorSlots -> "(heap uniform): image index out of
+        //       expected range". "expected both handles valid" has no control of its own.
         // Image indices live in [0, kMaxDescriptorSlots); uniform indices must never
         // land in that range, or free() cannot tell the two allocations apart.
         if (imageHandle.index >= wallpaperx::kMaxDescriptorSlots) {
@@ -244,14 +257,24 @@ bool testHeapTierRejectsDoubleFree() {
         wallpaperx::DescriptorHandle handleC = device.descriptorAllocator().allocate(c.view(), c.sampler());
         const bool aliased = handleB.index == handleC.index;
 
-        device.descriptorAllocator().free(handleB);
-        device.descriptorAllocator().free(handleC);
-
+        // GOAL: S2.10 -- two simultaneously live allocations never share a slot.
+        // WHY-THIS-SHAPE: graded before either handle is freed, and an aliased pair is freed once.
+        //       Freeing both first made the line unreachable: under aliasing the second free() is a
+        //       double free of the shared slot and throws, so the run went red on "failed: handle
+        //       already freed" and never printed this line.
+        // CONTROL: renderer/vulkan/descriptor_slots.cpp takeReleased, the `m_released.erase(...)`
+        //       deleted so one released slot is handed out twice -> on descriptor_allocator_probe_lavapipe
+        //       "descriptor_allocator_probe (heap double-free): two live resources got the same slot".
+        //       Reverted.
         if (aliased) {
             std::cerr << "descriptor_allocator_probe (heap double-free): two live resources got the same slot"
                       << std::endl;
+            device.descriptorAllocator().free(handleB);
             return false;
         }
+
+        device.descriptorAllocator().free(handleB);
+        device.descriptorAllocator().free(handleC);
     } catch (const std::exception& e) {
         std::cerr << "descriptor_allocator_probe (heap double-free) failed: " << e.what() << std::endl;
         return false;
@@ -328,52 +351,12 @@ bool testHeapTierExhaustion() {
     return true;
 }
 
-bool testHeapTierAllowsMultipleAllocate() {
-    unsetenv("WALLPAPERX_FORCE_TIER");
-
-    bool skipped = false;
-    const bool ok = wallpaperx::testing::gradedRun(
-        "descriptor_allocator_probe (heap multi-slot)", [&](wallpaperx::testing::ValidationGrade& grade) {
-    try {
-        wallpaperx::Device device(/*enableValidation=*/true);
-        grade.watch(device);
-        if (auto result = heapTierGuard(device, "heap multi-slot")) {
-            skipped = true;
-            return *result;
-        }
-        TestResource a(device);
-        TestResource b(device);
-
-        wallpaperx::DescriptorHandle handleA = device.descriptorAllocator().allocate(a.view(), a.sampler());
-        wallpaperx::DescriptorHandle handleB = device.descriptorAllocator().allocate(b.view(), b.sampler());
-
-        if (!handleA.valid() || !handleB.valid() || handleA.index == handleB.index) {
-            std::cerr << "descriptor_allocator_probe (heap): expected two distinct valid slots" << std::endl;
-            return false;
-        }
-
-        device.descriptorAllocator().free(handleA);
-        device.descriptorAllocator().free(handleB);
-    } catch (const std::exception& e) {
-        std::cerr << "descriptor_allocator_probe (heap multi-slot) failed: " << e.what() << std::endl;
-        return false;
-    }
-
-    return true;
-    });
-    if (!ok) return false;
-    if (skipped) return true;
-    std::cout << "descriptor_allocator_probe (heap multi-slot): passed" << std::endl;
-    return true;
-}
-
 }
 
 int main() {
     bool ok = true;
     ok &= testTierRejectsDoubleAllocate("classic");
     ok &= testTierRejectsDoubleAllocate("buffer");
-    ok &= testHeapTierAllowsMultipleAllocate();
     ok &= testHeapTierUniformSlotsDoNotCollideWithImageSlots();
     ok &= testHeapTierRejectsDoubleFree();
     ok &= testHeapTierExhaustion();

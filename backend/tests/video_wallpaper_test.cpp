@@ -71,6 +71,7 @@
 // would be an assertion on the scheduler. The daemon's own calls are hooked in this executable
 // (tests/client/call_gate.h) and the render thread is held inside them.
 
+#include "test_image_dir.h"
 #include "daemon/crash_record.h"
 #include "daemon/dbus_service.h"
 #include "daemon/render_worker.h"
@@ -849,7 +850,7 @@ const Band* bandAtRow(double sourceRow) {
     return nullptr;
 }
 
-std::string testAssetDir() { return std::string(WALLPAPERX_TEST_IMAGE_DIR); }
+std::string testAssetDir() { return wallpaperx::testing::testImageDir(); }
 std::string clipPath() { return std::string(WALLPAPERX_VIDEO_ASSET_DIR) + "/wallpaper_bands.mp4"; }
 
 // The same bands in a file holding exactly one picture. The clock parks a session opened on it
@@ -1151,10 +1152,11 @@ void runBusChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::strin
     // WHY-THIS-SHAPE: the frame's own published width and height, which is what an importer builds
     //       its texture from; the target size is deliberately a different aspect AND both axes
     //       differ from the clip's, so a swap or a passthrough cannot satisfy it.
-    // CONTROL: no mutation of the crop reddens this one -- a stretched picture is still served at the
-    //       target size -- so it is controlled by the same removal of drawableType()'s `video` arm as the
-    //       check above, which leaves no frame to measure at all. What it forbids is a frame sized from
-    //       the decoded picture, and nothing in this build produces one to mutate toward.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the render pass's `ensureTargets(monitorId, size)`
+    //       given the size with its axes swapped when the pass draws a video -> "FAIL: the video frame is
+    //       served at the monitor's target size, not the clip's", alone (the pixel check below reads the
+    //       frame at its own size and stays green). Via control_batch.sh, --phase '^bus$', 2026-10-14,
+    //       NVIDIA. Reverted.
     const bool sized = frame.width == kTargetWidth && frame.height == kTargetHeight;
     check(sized, "the video frame is served at the monitor's target size, not the clip's");
     if (!sized) {
@@ -1206,6 +1208,11 @@ void runBusChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::strin
     //       and the frame is re-fetched -- not just read from status. A monitor whose images were
     //       released still reports its old generation, so only asking for the frame back
     //       distinguishes "unaffected" from "still says it has one".
+    // CONTROL: a video request made to re-render every other monitor (requestWallpaper() in
+    //       backend/daemon/wallpaper_manager.cpp bumping their requestSeq, DbusService::setWallpaper in
+    //       backend/daemon/dbus_service.cpp posting them) -> "FAIL: a still wallpaper on another monitor is
+    //       unchanged by the video render" and the two lines after it. Via control_batch.sh, --phase
+    //       '^bus$', 2026-10-14, NVIDIA. Reverted.
     const StatusReply stillAfter = getStatusOrExplain(proxy);
     const nlohmann::json* stillEntry = wallpaperStatus(stillAfter, std::to_string(kMonitorStill));
     const bool untouched = stillEntry != nullptr && stillEntry->value("has_frame", false) &&
@@ -4054,7 +4061,8 @@ void runSpeedChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const std:
     // CONTROL: `speed = playbackSpeed(it->second.properties);` in advanceSessionLocked
     //       (backend/daemon/wallpaper_manager.cpp) replaced by `speed = 1.0;`, via control_run.sh,
     //       2026-09-29 -> "FAIL: a video set with speed 2 shows its pictures twice as fast as its file's
-    //       own rate", with the speed-0.01 check below. Reverted.
+    //       own rate", with the speed-0.01 check below. Reverted. Re-run via control_batch.sh, --phase
+    //       '^speed$', 2026-10-14 -> the same line, with the speed-0.5 check below.
     // CONTROL: gapBetween() (backend/daemon/wallpaper_manager.cpp) made to return kMinPictureInterval
     //       always, a clock free-running at the cap -> the same line, by the lower bound: "20 pictures
     //       took 0.166630 s". Reverted.
@@ -4104,60 +4112,80 @@ void runSpeedChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const std:
     }
 
     // GOAL: S15.100's other direction, on a video already playing -- SetWallpaperProperties setting
-    //       speed 0.01 slows it at once: in the next second it shows no more than the picture already
-    //       under way, where speed 2 shows twenty and speed 1 ten.
-    // WHY-THIS-SHAPE: an upper bound only, since a slow machine only lowers the count; two pictures
-    //       leaves room for one being drawn as the call lands. Collecting throughout, so "few
+    //       speed 0.5 slows it at once: in the next second it shows about five pictures, where speed 2
+    //       shows twenty and speed 1 ten.
+    // WHY-THIS-SHAPE: an upper bound only, since a slow machine only lowers the count; seven is five plus
+    //       one under way plus one of slack, still three short of speed 1. Collecting throughout, so "few
     //       pictures" cannot be the off switch stopping an unwatched video.
-    // CONTROL: the same `speed = 1.0;` mutation as above, 2026-09-29 -> "FAIL: a playing video set to
-    //       speed 0.01 shows at most the picture already under way in the next second". Reverted.
-    const std::string slowError = errorNameFrom([&] { setWallpaperProperties(proxy, kMonitorSpeed, speed(0.01)); });
+    // CONTROL: the same `speed = 1.0;` mutation as above, via control_batch.sh, --phase '^speed$',
+    //       2026-10-14, NVIDIA and Lavapipe -> "FAIL: a playing video set to speed 0.5 shows at most seven
+    //       pictures in the next second", with the speed-2 line above. Reverted.
+    const std::string slowError = errorNameFrom([&] { setWallpaperProperties(proxy, kMonitorSpeed, speed(0.5)); });
     check(slowError.empty(), "a playing video's speed can be changed with SetWallpaperProperties");
     const uint64_t slowFrom = newest(kMonitorSpeed);
     collectUntil([] { return false; }, std::chrono::seconds(1));
     const uint64_t slowShown = newest(kMonitorSpeed) - slowFrom;
-    reportUnless(slowError.empty() && slowShown <= 2,
-                 "a playing video set to speed 0.01 shows at most the picture already under way in the next second",
+    reportUnless(slowError.empty() && slowShown <= 7,
+                 "a playing video set to speed 0.5 shows at most seven pictures in the next second",
                  std::to_string(slowShown) + " picture(s) in that second");
 
-    // GOAL: S15.101 -- the picture left waiting when the speed changes is timed again at the new
-    //       speed at once. At 0.01 the waiting picture is due ten seconds out; put back to 1, it must
-    //       come within a fraction of a second, not when its old time comes round. False for a clock
-    //       that fixes a picture's time when it is decoded, and for a daemon that does not wake the
-    //       render thread, asleep until that old time.
-    // WHY-THIS-SHAPE: waited for up to fifteen seconds and the time printed, so a picture that comes
-    //       at its old time (about nine seconds on) reads as late, not as never. 1.5 s is fifteen of
-    //       the file's intervals. Collecting throughout, so the video cannot stop as unwatched.
-    // CONTROL: `m_worker.wake();` deleted from DbusService::setWallpaperProperties
-    //       (backend/daemon/dbus_service.cpp) -> "FAIL: the picture left waiting at speed 0.01 is
-    //       shown at once when the speed goes back to 1", alone, "it came 8.995967 s after the change".
-    //       Reverted.
-    // CONTROL: the clock given the shape that fixes a picture's time when it is decoded --
-    //       VideoSession::Waiting::retime (backend/daemon/wallpaper_manager.cpp) reduced to `return;`, so
-    //       the wait keeps the speed it was decoded at -> the same line red, "it came 9.044575 s after the
-    //       change". Via control_batch.sh, --phase '^speed$', 2026-09-30. Reverted. The wake deletion
-    //       above was observed 2026-09-29 via control_run.sh and is untouched by the re-timing change.
-    const uint64_t waitingFrom = newest(kMonitorSpeed);
-    const Clock::time_point resumeAsked = Clock::now();
-    const std::string resumeError = errorNameFrom([&] { setWallpaperProperties(proxy, kMonitorSpeed, speed(1.0)); });
-    const bool resumed = collectUntil([&] { return newest(kMonitorSpeed) > waitingFrom; }, std::chrono::seconds(15));
-    check(resumeError.empty() && resumed, "a video slowed to 0.01 shows its next picture once put back to speed 1");
-    if (!resumed) {
-        const StatusReply status = getStatusOrExplain(proxy);
-        const nlohmann::json* entry = wallpaperStatus(status, std::to_string(kMonitorSpeed));
-        std::fprintf(stderr, "  SetWallpaperProperties answered '%s'; still at generation %llu; GetStatus: %s\n",
-                     resumeError.c_str(), static_cast<unsigned long long>(newest(kMonitorSpeed)),
-                     entry != nullptr ? entry->dump().c_str() : status.error().c_str());
-    } else {
-        const std::optional<Clock::time_point> shown = firstSeen(pictures, kMonitorSpeed, waitingFrom + 1);
-        const double waited = shown ? std::chrono::duration<double>(*shown - resumeAsked).count() : -1.0;
-        std::printf("video_wallpaper_test: %llu picture(s) in the second at speed 0.01; the one left waiting came "
-                    "%.4f s after speed 1 was set\n",
-                    static_cast<unsigned long long>(slowShown), waited);
-        std::fflush(stdout);
-        reportUnless(shown && waited <= 1.5,
-                     "the picture left waiting at speed 0.01 is shown at once when the speed goes back to 1",
-                     "it came " + std::to_string(waited) + " s after the change");
+    // GOAL: S15.101 -- the picture left waiting when the speed changes is timed again at the new speed at
+    //       once. At 0.5 a picture just shown has its successor due 200 ms out; raised to 2 at that moment,
+    //       the successor is due within 50 ms. False for a clock that fixes a picture's time when it is
+    //       decoded (about 200 ms), and for a daemon that does not wake the render thread, asleep until
+    //       that old time.
+    // WHY-THIS-SHAPE: the speed is raised right after a picture's FrameReady, so the old time is a whole
+    //       interval away; five rounds and their MEDIAN graded against 125 ms, so one late receipt or one
+    //       slow render neither accuses a correct daemon nor clears a wrong one. Each round first puts the
+    //       video back to 0.5 and lets two pictures pass, so the wait raised is one timed at 0.5. Waited up
+    //       to five seconds a round and every time printed, so a picture that comes at its old time reads
+    //       as late, not as never.
+    // CONTROL: via control_batch.sh, --phase '^speed$', 2026-10-14, NVIDIA and Lavapipe, each alone,
+    //       reverted: `m_worker.wake();` deleted from DbusService::setWallpaperProperties
+    //       (backend/daemon/dbus_service.cpp), and VideoSession::Waiting::retime
+    //       (backend/daemon/wallpaper_manager.cpp) reduced to `return;` -> "FAIL: the picture left waiting at
+    //       speed 0.5 is shown within 125 ms once the speed goes to 2", medians 198.8-199.2 ms (clean: 49.7).
+    // COVERAGE-ASSERT: five rounds must each see the next picture, or the phase fails rather than grading
+    //       fewer.
+    {
+        std::vector<double> waits;
+        bool lost = false;
+        for (int round = 0; round < 5 && !lost; ++round) {
+            const std::string downError =
+                errorNameFrom([&] { setWallpaperProperties(proxy, kMonitorSpeed, speed(0.5)); });
+            const uint64_t before = newest(kMonitorSpeed);
+            if (!downError.empty() ||
+                !collectUntil([&] { return newest(kMonitorSpeed) >= before + 2; }, std::chrono::seconds(5))) {
+                lost = true;
+                std::fprintf(stderr, "  round %d: speed 0.5 answered '%s'; the video stopped at generation %llu\n", round,
+                             downError.c_str(), static_cast<unsigned long long>(newest(kMonitorSpeed)));
+                break;
+            }
+            const uint64_t shownAt = newest(kMonitorSpeed);
+            const Clock::time_point raised = Clock::now();
+            const std::string upError = errorNameFrom([&] { setWallpaperProperties(proxy, kMonitorSpeed, speed(2.0)); });
+            const bool next = collectUntil([&] { return newest(kMonitorSpeed) > shownAt; }, std::chrono::seconds(5));
+            const std::optional<Clock::time_point> came = firstSeen(pictures, kMonitorSpeed, shownAt + 1);
+            if (!upError.empty() || !next || !came) {
+                lost = true;
+                std::fprintf(stderr, "  round %d: speed 2 answered '%s'; no picture after generation %llu\n", round,
+                             upError.c_str(), static_cast<unsigned long long>(shownAt));
+                break;
+            }
+            waits.push_back(std::chrono::duration<double, std::milli>(*came - raised).count());
+        }
+        check(!lost && waits.size() == 5, "five rounds of raising the speed from 0.5 to 2 each showed the next picture");
+        if (!lost && waits.size() == 5) {
+            std::vector<double> sorted = waits;
+            std::ranges::sort(sorted);
+            std::printf("video_wallpaper_test: speed 0.5 raised to 2 just after a picture; the next came %.1f, %.1f, "
+                        "%.1f, %.1f and %.1f ms later (median %.1f; re-timed it is due within 50, unchanged 200)\n",
+                        waits[0], waits[1], waits[2], waits[3], waits[4], sorted[2]);
+            std::fflush(stdout);
+            reportUnless(sorted[2] <= 125.0,
+                         "the picture left waiting at speed 0.5 is shown within 125 ms once the speed goes to 2",
+                         "the median wait was " + std::to_string(sorted[2]) + " ms");
+        }
     }
 
     // GOAL: S15.99's video half -- a properties change keeps the playing video: no speed change above
@@ -5672,8 +5700,9 @@ std::optional<StalledStretch> stalledWindowRates(RenderWorker& worker, FrameRead
 
 // S15.109-S15.111 -- the schedule when the file asks for more than the 120-a-second cap: a 240 a second
 // file at speed 1 and then at speed 2, each with the render thread held up for less than one capped
-// interval, then slowed below the cap.
-void runHighRateChecks(const WallpaperManager::Config& config, const std::string& rate240) {
+// interval; then a 120 a second file at speed 2, slowed below the cap.
+void runHighRateChecks(const WallpaperManager::Config& config, const std::string& rate240,
+                       const std::string& rate120) {
     const char* kGoals = "S15.109-S15.111 (a video asking for more than 120 pictures a second: its rate, a late picture "
                          "at speed 2, and the lag it banks)";
     PhaseGrade grade("the high-rate phase");
@@ -5813,35 +5842,50 @@ void runHighRateChecks(const WallpaperManager::Config& config, const std::string
         return;
     }
 
-    // GOAL: S15.111 -- the lag a long run at the cap banks is bounded to one interval: after seconds at
-    //       speed 2, where the file asks for 480 a second and gets 120, slowing to 0.25 (60 a second)
-    //       shows about 15 pictures in the first 250 ms and 60 in the first second -- not the banked file
-    //       time replayed at the cap -- and goes on playing.
-    // WHY-THIS-SHAPE: the drop is to 0.25, not to 1: at 1 this file still asks for 240, above the cap,
-    //       so no banked lag could show. Counted from the change, because a replay lands there: 15 in
-    //       250 ms asked (measured 15-16 idle, 14-16 with six busy loops on its two cores), bounded at 20,
-    //       while a lag of 200 ms shows 27. Both counts are upper bounds, which a slow or paused host only
-    //       lowers. The
-    //       floor of 30 is graded only when a thread stamping the clock every 5 ms saw the process run
-    //       through the second (under 250 ms lost, half the floor's margin): it counts wall-clock time,
-    //       which a paused host would spend. "Keeps playing" waits for one more picture instead, so a
-    //       stopped video fails whatever the host did.
-    // CONTROL: via control_batch.sh, --phase highRate, 2026-09-30, NVIDIA, each reverted, in markShown or
-    //       the clock (backend/daemon/wallpaper_manager.cpp). (a) `planned.due - interval` made
-    //       `planned.due - 24 * interval`, a 200 ms bound on the lag -> "FAIL: slowing below the cap after
-    //       a long run at it shows no burst of banked pictures in its first quarter second", 28 in 250 ms,
-    //       the one-second bound green. (b) the whole trail bound removed, `shown = planned;` -> both bound
-    //       lines, 30 and 120. (c) the Waiting's gap, as advanceSessionLocked builds it, multiplied by 100
-    //       below speed 0.5 -> "FAIL: the video plays at no less than half the rate asked for once slowed
-    //       to speed 0.25", 1 picture. (d) the wait check returning 100 s ahead below speed 0.5 -> "FAIL:
-    //       the video keeps playing once slowed to speed 0.25" after the 30 s wait, with the floor line
-    //       beside it, 0 pictures.
-    // CONTROL: test-side, 2026-09-29: the process stopped for 600 ms (SIGSTOP and SIGCONT from a forked
-    //       child) 100 ms after the change -> by hand, NOT VERIFIED "paused this process 599.2 ms", 24
-    //       pictures in the second; the same with the pause gate made `if (false)`, via control_batch.sh ->
-    //       "FAIL: the video plays at no less than half the rate asked for once slowed to speed 0.25".
+    // GOAL: S15.111 -- the lag a long run at the cap banks is bounded to one interval: after two seconds
+    //       of the 120 a second file at speed 2, where it asks for 240 a second and gets 120, slowing to
+    //       0.5 (60 a second) shows about 15 pictures in the first 250 ms and 60 in the first second -- not
+    //       the banked file time replayed at the cap -- and goes on playing.
+    // WHY-THIS-SHAPE: the 120 a second file, not the 240 one: at 0.5 the 240 file asks for exactly the
+    //       cap, so a replay at the cap would look like the rate asked. Counted from the change, because a
+    //       replay lands there: 15 in 250 ms asked, bounded at 20, while a 200 ms lag shows 27. Both counts
+    //       are upper bounds, which a slow or paused host only lowers. The banking stretch is a premise: a
+    //       second before the change that did not run near the cap is reported as not graded. The floor of
+    //       30 is graded only when a thread stamping the clock every 5 ms saw the process run through the
+    //       second; "keeps playing" waits for one more picture, so a stopped video fails whatever the host did.
+    // CONTROL: via control_batch.sh, --phase highRate, 2026-10-14, in backend/daemon/wallpaper_manager.cpp,
+    //       each restored: (a) shownAt's `plan.due - interval` made `plan.due - 24 * interval`, a 200 ms bound
+    //       on the lag; (b) shownAt's trail bound removed, the plan always kept; (c) the Waiting
+    //       advanceSessionLocked builds given 100 times its gap at a speed under 1; (d) the clock's wait
+    //       check returning 100 s ahead at a speed under 1. NVIDIA: (a) the burst line alone, 27 in 250 ms;
+    //       (b) both bound lines, 30 and 119; (c) the floor line, 0 pictures; (d) "keeps playing" after the
+    //       30 s wait, and the floor line, 0 pictures.
     {
-        if (!setSpeed(0.25)) return;
+        const uint64_t beforeRequest = latestGeneration(pictures, kMonitorHighRate);
+        try {
+            manager.requestWallpaper("video", rate120, kMonitorHighRate, {{"speed", 2.0}});
+        } catch (const std::exception& e) {
+            check(false, "the 120 a second file is accepted at speed 2");
+            std::fprintf(stderr, "  refused: %s\n", e.what());
+            return;
+        }
+        worker.post(kMonitorHighRate);
+        if (!signals.wait(kMonitorHighRate, beforeRequest + 1)) {
+            check(false, "the 120 a second file draws once requested at speed 2");
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        const Clock::time_point banked = Clock::now();
+        size_t atCap = 0;
+        for (const PictureLog::Event& e : pictures.forMonitor(kMonitorHighRate)) {
+            if (e.generation > beforeRequest && e.at >= banked - std::chrono::seconds(1)) ++atCap;
+        }
+        if (atCap < 100) {
+            notVerified("S15.111", "the 120 a second file at speed 2 drew " + std::to_string(atCap) +
+                                       " pictures in the second before slowing, so no lag was banked at the cap");
+            return;
+        }
+        if (!setSpeed(0.5)) return;
         const Clock::time_point changed = Clock::now();
         const Clock::time_point burstEnd = changed + std::chrono::milliseconds(250);
         const Clock::time_point secondEnd = changed + std::chrono::seconds(1);
@@ -5868,9 +5912,10 @@ void runHighRateChecks(const WallpaperManager::Config& config, const std::string
             if (e.at >= changed && e.at < secondEnd) inSecond.insert(e.generation);
         }
         const double pausedMs = std::chrono::duration<double, std::milli>(paused).count();
-        std::printf("video_wallpaper_test: after slowing from speed 2 to 0.25: %zu picture(s) in the first 250 ms, %zu "
-                    "in the first second; the host paused this process %.1f ms of it\n",
-                    inBurst.size(), inSecond.size(), pausedMs);
+        std::printf("video_wallpaper_test: the 120 a second file, %zu pictures in the second at speed 2, then slowed "
+                    "to 0.5: %zu picture(s) in the first 250 ms, %zu in the first second; the host paused this "
+                    "process %.1f ms of it\n",
+                    atCap, inBurst.size(), inSecond.size(), pausedMs);
         std::fflush(stdout);
         reportUnless(inBurst.size() <= 20,
                      "slowing below the cap after a long run at it shows no burst of banked pictures in its first "
@@ -5880,13 +5925,13 @@ void runHighRateChecks(const WallpaperManager::Config& config, const std::string
                      "slowing below the cap after a long run at it shows the rate asked for, not the lag it banked",
                      std::to_string(inSecond.size()) + " picture(s) in one second, where 60 are asked for");
         const uint64_t last = latestGeneration(pictures, kMonitorHighRate);
-        check(signals.wait(kMonitorHighRate, last + 1), "the video keeps playing once slowed to speed 0.25");
+        check(signals.wait(kMonitorHighRate, last + 1), "the video keeps playing once slowed to speed 0.5");
         if (paused > std::chrono::milliseconds(250)) {
             notVerified("S15.111's floor", "the host paused this process " + std::to_string(pausedMs) +
                                                " ms of the second after slowing, so its picture count is not graded");
         } else {
             reportUnless(inSecond.size() >= 30, "the video plays at no less than half the rate asked for once slowed to "
-                                                "speed 0.25",
+                                                "speed 0.5",
                          std::to_string(inSecond.size()) + " picture(s) in one second, where 60 are asked for");
         }
     }
@@ -7206,9 +7251,8 @@ void runCleanPlayHideChecks(const WallpaperManager::Config& base, const std::str
 // with no second is the clock, which is the daemon's.
 // CONTROL: the clock's wait check in advanceSessionLocked (backend/daemon/wallpaper_manager.cpp) returning
 //       `now + std::chrono::seconds(100)` for a waiting picture, via control_batch.sh, --phase
-//       '^(midWaitRaise|dueSlowdown)$', 2026-09-30 -> this line red in both, where a wait for the second
-//       picture alone had reported NOT VERIFIED "on this host"; the same break, --phase '^slowStallCredit$',
-//       2026-09-30 -> this line red there too. Reverted.
+//       '^(slowStallCredit|midWaitRaise|dueSlowdown)$', 2026-10-14, NVIDIA -> this line red in all three,
+//       where a wait for the second picture alone had reported NOT VERIFIED "on this host". Restored.
 bool firstTwoPictures(FrameReadyLog& signals, PhaseGrade& grade, const char* goal) {
     if (!signals.wait(kMonitorClean, 1)) {
         grade.expectNoDevice();
@@ -7224,26 +7268,22 @@ bool firstTwoPictures(FrameReadyLog& signals, PhaseGrade& grade, const char* goa
 // however long the speed-scaled interval is.
 //
 // GOAL: S15.114 -- a picture drawn later than one of the file's own intervals is not counted as clean
-//       play at any speed: at speed 0.1 on a ten-a-second file (a picture a second), a render thread held
-//       up 1.5 s after a picture draws the next about 500 ms late, and the 1.5 s gap before it adds
+//       play at any speed: at speed 0.5 on the one-picture-every-2-s file (a picture every 4 s), a render
+//       thread held up 7 s after a picture draws the next about 3 s late, and the 7 s gap before it adds
 //       nothing toward cleanPlayAfter, so the death count still stands when that picture is announced.
-//       False for an allowance of the interval divided by the speed (1 s here), under which the stall
+//       False for an allowance of the interval divided by the speed (4 s here), under which the stall
 //       counts as play and the count is cleared by it.
-// WHY-THIS-SHAPE: cleanPlayAfter is 1.3 s, between what each rule credits by that picture: the stall
-//       rule at most the one second before the hold, the speed-scaled one at least the 1.5 s gap. The
-//       count is read as soon as that picture is announced, because the next picture, due 500 ms after it
-//       under a kept plan, carries the credit past 1.3 s under either rule. The hold is posted after the
-//       second picture, so the picture it delays was due during it; the gaps are measured, and a run
-//       whose gaps do not bracket 1.3 s that way, or whose next picture came before the read, is
-//       reported as not graded rather than read either way. The first two pictures come through
-//       firstTwoPictures(): only a missing first one is this host; a missing second is the daemon's clock
-//       and fails, so a clock stopped after one picture cannot pass as not graded.
+// WHY-THIS-SHAPE: 0.5, because at 1 or 2 the speed-scaled interval is not longer than the file's own, so
+//       the two allowances agree. Late by 3 s: halfway between the file's 2 s and the scaled 4 s.
+//       cleanPlayAfter is 5.5 s, above the 4 s gap before the hold and below the 7 s across it. The count
+//       is read as soon as that picture is announced; a run whose gaps do not bracket 5.5 s that way, or
+//       whose next picture came before the read, is reported as not graded. The first two pictures come
+//       through firstTwoPictures(): a missing second is the daemon's clock and fails.
 // CONTROL: in advanceSessionLocked (backend/daemon/wallpaper_manager.cpp) the on-time allowance's
 //       `std::min(intervalAtSpeed(timing, speed), ownInterval(timing))` reduced to
-//       `intervalAtSpeed(timing, speed)`, via control_batch.sh, --phase '^slowStallCredit$', 2026-09-30 ->
-//       "FAIL: at speed 0.1, a stall longer than the file's own interval earns no clean-play credit",
-//       printing "the count is 0" with 1504 ms across the held picture. Reverted. The stopped clock: see
-//       firstTwoPictures().
+//       `intervalAtSpeed(timing, speed)`, via control_batch.sh, --phase '^slowStallCredit$', 2026-10-14 ->
+//       "FAIL: at speed 0.5, a stall longer than the file's own interval earns no clean-play credit", "the
+//       count is 0" with 7005 ms across the held picture, NVIDIA. Restored. The stopped clock: see firstTwoPictures().
 void runSlowStallCreditChecks(const WallpaperManager::Config& base, const std::string& clip) {
     const char* kGoal = "S15.114 (at a slow speed, a stall longer than the file's own interval earns no clean-play "
                         "credit)";
@@ -7255,7 +7295,7 @@ void runSlowStallCreditChecks(const WallpaperManager::Config& base, const std::s
     WallpaperManager::Config config = base;
     config.configFile = scratch.path() / "config.json";
     config.stateDir = scratch.path() / "state";
-    constexpr auto kCleanPlayAfter = std::chrono::milliseconds(1300);
+    constexpr auto kCleanPlayAfter = std::chrono::milliseconds(5500);
     config.cleanPlayAfter = kCleanPlayAfter;
     writeConfig(config.configFile, {{kMonitorClean, "video", clip}});
     {
@@ -7287,13 +7327,13 @@ void runSlowStallCreditChecks(const WallpaperManager::Config& base, const std::s
     const std::vector<int> restored = manager.restoreSaved();
     manager.recordStartingVideos();
     check(countNow() == 1, "the video starts this run carrying one death (the harness's premise)");
-    manager.setWallpaperProperties(kMonitorClean, {{"speed", 0.1}});
+    manager.setWallpaperProperties(kMonitorClean, {{"speed", 0.5}});
     wallpaperx::testing::nameScreen(manager, kMonitorClean, "DP-SLOWSTALL");
     for (const int id : restored) worker.post(id);
     if (!firstTwoPictures(signals, grade, kGoal)) return;
     const Clock::time_point heldFrom = Clock::now();
     worker.postTask([](RenderWorker::TaskState state) {
-        if (state == RenderWorker::TaskState::Run) std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        if (state == RenderWorker::TaskState::Run) std::this_thread::sleep_for(std::chrono::milliseconds(7000));
     });
     const bool third = signals.wait(kMonitorClean, 3);
     const int afterStall = countNow();
@@ -7312,22 +7352,23 @@ void runSlowStallCreditChecks(const WallpaperManager::Config& base, const std::s
     const auto ms = [](Clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
     const double beforeHold = ms(*second - *first);
     const double stalledGap = ms(*stalled - *second);
-    std::printf("video_wallpaper_test: at speed 0.1, %.0f ms between the first two pictures, %.0f ms across the "
+    std::printf("video_wallpaper_test: at speed 0.5, %.0f ms between the first two pictures, %.0f ms across the "
                 "held-up one (the hold began %.0f ms after the second); the count read %d with %llu picture(s) "
                 "announced\n",
                 beforeHold, stalledGap, ms(heldFrom - *second), afterStall,
                 static_cast<unsigned long long>(latestAtRead));
     std::fflush(stdout);
     const double limit = ms(kCleanPlayAfter);
-    if (beforeHold > limit - 100 || stalledGap < limit + 100 || stalledGap - 1000 < 200 || stalledGap - 1000 > 800 ||
-        latestAtRead != 3) {
+    // Late against the 4 s the picture was due after: past the file's 2 s, short of the scaled 4 s.
+    const double late = stalledGap - 4000;
+    if (beforeHold > limit - 100 || stalledGap < limit + 100 || late < 2400 || late > 3600 || latestAtRead != 3) {
         notVerified(kGoal, "the gaps did not bracket cleanPlayAfter as this check needs (at most " +
                                std::to_string(limit - 100) + " ms before the hold, at least " +
-                               std::to_string(limit + 100) + " ms across it with the picture 200-800 ms late, and the "
+                               std::to_string(limit + 100) + " ms across it with the picture 2.4-3.6 s late, and the "
                                "count read before the next picture)");
         return;
     }
-    reportUnless(afterStall == 1, "at speed 0.1, a stall longer than the file's own interval earns no clean-play credit",
+    reportUnless(afterStall == 1, "at speed 0.5, a stall longer than the file's own interval earns no clean-play credit",
                  "the count is " + std::to_string(afterStall) + ", " + collector.describe());
 }
 
@@ -7345,25 +7386,24 @@ double millisBetween(Clock::time_point from, Clock::time_point to) {
     return std::chrono::duration<double, std::milli>(to - from).count();
 }
 
-// GOAL: S15.118 -- raising the speed during a wait re-times only what is left of it. On the ten-a-second
-//       file at speed 0.05 (a picture every 2 s), raised to 0.2 about 1.2 s into a wait: the waiting
-//       picture comes the rest of its 100 ms, at 0.2, after the change (about 200 ms) -- not at once and
-//       not at the old time -- and is on time, so the 1.4 s since the picture before it is clean play and
-//       clears the death count. False for a wait re-timed as a whole at the new speed (its due time 0.7 s
-//       in the past: drawn at once, judged late, no credit) and for a wait that keeps the old speed.
-// WHY-THIS-SHAPE: cleanPlayAfter is 1 s. The first clock-drawn picture only starts the credit, so the gap
+// GOAL: S15.118 -- raising the speed during a wait re-times only what is left of it. On the
+//       one-picture-every-2-s file at speed 0.5 (a picture every 4 s), raised to 2 about 2.4 s into a wait:
+//       the waiting picture comes the rest of its 2 s, at 2, after the change (about 400 ms) -- not at once
+//       and not at the old time -- and is on time, so the 2.8 s since the picture before it is clean play
+//       and clears the death count. False for a wait re-timed as a whole at the new speed (its due time
+//       1.4 s in the past: drawn at once, judged late, no credit) and for a wait that keeps the old speed.
+// WHY-THIS-SHAPE: cleanPlayAfter is 2 s. The first clock-drawn picture only starts the credit, so the gap
 //       across the change is all the credit there is when the next picture is announced, and it clears the
-//       count only if that picture was on time; the count is read before the one after it, 500 ms later.
-//       The release time is bounded on both sides of the re-timed moment, halfway to each wrong answer,
-//       from the measured moment of the change. A change that did not land inside the wait, or a gap the
-//       host stretched past what brackets cleanPlayAfter, is reported as not graded.
-// CONTROL: via control_batch.sh, --phase '^midWaitRaise$', 2026-09-30, NVIDIA, each reverted, in
+//       count only if that picture was on time; the count is read before the one after it, 1 s later. The
+//       release time is bounded on both sides of the re-timed moment, halfway to each wrong answer, from
+//       the measured moment of the change. A change outside 2.0-3.4 s into the wait, or a gap the host
+//       stretched past what brackets cleanPlayAfter, is reported as not graded.
+// CONTROL: via control_batch.sh, --phase '^midWaitRaise$', 2026-10-14, each restored, in
 //       VideoSession::Waiting::retime (backend/daemon/wallpaper_manager.cpp): (a) reduced to `speed =
-//       newSpeed; return;`, the whole wait re-timed -> both lines red, "it came 0.28 ms after the change,
-//       re-timed it is due after 199.98 ms" and "the count is 1"; (b) returning at once, the old speed kept
-//       -> the release line alone, "800.07 ms after the change". (c) for "is drawn": retime ending with
-//       `left = std::chrono::hours(1); from = now;` -> that line, here and in the next two phases. (d) for
-//       the one-death premise: restoreSaved()'s `if (deaths > 0)` before `m_startingVideos.push_back` made
+//       newSpeed; return;`, the whole wait re-timed -> both lines red, "0 ms after the change" and "the
+//       count is 1"; (b) returning at once, the old speed kept -> the release line alone, 1600 ms; (c) for "is drawn": retime ending with `left =
+//       std::chrono::hours(1); from = now;` -> that line, here and in the next two phases; (d) for the
+//       one-death premise: restoreSaved()'s `if (deaths > 0)` before `m_startingVideos.push_back` made
 //       `if (false)` -> "FAIL: the video starts this run carrying one death", here and in dueSlowdown.
 void runMidWaitRaiseChecks(const WallpaperManager::Config& base, const std::string& clip) {
     const char* kGoal = "S15.118 (a speed raised during a wait re-times only what is left of it)";
@@ -7375,7 +7415,7 @@ void runMidWaitRaiseChecks(const WallpaperManager::Config& base, const std::stri
     WallpaperManager::Config config = base;
     config.configFile = scratch.path() / "config.json";
     config.stateDir = scratch.path() / "state";
-    constexpr auto kCleanPlayAfter = std::chrono::milliseconds(1000);
+    constexpr auto kCleanPlayAfter = std::chrono::milliseconds(2000);
     config.cleanPlayAfter = kCleanPlayAfter;
     writeConfig(config.configFile, {{kMonitorClean, "video", clip}});
     {
@@ -7399,7 +7439,7 @@ void runMidWaitRaiseChecks(const WallpaperManager::Config& base, const std::stri
     const std::vector<int> restored = manager.restoreSaved();
     manager.recordStartingVideos();
     check(deathsIn(config.stateDir) == 1, "the video starts this run carrying one death (the harness's premise)");
-    manager.setWallpaperProperties(kMonitorClean, {{"speed", 0.05}});
+    manager.setWallpaperProperties(kMonitorClean, {{"speed", 0.5}});
     wallpaperx::testing::nameScreen(manager, kMonitorClean, "DP-MIDWAIT");
     for (const int id : restored) worker.post(id);
     if (!firstTwoPictures(signals, grade, kGoal)) return;
@@ -7408,8 +7448,8 @@ void runMidWaitRaiseChecks(const WallpaperManager::Config& base, const std::stri
         notVerified(kGoal, "the second picture's announcement was not recorded");
         return;
     }
-    std::this_thread::sleep_until(*second + std::chrono::milliseconds(1200));
-    manager.setWallpaperProperties(kMonitorClean, {{"speed", 0.2}});
+    std::this_thread::sleep_until(*second + std::chrono::milliseconds(2400));
+    manager.setWallpaperProperties(kMonitorClean, {{"speed", 2.0}});
     worker.wake();
     const Clock::time_point changed = Clock::now();
     const bool third = settlesWithin(std::chrono::seconds(10), [&] { return latestGeneration(pictures, kMonitorClean) >= 3; });
@@ -7422,17 +7462,17 @@ void runMidWaitRaiseChecks(const WallpaperManager::Config& base, const std::stri
     const double changeAfter = millisBetween(*second, changed);
     const double released = shown ? millisBetween(changed, *shown) : -1.0;
     const double gap = shown ? millisBetween(*second, *shown) : -1.0;
-    // The 100 ms of file time between the two pictures, run at 0.05 until the change and at 0.2 after.
-    const double expected = (100.0 - changeAfter * 0.05) / 0.2;
-    const double keptOldSpeed = 2000.0 - changeAfter;
-    std::printf("video_wallpaper_test: speed 0.05 raised to 0.2 %.0f ms into a wait; the picture came %.0f ms later "
+    // The 2 s of file time between the two pictures, run at 0.5 until the change and at 2 after.
+    const double expected = (2000.0 - changeAfter * 0.5) / 2.0;
+    const double keptOldSpeed = 4000.0 - changeAfter;
+    std::printf("video_wallpaper_test: speed 0.5 raised to 2 %.0f ms into a wait; the picture came %.0f ms later "
                 "(re-timed: %.0f ms, the old speed: %.0f ms), %.0f ms after the one before it; the count read %d with "
                 "%llu picture(s) announced\n",
                 changeAfter, released, expected, keptOldSpeed, gap, afterThird,
                 static_cast<unsigned long long>(latestAtRead));
     std::fflush(stdout);
-    if (!shown || changeAfter < 1000 || changeAfter > 1700) {
-        notVerified(kGoal, "the speed change did not land 1.0-1.7 s into the 2 s wait, so there was no wait left to "
+    if (!shown || changeAfter < 2000 || changeAfter > 3400) {
+        notVerified(kGoal, "the speed change did not land 2.0-3.4 s into the 4 s wait, so there was no wait left to "
                            "re-time");
         return;
     }
@@ -7441,7 +7481,7 @@ void runMidWaitRaiseChecks(const WallpaperManager::Config& base, const std::stri
                  "the new speed",
                  "it came " + std::to_string(released) + " ms after the change, re-timed it is due after " +
                      std::to_string(expected) + " ms");
-    if (gap < 1100 || latestAtRead != 3) {
+    if (gap < 2100 || latestAtRead != 3) {
         notVerified(kGoal, "the gap across the change was not at least 100 ms over cleanPlayAfter, or the next "
                            "picture came before the count was read");
         return;
@@ -7452,20 +7492,20 @@ void runMidWaitRaiseChecks(const WallpaperManager::Config& base, const std::stri
 }
 
 // GOAL: S15.119 -- a draw outside the clock, of a picture waiting under a speed change the clock has not
-//       yet seen, keeps the new speed's schedule. At speed 0.05, 1 s into a wait, the speed is raised to
-//       0.2 and a resize redraws the waiting picture at once: its place on the schedule is the re-timed
-//       one (about 250 ms after the change) and the next picture follows 500 ms after that. False for a
-//       redraw that reads the wait at the old speed: it schedules from the old due time and the next
-//       picture comes about 1.5 s after the change.
+//       yet seen, keeps the new speed's schedule. On the one-picture-every-2-s file at speed 0.5, 2 s into
+//       a 4 s wait, the speed is raised to 2 and a resize redraws the waiting picture at once: its place on
+//       the schedule is the re-timed one (about 500 ms after the change) and the next picture follows 1 s
+//       after that. False for a redraw that reads the wait at the old speed: it schedules from the old due
+//       time and the next picture comes about 3 s after the change.
 // WHY-THIS-SHAPE: no wake after the speed change and the redraw posted at once, so the render worker,
 //       which runs a job before its clock round, draws before the clock re-times anything. The redraw's
 //       own picture must come within 150 ms of the change, or it was the clock that drew it, and the
 //       phase says so. The bound on the next picture lies halfway between the two answers.
 // CONTROL: `waiting->retime(now, speed);` removed from markShown (backend/daemon/wallpaper_manager.cpp),
-//       via control_batch.sh, --phase '^renderPathRetime$', 2026-09-30, NVIDIA -> "FAIL: a redraw after a
-//       speed change the clock has not seen keeps the new speed's schedule", "the next picture came
-//       1500.21 ms after the change, due after 749.98 ms", the redraw 1 ms after it. Reverted. "Goes on
-//       playing": the retime `hours(1)` break of the phase above -> red. Reverted.
+//       via control_batch.sh, --phase '^renderPathRetime$', 2026-10-14 -> "FAIL: a redraw after a speed
+//       change the clock has not seen keeps the new speed's schedule", the next picture 3000 ms after the
+//       change against 1500 due, the redraw 1 ms after it, NVIDIA. Restored. "Goes on playing": the
+//       retime `hours(1)` break of the phase above -> red. Restored.
 void runRenderPathRetimeChecks(const WallpaperManager::Config& base, const std::string& clip) {
     const char* kGoal = "S15.119 (a redraw after a speed change the clock has not seen keeps the new speed's schedule)";
     PhaseGrade grade("the redraw re-timing phase");
@@ -7483,7 +7523,7 @@ void runRenderPathRetimeChecks(const WallpaperManager::Config& base, const std::
     WorkerUnblock unblock{worker};
     const std::string screen = "DP-RETIME";
     wallpaperx::testing::nameScreen(manager, kMonitorClean, screen);
-    manager.requestWallpaper("video", clip, kMonitorClean, {{"speed", 0.05}});
+    manager.requestWallpaper("video", clip, kMonitorClean, {{"speed", 0.5}});
     worker.post(kMonitorClean);
     if (!signals.wait(kMonitorClean, 1)) {
         grade.expectNoDevice();
@@ -7495,8 +7535,8 @@ void runRenderPathRetimeChecks(const WallpaperManager::Config& base, const std::
         notVerified(kGoal, "the first picture's announcement was not recorded");
         return;
     }
-    std::this_thread::sleep_until(*first + std::chrono::milliseconds(1000));
-    manager.setWallpaperProperties(kMonitorClean, {{"speed", 0.2}});
+    std::this_thread::sleep_until(*first + std::chrono::milliseconds(2000));
+    manager.setWallpaperProperties(kMonitorClean, {{"speed", 2.0}});
     std::vector<int> redraw;
     manager.setOutputSize(screen, kResizedWidth, kResizedHeight, redraw);
     const Clock::time_point asked = Clock::now();
@@ -7514,14 +7554,14 @@ void runRenderPathRetimeChecks(const WallpaperManager::Config& base, const std::
     const double changeAfter = millisBetween(*first, asked);
     const double drawnAfter = redrawn ? millisBetween(asked, *redrawn) : -1.0;
     const double nextAfter = next ? millisBetween(asked, *next) : -1.0;
-    const double expected = (100.0 - changeAfter * 0.05) / 0.2 + 500.0;
-    const double oldSchedule = 2000.0 - changeAfter + 500.0;
+    const double expected = (2000.0 - changeAfter * 0.5) / 2.0 + 1000.0;
+    const double oldSchedule = 4000.0 - changeAfter + 1000.0;
     std::printf("video_wallpaper_test: speed raised %.0f ms into a wait with a redraw; the redraw came %.0f ms later "
                 "and the next picture %.0f ms after the change (the new speed's schedule: %.0f ms, the old: %.0f ms)\n",
                 changeAfter, drawnAfter, nextAfter, expected, oldSchedule);
     std::fflush(stdout);
-    if (!redrawn || !next || drawnAfter > 150 || changeAfter < 900 || changeAfter > 1400) {
-        notVerified(kGoal, "the redraw was not drawn within 150 ms of a change 0.9-1.4 s into the wait, so the clock "
+    if (!redrawn || !next || drawnAfter > 150 || changeAfter < 1800 || changeAfter > 2800) {
+        notVerified(kGoal, "the redraw was not drawn within 150 ms of a change 1.8-2.8 s into the wait, so the clock "
                            "may have seen the speed first");
         return;
     }
@@ -7533,20 +7573,26 @@ void runRenderPathRetimeChecks(const WallpaperManager::Config& base, const std::
 
 // GOAL: S15.120 -- lowering the speed after a picture is already due changes nothing about that picture:
 //       held up past its time by a stall, it is drawn as soon as the render thread is free, and the stall
-//       stays a stall, earning no clean-play credit. On the ten-a-second file at speed 0.1, the render
-//       thread held 1.5 s after a picture and the speed lowered to 0.01 once the next was due. False for
-//       a wait re-timed as a whole at the new speed (the picture then waits about 10 s), and for a re-time
-//       that moves a due picture's time to the moment of the change (the stall then reads as on time).
-// WHY-THIS-SHAPE: cleanPlayAfter is 1 s, and the first clock-drawn picture only starts the credit, so the
-//       1.5 s gap across the hold clears the count only if that picture is judged on time; at 0.01 the next
-//       picture is 10 s off, so the count read after this one is its answer. The hold and the change are
-//       timed, and a change that did not land between the picture's due time and the end of the hold is
-//       reported as not graded.
-// CONTROL: via control_batch.sh, --phase '^dueSlowdown$', 2026-09-30, NVIDIA, each reverted, in
+//       stays a stall, earning no clean-play credit. On the one-picture-every-2-s file at speed 2 (a
+//       picture a second), the render thread held 3.4 s after a picture and the speed lowered to 0.5 at
+//       2 s, once the next was due. False for a wait re-timed as a whole at the new speed (the picture then
+//       waits to 4 s, 600 ms past the hold), and for a re-time that moves a due picture's time to the moment
+//       the clock sees the change (the stall then reads as on time).
+// WHY-THIS-SHAPE: 0.5 is the lowest speed, and its allowance is the file's own 2 s, so the picture must be
+//       more than 2 s late to be a stall: the hold makes it 2.4 s late. A whole re-time would release it
+//       4 s after the picture before, so the bound is half the distance from the hold's end to that, at most
+//       300 ms; a hold ending past 3.5 s leaves under 250 ms and is reported as not graded. cleanPlayAfter is 1 s, and the first
+//       clock-drawn picture only starts the credit, so the 3.4 s gap clears the count only if that picture
+//       is judged on time; the next picture is 4 s off, so the count read after this one is its answer. A
+//       change that did not land between the due time and the end of the hold is reported as not graded.
+// CONTROL: via control_batch.sh, --phase '^dueSlowdown$', 2026-10-14, each restored, in
 //       VideoSession::Waiting::retime (backend/daemon/wallpaper_manager.cpp): (a) reduced to `speed =
-//       newSpeed; return;` -> both lines red, "it came 8496.26 ms after the hold ended" and "the count is
-//       0"; (b) `from = changed;` made `from = now;`, so a due picture's time moves to the change -> the
-//       credit line alone, "the count is 0". "Is drawn": the retime `hours(1)` break -> red. Reverted.
+//       newSpeed; return;` -> both lines red, "598 ms after the hold ended" and "the count is 0"; (b)
+//       `from = changed;` made `from = now;`, so a due picture's time moves to the change -> the credit
+//       line alone, "the count is 0", NVIDIA. "Is drawn": the retime `hours(1)` break -> red. (a) re-run
+//       2026-10-15 after the bound became relative, in a private copy of the tree, Lavapipe and NVIDIA:
+//       both lines red, "598 ms after the hold" against a 300 ms bound. The not-graded branch: the hold
+//       made 3600 ms (test-side) -> "NOT VERIFIED ... did not end 3.2-3.5 s after the picture".
 void runDueSlowdownChecks(const WallpaperManager::Config& base, const std::string& clip) {
     const char* kGoal = "S15.120 (a speed lowered after a picture is due neither delays it nor makes a stall clean)";
     const wallpaperx::testing::ScratchDir scratch("videodueslow");
@@ -7580,7 +7626,7 @@ void runDueSlowdownChecks(const WallpaperManager::Config& base, const std::strin
     const std::vector<int> restored = manager.restoreSaved();
     manager.recordStartingVideos();
     check(deathsIn(config.stateDir) == 1, "the video starts this run carrying one death (the harness's premise)");
-    manager.setWallpaperProperties(kMonitorClean, {{"speed", 0.1}});
+    manager.setWallpaperProperties(kMonitorClean, {{"speed", 2.0}});
     wallpaperx::testing::nameScreen(manager, kMonitorClean, "DP-DUESLOW");
     for (const int id : restored) worker.post(id);
     if (!firstTwoPictures(signals, grade, kGoal)) return;
@@ -7594,11 +7640,11 @@ void runDueSlowdownChecks(const WallpaperManager::Config& base, const std::strin
     worker.postTask([holdFrom, holdTo](RenderWorker::TaskState state) {
         if (state != RenderWorker::TaskState::Run) return;
         holdFrom->store(Clock::now().time_since_epoch().count());
-        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        std::this_thread::sleep_for(std::chrono::milliseconds(3400));
         holdTo->store(Clock::now().time_since_epoch().count());
     });
-    std::this_thread::sleep_until(*second + std::chrono::milliseconds(1200));
-    manager.setWallpaperProperties(kMonitorClean, {{"speed", 0.01}});
+    std::this_thread::sleep_until(*second + std::chrono::milliseconds(2000));
+    manager.setWallpaperProperties(kMonitorClean, {{"speed", 0.5}});
     worker.wake();
     const Clock::time_point changed = Clock::now();
     const bool third = settlesWithin(std::chrono::seconds(15), [&] { return latestGeneration(pictures, kMonitorClean) >= 3; });
@@ -7615,19 +7661,25 @@ void runDueSlowdownChecks(const WallpaperManager::Config& base, const std::strin
     const double holdEnd = millisBetween(*second, heldTo);
     const double drawnAfterHold = shown ? millisBetween(heldTo, *shown) : -1.0;
     const double gap = shown ? millisBetween(*second, *shown) : -1.0;
-    std::printf("video_wallpaper_test: at speed 0.1, the render thread held %.0f-%.0f ms after a picture and the speed "
-                "lowered to 0.01 at %.0f ms; the next picture came %.0f ms after the hold, %.0f ms after the one before "
+    std::printf("video_wallpaper_test: at speed 2, the render thread held %.0f-%.0f ms after a picture and the speed "
+                "lowered to 0.5 at %.0f ms; the next picture came %.0f ms after the hold, %.0f ms after the one before "
                 "it; the count read %d with %llu picture(s) announced\n",
                 holdStart, holdEnd, changeAfter, drawnAfterHold, gap, afterThird,
                 static_cast<unsigned long long>(latestAtRead));
     std::fflush(stdout);
+    // Late past the file's own 2 s against the 1 s it was due after, which only a hold of 3.2 s or more makes.
     if (!shown || holdFrom->load() == 0 || holdTo->load() == 0 || holdStart > 800 || changeAfter < 1050 ||
         changeAfter > holdEnd - 50) {
         notVerified(kGoal, "the hold did not begin before the picture was due, or the speed change did not land "
                            "between its due time and the end of the hold");
         return;
     }
-    reportUnless(drawnAfterHold <= 300,
+    if (holdEnd < 3200 || holdEnd > 3500) {
+        notVerified(kGoal, "the hold did not end 3.2-3.5 s after the picture before it, so the picture was not more "
+                           "than 2 s late or a whole re-time would land too close to the hold's end to tell apart");
+        return;
+    }
+    reportUnless(drawnAfterHold <= std::min(300.0, (4000.0 - holdEnd) / 2),
                  "a picture already due when its speed is lowered is drawn as soon as the render thread is free",
                  "it came " + std::to_string(drawnAfterHold) + " ms after the hold ended");
     if (gap < 1100 || latestAtRead != 3) {
@@ -8440,7 +8492,7 @@ enum class Graded { Passed, Failed, NotGraded };
 // WHY-THIS-SHAPE: counted from readings newer than the stop, not from all of `shown`, which can hold the
 //       stopped picture itself read again by the hand-over. One function for every resume phase: a copy
 //       per phase is how the eviction phase kept skipping a stalled resume.
-// CONTROL: via control_batch.sh, --phase '^resume$', 2026-09-30, DbusService::setMonitorPause
+// CONTROL: via control_batch.sh, --phase '^resume$', re-run 2026-10-16 on NVIDIA at half speed, DbusService::setMonitorPause
 //       (backend/daemon/dbus_service.cpp) returning before the manager call for "play" -> "FAIL: a pause
 //       ended inside its delay carries on from the open decoder, with the next picture", printing "stopped
 //       on 11 (generation 12); 0 new picture(s) within 20 s of the resume: nothing"; S15.152's line red
@@ -8505,10 +8557,10 @@ void runResumeChecks(const WallpaperManager::Config& base, const std::string& co
     const auto unanswerable = [&]() { return readingStopped(taker, kGoals); };
 
     setMonitorOutput(proxy, kMonitorResume, screen);
-    // A quarter speed, seven or eight pictures a second, so the consumer rarely misses one; when it
-    // does, the check it would have graded reports that instead of guessing.
+    // Half speed, the slowest allowed, so the consumer rarely misses a picture; when it does, the check
+    // it would have graded reports that instead of guessing.
     wallpaperx::testing::setWallpaperWithProperties(proxy, "video", counterClip, kMonitorResume,
-                                                    {{"speed", sdbus::Variant(0.25)}});
+                                                    {{"speed", sdbus::Variant(0.5)}});
     if (!settlesWithin(std::chrono::seconds(30), [&] { return latestGeneration(rig.pictures, kMonitorResume) > 0; })) {
         grade.expectNoDevice();
         notVerified(kGoals, "the counter video produced no frame on this host");
@@ -8518,10 +8570,10 @@ void runResumeChecks(const WallpaperManager::Config& base, const std::string& co
     // numbers, each the one after the picture committed before it. A reader that read nothing, or read
     // the same number from every frame, would make each "showed F" below mean nothing. Only readings of
     // successive generations are compared, and at least five such pairs must have been.
-    // CONTROL: test-side, by hand, 2026-09-30, NVIDIA: counterFromBgra given the frame's height as its
-    //       width in the GL import path -> "FAIL: the served pictures read back as the fixture's frame
-    //       numbers, in order", "11 successive pair(s) compared", every reading -1. Restored. The mapped
-    //       dma_buf path (Lavapipe) has the same call and was not broken separately.
+    // CONTROL: test-side, via control_batch.sh, --phase '^resume$', 2026-10-16, NVIDIA and Lavapipe:
+    //       counterFromBgra given the frame's height as its width at both of its calls -> "FAIL: the served
+    //       pictures read back as the fixture's frame numbers, in order", "11 successive pair(s) compared",
+    //       every reading -1, on each driver. Breaking the first call alone left NVIDIA green. Restored.
     {
         taker.takeAtLeast(12, std::chrono::seconds(20));
         if (unanswerable()) return;
@@ -8565,7 +8617,7 @@ void runResumeChecks(const WallpaperManager::Config& base, const std::string& co
     //       picture are asserted, since a daemon that released and resumed exactly would show the same
     //       picture again rather than its successor. The two pictures are identified by generation as
     //       well as by frame number, so a consumer the host delayed past one is a skip, not a verdict.
-    // CONTROL: via control_batch.sh, --phase '^resume$', 2026-09-30, advanceSessionLocked()
+    // CONTROL: via control_batch.sh, --phase '^resume$', re-run 2026-10-16 on NVIDIA at half speed, advanceSessionLocked()
     //       (backend/daemon/wallpaper_manager.cpp) releasing a paused session at once -- `paused ?
     //       std::chrono::steady_clock::duration::zero() : m_config.idleSessionRelease` -> "FAIL: a pause
     //       ended inside its delay does not open the file again" and "FAIL: a pause ended inside its delay
@@ -8575,6 +8627,8 @@ void runResumeChecks(const WallpaperManager::Config& base, const std::string& co
     {
         const std::optional<ReadPicture> frozen = stopOn([&] { setMonitorPause(proxy, kMonitorResume, "always_paused"); });
         if (unanswerable()) return;
+        // CONTROL: via control_batch.sh, 2026-10-16, NVIDIA: WallpaperManager::setMonitorPause
+        //       (backend/daemon/wallpaper_manager.cpp) ignoring "always_paused" -> this line red. Reverted.
         if (!frozen) {
             check(false, "always_paused stops the counter video (the premise of the resume checks)");
             return;
@@ -8593,14 +8647,14 @@ void runResumeChecks(const WallpaperManager::Config& base, const std::string& co
     // WHY-THIS-SHAPE: measured from the SetMonitorPause call to the file's close, with a deadline and a
     //       failure branch; the consumer keeps collecting, so the monitor stays watched and only the pause
     //       stops it. The lower bound is the delay less a margin, so a release at the 2 s idle delay fails.
-    // CONTROL: via control_batch.sh, --phase '^resume$', 2026-09-30, each alone, reverted, in
+    // CONTROL: via control_batch.sh, --phase '^resume$', re-run 2026-10-16 on NVIDIA at half speed, each alone, reverted, in
     //       advanceSessionLocked() (backend/daemon/wallpaper_manager.cpp): the paused delay replaced by
     //       m_config.idleSessionRelease -> "FAIL: a paused session is released after pausedSessionRelease,
     //       not sooner or later", released 2.013 s after the pause; a paused round returning
     //       `session.idleSince.reset(); return std::nullopt;` -> the same line, "not released after 20 s".
     // GOAL: S15.151's pause half -- after that release the resume shows the picture that was on screen
     //       when the video stopped, then its successor.
-    // CONTROL: via control_run.sh, --phase '^resume$', re-run 2026-10-08 on NVIDIA, each alone, reverted, in
+    // CONTROL: via control_batch.sh, --phase '^resume$', re-run 2026-10-16 on NVIDIA at half speed, each alone, reverted, in
     //       backend/daemon/wallpaper_manager.cpp: `startAt` passed as std::nullopt to the VideoPipeline built
     //       in videoSessionLocked()'s `open` lambda -> "FAIL: a video whose paused session was released
     //       resumes on the picture it stopped on, then its successor", printing "stopped on 13 (generation
@@ -8612,7 +8666,7 @@ void runResumeChecks(const WallpaperManager::Config& base, const std::string& co
     //       a quarantine at the next start (resumeBlame grades that it is counted as a playing death).
     // WHY-THIS-SHAPE: read at the calls themselves, on the render thread; a record read before and after
     //       the resume would miss one written only around the seek or the catch-up.
-    // CONTROL: via control_run.sh, --phase '^resume$', 2026-10-08, NVIDIA, each alone, reverted, in
+    // CONTROL: via control_batch.sh, --phase '^resume$', re-run 2026-10-16, NVIDIA at half speed, each alone, reverted, in
     //       backend/daemon/wallpaper_manager.cpp: videoSessionLocked()'s `open` lambda emplacing `applying` for
     //       an open at a position too -> "FAIL: the resume's seek back runs under no crash record", "1 seek(s),
     //       1 under the record"; an ApplyingRecord around advanceSessionLocked()'s CatchingUp decode -> "FAIL: nor
@@ -8624,6 +8678,8 @@ void runResumeChecks(const WallpaperManager::Config& base, const std::string& co
         g_files.resetCounts();
         const std::optional<ReadPicture> frozen = stopOn([&] { setMonitorPause(proxy, kMonitorResume, "always_paused"); });
         if (unanswerable()) return;
+        // CONTROL: via control_batch.sh, --phase '^resume$', 2026-10-16, NVIDIA: WallpaperManager::setMonitorPause
+        //       (backend/daemon/wallpaper_manager.cpp) ignoring the second "always_paused" -> only this line red. Reverted.
         if (!frozen) {
             check(false, "always_paused stops the counter video again");
             return;
@@ -8658,7 +8714,7 @@ void runResumeChecks(const WallpaperManager::Config& base, const std::string& co
     // GOAL: S15.151's hidden half -- a video whose screen was reported not drawn, and whose session was
     //       released at the unwatched delay, resumes on the picture it stopped on when the screen is drawn
     //       again, then its successor.
-    // CONTROL: the two S15.151 breaks above -> "FAIL: a video whose hidden session was released resumes on
+    // CONTROL: the two S15.151 breaks above, re-run 2026-10-16 -> "FAIL: a video whose hidden session was released resumes on
     //       the picture it stopped on, then its successor", printing "stopped on 1 (generation 16), then
     //       showed 0 and 1". Reverted.
     {
@@ -8667,6 +8723,8 @@ void runResumeChecks(const WallpaperManager::Config& base, const std::string& co
         if (unanswerable()) return;
         const bool released =
             frozen && settlesWithin(std::chrono::seconds(20), [&] { return g_files.closes(counterClip) >= 1; });
+        // CONTROL: via control_batch.sh, --phase '^resume$', 2026-10-16, NVIDIA: WallpaperManager::setOutputVisible
+        //       (backend/daemon/wallpaper_manager.cpp) ignoring a hide -> only this line red. Reverted.
         check(released, "a hidden counter video stops and its session is released (the premise)");
         if (!released) return;
         const std::vector<ReadPicture> shown = resumeAndRead([&] { setOutputVisible(proxy, screen, true); });
@@ -8683,22 +8741,23 @@ void runResumeChecks(const WallpaperManager::Config& base, const std::string& co
     //       The wait is for two generations newer than the stopped one, not two readings: the stopped
     //       generation, announced while nobody collected, is read again by the taker, and counting it left
     //       one new picture to grade whenever the catch-up's rounds gave that second reading room.
-    // CONTROL: via control_run.sh, --phase '^resume$', 2026-10-08, NVIDIA, WallpaperManager::recordDeliveredLocked
-    //       (backend/daemon/wallpaper_manager.cpp) also resetting `releasedAt` -> this line red, printing
-    //       "stopped on 21 (generation 24), then showed 0 and 1". Reverted. Unbroken it reads "21 (generation
-    //       24), 21 (generation 25), 22 (generation 26)": the first is the taker's second reading of the stop.
+    // CONTROL: via control_batch.sh, --phase '^resume$', re-run 2026-10-16, NVIDIA at half speed,
+    //       WallpaperManager::recordDeliveredLocked (backend/daemon/wallpaper_manager.cpp) also resetting
+    //       `releasedAt` -> this line red, printing "stopped on 27 (generation 30), then showed 0 and 1". Reverted.
+    //       Unbroken it reads "27 (generation 30), 27 (generation 31), 28 (generation 32)": the first is the
+    //       taker's second reading of the stop.
     {
         g_files.resetCounts();
         const bool released = settlesWithin(std::chrono::seconds(20), [&] { return g_files.closes(counterClip) >= 1; });
+        // CONTROL: via control_batch.sh, --phase '^resume$', 2026-10-16, NVIDIA: advanceSessionLocked()
+        //       (backend/daemon/wallpaper_manager.cpp) skipping every unpaused idle release from the second on (the hidden
+        //       one above is the first) -> only this line red. Reverted.
         check(released, "a video nobody collects stops and its session is released (the premise)");
         if (!released) return;
         const size_t from = taker.pictures().size();
         const std::optional<ReadPicture> frozen = taker.current();
         if (unanswerable()) return;
-        if (!frozen) {
-            check(false, "the stopped video's picture is handed over to a consumer that asks again");
-            return;
-        }
+        if (!frozen) return;
         taker.takeUntil([&] { return taker.newerThan(from, frozen->generation) >= 2; }, std::chrono::seconds(20));
         if (unanswerable()) return;
         const std::vector<ReadPicture> shown(taker.pictures().begin() + static_cast<long>(from), taker.pictures().end());
@@ -8715,10 +8774,11 @@ void runResumeChecks(const WallpaperManager::Config& base, const std::string& co
     // WHY-THIS-SHAPE: the still opens no session, so nothing between spends the recorded position; only the
     //       wallpaper it was recorded for decides whether it is used. Read while the screen is hidden, from
     //       the render the new wallpaper owes, which no clock round has moved on.
-    // CONTROL: via control_batch.sh, --phase '^resume$', 2026-09-30, the `releasedAt->forSeq == wallpaperSeq`
-    //       term dropped from videoSessionLocked() (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a video
-    //       set again after a still starts at its first picture, not where the old one stood", printing
-    //       "stopped on 22; the video set again showed 22", alone. Reverted.
+    // CONTROL: via control_batch.sh, --phase '^resume$', re-run 2026-10-16, NVIDIA at half speed, the
+    //       `releasedAt->forSeq == wallpaperSeq` term dropped from videoSessionLocked()
+    //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a video set again after a still starts at its first
+    //       picture, not where the old one stood", printing "stopped on 28; the video set again showed 28",
+    //       alone. Reverted.
     {
         g_files.resetCounts();
         const std::optional<ReadPicture> frozen = stopOn([&] { setOutputVisible(proxy, screen, false); });
@@ -8740,9 +8800,9 @@ void runResumeChecks(const WallpaperManager::Config& base, const std::string& co
                                     return latestGeneration(rig.pictures, kMonitorResume) > before;
                                 });
         // A render that never happened is not a verdict on where the video starts.
-        // CONTROL: test-side, by hand, 2026-10-01: the still replaced by an undecodable file -> "FAIL: the still
-        //       and then the video set again are each drawn (the premise of S15.154)", "the still was never
-        //       drawn", and no FAIL on the property's line. Restored.
+        // CONTROL: test-side, via control_batch.sh, 2026-10-16, NVIDIA: the counter video set as the still, which
+        //       no image decoder reads -> "FAIL: the still and then the video set again are each drawn (the
+        //       premise of S15.154)", "the still was never drawn", and no FAIL on the property's line. Restored.
         check(stillShown && videoShown, "the still and then the video set again are each drawn (the premise of S15.154)");
         if (!stillShown || !videoShown) {
             std::fprintf(stderr, "  %s was never drawn\n", stillShown ? "the video set again" : "the still");
@@ -8784,7 +8844,7 @@ void runResumeEvictionChecks(const WallpaperManager::Config& base, const std::st
 
     setMonitorOutput(proxy, kMonitorResume, screenFor(kMonitorResume));
     wallpaperx::testing::setWallpaperWithProperties(proxy, "video", counterClip, kMonitorResume,
-                                                    {{"speed", sdbus::Variant(0.25)}});
+                                                    {{"speed", sdbus::Variant(0.5)}});
     if (!settlesWithin(std::chrono::seconds(30), [&] { return latestGeneration(rig.pictures, kMonitorResume) > 0; })) {
         grade.expectNoDevice();
         notVerified(kGoal, "the counter video produced no frame on this host");
@@ -8795,6 +8855,8 @@ void runResumeEvictionChecks(const WallpaperManager::Config& base, const std::st
     const bool quiet = taker.takeUntilQuiet(kQuietWindow, std::chrono::seconds(25));
     const std::optional<ReadPicture> frozen = quiet ? taker.current() : std::nullopt;
     if (readingStopped(taker, kGoal)) return;
+    // CONTROL: via control_batch.sh, 2026-10-16, NVIDIA: WallpaperManager::setOutputVisible
+    //       (backend/daemon/wallpaper_manager.cpp) ignoring a hide -> this line red. Reverted.
     if (!frozen) {
         check(false, "a hidden counter video stops (the premise of the eviction check)");
         return;
@@ -8806,7 +8868,7 @@ void runResumeEvictionChecks(const WallpaperManager::Config& base, const std::st
     //       free the hidden monitor's session -- the only one not on a drawn screen. The close is asserted
     //       before the resume. A reopen never evicts -- it waits for a free slot -- so another monitor is
     //       then given a still, whose render frees that monitor's session and runs the round that reopens.
-    // CONTROL: via control_batch.sh, --phase '^resumeEviction$', 2026-10-01, closeVideoSessionLocked() in
+    // CONTROL: via control_batch.sh, --phase '^resumeEviction$', re-run 2026-10-16 on NVIDIA at half speed, closeVideoSessionLocked() in
     //       place of releaseVideoSessionLocked() in evictIdleVideoSessionLocked()
     //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a video whose session was evicted resumes on the
     //       picture it stopped on, then its successor", printing "stopped on 7 (generation 8), then showed 0
@@ -8817,6 +8879,8 @@ void runResumeEvictionChecks(const WallpaperManager::Config& base, const std::st
         setWallpaper(proxy, "video", clips[static_cast<size_t>(id - 1)], id);
     }
     const bool evicted = settlesWithin(std::chrono::seconds(60), [&] { return g_files.closes(counterClip) >= 1; });
+    // CONTROL: via control_batch.sh, 2026-10-16, NVIDIA: evictIdleVideoSessionLocked()
+    //       (backend/daemon/wallpaper_manager.cpp) never choosing a victim -> this line red. Reverted.
     check(evicted, "the hidden video's session is evicted for the eighth other video (the premise)");
     if (!evicted) return;
     const size_t from = taker.pictures().size();
@@ -9326,13 +9390,12 @@ void runResumeHoldChecks(const WallpaperManager::Config& base, const std::string
                      " ms catch-up");
 }
 
-// S15.415 and S15.416: a resume interrupted while it catches up. Each packet sent to the decoder is delayed
+// S15.415: a resume interrupted while it catches up. Each packet sent to the decoder is delayed
 // so the catch-up spans seconds of clock rounds and the phase can act inside it.
 void runResumeCatchUpChecks(const WallpaperManager::Config& base, const std::string& counterClip) {
     using wallpaperx::testing::setMonitorOutput;
-    using wallpaperx::testing::setOutputSize;
     using wallpaperx::testing::setOutputVisible;
-    const char* kGoals = "S15.415 and S15.416 (a resume interrupted while it catches up)";
+    const char* kGoals = "S15.415 (a resume interrupted while it catches up)";
     const std::optional<CounterOrder> order = counterOrder(counterClip, kGoals);
     if (!order) return;
     WallpaperManager::Config config = base;
@@ -9357,7 +9420,7 @@ void runResumeCatchUpChecks(const WallpaperManager::Config& base, const std::str
     const std::string screen = "DP-CATCHUP";
     setMonitorOutput(proxy, kMonitorResume, screen);
     wallpaperx::testing::setWallpaperWithProperties(proxy, "video", counterClip, kMonitorResume,
-                                                    {{"speed", sdbus::Variant(0.25)}});
+                                                    {{"speed", sdbus::Variant(0.5)}});
     if (!settlesWithin(std::chrono::seconds(30), [&] { return latestGeneration(rig.pictures, kMonitorResume) > 0; })) {
         grade.expectNoDevice();
         notVerified(kGoals, "the counter video produced no frame on this host");
@@ -9381,6 +9444,9 @@ void runResumeCatchUpChecks(const WallpaperManager::Config& base, const std::str
         const bool released =
             frozen && settlesWithin(std::chrono::seconds(20), [&] { return g_files.closes(counterClip) >= 1; });
         const bool farIn = frozen && frozen->counter % kKeyframeInterval >= 4;
+        // CONTROL: via control_batch.sh, 2026-10-16, NVIDIA: WallpaperManager::setOutputVisible
+        //       (backend/daemon/wallpaper_manager.cpp) ignoring a hide -> this line red, "stopped on nothing;
+        //       never released". Reverted.
         check(released && farIn, "the counter video stops well past a keyframe when hidden, and is released (the premise)");
         if (!released || !farIn) {
             std::fprintf(stderr, "  stopped on %s; %s\n", frozen ? std::to_string(frozen->counter).c_str() : "nothing",
@@ -9402,7 +9468,7 @@ void runResumeCatchUpChecks(const WallpaperManager::Config& base, const std::str
     // WHY-THIS-SHAPE: the screen is hidden again inside the first packet of the slowed catch-up, so the
     //       session is released holding no picture of its own; a release that recorded only a picture the
     //       session drew records nothing, and the video starts again from its first picture.
-    // CONTROL: via control_run.sh, --phase '^resumeCatchUp$', 2026-10-08, NVIDIA, reverted:
+    // CONTROL: via control_batch.sh, --phase '^resumeCatchUp$', re-run 2026-10-16, NVIDIA at half speed, reverted:
     //       releaseVideoSessionLocked() (backend/daemon/wallpaper_manager.cpp) treating only Undrawn as having
     //       drawn nothing, so a CatchingUp session records its pipeline's (empty) shown position -> "FAIL: a video
     //       released while it catches up resumes, next time, on the picture it stopped on, then its successor",
@@ -9412,6 +9478,9 @@ void runResumeCatchUpChecks(const WallpaperManager::Config& base, const std::str
         const std::optional<ReadPicture> frozen = playThenRelease();
         if (!frozen) return;
         g_files.resetCounts();
+        // CONTROL: via control_batch.sh, --phase '^resumeCatchUp$', 2026-10-16, NVIDIA: reopenVideosLocked()
+        //       (backend/daemon/wallpaper_manager.cpp) never owing a render to a playing video with no session -> only this
+        //       line red. Reverted.
         if (!resumeSlowly()) {
             check(false, "a hidden counter video shown again sends its decoder a packet (the premise)");
             return;
@@ -9420,6 +9489,9 @@ void runResumeCatchUpChecks(const WallpaperManager::Config& base, const std::str
         const bool released = settlesWithin(std::chrono::seconds(20), [&] { return g_files.closes(counterClip) >= 1; });
         g_sendDelayMs.store(0);
         const uint64_t latest = latestGeneration(rig.pictures, kMonitorResume);
+        // CONTROL: via control_batch.sh, --phase '^resumeCatchUp$', 2026-10-16, NVIDIA: advanceSessionLocked()
+        //       (backend/daemon/wallpaper_manager.cpp) returning before releaseVideoSessionLocked() for a CatchingUp session
+        //       -> only this line red. Reverted.
         check(released, "a video hidden again while it catches up is released (the premise)");
         if (!released) return;
         if (latest != frozen->generation) {
@@ -9434,43 +9506,6 @@ void runResumeCatchUpChecks(const WallpaperManager::Config& base, const std::str
         const std::vector<ReadPicture> shown(taker.pictures().begin() + static_cast<long>(from), taker.pictures().end());
         gradeNextTwo("a video released while it catches up resumes, next time, on the picture it stopped on, then its "
                      "successor",
-                     shown, *frozen, frozen->counter, order->after(frozen->counter));
-    }
-
-    // GOAL: S15.416 -- a new size reported while a resume catches up is drawn at once, at the picture the video
-    //       stopped on, then its successor; the monitor records no failure.
-    // WHY-THIS-SHAPE: the size changes inside the first packet of the slowed catch-up, so the render the new
-    //       size owes finds the session still catching up and has to reach the picture itself before it can
-    //       draw into the rebuilt images.
-    // CONTROL: via control_run.sh, --phase '^resumeCatchUp$', 2026-10-08, NVIDIA, reverted: renderPassLocked()
-    //       (backend/daemon/wallpaper_manager.cpp) without its `caughtUpSessionLocked()` call, so the pass draws a
-    //       session that has decoded nothing -> "FAIL: a new size reported while a resume catches up records no
-    //       failure", "last_error: VideoPipeline::draw: no picture has been decoded", and "FAIL: ... draws the
-    //       picture it stopped on, then its successor", "0 new picture(s) within 20 s".
-    // COVERAGE-ASSERT: no new generation had appeared when the size was reported.
-    {
-        const std::optional<ReadPicture> frozen = playThenRelease();
-        if (!frozen) return;
-        if (!resumeSlowly()) {
-            check(false, "a hidden counter video shown again sends its decoder a packet (the premise)");
-            return;
-        }
-        const size_t from = taker.pictures().size();
-        const uint64_t atResize = latestGeneration(rig.pictures, kMonitorResume);
-        setOutputSize(proxy, screen, 192, 144);
-        taker.takeUntil([&] { return taker.newerThan(from, frozen->generation) >= 2; }, std::chrono::seconds(30));
-        g_sendDelayMs.store(0);
-        if (readingStopped(taker, kGoals)) return;
-        if (atResize != frozen->generation) {
-            notVerified("S15.416", "the slowed catch-up reached its picture before the new size was reported");
-            return;
-        }
-        const std::vector<ReadPicture> shown(taker.pictures().begin() + static_cast<long>(from), taker.pictures().end());
-        const StatusReply status = getStatusOrExplain(proxy);
-        const nlohmann::json* entry = wallpaperStatus(status, std::to_string(kMonitorResume));
-        const std::string error = entry != nullptr ? entry->value("last_error", std::string()) : "no status";
-        reportUnless(error.empty(), "a new size reported while a resume catches up records no failure", "last_error: " + error);
-        gradeNextTwo("a new size reported while a resume catches up draws the picture it stopped on, then its successor",
                      shown, *frozen, frozen->counter, order->after(frozen->counter));
     }
 }
@@ -9620,7 +9655,7 @@ void runResumeHealthChecks(const WallpaperManager::Config& base, const std::stri
     setMonitorOutput(proxy, kMonitorResume, screen);
     setMonitorOutput(proxy, kStill, stillScreen);
     wallpaperx::testing::setWallpaperWithProperties(proxy, "video", counterClip, kMonitorResume,
-                                                    {{"speed", sdbus::Variant(0.25)}});
+                                                    {{"speed", sdbus::Variant(0.5)}});
     setWallpaper(proxy, "static", still, kStill);
     const auto generation = [&] { return latestGeneration(rig.pictures, kMonitorResume); };
     const auto gpu = [&] { return rig.manager.snapshot().health.gpu; };
@@ -9646,6 +9681,9 @@ void runResumeHealthChecks(const WallpaperManager::Config& base, const std::stri
         g_files.resetCounts();
         setOutputVisible(proxy, screen, false);
         const bool released = settlesWithin(std::chrono::seconds(20), [&] { return g_files.closes(counterClip) >= 1; });
+        // CONTROL: via control_batch.sh, --phase '^resumeHealth$', 2026-10-16, NVIDIA:
+        //       WallpaperManager::setOutputVisible (backend/daemon/wallpaper_manager.cpp) ignoring a hide -> this
+        //       line red. Reverted.
         check(released, "a hidden counter video is released (the premise)");
         if (!released) return std::nullopt;
         g_files.resetCounts();
@@ -9692,13 +9730,13 @@ void runResumeHealthChecks(const WallpaperManager::Config& base, const std::stri
     //       first is read from one snapshot holding both health and the committed generation: the bus-announced
     //       generation can lag the commit, and would grade a clear that preceded the failure as a missing clear.
     //       Health is read once the resumed picture is announced, which comes after its commit.
-    // CONTROL: via control_run.sh, --phase '^resumeHealth$', 2026-10-09, video_wallpaper_lavapipe, reverted: the
+    // CONTROL: via control_batch.sh, --phase '^resumeHealth$', re-run 2026-10-16 at half speed on both drivers, reverted: the
     //       `if (delivered)` publish in advanceSessionLocked() (backend/daemon/wallpaper_manager.cpp) made
     //       `if (false && delivered)` -> "FAIL: the resumed picture, drawn in the round its catch-up finished,
     //       clears a GPU failure recorded since the kept-frame render", "gpu health still: OffscreenTargetManager:
     //       vkCreateFramebuffer failed with VK_ERROR_DEVICE_LOST". The later-round half then fails at its premise:
     //       the failure left standing stops the next resume (reopenVideosLocked posts nothing while it stands).
-    //       Test-side, by hand: waiting for the resumed picture's commit before failing the still -> "NOT VERIFIED
+    //       Test-side, via control_batch.sh, 2026-10-16, NVIDIA: waiting for the resumed picture's commit before failing the still -> "NOT VERIFIED
     //       -- S15.428's same-round half", no FAIL, and the later-round half green after the still's redraw.
     {
         const std::optional<uint64_t> frozen = stopPastKeyframe();
@@ -9709,6 +9747,9 @@ void runResumeHealthChecks(const WallpaperManager::Config& base, const std::stri
         const bool catchingUp = settlesWithin(std::chrono::seconds(20), [&] { return g_decodeCalls.load() > sends; });
         const StillFailure still = catchingUp ? failStill(kFaultWidth, kFaultHeight, *frozen) : StillFailure{};
         g_sendDelayMs.store(0);
+        // CONTROL: via control_batch.sh, --phase '^resumeHealth$', 2026-10-16, NVIDIA: reopenVideosLocked()
+        //       (backend/daemon/wallpaper_manager.cpp) never owing a render to a playing video with no session -> only this
+        //       line red. Reverted.
         check(catchingUp && still.failed,
               "the resumed video catches up, and a still's render records a GPU failure (the premise)");
         if (!catchingUp || !still.failed) return;
@@ -9738,7 +9779,7 @@ void runResumeHealthChecks(const WallpaperManager::Config& base, const std::stri
     //       exists only in the catch-up's last step; the screen is hidden there, so that round's draw check finds
     //       it not playing and leaves the picture undrawn. A flag read at the start of the catch-up round would
     //       have been spent by then.
-    // CONTROL: via control_run.sh, --phase '^resumeHealth$', 2026-10-09, video_wallpaper_lavapipe, reverted: the
+    // CONTROL: via control_batch.sh, --phase '^resumeHealth$', re-run 2026-10-16, NVIDIA at half speed, reverted: the
     //       condition guarding `delivered = healthCheck(...)` in advanceSessionLocked()
     //       (backend/daemon/wallpaper_manager.cpp) made `resuming && session.openedAt` -- read at the start of the
     //       round -> only this line red, "gpu health still: OffscreenTargetManager: vkCreateFramebuffer failed with
@@ -9758,6 +9799,9 @@ void runResumeHealthChecks(const WallpaperManager::Config& base, const std::stri
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         const bool slipped = committed() == *frozen && g_files.closes(counterClip) == 0;
         const bool failed = slipped && failStill(kFaultWidth + 8, kFaultHeight + 8, *frozen).beforePicture;
+        // CONTROL: via control_batch.sh, --phase '^resumeHealth$', 2026-10-16, NVIDIA: advanceSessionLocked()'s draw
+        //       check (backend/daemon/wallpaper_manager.cpp) dropping its `playingSeqLocked(...) != playing` term, so the
+        //       caught-up picture is drawn on a hidden screen -> only this line red. Reverted.
         check(slipped && failed, "the caught-up picture was left undrawn, and a still's render then records a GPU failure "
                                  "(the premise)");
         if (!slipped || !failed) return;
@@ -10176,11 +10220,12 @@ int main(int argc, char** argv) {
                             "exercised -- a file declaring a thousand pictures a second would go ungraded");
         }
         phase("highRate", [&] {
-            if (std::filesystem::exists(rate240)) {
-                runHighRateChecks(config, rate240);
+            if (std::filesystem::exists(rate240) && std::filesystem::exists(rate120)) {
+                runHighRateChecks(config, rate240, rate120);
             } else {
-                notVerified("S15.109-S15.111", "the fixture " + rate240 + " was not generated, so playback above the "
-                                               "120-a-second cap was not exercised");
+                notVerified("S15.109-S15.111", "the fixtures " + rate240 + " and " + rate120 +
+                                               " were not both generated, so playback above the 120-a-second cap "
+                                               "was not exercised");
             }
         });
         phase("handoverLog", [&] { runHandoverLogChecks(config, clip); });
@@ -10197,10 +10242,18 @@ int main(int argc, char** argv) {
               [&] { runCleanPlayHideChecks(config, clip, std::chrono::seconds(6), /*gradeClear=*/true); });
         phase("cleanPlayHide3s",
               [&] { runCleanPlayHideChecks(config, clip, std::chrono::seconds(3), /*gradeClear=*/false); });
-        phase("slowStallCredit", [&] { runSlowStallCreditChecks(config, clip); });
-        phase("midWaitRaise", [&] { runMidWaitRaiseChecks(config, clip); });
-        phase("renderPathRetime", [&] { runRenderPathRetimeChecks(config, clip); });
-        phase("dueSlowdown", [&] { runDueSlowdownChecks(config, clip); });
+        // At the three speeds only a file of seconds-long pictures makes waits long enough to land a change in.
+        const auto onSlowFile = [&](const char* goal, auto run) {
+            if (std::filesystem::exists(slow)) {
+                run(config, slow);
+            } else {
+                notVerified(goal, "the fixture " + slow + " was not generated");
+            }
+        };
+        phase("slowStallCredit", [&] { onSlowFile("S15.114", runSlowStallCreditChecks); });
+        phase("midWaitRaise", [&] { onSlowFile("S15.118", runMidWaitRaiseChecks); });
+        phase("renderPathRetime", [&] { onSlowFile("S15.119", runRenderPathRetimeChecks); });
+        phase("dueSlowdown", [&] { onSlowFile("S15.120", runDueSlowdownChecks); });
         phase("playbackBlame", [&] { runPlaybackBlameChecks(config, clips, still, onePicture); });
     } catch (const std::exception& e) {
         // Without this an escaping sdbus::Error -- what a host with no session bus produces --

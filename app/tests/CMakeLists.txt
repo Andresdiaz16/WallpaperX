@@ -51,7 +51,7 @@ set(WALLPAPERX_APP_PREVIEW_SOURCES
 set(WALLPAPERX_APP_TESTS_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 function(wallpaperx_app_library_test_target target)
-    target_include_directories(${target} PRIVATE ${WALLPAPERX_APP_TESTS_DIR}/../library)
+    target_include_directories(${target} PRIVATE ${WALLPAPERX_APP_TESTS_DIR}/../library ${WALLPAPERX_APP_TESTS_DIR}/../../shared)
     target_link_libraries(${target} PRIVATE Qt6::Concurrent Qt6::Gui nlohmann_json::nlohmann_json PkgConfig::LIBZIP PkgConfig::LIBAV)
 endfunction()
 

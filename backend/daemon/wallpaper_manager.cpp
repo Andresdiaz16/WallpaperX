@@ -129,13 +129,17 @@ std::chrono::nanoseconds ownInterval(const PictureTiming& picture) {
 }
 
 // How long after `before` its successor `after` is due on the file's own timeline: their
-// timestamps' difference where that is usable, else `before`'s own duration -- which is what a
-// loop's first picture, a timestamp going backwards or one jumping past the ceiling get. Not
-// floored: the floor is applied against when the previous picture was drawn.
+// timestamps' difference where that is usable -- for a loop's first picture, the distance to where
+// the pass before ended -- else `before`'s own duration, which a timestamp going backwards or one
+// jumping past the ceiling gets. The ceiling is one step's, plus `before`'s own duration for each
+// picture skipped between them, so skipping deeper never lets a real jump through. Not floored: the
+// floor is applied against when the previous picture was drawn.
 std::chrono::nanoseconds gapBetween(const PictureTiming& before, const PictureTiming& after) {
-    if (!after.startsPass && before.presentation && after.presentation) {
-        const std::chrono::nanoseconds gap = *after.presentation - *before.presentation;
-        if (gap > std::chrono::nanoseconds::zero() && gap <= kMaxPictureInterval) return gap;
+    const std::optional<std::chrono::nanoseconds> next = after.startsPass ? after.passEnded : after.presentation;
+    if (before.presentation && next) {
+        const std::chrono::nanoseconds gap = *next - *before.presentation;
+        const std::chrono::nanoseconds ceiling = kMaxPictureInterval + ownInterval(before) * (after.readSince - 1);
+        if (gap > std::chrono::nanoseconds::zero() && gap <= ceiling) return gap;
     }
     return ownInterval(before);
 }
@@ -1685,6 +1689,7 @@ std::vector<int> WallpaperManager::restoreSaved() {
     // Only on rows this build applies: a kept row's values are its newer build's to judge.
     std::map<int, int> droppedPropertiesOn;
     std::map<int, int> clampedVolumesOn;
+    std::map<int, int> snappedSpeedsOn;
     // Monitor id -> the last `pause` text a row gave it. Not m_pauseSettings: that erases play,
     // which would make an explicit play indistinguishable from a row that says nothing.
     std::map<int, std::string> pauseRead;
@@ -1878,9 +1883,12 @@ std::vector<int> WallpaperManager::restoreSaved() {
         state.path = entry.path;
         int dropped = 0;
         int clamped = 0;
-        state.properties = usableProperties(propertiesFromJson(entry.propertiesJson, dropped), dropped, clamped);
+        int snapped = 0;
+        state.properties =
+            usableProperties(propertiesFromJson(entry.propertiesJson, dropped), dropped, clamped, snapped);
         droppedPropertiesOn[entry.monitorId] = dropped;
         clampedVolumesOn[entry.monitorId] = clamped;
+        snappedSpeedsOn[entry.monitorId] = snapped;
         ++state.requestSeq;
         ++state.wallpaperSeq;
         state.lastError.clear();
@@ -1921,6 +1929,8 @@ std::vector<int> WallpaperManager::restoreSaved() {
     for (const auto& [monitorId, dropped] : droppedPropertiesOn) droppedProperties += dropped;
     int clampedVolumes = 0;
     for (const auto& [monitorId, clamped] : clampedVolumesOn) clampedVolumes += clamped;
+    int snappedSpeeds = 0;
+    for (const auto& [monitorId, snapped] : snappedSpeedsOn) snappedSpeeds += snapped;
     int rejectedSizes = 0;
     // Only a name still bound: one a later row took away is counted as displaced, not here.
     for (const std::string& name : sizeRejectedFor) {
@@ -1978,6 +1988,11 @@ std::vector<int> WallpaperManager::restoreSaved() {
                     " wallpaper volumes outside 0 to 1 moved to the nearer of the two; set them again if that "
                     "is not the level wanted");
     }
+    if (snappedSpeeds > 0) {
+        m_kept.note(std::to_string(snappedSpeeds) +
+                    " wallpaper speeds other than " + playbackSpeedsText("and") +
+                    " moved to the nearest; set them again if that is not the speed wanted");
+    }
     if (duplicateIds > 0) {
         // Not "the last entry won": three collisions feed this counter and one is resolved by
         // the EARLIER row, the one this build can show. The copy is named by its own note
@@ -2006,7 +2021,7 @@ std::vector<int> WallpaperManager::restoreSaved() {
     // already sanitized and would be escaped a second time.
     // Any rejected size, not only those left uncompensated: the rewrite removes its bytes either way.
     repaired = displacedNames > 0 || rejectedNames > 0 || !sizeRejectedFor.empty() || duplicateIds > 0 ||
-               droppedProperties > 0 || clampedVolumes > 0 || !pauseConflicts.empty() || !soundConflicts.empty() ||
+               droppedProperties > 0 || clampedVolumes > 0 || snappedSpeeds > 0 || !pauseConflicts.empty() || !soundConflicts.empty() ||
                m_kept.anyDropped();
     if ((!m_kept.carried().empty() || repaired) && m_health.persistence.status == HealthStatus::Ok) {
         recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Ok,
@@ -2301,13 +2316,11 @@ WallpaperManager::VideoSession& WallpaperManager::videoSessionLocked(int monitor
 
     using Clock = decltype(VideoSession::clock);
     const Clock clock = startAt ? Clock(VideoSession::CatchingUp{}) : Clock(VideoSession::Undrawn{});
-    const std::optional<std::chrono::nanoseconds> average = pipeline->averageFrameInterval();
     const auto entry = m_videoSessions
                            .insert_or_assign(monitorId, VideoSession{wallpaperSeq, ++m_videoSessionUse, path,
                                                                      std::move(blame), std::move(pipeline), startAt,
                                                                      clock})
                            .first;
-    entry->second.slowedByCap = average && *average < kMinPictureInterval;
     {
         // A new session's readers are all new to it, and its play starts afresh. This is the only
         // place a session is made, so the only reset any of these needs.
@@ -2373,33 +2386,81 @@ WallpaperManager::VideoSession::OnScreen WallpaperManager::VideoSession::Waiting
     return {now, now};
 }
 
-void WallpaperManager::VideoSession::DecodeLoad::Average::add(double load) {
-    // The mean of the first kSettled decodes, then an eighth of each new one, and none counted past
-    // twice its time: one decode, however slow, cannot make a file that keeps up look slow for long.
-    if (samples < kSettled) ++samples;
-    value += (std::min(load, 2.0) - value) / samples;
+void WallpaperManager::VideoSession::DecodeLoad::Average::add(double sample, double cap, uint32_t weight) {
+    // The mean of the first kSettled, then an eighth of each one after; the cap keeps one decode, however
+    // slow, from making a file that keeps up look slow for long.
+    const double counted = std::min(sample, cap);
+    for (; weight > 0 && samples < kSettled; --weight) value += (counted - value) / ++samples;
+    value = counted + (value - counted) * std::pow(1.0 - 1.0 / kSettled, weight);
+}
+
+void WallpaperManager::VideoSession::DecodeLoad::Span::add(double intervals, uint32_t read) {
+    perPicture.add(intervals, 1e9);
+    const double counted = std::clamp(std::min(intervals, static_cast<double>(read)), 1.0, double{kSettled});
+    covered = std::min(kSettled, covered + static_cast<uint32_t>(std::lround(counted)));
+}
+
+double WallpaperManager::VideoSession::DecodeLoad::span(size_t at) const {
+    at = std::min(at, kLevels - 1);
+    if (at == 0) return 1.0;
+    // Measured once its pictures cover kSettled intervals: one long gap at a sparse-key file's key level
+    // does, a lone short one -- a P picture just before a key one -- does not.
+    if (spans[at].covered >= kSettled) return spans[at].perPicture.value;
+    if (kept[0] == 0) return 1.0;
+    // As the pictures' types predict, from what was decoded before any skipping: too few key pictures
+    // seen there, or a B pyramid, can put it either side of what the level spans.
+    return static_cast<double>(kept[0]) / static_cast<double>(std::max<uint64_t>(kept[at], 1));
+}
+
+void WallpaperManager::VideoSession::DecodeLoad::saw(PictureSkip decodedAt, PictureSkip keptThrough) {
+    if (decodedAt != PictureSkip::Nothing) return;
+    for (size_t at = 0; at <= static_cast<size_t>(keptThrough); ++at) ++kept[at];
 }
 
 void WallpaperManager::VideoSession::DecodeLoad::add(std::chrono::nanoseconds took, std::chrono::nanoseconds shownFor,
-                                                     std::chrono::nanoseconds covered) {
+                                                     std::chrono::nanoseconds covered, PictureSkip previousAt,
+                                                     PictureSkip decodedAt, PictureSkip deepest, uint32_t read) {
     const auto against = [&](std::chrono::nanoseconds span) {
         return static_cast<double>(took.count()) / static_cast<double>(span.count());
     };
-    everyPicture.add(against(shownFor));
-    asRun.add(against(covered));
-    // Skipping starts unpaced: its samples so far measured decoding every picture.
-    if (state == State::Keeps) {
-        if (everyPicture.samples >= kSettled && everyPicture.value >= 1.0) {
-            state = State::Behind;
-            asRun = {};
-        }
-    } else if (everyPicture.value < kKeepsUp) {
-        state = State::Keeps;
-    } else if (state == State::Skips && asRun.value >= 1.0) {
-        state = State::Behind;
-    } else if (state == State::Behind && asRun.samples >= kSettled && asRun.value < kKeepsUp) {
-        state = State::Skips;
+    const double intervals = static_cast<double>(covered.count()) / static_cast<double>(shownFor.count());
+    // The pictures this one stands for: each one skipped was read, so a gap a timestamp jump stretched
+    // counts no more than the packets behind it.
+    const auto weight =
+        static_cast<uint32_t>(std::lround(std::clamp(std::min(intervals, static_cast<double>(read)), 1.0, 1e6)));
+    // Capped at twice the average, or what a picture of this level spans if more: a file far over load
+    // must be seen to be, or a climb stops short at a level predicted to keep up that does not, and a
+    // level that skips would predict a lower one keeps up that was already seen not to.
+    const auto deepestAt = static_cast<size_t>(deepest);
+    everyPicture.add(against(shownFor), 2.0 * std::max({everyPicture.value, span(std::min(level, deepestAt)), 1.0}),
+                     weight);
+    if (decodedAt == std::min(skip(), deepest) && previousAt == decodedAt) {
+        // One a picture, not weighted: decoderBehind() then lasts kSettled pictures into a level, which
+        // lets the pictures it inherited late from the last one catch up without the sound being moved.
+        asRun.add(against(covered));
+        if (decodedAt != PictureSkip::Nothing) spans[static_cast<size_t>(decodedAt)].add(intervals, read);
     }
+    const auto moveTo = [this](size_t to) {
+        level = to;
+        asRun = {};
+    };
+    const auto keepsUpAt = [this](size_t at) { return everyPicture.value / span(at) < kKeepsUp; };
+    // A level seen or predicted to leave nothing out cannot help, nor one the decoder does not apply.
+    for (size_t lower = 0; lower < std::min(level, deepestAt + 1); ++lower) {
+        if ((lower == 0 || span(lower) > kSkipped) && keepsUpAt(lower)) {
+            moveTo(lower);
+            return;
+        }
+    }
+    // Behind as this level's own pictures measure it, or as the cost of every picture predicts for it:
+    // that needs none of this level's pictures, which a decoder's frames in flight hold back for a while.
+    const Average& paced = level == 0 ? everyPicture : asRun;
+    const bool behind = (paced.samples >= kSettled && paced.value >= 1.0) ||
+                        (everyPicture.samples >= kSettled && everyPicture.value >= span(level));
+    if (!behind || unpaced()) return;
+    size_t to = level + 1;
+    while (to <= deepestAt && !(span(to) > kSkipped * span(level) && keepsUpAt(to))) ++to;
+    moveTo(to > deepestAt ? kUnpaced : to);
 }
 
 void WallpaperManager::markShown(VideoSession& session, SteadyTime now, double speed) {
@@ -2414,13 +2475,8 @@ void WallpaperManager::markShown(VideoSession& session, SteadyTime now, double s
     session.clock = shown;
 }
 
-bool WallpaperManager::soundWanted(const VideoSession& session, const SoundWanted& wanted) {
-    // A file whose pictures the rate cap slows would need its sound stretched too.
-    return wanted.audible() && !session.slowedByCap;
-}
-
 AudioTrack* WallpaperManager::heardTrackLocked(int monitorId, VideoSession& session, const SoundWanted& wanted) {
-    if (!soundWanted(session, wanted)) {
+    if (!wanted.audible()) {
         if (session.audio) session.audio->stop();
         return nullptr;
     }
@@ -2437,6 +2493,7 @@ AudioTrack* WallpaperManager::heardTrackLocked(int monitorId, VideoSession& sess
     }
     // Cubed, as desktop mixers do, so the slider's middle sounds like the middle.
     session.audio->setVolume(wanted.volume * wanted.volume * wanted.volume);
+    session.audio->setRate(wanted.speed);
     return session.audio.get();
 }
 
@@ -2456,15 +2513,24 @@ WallpaperManager::SoundPace WallpaperManager::steerSoundLocked(int monitorId, Vi
             track->stop();
             return {};
         }
+        const double rate = track->rate();
         const VideoSession::OnScreen planned = waiting.planned();
         // Where markShown() puts the waiting picture if drawn now: on its plan up to an interval late,
         // at `now` past that.
-        const SteadyTime drawnAt = waiting.shownAt(now, intervalAtSpeed(next, 1.0)).timeline;
+        const SteadyTime drawnAt = waiting.shownAt(now, intervalAtSpeed(next, wanted.speed)).timeline;
+        // A play placed by `drawnAt` on a picture drawn this round waits for the draw: a draw later than
+        // `now` shows it later than `drawnAt` says, and with no clock to correct it that gap would read
+        // as the sound having drifted.
+        const auto playOnDrawn = [&](const AudioTrack::Anchor& anchor) -> SoundPace {
+            if (planned.due <= now) return {.playAtDraw = SoundPace::DrawPlay{anchor.from, anchor.at - drawnAt}};
+            track->play(anchor);
+            return {};
+        };
         if (!track->anchor()) {
             if (planned.due <= now) {
                 // Drawn this round, so heard from where it is shown rather than on a schedule that stood
                 // still while play was stopped.
-                track->play({*next.presentation, drawnAt});
+                return playOnDrawn({*next.presentation, drawnAt});
             } else if (!next.startsPass) {
                 track->play({*next.presentation - waiting.left, waiting.from});
             } else if (waiting.reaches && planned.timeline - now > kHandOverLead) {
@@ -2482,44 +2548,57 @@ WallpaperManager::SoundPace WallpaperManager::steerSoundLocked(int monitorId, Vi
         // after the moment `from`.
         const AudioTrack::Anchor schedule{*next.presentation - waiting.left, waiting.from};
         const AudioTrack::Anchor asked = *track->anchor();
-        // How far ahead of the schedule `sound` has the file, the schedule's file time moved by `shift`
+        const AudioTrack::Clock askedClock{asked.from, asked.at, rate};
+        // How much sooner than the schedule `sound` reaches the schedule's file time, moved by `shift`
         // onto the pass that sound plays.
-        const auto ahead = [&](const AudioTrack::Anchor& sound, std::chrono::nanoseconds shift) {
-            return sound.from + (schedule.at - sound.at) - (schedule.from + shift);
+        const auto ahead = [&](const AudioTrack::Clock& sound, std::chrono::nanoseconds shift) {
+            return schedule.at - sound.heardAt(schedule.from + shift);
         };
         // A new pass the sound was not asked onto: it still plays the pass before, and is handed to
         // this one where its pictures start it. Not before kHandOverLead: a track acts on one play at a
         // time, and an earlier one may not have been taken up yet. A sound handed on early sits off this
         // pass's pictures by what they trail it, and is left for them to drop to rather than played from
         // the pass's start again; past half of kShortestHandedPass, only in a catch-up hold, which this
-        // then ends by moving the sound to them. A file that cannot keep up drops nothing to reach it.
-        const bool cannotKeepUp = session.decodeLoad.state == VideoSession::DecodeLoad::State::Behind;
-        const std::chrono::nanoseconds passAway = session.pass && !cannotKeepUp ? kShortestHandedPass / 2 : kSoundDrift;
-        if (next.startsPass && std::chrono::abs(ahead(asked, std::chrono::nanoseconds::zero())) > passAway) {
-            if (planned.timeline - now > kHandOverLead) return {.roundAt = planned.timeline - kHandOverLead};
-            track->play({*next.presentation, drawnAt});
-            return {};
+        // then ends by moving the sound to them. Pictures that do not follow the sound are put back on it
+        // here, the one place they meet: their sound stops at the file's end and is silent until the
+        // pass's first picture is drawn, where it starts again, unless it already plays this pass, handed
+        // on before the file fell that far behind, and would be heard twice. A request from the pass
+        // before leads by about a whole pass.
+        const bool unpaced = session.decodeLoad.unpaced();
+        const std::chrono::nanoseconds passAway = session.pass ? kShortestHandedPass / 2 : kSoundDrift;
+        if (next.startsPass) {
+            const std::chrono::nanoseconds lead = ahead(askedClock, std::chrono::nanoseconds::zero());
+            if (unpaced) {
+                const std::chrono::nanoseconds onThisPass =
+                    session.pass ? atSpeed(session.pass->end - session.pass->first, rate) / 2 : kSoundDrift;
+                if (lead < -kSoundDrift || lead > onThisPass) {
+                    return {.playAtDraw = SoundPace::DrawPlay{.from = *next.presentation, .restart = true}};
+                }
+            } else if (std::chrono::abs(lead) > passAway) {
+                if (planned.timeline - now > kHandOverLead) return {.roundAt = planned.timeline - kHandOverLead};
+                return playOnDrawn({*next.presentation, drawnAt});
+            }
         }
         // The sound already handed to the next pass while this one's last pictures play out.
         std::chrono::nanoseconds shift{};
         if (session.pass && !next.startsPass) {
             const std::chrono::nanoseconds onward = session.pass->first - session.pass->end;
-            if (std::chrono::abs(ahead(asked, onward)) < std::chrono::abs(ahead(asked, shift))) shift = onward;
+            if (std::chrono::abs(ahead(askedClock, onward)) < std::chrono::abs(ahead(askedClock, shift))) shift = onward;
         }
         const std::optional<AudioTrack::Clock> clock = track->clock(now);
-        if (clock) session.heard = VideoSession::Heard{track->request(), clock->file, clock->at};
-        // A file that cannot decode in real time even skipping cannot keep up with its sound: its pictures
-        // keep their own clock, and the sound plays on until the next pass hands it to them.
-        if (cannotKeepUp) return {};
+        if (clock) session.heard = VideoSession::Heard{track->request(), clock->file, clock->at, clock->rate};
+        // Its pictures are shown as they are decoded, and the sound, never moved to them, stops at the file's
+        // end and is silent until the next pass's first picture starts it again.
+        if (unpaced) return {};
         // Where the sound is known to be: as last heard on the latest request; else, once that request
         // is taken up and its time has come, where it was asked to be. Nothing before that, when it
         // still plays what came before.
         const bool heardOnRequest = session.heard && session.heard->request == track->request();
-        std::optional<AudioTrack::Anchor> known;
+        std::optional<AudioTrack::Clock> known;
         if (heardOnRequest) {
-            known = AudioTrack::Anchor{session.heard->file, session.heard->at};
+            known = AudioTrack::Clock{session.heard->file, session.heard->at, session.heard->rate};
         } else if (track->taken() && asked.at <= now) {
-            known = asked;
+            known = askedClock;
         }
         if (!known) return {};
         // When the sound reaches the waiting picture against when the schedule has it, and how far it
@@ -2529,33 +2608,40 @@ WallpaperManager::SoundPace WallpaperManager::steerSoundLocked(int monitorId, Vi
         // than kSoundDrift ahead once they cannot chase it, is moved to where the picture is shown. A
         // sound handed to this pass's start and not heard yet is theirs to chase while it sits inside the
         // margin, through the pass's first kCatchUpHold of pictures; a clock still missing past that is
-        // taken for one that will not come.
+        // taken for one that will not come. While the decoder is still finding a level it keeps pace at,
+        // pictures late for want of a clock or a hold move nothing: the sound is not moved to cover the
+        // decoder, and the late picture is drawn.
         const std::chrono::nanoseconds behind = -ahead(*known, shift);
         const std::chrono::nanoseconds overdue = drawnAt - planned.timeline;
         const bool handedUnheard = passAway > kSoundDrift && shift == std::chrono::nanoseconds::zero() &&
                                    !heardOnRequest && asked.from == session.pass->first &&
                                    *next.presentation - session.pass->first <= kCatchUpHold &&
                                    std::chrono::abs(behind) <= passAway;
-        const bool chased = catchUp == CatchUp::Chasing && (clock || handedUnheard);
+        const bool chased =
+            session.decodeLoad.decoderBehind() || (catchUp == CatchUp::Chasing && (clock || handedUnheard));
         if (behind > kSoundDrift || (!chased && overdue - behind > kSoundDrift)) {
             // Kept on the pass it was handed to, and from that pass's start: a play from before it would
             // be heard early.
             AudioTrack::Anchor moved{schedule.from + shift, schedule.at + overdue};
             if (shift != std::chrono::nanoseconds::zero() && moved.from < session.pass->first) {
-                moved = {session.pass->first, moved.at + (session.pass->first - moved.from)};
+                moved = {session.pass->first, moved.at + atSpeed(session.pass->first - moved.from, rate)};
             }
-            track->play(moved);
-            return {};
+            return playOnDrawn(moved);
         }
         if (!clock) return {};
         waiting.from += behind;
-        if (!session.pass || shift != std::chrono::nanoseconds::zero()) return {.timesPicture = true};
         // From the second pass on, the next one's sound is asked for kHandOverLead before this one's
         // ends, wherever the pictures are, so the switch lands on time.
-        const SteadyTime passEnds = clock->heardAt(session.pass->end);
-        if (passEnds - now > kHandOverLead) return {.timesPicture = true, .roundAt = passEnds - kHandOverLead};
-        track->play({session.pass->first, passEnds});
-        return {.timesPicture = true};
+        SoundPace pace{.timesPicture = true};
+        if (session.pass && shift == std::chrono::nanoseconds::zero()) {
+            const SteadyTime passEnds = clock->heardAt(session.pass->end);
+            if (passEnds - now > kHandOverLead) {
+                pace.roundAt = passEnds - kHandOverLead;
+            } else {
+                track->play({session.pass->first, passEnds});
+            }
+        }
+        return pace;
     } catch (const std::exception&) {
         // Only making the track allocates. Without one the picture plays on silent, and the next
         // round tries again.
@@ -2795,7 +2881,7 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
     }
     // A parked session opened at the picture on screen holds no picture yet, and its sound starts
     // from that picture's time, so it is decoded first, as a playing one would be.
-    const bool parkedCatchingUp = motion == Motion::Parked && resuming && soundWanted(session, sound);
+    const bool parkedCatchingUp = motion == Motion::Parked && resuming && sound.audible();
     if (!playing && !parkedCatchingUp) {
         // A file whose one picture is on screen plays its sound alone, and its session is in use
         // while it does. A render owed redraws this same video, so the sound plays on through it.
@@ -2803,10 +2889,9 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
         if (motion == Motion::Parked) {
             using Content = AudioTrack::Content;
             const AudioTrack* track = loopParkedSoundLocked(monitorId, session, sound, now);
-            // Null while wanted is a track that could not be made; null otherwise, a sound not to be
-            // heard, which the rate cap makes a lasting answer for this file.
+            // Null while wanted is a track that could not be made; null otherwise, a sound not to be heard.
             const Content content = track != nullptr ? track->content()
-                                    : soundWanted(session, sound) ? Content::Failed
+                                    : sound.audible() ? Content::Failed
                                     : Content::None;
             if (content == Content::Unknown || content == Content::Sound) {
                 // The output wakes a round when the content changes, which is when this is asked again.
@@ -2822,7 +2907,7 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
                 }
             }
         }
-        const bool soundPlays = motion == Motion::RenderOwed && soundWanted(session, sound) && session.audio;
+        const bool soundPlays = motion == Motion::RenderOwed && sound.audible() && session.audio;
         if (!soundPlays && session.audio) session.audio->stop();
         // Stopped, for whatever reason: paused, nobody can see it, a render is owed, its file held
         // one picture. The picture on screen stays where it is -- nothing here touches the frame --
@@ -2841,11 +2926,20 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
     }
     session.idleSince.reset();
     // One decode's sample, against the time on screen at this round's speed. None for a picture that
-    // starts a pass: its decode holds the loop's seek and key picture, paid once a pass.
-    const auto measureDecode = [&](SteadyTime started, const PictureTiming& after, std::chrono::nanoseconds gap) {
-        if (after.startsPass) return;
-        session.decodeLoad.add(std::chrono::steady_clock::now() - started, intervalAtSpeed(after, speed),
-                               std::max(atSpeed(gap, speed), kMinPictureInterval));
+    // starts a pass while nothing is skipped: its decode holds the loop's seek and key picture, paid once
+    // a pass. Skipping, it may be the pass's only picture, and the level could never come down without
+    // it. Returns when the decode ended, which is what the round's `now` becomes: a slow decode's
+    // picture is judged, and shown, after it.
+    const auto measureDecode = [&](SteadyTime started, const PictureTiming& before, const PictureTiming& after,
+                                   std::chrono::nanoseconds gap) {
+        const SteadyTime ended = std::chrono::steady_clock::now();
+        session.decodeLoad.saw(after.skip, after.keptThrough);
+        if (!after.startsPass || after.skip != PictureSkip::Nothing) {
+            session.decodeLoad.add(ended - started, intervalAtSpeed(after, speed),
+                                   std::max(atSpeed(gap, speed), kMinPictureInterval), before.skip, after.skip,
+                                   session.pipeline->deepestSkip(), after.readSince);
+        }
+        return ended;
     };
 
     try {
@@ -2854,7 +2948,7 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
         // A decode that is still dropping pictures on the way to its own gets the next round: the picture
         // on screen stays, and the rounds between let every other screen and request have the GPU.
         if (resuming) {
-            const Decode step = decodeUntil(*session.pipeline, catchUpUntil, session.skip());
+            const Decode step = decodeUntil(*session.pipeline, catchUpUntil, session.decodeLoad.skip());
             if (step == Decode::Dropping) return now;
             if (step == Decode::Exhausted) {
                 throw WallpaperContentError(describeRejection("VideoPipeline", "no picture could be decoded", session.path));
@@ -2873,15 +2967,16 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
             const Session::OnScreen shown = *onScreen;
             const PictureTiming before = session.pipeline->timing();
             const SteadyTime decodeStarted = std::chrono::steady_clock::now();
-            const Decode step = decodeUntil(*session.pipeline, catchUpUntil, session.skip());
+            const Decode step = decodeUntil(*session.pipeline, catchUpUntil, session.decodeLoad.skip());
             if (step == Decode::Dropping) return now;
             if (step == Decode::Exhausted) {
                 throw WallpaperContentError(
                     describeRejection("VideoPipeline", "no picture could be decoded when it started again", session.path));
             }
             const PictureTiming after = session.pipeline->timing();
-            if (before.startsPass && after.startsPass) {
-                // The pass that just ended held one picture, so the file does: it is already on
+            if (before.startsPass && after.startsPass && before.skip == PictureSkip::Nothing &&
+                after.skip == PictureSkip::Nothing) {
+                // The pass that just ended held one picture with nothing skipped, so the file does: it is already on
                 // screen and there is nothing to show after it. Asking again would decode that
                 // same picture for ever and announce it as a new frame each time. Recorded on the
                 // monitor, where it outlives the session: the session itself is kept like any other
@@ -2902,7 +2997,7 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
             const std::chrono::nanoseconds gap = gapBetween(before, after);
             std::optional<std::chrono::nanoseconds> reaches;
             if (before.presentation) reaches = *before.presentation + gap;
-            measureDecode(decodeStarted, after, gap);
+            now = measureDecode(decodeStarted, before, after, gap);
             session.clock = Session::Waiting{shown, shown.timeline, gap, speed, reaches};
         }
         // Every draw below passes here first, so what it reads is timed at this round's speed.
@@ -2915,11 +3010,11 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
             // one a round, then while the round's catch-up slice lasts. One still behind when the slice
             // runs out is held for the next round rather than drawn, until kCatchUpHold, so a file slow
             // to decode lands on the sound instead of running through late pictures; then it is drawn,
-            // the sound moved to it if past kSoundDrift. A file that cannot decode in real time even
-            // skipping is not timed by its sound, so its late pictures are drawn.
+            // the sound moved to it if past kSoundDrift.
             for (bool dropped = false;; dropped = true) {
                 const PictureTiming held = session.pipeline->timing();
-                if (!pace.timesPicture || held.startsPass || waiting->planned().timeline + ownInterval(held) > now) {
+                if (!pace.timesPicture || held.startsPass ||
+                    waiting->planned().timeline + intervalAtSpeed(held, speed) > now) {
                     waiting->catchingUpSince.reset();
                     break;
                 }
@@ -2934,14 +3029,14 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
                     if (!waiting->catchingUpSince) waiting->catchingUpSince = checked;
                     return now;
                 }
-                const Decode step = decodeUntil(*session.pipeline, catchUpUntil, session.skip());
+                const Decode step = decodeUntil(*session.pipeline, catchUpUntil, session.decodeLoad.skip());
                 if (step == Decode::Dropping) return now;
                 if (step == Decode::Exhausted) {
                     throw WallpaperContentError(describeRejection("VideoPipeline", "no picture could be decoded", session.path));
                 }
                 const PictureTiming after = session.pipeline->timing();
                 const std::chrono::nanoseconds gap = gapBetween(held, after);
-                measureDecode(checked, after, gap);
+                now = measureDecode(checked, held, after, gap);
                 waiting->left += gap;
                 waiting->reaches = held.presentation ? std::optional(*held.presentation + gap) : std::nullopt;
                 pace = steerSoundLocked(monitorId, session, *waiting, sound, now, CatchUp::Chasing);
@@ -2952,6 +3047,8 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
         // decodes it never is; one converted while it waits is still dropped if the sound passes it.
         session.pipeline->convert();
         if (waitUntil) return *waitUntil;
+        // Drawn, and recorded as shown, after whatever this round has decoded and converted.
+        now = std::chrono::steady_clock::now();
 
         const OffscreenTarget* target = nullptr;
         {
@@ -3003,7 +3100,15 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
         }
         // Outside the state lock: it writes to the state directory.
         if (playedClean) m_playing.clear(monitorId);
-        markShown(session, now, speed);
+        if (pace.playAtDraw && pace.playAtDraw->restart) {
+            session.clock = Session::OnScreen{now, now};
+        } else {
+            markShown(session, now, speed);
+        }
+        if (pace.playAtDraw && session.audio) {
+            const SteadyTime shownAt = std::get<Session::OnScreen>(session.clock).timeline;
+            session.audio->play({pace.playAtDraw->from, shownAt + pace.playAtDraw->after});
+        }
         round.shown.push_back(ClockRound::Shown{monitorId, generation});
         // The next picture is decoded at once, so its time is known before it is due.
         return now;

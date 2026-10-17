@@ -21,6 +21,7 @@
 #include <climits>
 #include <cmath>
 #include <memory>
+#include <span>
 #include <string_view>
 
 #include <dirent.h>
@@ -126,6 +127,27 @@ std::expected<WallpaperProperty, QString> parseProperty(const QString& key, cons
     } else if (fallback->is_string()) {
         value = fromJson(*fallback);
     }
+
+    // A key the daemon gives a meaning. Its declared range picks which of the playback speeds are
+    // offered, and a default between them is moved to the nearest offered by the daemon's own rule.
+    // The sound keys are checked in settleSoundProperties(), which knows whether they are kept.
+    if (key == u"speed") {
+        if (property.type != WallpaperProperty::Type::Float) {
+            return refuse(QStringLiteral("is not a float, and WallpaperX reads a video's speed as one."));
+        }
+        const QList<double> offered = property.choices();
+        if (offered.isEmpty()) {
+            return refuse(QStringLiteral("allows %1 to %2, and WallpaperX plays video at %3 times its speed.")
+                              .arg(property.minimum)
+                              .arg(property.maximum)
+                              .arg(QString::fromStdString(playbackSpeedsText("or"))));
+        }
+        if (value.typeId() == QMetaType::Double && value.toDouble() >= property.minimum &&
+            value.toDouble() <= property.maximum) {
+            const std::span<const double> among(offered.constData(), static_cast<std::size_t>(offered.size()));
+            value = nearestPlaybackSpeed(value.toDouble(), among);
+        }
+    }
     const auto accepted = property.accept(value);
     if (!accepted) {
         return refuse(property.type == WallpaperProperty::Type::Float
@@ -133,22 +155,6 @@ std::expected<WallpaperProperty, QString> parseProperty(const QString& key, cons
                           : QStringLiteral("has a default that is not a %1.").arg(property.typeName()));
     }
     property.defaultValue = *accepted;
-
-    // A key the daemon gives a meaning, refused rather than clamped: a clamped range is one the
-    // author never declared. The sound keys are checked in settleSoundProperties(), which knows
-    // whether they are kept.
-    if (key == u"speed") {
-        if (property.type != WallpaperProperty::Type::Float) {
-            return refuse(QStringLiteral("is not a float, and WallpaperX reads a video's speed as one."));
-        }
-        if (!(property.minimum > 0.0) || property.maximum > kMaxPlaybackSpeed) {
-            return refuse(QStringLiteral("allows %1 to %2, and WallpaperX plays video above 0 and at most %3 times "
-                                         "its speed.")
-                              .arg(property.minimum)
-                              .arg(property.maximum)
-                              .arg(kMaxPlaybackSpeed));
-        }
-    }
     return property;
 }
 
@@ -560,6 +566,20 @@ QString WallpaperProperty::typeName() const
     return {};
 }
 
+QList<double> WallpaperProperty::choices() const
+{
+    QList<double> within;
+    if (key != u"speed" || type != Type::Float) {
+        return within;
+    }
+    for (const double speed : kPlaybackSpeeds) {
+        if (speed >= minimum && speed <= maximum) {
+            within.append(speed);
+        }
+    }
+    return within;
+}
+
 std::optional<QVariant> WallpaperProperty::accept(const QVariant& value) const
 {
     switch (type) {
@@ -577,6 +597,9 @@ std::optional<QVariant> WallpaperProperty::accept(const QVariant& value) const
         }
         const double number = value.toDouble();
         if (!std::isfinite(number) || number < minimum || number > maximum) {
+            return std::nullopt;
+        }
+        if (const QList<double> offered = choices(); !offered.isEmpty() && !offered.contains(number)) {
             return std::nullopt;
         }
         return QVariant(number);

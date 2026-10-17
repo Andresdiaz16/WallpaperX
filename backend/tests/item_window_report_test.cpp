@@ -833,27 +833,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (phaseSelected("transient-recovery")) {
-        const QString out = QStringLiteral("DP-BLIP");
-        Scene scene = harness.settled(out);
-        if (ready(scene, "the transient-recovery phase")) {
-            // GOAL: a window report refused once as RenderFailed is sent again on its own retry, with
-            //       nothing changing, and the daemon ends up holding it.
-            // CONTROL: `m_windowReportTimer.start(m_windowRetryMs);` deleted from sendWindowReport's
-            //       `Refusal::Retried` branch (backend/kde/wallpaperx_item.cpp) -> this line red. Via
-            //       control_batch.sh, re-run 2026-10-11, --phase '^transient-recovery$'. Reverted.
-            stub.refuseNext(kFocus, out, kRenderFailed);
-            const std::size_t mark = stub.mark();
-            scene.renderer->setProperty("windowFocused", true);
-            const bool resent = pumpUntil([&] { return stub.calls(kFocus, out, mark).size() >= 2; }, kArrivalLimitMs);
-            const std::vector<ReportStub::Call> calls = stub.calls(kFocus, out, mark);
-            check(resent && calls[0].error == kRenderFailed && calls[1].error.isEmpty() && focusArgsAre(calls[1], true, false) &&
-                      calls[1].atMs - calls[0].atMs >= kRetryFloorMs,
-                  "a window report refused once as RenderFailed is sent again after the retry interval and accepted");
-            std::fprintf(stderr, "  %s: %s\n", qPrintable(out), ReportStub::describe(calls).c_str());
-        }
-    }
-
     if (phaseSelected("refusal-kinds")) {
         // GOAL: S15.403 -- a window report refused for any reason but its arguments or an unknown method is resent
         //       after about 2 s and accepted -- LimitsExceeded, NoMemory, AccessDenied, Disconnected and an

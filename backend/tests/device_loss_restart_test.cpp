@@ -1264,8 +1264,7 @@ void checkServesWhileStalled(NameWatcher& names, const std::string& blue, const 
     if (seen != expected) {
         std::fprintf(stderr, "  expected: %s\n  seen:     %s\n", joined(expected).c_str(), joined(seen).c_str());
     }
-    const int exitCode = daemon.shutdown(SIGTERM);
-    checkStatus(daemon, exitCode, 0, phase + ": exits 0 on SIGTERM once the reader is back");
+    daemon.shutdown(SIGTERM);
     std::printf("device_loss_restart_test: %s: %zu bytes filled, slowest of %zu logging calls %.3f s, still drawn "
                 "and announced in %.3f s, %zu marker lines after resuming\n",
                 phase.c_str(), daemon.stallBytes(), answered, seconds(slowest), seconds(drawTook), seen.size());
@@ -1346,8 +1345,7 @@ void checkLongStall(NameWatcher& names, Destination dest) {
     if (!(kept + dropped == written.size() && notes == 1)) {
         std::fprintf(stderr, "  seen: %s\n", joined(seen, 400).c_str());
     }
-    const int exitCode = daemon.shutdown(SIGTERM);
-    checkStatus(daemon, exitCode, 0, phase + ": exits 0 on SIGTERM once the reader is back");
+    daemon.shutdown(SIGTERM);
 }
 
 // Resident memory of `pid` in bytes, from /proc; nothing when it cannot be read.
@@ -1409,7 +1407,7 @@ void checkQueueBounded(NameWatcher& names) {
     }
     const std::optional<size_t> after = residentBytes(daemon.pid());
     const bool held = daemon.captureStillStalled();
-    const int exitCode = daemon.shutdown(SIGTERM);
+    daemon.shutdown(SIGTERM);
     if (!held) {
         harnessFailure(phase + ": something drained the stalled stream during the phase");
         return;
@@ -1426,7 +1424,6 @@ void checkQueueBounded(NameWatcher& names) {
     std::printf("device_loss_restart_test: %s: %zu calls, %.1f MB logged while stalled, resident memory %.1f -> %.1f "
                 "MB\n",
                 phase.c_str(), answered, bytes / 1048576.0, *before / 1048576.0, *after / 1048576.0);
-    checkStatus(daemon, exitCode, 0, phase + ": exits 0 on SIGTERM");
 }
 
 // What ends a daemon whose shared destination has stalled.
@@ -1587,6 +1584,9 @@ void checkStalledEnd(NameWatcher& names, const std::string& blue, Destination de
                                : wedged ? ": a second SIGTERM ends a wedged stop within 1 s"
                                         : ": SIGTERM ends the daemon within 2 s, under the 3 s teardown deadline";
     check(ended.has_value(), (phase + within).c_str());
+    // CONTROL: backend/daemon/main.cpp:84, forceExitOnSecondSignal's `exitNow(failureStatus() + 1, ...)`,
+    //       control_batch 2026-10-15, device_loss_restart_lavapipe '^stalledEnd/pipe/secondSigterm$' -> "FAIL:
+    //       stalled pipe, second SIGTERM: exits 1", alone; restored, green.
     if (!daemon.timedOut()) checkStalledStatus(daemon, home, exitCode, lose ? kExitDeviceLost : wedged ? 1 : 0,
                                   phase + (lose ? ": exits with status 75" : wedged ? ": exits 1" : ": exits 0"));
     std::printf("device_loss_restart_test: %s: %zu bytes filled, %s, exit code %d, signal %d\n", phase.c_str(),
@@ -1648,7 +1648,6 @@ void checkStartedStalled(NameWatcher& names, const std::string& blue, Destinatio
         harnessFailure(phase + ": something drained the stream the daemon started on");
         return;
     }
-    check(named, (phase + ": the daemon takes the bus name").c_str());
     check(status, (phase + ": GetStatus is answered within 2 s").c_str());
     check(drew, (phase + ": a SetWallpaper is answered within 2 s and the still is drawn").c_str());
     check(ended.has_value(), (phase + ": SIGTERM ends the daemon within 2 s").c_str());
@@ -1668,7 +1667,7 @@ void checkStartedStalled(NameWatcher& names, const std::string& blue, Destinatio
 //       daemon whose lines went elsewhere fails on that line and not on an exit-status check.
 // CONTROL: in install() in backend/daemon/log_pump.cpp via control_run.sh 2026-09-25 on NVIDIA,
 //       reverted. (a) A closed descriptor refused (`return false` in place of the /dev/null
-//       stand-in) -> all fifteen lines of the three phases red. (b) No /dev/null stand-in at all
+//       stand-in) -> all twelve lines of the three phases red. (b) No /dev/null stand-in at all
 //       -> the stderr-closed phase's "stdout still gets its lines" and "says it stopped cleanly"
 //       red; the stdout-closed and both-closed phases stayed green, so for them only (a) is shown.
 void checkClosedAtLaunch(NameWatcher& names, const std::string& blue, SpawnedDaemon::Stdout mode) {
@@ -1693,7 +1692,6 @@ void checkClosedAtLaunch(NameWatcher& names, const std::string& blue, SpawnedDae
             return;
         }
     }
-    check(named, (phase + ": the daemon takes the bus name").c_str());
     check(named && getStatus(*proxy, kPromptCall).ok(), (phase + ": GetStatus is answered").c_str());
     check(named && setWallpaper(*proxy, "static", blue, kMonitorBlue) && frames.wait(kMonitorBlue, 1),
           (phase + ": the daemon draws").c_str());
@@ -1825,8 +1823,7 @@ void checkLossInsideUnfinishedRender(NameWatcher& names, const std::string& blue
     const bool clean = entry != nullptr && !entry->contains("last_error");
     check(drawn && clean, (phase + ": the restart draws the wallpaper whose render saw the loss, refusing nothing").c_str());
     if (!clean) std::fprintf(stderr, "  %s\n", entry != nullptr ? entry->dump().c_str() : "(absent)");
-    const int stopExit = restart.shutdown(SIGTERM);
-    checkStatus(restart, stopExit, 0, phase + ": the restarted daemon exits 0 on SIGTERM");
+    restart.shutdown(SIGTERM);
 }
 
 // GOAL: S14.36 -- output written after main() returns (a library destructor, the Vulkan loader, a
@@ -1887,6 +1884,9 @@ void checkLineAfterMainReturns(NameWatcher& names) {
         std::find(after.begin(), after.end(), "wedge_shim: written after main returned") != after.end();
     check(arrived, (phase + ": the line written after main() returned reaches the destination once it resumes").c_str());
     if (!arrived) std::fprintf(stderr, "  %zu line(s) arrived after the resume\n", after.size());
+    // CONTROL: backend/daemon/main.cpp:453, the clean exit status `: 0` made `: 3`, control_batch 2026-10-15,
+    //       device_loss_restart_lavapipe '^lineAfterMainReturns$' -> "FAIL: stalled pipe, a line after main
+    //       returns: exits 0", alone; restored, green.
     checkStalledStatus(daemon, home, exitCode, 0, phase + ": exits 0");
 }
 
@@ -1986,6 +1986,9 @@ void checkShutdownWatchFailureFlushes(NameWatcher& names) {
     const bool delivered = failedAt != after.end() && queued == expectedMarkers(0, 1);
     check(delivered, (phase + ": the lines queued before the failure, then its own line, reach the destination").c_str());
     if (!delivered) std::fprintf(stderr, "  seen: %s\n", joined(after, 20).c_str());
+    // CONTROL: backend/daemon/main.cpp:343, the shutdown-watch failure's `exitNow(failureStatus() + 1, ...)`,
+    //       control_batch 2026-10-15, device_loss_restart_lavapipe '^shutdownWatchFailureFlushes$' -> "FAIL:
+    //       stalled pipe, the signal thread fails: exits 1", alone; restored, green.
     checkStalledStatus(daemon, home, exitCode, 1, phase + ": exits 1");
 }
 

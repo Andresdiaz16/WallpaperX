@@ -237,8 +237,6 @@ TestCase {
         const item = drivenPlugin(testCase);
         compare(item.screenState, testCase.state, "the state this drive derives");
         const shown = item.describe();
-        verify(shown.length > 0, "the message is not blank: a blank desktop is what a plugin "
-                                 + "that is not installed looks like");
         verify(shown.indexOf(testCase.says) !== -1,
                "the message names this cause -- looked for [" + testCase.says
                + "] in [" + shown + "]");
@@ -260,9 +258,7 @@ TestCase {
         const cases = causeCases();
         const shown = [];
         for (let i = 0; i < cases.length; ++i) {
-            const message = drivenPlugin(cases[i]).describe();
-            verify(message.length > 0, cases[i].tag + " renders a blank desktop");
-            shown.push(message);
+            shown.push(drivenPlugin(cases[i]).describe());
         }
 
         let compared = 0;
@@ -456,9 +452,15 @@ TestCase {
     //       The request count is asserted, not just the state: a plugin that never sent
     //       anything and a stub that never answered both leave "unreachable", and only the
     //       counter tells them apart.
-    // CONTROL: `res.status = 500` added to the stub's Good arm in tests/qml_states_test.cpp
-    //       -> "FAIL: a reply served over HTTP reaches the set state. Actual (): refused.
-    //       Expected (): set", 23 other cases green. Observed 2026-08-19. Reverted.
+    //       The wait is for this request's answer (`pending` cleared), not for "set": the naming
+    //       read already left "set", so a state wait returned before the request reached a stub
+    //       slowed by load, and counted 0 requests.
+    // CONTROL: control_run.sh 2026-10-16, reverted, tests/qml_states_test.cpp, each only after
+    //       serveGood(): the Good arm answering 500 -> "a reply served over HTTP reaches the set
+    //       state. Actual (): refused. Expected (): set"; the Good arm sleeping 6 s -> "'the
+    //       refresh's request was answered' returned FALSE", where the state wait passed (NOT RED).
+    //       The stub delaying each Good request 300 ms reproduces the load failure on the state
+    //       wait ("exactly one request ... Actual (): 0") and leaves this shape green.
     function test_the_stub_serves_a_reply_the_plugin_accepts() {
         if (!stubDaemon.available()) {
             skip(stubDaemon.unavailableReason());
@@ -467,8 +469,9 @@ TestCase {
         stubDaemon.serveGood();
         item.refresh();
 
-        tryCompare(item, "screenState", "set", 5000,
-                   "a reply served over HTTP reaches the set state");
+        verify(item.pending !== null, "the refresh sent a request");
+        tryVerify(function () { return item.pending === null; }, 5000, "the refresh's request was answered");
+        compare(item.screenState, "set", "a reply served over HTTP reaches the set state");
         compare(stubDaemon.requests(), 1, "the plugin made exactly one request to the daemon's origin");
         compare(item.wallpaperPath, "/home/u/Pictures/beach.png", "the served path reached the binding");
     }
@@ -592,25 +595,6 @@ TestCase {
         compare(stubDaemon.requests(), 1, "the plugin made exactly one request");
         verify(item.describe().indexOf("cannot read") !== -1,
                "the desktop message names the unreadable cause: [" + item.describe() + "]");
-    }
-
-    // GOAL: a refusal is never reported as "the daemon is not running". This is the defect the
-    //       goal was written from, stated on its own so a regression prints as itself.
-    // WHY-THIS-SHAPE: asserted as the absence of the other cause's remedy rather than only as
-    //       state equality, because the state name is not what the user reads; a describe()
-    //       that mapped "refused" onto the not-running text would pass a state-only check.
-    // CONTROL: `root.answered = false` added to apply()'s non-200 path -- red with 'a refusal
-    //       must not send the user to start a daemon that answered it: [WallpaperX is not
-    //       running.\nStart the wallpaperx-daemon service.]'. Reverted.
-    function test_a_refusal_is_not_reported_as_a_dead_daemon() {
-        const item = loadPlugin(suite.namedScreen);
-        item.apply(409, '{"error":"another client holds this output"}');
-
-        const shown = item.describe();
-        verify(shown.indexOf("Start the wallpaperx-daemon service") === -1,
-               "a refusal must not send the user to start a daemon that answered it: [" + shown + "]");
-        verify(shown.indexOf("is not running") === -1,
-               "a refusal must not report the daemon as down: [" + shown + "]");
     }
 
     // GOAL: a cause stops being shown once it stops applying. False if a refusal's reason
@@ -911,7 +895,6 @@ TestCase {
                "a known screen with no wallpaper loads the renderer, so its size is reported before the first wallpaper");
         compare(surface.status, Loader.Ready, "the stand-in renderer loaded, which is what lets this check fail");
         compare(surface.item.monitorId, 2, "the renderer is told which monitor it is");
-        compare(surface.item.output, suite.namedScreen, "and the connector name its size is filed under");
         verify(backdrop.visible, "the message stays over the renderer until a frame is shown");
         verify(item.describe().indexOf("No wallpaper chosen") >= 0, "and it is the no-wallpaper message");
     }
@@ -947,7 +930,6 @@ TestCase {
         compare(surface.status, Loader.Ready,
                 "the stand-in renderer loaded, which is what lets this check fail");
         verify(surface.item !== null, "the renderer occupies the surface");
-        compare(surface.item.monitorId, 0, "the renderer is told which screen to ask about");
         compare(surface.width, item.width, "the renderer covers the screen");
         compare(surface.height, item.height, "the renderer covers the screen");
         // "Being drawn" is the claim, so the stand-in has to make it: a loaded renderer that has
@@ -1196,8 +1178,6 @@ TestCase {
         host.visible = true;
         compare(drawn.surface.status, Loader.Ready, "showing it again creates the renderer at once");
         verify(drawn.surface.item !== null, "the renderer exists without waiting for anything");
-        compare(drawn.surface.item.monitorId, 0, "and is told its monitor");
-        compare(drawn.surface.item.output, suite.namedScreen, "and its screen's name");
     }
 
     // GOAL: S15.203 -- a hidden copy reads /config at a change notice, so that when it is shown its

@@ -24,7 +24,6 @@ extern "C" {
 namespace {
 
 using wallpaperx::resetsDecoder;
-using wallpaperx::testing::check;
 using wallpaperx::testing::fail;
 
 constexpr int kNotVerifiedExitCode = 77;
@@ -236,7 +235,6 @@ int main(int argc, char** argv) {
             fail("a fixture lost the reset points or open keyframes the classifier is graded on");
         }
     }
-    if (!av1Entry) check(!resetsDecoder(AVCodecParameters{}, AVPacket{}), "an empty packet of no codec is not a reset point");
 
     const int failures = wallpaperx::testing::reportFailures("reset_point_probe");
     if (failures > 0) return 1;

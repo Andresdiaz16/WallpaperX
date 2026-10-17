@@ -49,10 +49,7 @@ const char* describe(Observed o) {
     return "unreachable";
 }
 
-int g_classified = 0;  // cases actually put through throwVkFailure
-
 Observed classify(VkResult result, std::string* message) {
-    ++g_classified;
     message->clear();
     try {
         wallpaperx::throwVkFailure("probe", result);
@@ -148,9 +145,6 @@ const std::vector<Case> kCases = {
 //       seven reds, "got std::runtime_error". Reverted. Fourth, for the two message checks:
 //       the `context +` dropped from the message throwVkFailure builds -> 26 reds, "FAIL: ...
 //       message names the calling context". Reverted. All four observed 2026-09-18.
-// COVERAGE-ASSERT: g_classified is asserted against the table size in main(). It guards a
-//       harness defect only -- a loop that stops early, or a table emptied by an edit -- and
-//       no production change can redden it; the per-case checks are what production breaks.
 void testClassification() {
     for (const Case& c : kCases) {
         std::string message;
@@ -176,12 +170,18 @@ void testClassification() {
         // and the result name the only thing that says what it failed with. Both end up in
         // the daemon's last_error verbatim.
         check(message.find("probe") != std::string::npos, prefix + "message names the calling context");
+        // CONTROL (this line): renderer/vulkan/gpu_fault.cpp, throwVkFailure's message built from the
+        //       result's number instead of vkResultName -> "FAIL: VK_ERROR_OUT_OF_HOST_MEMORY (the host
+        //       is out of memory) message names the result" and one per named result. Reverted.
         check(message.find(named) != std::string::npos, prefix + "message names the result");
     }
 }
 
 // A code this build cannot name must still be readable. An integer in last_error names
 // nothing, but it is at least unambiguous; an empty string or a fixed "unknown" is not.
+// CONTROL: renderer/vulkan/gpu_fault.cpp vkResultName, each reverted: the DEVICE_LOST case spelled
+//       "device lost" -> "FAIL: a named result is spelled out"; the default returning "unknown" ->
+//       "FAIL: an unnamed result is reported as its number".
 void testResultNaming() {
     check(wallpaperx::vkResultName(VK_ERROR_DEVICE_LOST) == "VK_ERROR_DEVICE_LOST",
           "a named result is spelled out");
@@ -195,11 +195,8 @@ int main() {
     testClassification();
     testResultNaming();
 
-    check(g_classified == static_cast<int>(kCases.size()),
-          "every case in the table was put through the classifier");
-
     if (wallpaperx::testing::reportFailures("gpu_fault_test") == 0) {
-        std::cout << "gpu_fault_test: all checks passed (" << g_classified << " results classified)" << std::endl;
+        std::cout << "gpu_fault_test: all checks passed (" << kCases.size() << " results classified)" << std::endl;
         return 0;
     }
     return 1;

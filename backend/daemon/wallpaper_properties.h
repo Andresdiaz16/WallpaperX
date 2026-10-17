@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include "playback_speed.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -42,26 +44,23 @@ using WallpaperProperties = std::map<std::string, PropertyValue>;
 constexpr std::size_t kMaxProperties = 64;
 constexpr std::size_t kMaxPropertyKeyBytes = 64;
 
-// The range a video is actually played at. A speed above the top is refused; a positive one below
-// the bottom is stored as set and played at the bottom, where the wait for one picture would
-// otherwise grow without bound.
-constexpr double kMinPlaybackSpeed = 0.01;
-constexpr double kMaxPlaybackSpeed = 2.0;
-
 // Why `properties` cannot be stored, or empty when it can. Keys are 1 to kMaxPropertyKeyBytes of
 // ASCII letters, digits, '_', '-' and '.', so they are safe to log and publish unescaped; numbers
-// are finite; "speed" is above 0 and at most kMaxPlaybackSpeed, "mute" a bool and "volume" a number
-// from 0 to 1, the keys the daemon gives a meaning.
+// are finite; "speed" is one of kPlaybackSpeeds, "mute" a bool and "volume" a number from 0 to 1,
+// the keys the daemon gives a meaning.
 std::string propertiesError(const WallpaperProperties& properties);
 
 // `properties` without the entries propertiesError() would refuse, and without those past
 // kMaxProperties, adding how many were left out to `dropped`. For a config file, where one bad
-// value must not cost the wallpaper it rides on. A numeric "volume" outside 0 to 1 is moved to the
-// nearer end and counted in `clampedVolumes` instead: a build before "volume" was reserved stored
-// whatever range the wallpaper declared, which no longer says what it meant.
-WallpaperProperties usableProperties(const WallpaperProperties& properties, int& dropped, int& clampedVolumes);
+// value must not cost the wallpaper it rides on. Two are moved instead, each counted: a numeric
+// "volume" outside 0 to 1 to the nearer end, in `clampedVolumes`, since a build before "volume" was
+// reserved stored whatever range the wallpaper declared; and a positive "speed" that is not one of
+// kPlaybackSpeeds to the nearest of all of them, in `snappedSpeeds`, since a config file may hold any
+// speed the wallpaper declared. Not the nearest the wallpaper offers: the daemon does not know its range.
+WallpaperProperties usableProperties(const WallpaperProperties& properties, int& dropped, int& clampedVolumes,
+                                     int& snappedSpeeds);
 
-// What "speed" says a video plays at: 1 without one, else within the playback range.
+// What "speed" says a video plays at: 1 without one, else one of kPlaybackSpeeds.
 double playbackSpeed(const WallpaperProperties& properties);
 
 // The wallpaper's own sound level: "mute" switches it off, unset means on.

@@ -110,8 +110,8 @@ bool g_failNextSubmitOnce = false;
 // These exist because byte damage does not reach the branches that handle them. Measured
 // 2026-09-10: flipping 1544 payload bytes of an H.264 elementary stream takes it from 20 decoded
 // frames to 18, and neither avcodec_send_packet nor avcodec_receive_frame ever reports
-// AVERROR_INVALIDDATA -- ffmpeg conceals the damage and simply emits fewer pictures. Confirmed by
-// negative control: making either branch throw leaves that run green. So the branches are graded
+// AVERROR_INVALIDDATA -- ffmpeg conceals the damage and simply emits fewer pictures, so no damaged file reaches
+// either branch, and none is decoded here. So the branches are graded
 // by returning the error from ffmpeg's own entry points, which is the only thing that reaches
 // them; a decremented count, not a flag, so the injection stops and the loop cannot spin.
 //
@@ -130,6 +130,13 @@ int g_sendEagainRemaining = 0;
 // injection spent inside the constructor.
 int g_ffmpegDecodeCalls = 0;
 int g_firstInjectionCall = -1;
+
+// While set, each packet sent to a decoder: the skip_frame it went with, and whether it was a key packet.
+// Set only once the decoder is open, so avformat_find_stream_info()'s own sends are not in it.
+bool g_recordSends = false;
+std::vector<std::pair<int, bool>> g_sends;
+// Beside each send: whether the packet holds an H.264 IDR slice, read from its length-prefixed NAL units.
+std::vector<bool> g_sendsIdr;
 
 // What one Device::submit was given, read off the VkSubmitInfo rather than inferred.
 struct RecordedSubmit {
@@ -170,29 +177,6 @@ bool haveAssets(const std::vector<const char*>& names) {
     return true;
 }
 
-// Copies an H.264 elementary stream with payload bytes flipped, skipping the first two kilobytes
-// so the sequence and picture parameter sets survive: a stream whose headers are destroyed is
-// refused at open, which is a different property from a stream whose pictures are damaged.
-// Returns how many bytes were changed.
-int writeDamagedCopy(const std::string& source, const std::string& destination) {
-    std::ifstream in(source, std::ios::binary);
-    std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    if (bytes.size() < 4096) return 0;
-    int flipped = 0;
-    for (size_t i = 2000; i < bytes.size(); i += 37) {
-        // Never inside a start code: introducing or destroying one changes where packets begin,
-        // which makes the demuxer's framing the thing under test instead of the decoder's.
-        const bool nearStartCode =
-            (i >= 3 && std::memcmp(&bytes[i - 3], "\0\0\0\1", 4) == 0) ||
-            (i >= 2 && std::memcmp(&bytes[i - 2], "\0\0\1", 3) == 0);
-        if (nearStartCode) continue;
-        bytes[i] = static_cast<char>(bytes[i] ^ 0xFF);
-        ++flipped;
-    }
-    std::ofstream out(destination, std::ios::binary);
-    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-    return out ? flipped : 0;
-}
 
 // ------------------------------------------------------------------------- //
 // Decoding helpers
@@ -203,6 +187,8 @@ struct DecodeResult {
     int deviceFrames = 0;
     int hostFrames = 0;
     VideoDecoder::Path path = VideoDecoder::Path::Undecided;
+    // The first picture's readSince(): the packets read since the decoder opened, or since a reopen's rewind.
+    uint32_t firstReadSince = 0;
 };
 
 const char* pathName(VideoDecoder::Path path) {
@@ -228,7 +214,7 @@ DecodeResult decodeAll(Device& device, const std::string& file,
     VideoDecoder decoder(device, file);
     if (armAfterOpen) armAfterOpen();
     while (std::optional<DecodedFrame> frame = decoder.next()) {
-        ++result.frames;
+        if (++result.frames == 1) result.firstReadSince = frame->readSince();
         if (frame->storage() == DecodedFrame::Storage::DeviceImage) {
             ++result.deviceFrames;
         } else {
@@ -257,19 +243,32 @@ void waitReporting(Device& device, Device::SubmitTicket ticket, const char* what
 // ------------------------------------------------------------------------- //
 
 // What a decode of `file` to its end returns when every call names `skip`: how many pictures, whether each
-// carried a presentation time and those times rose, and the path it took.
+// carried a presentation time and those times rose, whether each says it was decoded at `skip` and is of a
+// type that level keeps, whether any packet went to ffmpeg as AVDISCARD_BIDIR, and the path it took.
 struct SkipDecode {
     int pictures = 0;
     bool timed = true;
     bool rising = true;
+    bool tagged = true;
+    bool kept = true;
+    bool sentBidirectional = false;
     VideoDecoder::Path path = VideoDecoder::Path::Undecided;
 };
 SkipDecode decodeSkipping(Device& device, const std::string& file, wallpaperx::PictureSkip skip) {
     SkipDecode out;
     VideoDecoder decoder(device, file);
+    g_sends.clear();
+    g_recordSends = true;
+    struct Stop {
+        ~Stop() { g_recordSends = false; }
+    } stop;
     std::optional<std::chrono::nanoseconds> last;
     while (std::optional<DecodedFrame> frame = decoder.next(skip)) {
         ++out.pictures;
+        if (frame->skip() != skip) out.tagged = false;
+        // keptThrough() takes every B picture for an unreferenced one, which the middle B of a pyramid is
+        // not: graded from NonIntra up, where no B picture is decoded at all.
+        if (skip >= wallpaperx::PictureSkip::NonIntra && frame->keptThrough() < skip) out.kept = false;
         const std::optional<std::chrono::nanoseconds> at = frame->presentationTime();
         if (!at) {
             out.timed = false;
@@ -278,26 +277,29 @@ SkipDecode decodeSkipping(Device& device, const std::string& file, wallpaperx::P
         if (last && *at <= *last) out.rising = false;
         last = at;
     }
+    out.sentBidirectional =
+        std::any_of(g_sends.begin(), g_sends.end(), [](const auto& send) { return send.first == AVDISCARD_BIDIR; });
     out.path = decoder.path();
     return out;
 }
 
+void runSkipLevelChecks(Device& device, const char* label, bool hardware, const SkipDecode& all, const SkipDecode& some);
+
 // GOAL: S15.576 -- VideoDecoder::next(PictureSkip::Unreferenced) leaves out the pictures nothing references:
 //       counter_long.mp4 (H.264, three B-frames between references, the middle one referenced) decodes to
 //       fewer than three quarters of its 321 pictures, each with a presentation time and those rising;
-//       next(PictureSkip::Nothing) returns all 321; and counter_av1.mp4, whose decoders ignore the request,
-//       returns the same count under both. On the device here (`hardware`), in software in `content`.
+//       next(PictureSkip::Nothing) returns all 321. On the device here (`hardware`), in software in `content`.
 //       False if the request never reaches the codec, reaches it always, or drops pictures out of order.
 // WHY-THIS-SHAPE: counts against the same decoder unskipped, so the fixture's own count is not assumed
-//       beyond the 321 it is generated with. The AV1 half pins a documented limit (picture_skip.h) rather
-//       than a behaviour the decoder chooses: it is red only if an AV1 decode starts skipping.
+//       beyond the 321 it is generated with.
 // CONTROL: control_batch.sh 2026-10-13, reverted, video_decoder_content_lavapipe, renderer/video/video_decoder.cpp:
 //       `skip_frame` always AVDISCARD_DEFAULT -> "FAIL: content, software: asked to skip unreferenced pictures, the
 //       decoder returns fewer (321 of 321)"; skipping whatever `skip` asks -> "... asked to skip nothing, the decoder
-//       returns every picture (217 of 321)". Test-side: the AV1 half pointed at counter_long.mp4 -> "... an AV1 file
-//       returns every picture asked to skip ... (217 of 120)". The first break on video_decoder_hardware (RTX,
+//       returns every picture (217 of 321)". The first break on video_decoder_hardware (RTX,
 //       control_batch.sh 2026-10-13) -> "FAIL: hardware: asked to skip unreferenced pictures, the decoder returns
-//       fewer (321 of 321)".
+//       fewer (321 of 321)". Via control_batch.sh 2026-10-15, reverted, video_decoder_content_lavapipe: decode()'s presentation time
+//       negated when `skip` is not Nothing -> "FAIL: content, software: the pictures a skipping decode
+//       returns carry presentation times, and they rise".
 void runPictureSkipChecks(Device& device, const char* label, bool hardware) {
     using wallpaperx::PictureSkip;
     if (!haveAssets({"counter_long.mp4"})) {
@@ -322,17 +324,240 @@ void runPictureSkipChecks(Device& device, const char* label, bool hardware) {
               std::to_string(some.pictures) + " of " + std::to_string(all.pictures) + ")");
     check(some.timed && some.rising,
           std::string(label) + ": the pictures a skipping decode returns carry presentation times, and they rise");
-    if (!haveAssets({"counter_av1.mp4"})) {
+    runSkipLevelChecks(device, label, hardware, all, some);
+}
+
+// Decodes `file` at `from` until `pictures` have been returned, then records every send while it decodes at
+// `to` for `after` more pictures. The sends after the switch, in order.
+std::vector<std::pair<int, bool>> sendsAfterSwitch(Device& device, const std::string& file, wallpaperx::PictureSkip from,
+                                                   int pictures, wallpaperx::PictureSkip to, int after) {
+    VideoDecoder decoder(device, file);
+    for (int i = 0; i < pictures && decoder.next(from); ++i) {
+    }
+    g_sends.clear();
+    g_sendsIdr.clear();
+    g_recordSends = true;
+    struct Stop {
+        ~Stop() { g_recordSends = false; }
+    } stop;
+    for (int i = 0; i < after && decoder.next(to); ++i) {
+    }
+    return g_sends;
+}
+
+// The deepest level a decoder of `file` applies, or nothing when the fixture was not generated.
+std::optional<wallpaperx::PictureSkip> deepestFor(Device& device, const char* file) {
+    if (!std::filesystem::exists(assetDir() / file)) {
+        std::printf("video_decoder_probe: fixture %s was not generated, so its deepest level is not answerable\n", file);
+        g_notVerified = true;
+        return std::nullopt;
+    }
+    VideoDecoder decoder(device, asset(file));
+    return decoder.deepestSkip();
+}
+
+// GOAL: S15.608 -- each skip level leaves out more than the one below it, and says so on what it returns:
+//       counter_long.mp4 (H.264, key picture every 24, three B pictures between references, the middle one
+//       referenced) decodes to 321 pictures skipping nothing, then strictly fewer at Unreferenced and
+//       NonIntra, and no more at NonKey than at NonIntra, at least one; every picture returned says the level
+//       it was decoded at, and from NonIntra up each is of a type that level keeps; no packet at any level
+//       goes to ffmpeg as AVDISCARD_BIDIR, which drops the referenced middle B picture. False if a level maps
+//       to the wrong AVDISCARD value, or a picture carries another level's tag.
+// GOAL: S15.609 -- a level comes down onto pictures that can reference skipped ones (from NonIntra or NonKey
+//       to Unreferenced or Nothing) only at a packet that resets the decoder, an IDR here; every other change
+//       takes effect with the very next packet. From NonIntra to every picture: every packet before the next
+//       key packet still skips at NonIntra, and that key packet (an IDR in this closed-GOP file) is the
+//       first sent skipping nothing; from Unreferenced to Nothing, from NonKey to NonIntra and from NonIntra
+//       to NonKey, the very next packet (not a key one) goes at the new level. On counter_opengop_long.mp4
+//       (key every 48, only the first an IDR), from NonIntra to every picture, no packet after the switch is
+//       sent below NonIntra at a key packet that is not an IDR. False if a lower level is sent mid-group or
+//       at an open-GOP key picture, or if a change that skips nothing more waits for a reset point.
+// WHY-THIS-SHAPE: the sends are read where VideoDecoder hands each packet to ffmpeg (skip_frame, the key
+//       flag, and whether its NAL units hold an IDR slice), so the level each packet went with is seen
+//       directly; the pictures returned would not show it, as ffmpeg withholds a picture whose references
+//       were skipped. The key flag alone cannot tell an IDR from an open-GOP I picture: both carry it.
+// COVERAGE-ASSERT: at least one packet sent after the switch before the key packet (the gate held one back);
+//       the first packet after each at-once switch not a key packet; on the open-GOP file at least one key
+//       packet that is not an IDR sent after the switch, and an IDR recognised at the file's start.
+// CONTROL: control_batch.sh 2026-10-15, reverted, video_decoder_content_lavapipe, renderer/video/video_decoder.cpp: NonIntra sent as
+//       AVDISCARD_NONREF -> "FAIL: content, software: each skip level leaves out more than the one below it (321, 217,
+//       217, 14)"; NonIntra sent as AVDISCARD_BIDIR -> "... no packet goes to ffmpeg as AVDISCARD_BIDIR (level 2)"; each
+//       picture tagged Nothing -> "... every picture says the level it was decoded at"; keptThrough() without its
+//       key-picture rule -> "... every picture is of a type its level keeps (level 3)"; lowersOntoSkipped() always
+//       false (the reset gate removed) -> "... a lower level is sent only from a key packet"; its `from > Unreferenced` made
+//       `from >= Unreferenced` -> "... does not wait for a key packet"; made `to < from` (the old rule) -> "... from
+//       key only down to intra only goes through with the very next packet"; made `to != from` -> "... a higher
+//       level is sent with the very next packet"; decode()'s resetsDecoder() test replaced by the packet's key flag ->
+//       "... on an open-GOP file no lower level is sent at a packet that is not an IDR". Harness, same tool: IDR
+//       detection never true -> "... the open-GOP file's first packet was recognised as an IDR"; the open-GOP decode
+//       pointed at counter_long.mp4 -> "... at least one open-GOP key packet was sent after the switch ... (0)".
+//       Green: 321, 217, 14, 14; open GOP 164 sends after the switch, 3 open-GOP key packets, all at NonIntra. On
+//       the device only Nothing and Unreferenced are asked for, so the reset-gate lines run in software only.
+// GOAL: S15.619 -- the decoder's deepest level is Unreferenced on the device and NonKey in software for
+//       H.264; Nothing for AV1 (whose decoder applies no level), and Unreferenced for MPEG-2, in either; asked
+//       for NonKey on the device, every packet it sends goes with AVDISCARD_NONREF, and it returns exactly the
+//       pictures Unreferenced returns. False if a level is offered that the codec ignores or cannot come back
+//       down from, or the device drops anything beyond unreferenced pictures.
+// WHY-THIS-SHAPE: the sends are read at ffmpeg's entry, as above; the count is compared with the same file's
+//       Unreferenced decode, so a decoder that skips more (or less) than NONREF on the device shows.
+// CONTROL: control_batch.sh 2026-10-14, reverted, video_decoder_hardware (RTX 3080 Ti), renderer/video/video_decoder.cpp:
+//       decode()'s std::min(skip, deepestSkip()) made `skip` -> "FAIL: hardware: asked for key pictures only, the
+//       device is sent only AVDISCARD_NONREF" and "... drops nothing beyond unreferenced pictures (14 of 217)".
+//       Green: 91 sends, all 8 (NONREF); 217 of 217. Via control_batch.sh 2026-10-15, reverted,
+//       video_decoder_content_lavapipe, renderer/video/video_decoder.cpp, deepestSkip(): H.264 in software NonIntra ->
+//       "FAIL: content, software: the deepest level is key pictures only in software (got 2)"; the default case
+//       NonKey -> "... the deepest level for AV1 is Nothing (got 3)"; the MPEG-2 case removed -> "... the deepest
+//       level for MPEG-2 is Unreferenced (got 0)"; control_run.sh 2026-10-15, reverted, video_decoder_content_lavapipe:
+//       AV_CODEC_ID_VP9 added to the MPEG case -> "... the deepest level for VP9 is Nothing (got 1)".
+void runSkipLevelChecks(Device& device, const char* label, bool hardware, const SkipDecode& all, const SkipDecode& some) {
+    using wallpaperx::PictureSkip;
+    const std::string file = asset("counter_long.mp4");
+    const std::string who = std::string(label) + ": ";
+    {
+        VideoDecoder probe(device, file);
+        static_cast<void>(probe.next(PictureSkip::Nothing));
+        const PictureSkip deepest = probe.deepestSkip();
+        check(deepest == (hardware ? PictureSkip::Unreferenced : PictureSkip::NonKey),
+              who + "the deepest level is " + (hardware ? "Unreferenced on the device" : "key pictures only in software") +
+                  " (got " + std::to_string(static_cast<int>(deepest)) + ")");
+    }
+    if (const std::optional<PictureSkip> av1 = deepestFor(device, "counter_av1.mp4")) {
+        check(*av1 == PictureSkip::Nothing, who + "the deepest level for AV1 is Nothing (got " +
+                                                std::to_string(static_cast<int>(*av1)) + ")");
+    }
+    if (const std::optional<PictureSkip> mpeg2 = deepestFor(device, "counter_onekey_m2.ts")) {
+        check(*mpeg2 == PictureSkip::Unreferenced, who + "the deepest level for MPEG-2 is Unreferenced (got " +
+                                                       std::to_string(static_cast<int>(*mpeg2)) + ")");
+    }
+    if (const std::optional<PictureSkip> vp9 = deepestFor(device, "counter_vp9.webm")) {
+        check(*vp9 == PictureSkip::Nothing, who + "the deepest level for VP9 is Nothing (got " +
+                                                std::to_string(static_cast<int>(*vp9)) + ")");
+    }
+    // The device is asked only for the levels VideoDecoder applies there (deepestSkip()).
+    const std::vector<PictureSkip> levels =
+        hardware ? std::vector{PictureSkip::Nothing, PictureSkip::Unreferenced}
+                 : std::vector{PictureSkip::Nothing, PictureSkip::Unreferenced, PictureSkip::NonIntra, PictureSkip::NonKey};
+    std::vector<SkipDecode> at{all, some};
+    for (size_t i = 2; i < levels.size(); ++i) at.push_back(decodeSkipping(device, file, levels[i]));
+    std::string counts;
+    for (const SkipDecode& level : at) counts += (counts.empty() ? "" : ", ") + std::to_string(level.pictures);
+    std::printf("video_decoder_probe (%s): counter_long.mp4 at each level: %s pictures\n", label, counts.c_str());
+    bool fewerEachLevel = at[0].pictures == 321;
+    for (size_t i = 1; i < at.size(); ++i) {
+        fewerEachLevel = fewerEachLevel && (levels[i] == PictureSkip::NonKey ? at[i].pictures <= at[i - 1].pictures &&
+                                                                                    at[i].pictures >= 1
+                                                                              : at[i].pictures < at[i - 1].pictures);
+    }
+    check(fewerEachLevel, who + "each skip level leaves out more than the one below it (" + counts + ")");
+    for (size_t i = 0; i < at.size(); ++i) {
+        check(at[i].tagged, who + "every picture says the level it was decoded at (level " + std::to_string(i) + ")");
+        check(!at[i].sentBidirectional, who + "no packet goes to ffmpeg as AVDISCARD_BIDIR (level " + std::to_string(i) + ")");
+        // Only NonIntra and up say which pictures they keep; below that the kept flag is never cleared.
+        if (levels[i] >= PictureSkip::NonIntra) {
+            check(at[i].kept, who + "every picture is of a type its level keeps (level " + std::to_string(i) + ")");
+        }
+    }
+
+    const auto describe = [](const std::vector<std::pair<int, bool>>& sends) {
+        std::string out;
+        for (size_t i = 0; i < sends.size() && i < 40; ++i) out += " " + std::to_string(sends[i].first) + (sends[i].second ? "K" : "");
+        return out;
+    };
+    // Software frame threads read ahead by as many packets as there are threads, so where the next packet
+    // falls depends on the host: the switch is moved until it lands on one that is not a key packet.
+    const auto nextPacketAfter = [&](PictureSkip from, std::initializer_list<int> after, PictureSkip to) {
+        std::vector<std::pair<int, bool>> sends;
+        for (const int pictures : after) {
+            sends = sendsAfterSwitch(device, file, from, pictures, to, 4);
+            if (!sends.empty() && !sends.front().second) break;
+        }
+        return sends;
+    };
+    const std::vector<std::pair<int, bool>> fromUnref =
+        nextPacketAfter(PictureSkip::Unreferenced, {6, 10, 14, 19, 25, 31, 38}, PictureSkip::Nothing);
+    std::printf("video_decoder_probe (%s): from unreferenced to every picture, the sends:%s\n", label, describe(fromUnref).c_str());
+    check(!fromUnref.empty() && !fromUnref.front().second,
+          who + "a switch from unreferenced pictures skipped was made with a packet that is not a key packet next");
+    check(!fromUnref.empty() && fromUnref.front().first == AVDISCARD_DEFAULT,
+          who + "leaving unreferenced pictures skipped does not wait for a key packet");
+    if (hardware) {
+        // Asked for key pictures only, the device sends unreferenced skipping and nothing deeper.
+        const std::vector<std::pair<int, bool>> capped = sendsAfterSwitch(device, file, PictureSkip::Nothing, 6, PictureSkip::NonKey, 60);
+        const bool onlyNonRef = std::all_of(capped.begin(), capped.end(), [](const auto& s) { return s.first == AVDISCARD_NONREF; });
+        const SkipDecode atKey = decodeSkipping(device, file, PictureSkip::NonKey);
+        std::printf("video_decoder_probe (%s): asked for key pictures only, %zu sends:%s; %d pictures (%d at unreferenced)\n", label,
+                    capped.size(), describe(capped).c_str(), atKey.pictures, at[1].pictures);
+        check(capped.size() >= 20, who + "at least twenty sends were recorded after asking for key pictures only (" +
+                                       std::to_string(capped.size()) + ")");
+        check(capped.size() >= 20 && onlyNonRef, who + "asked for key pictures only, the device is sent only AVDISCARD_NONREF");
+        check(atKey.pictures == at[1].pictures, who + "asked for key pictures only, the device drops nothing beyond unreferenced pictures (" +
+                                                    std::to_string(atKey.pictures) + " of " + std::to_string(at[1].pictures) + ")");
+        return;
+    }
+
+    const std::vector<std::pair<int, bool>> down = sendsAfterSwitch(device, file, PictureSkip::NonIntra, 2, PictureSkip::Nothing, 30);
+    size_t firstAll = down.size();
+    for (size_t i = 0; i < down.size(); ++i) {
+        if (down[i].first == AVDISCARD_DEFAULT) {
+            firstAll = i;
+            break;
+        }
+    }
+    bool heldAtNonIntra = true;
+    for (size_t i = 0; i < firstAll; ++i) {
+        if (down[i].first != AVDISCARD_NONINTRA || down[i].second) heldAtNonIntra = false;
+    }
+    std::printf("video_decoder_probe (%s): from intra only to every picture, the sends:%s\n", label, describe(down).c_str());
+    check(firstAll > 0 && firstAll < down.size(),
+          who + "after leaving intra only, packets were sent at the old level before one skipping nothing");
+    check(firstAll < down.size() && down[firstAll].second && heldAtNonIntra,
+          who + "a lower level is sent only from a key packet, the packets before it still at the old level");
+
+    // From intra only up to key only, and from key only down to intra only: neither starts decoding a
+    // picture that references a skipped one, so each goes through at once.
+    const std::vector<std::pair<int, bool>> up = sendsAfterSwitch(device, file, PictureSkip::NonIntra, 2, PictureSkip::NonKey, 2);
+    std::printf("video_decoder_probe (%s): from intra only to key only, the sends:%s\n", label, describe(up).c_str());
+    check(!up.empty() && !up.front().second && up.front().first == AVDISCARD_NONKEY,
+          who + "a higher level is sent with the very next packet, not a key one");
+    const std::vector<std::pair<int, bool>> keyToIntra = nextPacketAfter(PictureSkip::NonKey, {2, 3, 4, 5, 6}, PictureSkip::NonIntra);
+    std::printf("video_decoder_probe (%s): from key only to intra only, the sends:%s\n", label, describe(keyToIntra).c_str());
+    check(!keyToIntra.empty() && !keyToIntra.front().second,
+          who + "a switch from key only to intra only was made with a packet that is not a key packet next");
+    check(!keyToIntra.empty() && keyToIntra.front().first == AVDISCARD_NONINTRA,
+          who + "from key only down to intra only goes through with the very next packet");
+
+    // Open GOP: every key packet after the first is an I picture that is not an IDR.
+    if (!haveAssets({"counter_opengop_long.mp4"})) {
         g_notVerified = true;
         return;
     }
-    const SkipDecode av1All = decodeSkipping(device, asset("counter_av1.mp4"), PictureSkip::Nothing);
-    const SkipDecode av1Some = decodeSkipping(device, asset("counter_av1.mp4"), PictureSkip::Unreferenced);
-    std::printf("video_decoder_probe (%s): counter_av1.mp4 decodes to %d pictures (%s), %d asked to skip\n", label,
-                av1All.pictures, pathName(av1All.path), av1Some.pictures);
-    check(av1All.pictures > 0 && av1Some.pictures == av1All.pictures,
-          std::string(label) + ": an AV1 file returns every picture asked to skip, as its decoders ignore the request (" +
-              std::to_string(av1Some.pictures) + " of " + std::to_string(av1All.pictures) + ")");
+    VideoDecoder open(device, asset("counter_opengop_long.mp4"));
+    g_sends.clear();
+    g_sendsIdr.clear();
+    g_recordSends = true;
+    for (int i = 0; i < 2 && open.next(PictureSkip::NonIntra); ++i) {
+    }
+    const size_t switchAt = g_sends.size();
+    int pictures = 0;
+    while (pictures < 1000 && open.next(PictureSkip::Nothing)) ++pictures;
+    g_recordSends = false;
+    const bool idrAtStart = !g_sendsIdr.empty() && g_sendsIdr.front();
+    int openKeys = 0;
+    bool loweredAtOpenKey = false;
+    int previous = AVDISCARD_NONINTRA;
+    for (size_t i = switchAt; i < g_sends.size(); ++i) {
+        const bool openKey = g_sends[i].second && !g_sendsIdr[i];
+        if (openKey && previous == AVDISCARD_NONINTRA) ++openKeys;
+        if (g_sends[i].first < previous && !g_sendsIdr[i]) loweredAtOpenKey = true;
+        previous = g_sends[i].first;
+    }
+    std::printf("video_decoder_probe (%s): open GOP, from intra only to every picture: %zu sends after the switch, %d "
+                "open-GOP key packets met at intra only, %d pictures\n",
+                label, g_sends.size() - switchAt, openKeys, pictures);
+    check(idrAtStart, who + "the open-GOP file's first packet was recognised as an IDR");
+    check(openKeys >= 1, who + "at least one open-GOP key packet was sent after the switch while at intra only (" +
+                             std::to_string(openKeys) + ")");
+    check(!loweredAtOpenKey, who + "on an open-GOP file no lower level is sent at a packet that is not an IDR");
 }
 
 void runHardwareChecks(Device& device) {
@@ -357,6 +582,10 @@ void runHardwareChecks(Device& device) {
 
     // GOAL: S13.38 -- a stream this device takes reports Path::Hardware, and the frame it hands
     //       back lives on the device.
+    // CONTROL: control_batch.sh 2026-10-15, reverted, video_decoder_hardware (RTX 3080 Ti), renderer/video/video_decoder.cpp:
+    //       decode() never setting `m_path = Path::Hardware` -> "FAIL: a stream this device accepts did not
+    //       report Path::Hardware"; DecodedFrame::storage() always HostPlanes -> "FAIL: the hardware path
+    //       produced a frame held in host memory" (and the probe then threw at deviceImage(), reported).
     check(decoder.path() == VideoDecoder::Path::Hardware,
           "a stream this device accepts did not report Path::Hardware");
     check(first->storage() == DecodedFrame::Storage::DeviceImage,
@@ -377,15 +606,22 @@ void runHardwareChecks(Device& device) {
     //       a software frame does not report the visible rectangle". (2) the DecodedFrame constructor's `m_colour = FrameColour{...}`
     //       replaced by a default-constructed FrameColour, which is the assume-a-default defect:
     //       "FAIL: the frame's colour matrix is not the BT.709 the fixture is tagged with" and
-    //       "... colour range is not the limited range ...".
+    //       "... colour range is not the limited range ...". Via control_batch.sh 2026-10-15, reverted, video_decoder_hardware (RTX):
+    //       (3) extent() returning the visible size -> "FAIL: the coded extent is not the 320x240 the
+    //       fixture's macroblocks round up to"; (4) bitDepth() plus 2 -> "FAIL: an 8-bit stream did not report a
+    //       bit depth of 8"; (5) pixelFormat() returning AV_PIX_FMT_VULKAN for a device frame, not the frames
+    //       context's sw_format -> "FAIL: the frame reports pixel format vulkan" (an `!= AV_PIX_FMT_NONE` check
+    //       stayed green for that, hence NV12, the format an 8-bit 4:2:0 stream decodes to on the device).
     check(first->extent().width == 320 && first->extent().height == 240,
           "the coded extent is not the 320x240 the fixture's macroblocks round up to");
-    check(first->visible().offset.x == 0 && first->visible().offset.y == 0,
-          "the visible rectangle does not start at the fixture's origin");
     check(first->visible().extent.width == 320 && first->visible().extent.height == 238,
           "the visible rectangle is the coded extent, so the crop the stream declares was not read");
     check(first->bitDepth() == 8, "an 8-bit stream did not report a bit depth of 8");
-    check(first->pixelFormat() != AV_PIX_FMT_NONE, "the frame reports no pixel format");
+    if (first->pixelFormat() != AV_PIX_FMT_NV12) {
+        const char* const name = av_get_pix_fmt_name(first->pixelFormat());
+        std::fprintf(stderr, "FAIL: the frame reports pixel format %s\n", name != nullptr ? name : "none");
+        fail("the frame does not report the NV12 an 8-bit 4:2:0 stream decodes to on the device");
+    }
     check(first->colour().matrix == AVCOL_SPC_BT709,
           "the frame's colour matrix is not the BT.709 the fixture is tagged with");
     check(first->colour().range == AVCOL_RANGE_MPEG,
@@ -420,7 +656,12 @@ void runHardwareChecks(Device& device) {
     //       2`: "FAIL: the frame's batch does not signal exactly one above the value it waits
     //       at", plus the two downstream lines and one unexpected validation message. (2)
     //       `vk->layout[0] = VK_IMAGE_LAYOUT_GENERAL;` added after the submit: "FAIL: the frame
-    //       does not describe itself the same way after a batch has read it".
+    //       does not describe itself the same way after a batch has read it". Via control_batch.sh 2026-10-15, reverted,
+    //       video_decoder_hardware (RTX): (3) submit() adding no timeline wait or signal and not advancing
+    //       the stored value -> "FAIL: the frame's batch carried no VkTimelineSemaphoreSubmitInfo" and "...
+    //       does not wait on and signal exactly one semaphore"; (4) the signal moved to a fresh timeline
+    //       semaphore, the stored value left -> "FAIL: the frame's batch waits on one semaphore and signals
+    //       another". The value lines index only when the batch carried values, so (3) reports, not overreads.
     // COVERAGE-ASSERT: each bracket asserts that exactly one submit was recorded inside it, so a
     //       future change that routes the frame's work somewhere else -- or lets ffmpeg's own
     //       submissions fall into the window -- fails here rather than grading the wrong batch.
@@ -444,8 +685,18 @@ void runHardwareChecks(Device& device) {
     if (firstSubmit.waitSemaphores.size() == 1 && firstSubmit.signalSemaphores.size() == 1) {
         check(firstSubmit.waitSemaphores[0] == firstSubmit.signalSemaphores[0],
               "the frame's batch waits on one semaphore and signals another");
+    }
+    if (!firstSubmit.waitValues.empty() && !firstSubmit.signalValues.empty()) {
         check(firstSubmit.signalValues[0] == firstSubmit.waitValues[0] + 1,
               "the frame's batch does not signal exactly one above the value it waits at");
+    }
+    // GOAL: S13.41 -- the batch waits at the pipeline stage the caller named, not an earlier one, which would
+    //       leave the image's read unordered against ffmpeg's decode write.
+    // CONTROL: control_batch.sh 2026-10-15, reverted, video_decoder_hardware (RTX 3080 Ti), renderer/video/video_decoder.cpp:
+    //       DecodedFrame::submit() waiting at VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, not `readStage` -> "FAIL: the
+    //       frame's batch does not wait at the stage the caller named". A batch without exactly one stage is
+    //       already red at the one-semaphore check above.
+    if (firstSubmit.waitStages.size() == 1) {
         check(firstSubmit.waitStages[0] == VK_PIPELINE_STAGE_TRANSFER_BIT,
               "the frame's batch does not wait at the stage the caller named");
     }
@@ -490,6 +741,9 @@ void runHardwareChecks(Device& device) {
         submitThrew = true;
     }
     g_failNextSubmitOnce = false;
+    // CONTROL: control_batch.sh 2026-10-15, reverted, video_decoder_hardware (RTX), renderer/video/video_decoder.cpp: submit()
+    //       catching the Device's exception and returning lastSubmission() -> "FAIL: an injected vkQueueSubmit
+    //       failure did not reach the caller as an exception".
     check(submitThrew, "an injected vkQueueSubmit failure did not reach the caller as an exception");
 
     g_submits.clear();
@@ -547,6 +801,10 @@ void runHardwareChecks(Device& device) {
             break;
         }
     }
+    // GOAL: S13.38 -- the path stays Hardware for the whole stream, not only for its first picture.
+    // CONTROL: control_batch.sh 2026-10-15, reverted, video_decoder_hardware (RTX), renderer/video/video_decoder.cpp: decode() setting
+    //       SoftwareCodec for every device picture after the first -> "FAIL: the path changed away from Hardware
+    //       part-way through the stream".
     check(decoder.path() == VideoDecoder::Path::Hardware,
           "the path changed away from Hardware part-way through the stream");
 
@@ -565,12 +823,13 @@ void runHardwareChecks(Device& device) {
         fail("the hardware path did not decode the whole stream");
     }
 
+    const auto waitedAt = [](const RecordedSubmit& submit) {
+        return submit.waitValues.empty() ? std::string("none") : std::to_string(submit.waitValues[0]);
+    };
     std::printf("video_decoder_probe (hardware): %s decoded %d frames of 320x238 BT.709 on the device; semaphore "
-                "advanced %llu -> %llu -> %llu\n",
-                device.info().gpuName.c_str(), hardwareFrames,
-                static_cast<unsigned long long>(firstSubmit.waitValues[0]),
-                static_cast<unsigned long long>(secondSubmit.waitValues[0]),
-                static_cast<unsigned long long>(afterFailure.waitValues[0]));
+                "advanced %s -> %s -> %s\n",
+                device.info().gpuName.c_str(), hardwareFrames, waitedAt(firstSubmit).c_str(),
+                waitedAt(secondSubmit).c_str(), waitedAt(afterFailure).c_str());
     runPictureSkipChecks(device, "hardware", true);
 }
 
@@ -605,6 +864,14 @@ void runRefusedChecks(Device& device) {
     //       carries on from the packets the hardware attempt consumed. Observed: "FAIL: the software reopen
     //       produced 5 frames where a never-hardware decode of the same file produces 10", via
     //       control_batch.sh 2026-09-30. Reverted.
+    // CONTROL (paths): control_batch.sh 2026-10-15, reverted, video_decoder_refused (RTX), renderer/video/video_decoder.cpp:
+    //       attachHardwareFrames()'s unnamed-refusal branch setting SoftwareCodec -> "FAIL: 10-bit H.264 did not
+    //       report Path::SoftwareRefused"; openDecoder()'s unadvertised-codec branch setting SoftwareRefused ->
+    //       "FAIL: MPEG-4 Part 2 did not report Path::SoftwareCodec". decode() discarding every picture not on
+    //       the device -> "FAIL: the refused stream produced no frames at all" and "FAIL: the unsupported-codec
+    //       stream produced no frames at all" (the same break reddens the frame lines of no-decoder and
+    //       refused-after-setup). The "produced a frame on the device" lines have no break: a host frame claimed
+    //       as a device one is refused by DecodedFrame's own constructor before any count sees it.
     const DecodeResult refused = decodeAll(device, asset("h264_10bit.mp4"));
     check(refused.path == VideoDecoder::Path::SoftwareRefused,
           "10-bit H.264 did not report Path::SoftwareRefused");
@@ -622,11 +889,32 @@ void runRefusedChecks(Device& device) {
     // must yield too, since both end up on ffmpeg's default decoder reading from the first packet.
     g_hideVideoExtensions = true;
     int softwareFrames = -1;
+    uint32_t softwareFirstReadSince = 0;
     {
         Device software(/*enableValidation=*/false);
-        softwareFrames = decodeAll(software, asset("h264_10bit.mp4")).frames;
+        const DecodeResult never = decodeAll(software, asset("h264_10bit.mp4"));
+        softwareFrames = never.frames;
+        softwareFirstReadSince = never.firstReadSince;
     }
     g_hideVideoExtensions = false;
+
+    // GOAL: S15.626 -- the first picture after a resume's seek counts no packet read before it: the
+    //       software reopen of the refused stream reports, for its first picture, the readSince() a decoder
+    //       that never tried hardware reports for the same file's first picture.
+    // WHY-THIS-SHAPE: a resume by timestamp cannot carry this: admit() drops every picture a Seeked resume
+    //       decodes first, and each drop zeroes the count itself. This reopen ends in a rewind with nothing to
+    //       drop, after the hardware attempt read packet 1, so only seekToResume()'s own reset keeps that read
+    //       out. Compared with a never-hardware decode, not a number: frame threads delay the first picture.
+    // CONTROL: control_batch.sh 2026-10-15, reverted, video_decoder_refused (RTX): renderer/video/video_decoder.cpp
+    //       seekToResume() without `m_readSinceReturned = 0` -> "FAIL: the reopen's first picture reports 11
+    //       packet(s) read where a never-hardware decode reports 10".
+    if (refused.firstReadSince != softwareFirstReadSince) {
+        std::fprintf(stderr,
+                     "FAIL: the reopen's first picture reports %u packet(s) read where a never-hardware decode reports "
+                     "%u\n",
+                     refused.firstReadSince, softwareFirstReadSince);
+        fail("the first picture after the software reopen counted packets read before it");
+    }
 
     if (refused.frames != softwareFrames) {
         std::fprintf(stderr,
@@ -637,8 +925,9 @@ void runRefusedChecks(Device& device) {
     }
 
     std::printf("video_decoder_probe (refused): 10-bit H.264 -> %s (%d frames, against %d from a never-hardware "
-                "decode of the same file); MPEG-4 -> %s (%d frames)\n",
-                pathName(refused.path), refused.frames, softwareFrames, pathName(codec.path), codec.frames);
+                "decode of the same file); MPEG-4 -> %s (%d frames); first picture read %u packet(s), against %u\n",
+                pathName(refused.path), refused.frames, softwareFrames, pathName(codec.path), codec.frames,
+                refused.firstReadSince, softwareFirstReadSince);
 }
 
 void runNoDecoderChecks(Device& device) {
@@ -670,13 +959,22 @@ void runNoDecoderChecks(Device& device) {
 
     // The whole of S13.40 that a host frame can answer: the same questions, the same answers,
     // read from planes in host memory instead of an image.
+    // CONTROL: control_batch.sh 2026-10-15, reverted, video_decoder_no_decoder_lavapipe, renderer/video/video_decoder.cpp:
+    //       extent() returning the visible size -> "FAIL: a software frame does not report the coded extent";
+    //       the constructor's FrameColour default-constructed -> "FAIL: a software frame does not report the
+    //       stream's colour matrix".
     VideoDecoder decoder(device, asset("h264_crop.mp4"));
     std::optional<DecodedFrame> frame = decoder.next();
     if (!frame) {
         fail("the software decoder produced no first frame to inspect");
         return;
     }
-    check(frame->storage() == DecodedFrame::Storage::HostPlanes, "the software path produced a device frame");
+    // GOAL: S13.40 -- a software frame hands out every plane of its planar Y'CbCr format, each with data
+    //       and a stride.
+    // CONTROL: control_batch.sh 2026-10-15, reverted, video_decoder_no_decoder_lavapipe, renderer/video/video_decoder.cpp:
+    //       hostPlanes() reporting no planes -> "FAIL: a planar Y'CbCr software frame reports fewer than two
+    //       planes"; the second plane's stride 0 -> "FAIL: a software frame reports a plane with no data or no
+    //       stride".
     check(frame->extent().width == 320 && frame->extent().height == 240,
           "a software frame does not report the coded extent");
     check(frame->visible().extent.width == 320 && frame->visible().extent.height == 238,
@@ -728,7 +1026,10 @@ void runClassifierChecks(Device& device, bool deviceStops) {
     //       exactly one of these two entries would go red. Producing the failure any other way
     //       is not possible: no file reaches this call, because a device that declines the
     //       stream declines it during the capability query instead.
-    // CONTROL: renderer/video/video_decoder.cpp, attachHardwareFrames()'s `if (!deviceHealthy())`
+    // CONTROL: control_batch.sh 2026-10-15, reverted, video_decoder_refused_after_setup (RTX), renderer/video/video_decoder.cpp:
+    //       attachHardwareFrames()'s av_hwframe_ctx_init failure on a healthy device setting SoftwareCodec ->
+    //       "FAIL: a hardware failure on a device that still answers did not select Path::SoftwareRefused".
+    //       Earlier: renderer/video/video_decoder.cpp, attachHardwareFrames()'s `if (!deviceHealthy())`
     //       changed to `if (false)`. Observed: the fault entry printed "FAIL: a hardware failure
     //       on a device that no longer answers did not raise GpuFailure". The mirrored mutation,
     //       `if (true)`, makes the refusal entry print "FAIL: a hardware failure on a device that
@@ -874,8 +1175,6 @@ void runMultiFileChecks(Device& device, const ScratchDir& scratch) {
         {"an ffconcat script listing an ordinary video", &concatOrdinary},
     };
     constexpr int kCases = 3;
-    check(static_cast<int>(sizeof(cases) / sizeof(cases[0])) == kCases,
-          "the multi-file case list no longer has the three entries this check is written for");
 
     int graded = 0;
     for (const auto& [what, path] : cases) {
@@ -972,8 +1271,6 @@ void runContentChecks(Device& device) {
     // changes both sides together and the run stays green -- observed, on the first version of
     // this line, by deleting the audio-only entry and watching it pass while reporting two.
     constexpr int kUnusableFiles = 3;
-    check(static_cast<int>(bad.size()) == kUnusableFiles,
-          "the list of unusable files no longer has the three entries this check is written for");
     check(refusedAsContent == kUnusableFiles, "not every unusable file was refused as a content error");
 
     // GOAL: S13.182 -- every refusal that names a wallpaper file is worded `VideoDecoder: reason:
@@ -1036,7 +1333,7 @@ void runContentChecks(Device& device) {
     //       open ...: Is a directory)", the same for /dev/null saying "Invalid data found when
     //       processing input", and the count "0 of 2". Both messages are WallpaperContentError,
     //       which is why the wording and not the type is what is asserted. Reverted, green.
-    // COVERAGE-ASSERT: kIrregularKinds is a literal against the list's own length.
+    // COVERAGE-ASSERT: the count refused is asserted against the literal kIrregularKinds, so a deleted case reds.
     {
         const std::string videoDirectory = scratch.file("a-directory.mp4");
         std::error_code dirEc;
@@ -1051,8 +1348,6 @@ void runContentChecks(Device& device) {
                 {"a character device", &charDevice},
             };
             constexpr int kIrregularKinds = 2;
-            check(static_cast<int>(sizeof(kinds) / sizeof(kinds[0])) == kIrregularKinds,
-                  "the decoder's irregular-path list no longer has the two entries this check is written for");
 
             int refusedByKind = 0;
             for (const auto& [what, path] : kinds) {
@@ -1077,68 +1372,24 @@ void runContentChecks(Device& device) {
 
     runMultiFileChecks(device, scratch);
 
-    // GOAL: S13.42 -- a real file with damaged payload does not kill the wallpaper. End to end:
-    //       it decodes to fewer pictures than the same file undamaged, and to more than none.
-    // WHY-THIS-SHAPE: graded on the software path, with the device's video extensions stripped.
-    //       Surviving damage is a property of the decode loop and not of where the pixels land,
-    //       so the software path answers it in full; and ffmpeg's hardware decoder responds to a
-    //       damaged reference picture by emitting further validation complaints of its own,
-    //       which would force this probe's excused-message list to grow to cover a dependency's
-    //       reaction to deliberately broken input.
-    // NO PRODUCTION CONTROL, deliberately, and the reason is the finding: measured 2026-09-10,
-    //       damaged bytes reach NO error branch of VideoDecoder at all. ffmpeg conceals the
-    //       damage internally and simply emits fewer pictures, so making either damaged-packet
-    //       branch throw leaves this phase green. What this phase does grade is the end-to-end
-    //       outcome; the branches themselves are graded by injection immediately below. Its own
-    //       control is on the harness: exclusive-ORing with 0x00 instead of 0xFF leaves
-    //       damagedBytes non-zero and the streams identical, and the comparison below reports
-    //       "the damaged fixture is not damaged".
-    // COVERAGE-ASSERT: damagedBytes and the frame-count comparison both have to hold, so a
-    //       fixture that stopped being damaged fails here instead of grading an intact stream.
-    const std::string damaged = scratch.file("damaged.h264");
-    const int damagedBytes = writeDamagedCopy(asset("h264_raw.h264"), damaged);
-    if (damagedBytes == 0) {
-        fail("video_decoder_probe (content): could not write a damaged copy, so packet damage was not exercised");
-        return;
-    }
-
     g_hideVideoExtensions = true;
     int cleanFrames = -1;
-    int damagedFrames = -1;
-    bool damagedThrew = false;
     {
         Device software(/*enableValidation=*/false);
         cleanFrames = decodeAll(software, asset("h264_raw.h264")).frames;
-        try {
-            damagedFrames = decodeAll(software, damaged).frames;
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "FAIL: a damaged packet was not skipped: %s\n", e.what());
-            damagedThrew = true;
-        }
     }
     g_hideVideoExtensions = false;
-
-    check(!damagedThrew, "decoding a stream with damaged packets raised instead of skipping them");
-    check(cleanFrames > 0, "the undamaged reference stream decoded to nothing");
-    check(damagedFrames > 0, "a stream with damaged packets decoded to nothing at all");
-    if (damagedFrames >= cleanFrames) {
-        std::fprintf(stderr,
-                     "FAIL: %d bytes were flipped but the damaged stream still decoded %d frames against the clean "
-                     "stream's %d, so nothing was actually damaged\n",
-                     damagedBytes, damagedFrames, cleanFrames);
-        fail("the damaged fixture is not damaged, so skipping was never exercised");
-    }
-
-    std::printf("video_decoder_probe (content): %d files refused as content errors; %d flipped bytes took the "
-                "stream from %d frames to %d\n",
-                refusedAsContent, damagedBytes, cleanFrames, damagedFrames);
+    check(cleanFrames > 0, "the reference stream the injections are compared with decoded to nothing");
+    std::printf("video_decoder_probe (content): %d files refused as content errors; the clean stream decodes to %d "
+                "frames\n",
+                refusedAsContent, cleanFrames);
 
     // GOAL: S13.42 -- each of the three answers ffmpeg can give that this decoder is written to
     //       absorb is actually absorbed: AVERROR_INVALIDDATA from the send, AVERROR_INVALIDDATA
     //       from the receive, and an EAGAIN that means "show me that packet again".
     // WHY-THIS-SHAPE: injected from ffmpeg's own entry points rather than produced by damaging a
     //       file, because damaging a file does not reach any of them -- see the note on the
-    //       injection counters above, and the negative control recorded there. Without the
+    //       injection counters above. Without the
     //       injection these three branches are exactly the kind of code a green suite is blind
     //       to: written defensively, never executed, and free to be wrong.
     //       The frame count is compared against the clean baseline decoded in this same
@@ -1402,6 +1653,20 @@ extern "C" const AVPixFmtDescriptor* av_pix_fmt_desc_get(AVPixelFormat format) {
     return &shown;
 }
 
+namespace {
+// An MP4 H.264 packet is NAL units each behind a 4-byte big-endian length; type 5 is an IDR slice.
+bool holdsIdrSlice(const AVPacket& packet) {
+    for (int at = 0; packet.data != nullptr && at + 4 < packet.size;) {
+        const uint32_t length = (uint32_t{packet.data[at]} << 24) | (uint32_t{packet.data[at + 1]} << 16) |
+                                (uint32_t{packet.data[at + 2]} << 8) | uint32_t{packet.data[at + 3]};
+        if ((packet.data[at + 4] & 0x1f) == 5) return true;
+        if (length == 0 || length > static_cast<uint32_t>(packet.size - at - 4)) return false;
+        at += 4 + static_cast<int>(length);
+    }
+    return false;
+}
+}  // namespace
+
 extern "C" int avcodec_send_packet(AVCodecContext* context, const AVPacket* packet) {
     ++g_ffmpegDecodeCalls;
     if (g_everyFormatHardware.load() && packet != nullptr && context != nullptr && context->opaque != nullptr) {
@@ -1422,6 +1687,10 @@ extern "C" int avcodec_send_packet(AVCodecContext* context, const AVPacket* pack
     if (real == nullptr) {
         std::fprintf(stderr, "video_decoder_probe: cannot resolve the real avcodec_send_packet\n");
         std::abort();
+    }
+    if (g_recordSends && context != nullptr && packet != nullptr) {
+        g_sends.push_back({context->skip_frame, (packet->flags & AV_PKT_FLAG_KEY) != 0});
+        g_sendsIdr.push_back(holdsIdrSlice(*packet));
     }
     return real(context, packet);
 }

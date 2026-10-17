@@ -85,6 +85,15 @@ public:
     // Where a decoder opened on the same file can start at this picture. Empty when it could not be
     // found again: it has no timestamp, or the pictures returned before it did not rise in time.
     std::optional<StreamPosition> position() const { return m_position; }
+    // What the decoder was leaving out when this picture's packet was sent. With frame threads that
+    // can be a level asked for several pictures before this one was returned.
+    PictureSkip skip() const { return m_skip; }
+    // The highest level that would still decode this picture, judged by its type alone. A B picture
+    // is taken as one no other picture references, which in a B pyramid it need not be.
+    PictureSkip keptThrough() const;
+    // Video packets read since the picture before it was returned, at least 1: about how far on from
+    // that picture it lies in the stream, skipped pictures included.
+    uint32_t readSince() const { return m_readSince; }
 
     struct DeviceImage {
         VkImage image = VK_NULL_HANDLE;
@@ -132,6 +141,8 @@ private:
     std::optional<std::chrono::nanoseconds> m_presentation;
     std::optional<std::chrono::nanoseconds> m_duration;
     std::optional<StreamPosition> m_position;
+    PictureSkip m_skip = PictureSkip::Nothing;
+    uint32_t m_readSince = 1;
 };
 
 // Demuxes one file and decodes its video stream on this GPU's hardware decoder when the device
@@ -234,7 +245,8 @@ public:
     // from. That does not bound the call. If software never decodes that packet into a picture, it
     // decodes from the first packet again and drops as many pictures as were returned, which is not
     // exact when the two decoders emit different pictures; a stream that ends before that many
-    // throws WallpaperContentError. After a start part way in, that count does not reach back to
+    // throws WallpaperContentError. A count kept while pictures were skipped says nothing, so software
+    // then starts again at the stream's first picture. After a start part way in, that count does not reach back to
     // the first packet, so software starts again at the start's position instead and the pictures
     // returned since are returned again.
     //
@@ -264,12 +276,20 @@ public:
     // start falls back to the first picture.
     bool startedMidStream() const { return m_startedAfter.has_value(); }
 
-    // The stream's average time between pictures, as its container declares it or as ffmpeg measured
-    // it while probing; nothing when neither is known. Never ffmpeg's guessed base rate, which for a
-    // file of varying rate is often its time base's tick.
-    std::optional<std::chrono::nanoseconds> averageFrameInterval() const;
+    // Where, on the timeline presentationTime() uses, the latest-ending video packet read so far that is
+    // meant to be shown ends: once next() has run out, the stream's end, which a skipped last picture
+    // leaves no other way to know. Nothing before a packet with a timestamp.
+    std::optional<std::chrono::nanoseconds> readThrough() const { return m_readThrough; }
 
     Path path() const { return m_path; }
+
+    // The highest level next() applies, decided by the codec; one asked above it is applied as this.
+    // H.264 and HEVC: NonKey in software, Unreferenced while the stream is or may be decoded on the
+    // device, where FFmpeg 9.0.2's Vulkan decode, given a reference picture skipped, binds a stand-in
+    // sharing another picture's image and can destroy an image view the GPU still reads. MPEG-1, -2 and
+    // -4 Part 2: Unreferenced, since resetsDecoder() reads none of their reset points to come back down
+    // from deeper at. Nothing for every other codec: AV1 and VP9 ignore a level changed after opening.
+    PictureSkip deepestSkip() const;
 
 private:
     std::variant<std::optional<DecodedFrame>, Dropping> decode(std::optional<uint32_t> dropLimit, PictureSkip skip);
@@ -381,14 +401,25 @@ private:
     // pictures next() has returned; the last one's timestamp for as long as every one returned had a
     // timestamp above the one before; and the number of the packet it was decoded from, when that
     // packet was numbered. A decoder opened at a position starts as though every picture before it
-    // had been returned: count 0, and the timestamp one below that picture's. Only a new pass zeroes
-    // the count: count 0 is how a start that has shown nothing is told apart.
+    // had been returned: count 0, and the timestamp one below that picture's. Only a new pass, or a
+    // resume that lost its place, zeroes the count: count 0 is how a start that has shown nothing is
+    // told apart. `skipped` is a packet
+    // sent with pictures being skipped since the count began: the count then no longer says which
+    // picture was last returned.
     struct Returned {
         uint64_t count = 0;
         std::optional<int64_t> lastTimestamp;
         std::optional<uint64_t> lastPacket;
+        bool skipped = false;
     };
     Returned m_returned;
+    // The level the packets now sent are skipped at, which the one asked for reaches downwards onto
+    // pictures that can reference skipped ones only at a packet resetsDecoder() accepts. Nothing after a
+    // flush: the decoder then holds no picture a later one could miss.
+    PictureSkip m_skipping = PictureSkip::Nothing;
+    std::optional<std::chrono::nanoseconds> m_readThrough;
+    // Video packets read since a picture was last returned.
+    uint32_t m_readSinceReturned = 0;
     // Video packets read since the container was opened or rewound, which is each one's number.
     // Unset after a seek: numbers counted from there would not name the same packets as another
     // decoder's.

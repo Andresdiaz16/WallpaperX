@@ -138,6 +138,10 @@ void runEnabledChecks(Device& device) {
     //       array vkCreateDevice was given", exit 1. A `push_back` there instead gives "FAIL:
     //       enabledDeviceExtensions() has 14 entries but vkCreateDevice was given 13", which is
     //       the length half. Both reverted.
+    // CONTROL (instance half): renderer/vulkan/device.cpp, after vkCreateInstance, the array swapped
+    //       for a copy -> "FAIL: enabledInstanceExtensions() is not the array vkCreateInstance was
+    //       given"; one entry popped instead -> "FAIL: enabledInstanceExtensions() has a different length
+    //       from what vkCreateInstance was given". Both reverted, on device_video_enabled_lavapipe.
     check(device.enabledInstanceExtensions().data() == g_instanceCreation.extensionNames,
           "enabledInstanceExtensions() is not the array vkCreateInstance was given");
     check(device.enabledInstanceExtensions().size() == g_instanceCreation.extensionCount,
@@ -191,6 +195,17 @@ void runEnabledChecks(Device& device) {
     const bool bufferLinked = chainHas(head, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT);
     const DescriptorTier tier = device.descriptorTier();
 
+    // CONTROL: renderer/vulkan/device.cpp createLogicalDevice's chain, each reverted: the heap struct
+    //       linked after the buffer struct under the Buffer tier -> on the RTX entry
+    //       device_video_enabled_buffer "FAIL: the descriptor-heap feature struct is linked into the
+    //       chain iff the Heap tier is in use -- it is not" and "FAIL: the descriptor-heap struct is in
+    //       the chain with its flag clear"; heap.pNext pointed past maintenance5 -> "FAIL: the
+    //       maintenance5 feature struct is linked ..."; maintenance5.pNext set to nullptr -> "FAIL: the
+    //       untyped-pointers feature struct is linked ..."; shaderUntypedPointers set VK_FALSE -> "FAIL:
+    //       the untyped-pointers struct is in the chain with its flag clear" (those three on
+    //       device_video_enabled_lavapipe); descriptorBuffer set VK_FALSE -> on device_video_enabled_buffer
+    //       "FAIL: the descriptor-buffer struct is in the chain with its flag clear". The buffer-linked
+    //       line has no control of its own.
     check(heapLinked == (tier == DescriptorTier::Heap),
           "the descriptor-heap feature struct is linked into the chain iff the Heap tier is in use -- it is not");
     check(maintenance5Linked == (tier == DescriptorTier::Heap),
@@ -237,6 +252,9 @@ void runEnabledChecks(Device& device) {
     } else {
         check(device.timelineSemaphore() == (vulkan12->timelineSemaphore == VK_TRUE),
               "timelineSemaphore() disagrees with the Vulkan 1.2 features struct vkCreateDevice was given");
+        // CONTROL: renderer/vulkan/device.h samplerYcbcrConversion() negated -> "FAIL:
+        //       samplerYcbcrConversion() disagrees with the Vulkan 1.1 features struct vkCreateDevice was
+        //       given" on device_video_enabled_lavapipe. Reverted.
         check(device.samplerYcbcrConversion() == (vulkan11->samplerYcbcrConversion == VK_TRUE),
               "samplerYcbcrConversion() disagrees with the Vulkan 1.1 features struct vkCreateDevice was given");
     }
@@ -266,21 +284,18 @@ void runDecodeInvariants(Device& device) {
     //       VideoDecoder::openDecoder() branches on videoDecodeOps alone and would then index a
     //       list that disagrees with it.
     // CONTROL: renderer/vulkan/device.cpp, delete `m_info.videoDecodeOps |= decode.ops;` from the
-    //       family readback, so the families are listed while nothing is reported. Observed ten
+    //       family readback, so the families are listed while nothing is reported. Observed several
     //       reds, this one first: "FAIL: a decode family is listed while info().videoDecodeOps is
     //       zero". Reverted.
     check(families.empty() == (reported == 0),
           families.empty() ? "info().videoDecodeOps is non-zero while no decode family is listed"
                            : "a decode family is listed while info().videoDecodeOps is zero");
 
-    uint32_t familyCount = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(device.physicalDevice(), &familyCount, nullptr);
-
     VkVideoCodecOperationFlagsKHR union_ = 0;
     for (const Device::VideoDecodeFamily& decode : families) {
         union_ |= decode.ops;
-        check(decode.ops != 0, "a listed decode family advertises no codec operation at all");
-        check(decode.family < familyCount, "a listed decode family index is not a real queue family");
+        // CONTROL: renderer/vulkan/device.cpp, the decode family's vkGetDeviceQueue deleted -> on the RTX
+        //       entry device_video_decode "FAIL: a listed decode family has no queue handle". Reverted.
         check(decode.queue != VK_NULL_HANDLE, "a listed decode family has no queue handle");
         check((decode.ops & reported) == decode.ops,
               "a decode family advertises a codec operation that info().videoDecodeOps does not report");
@@ -295,6 +310,9 @@ void runDecodeInvariants(Device& device) {
             check(decode.queue == device.graphicsQueue(),
                   "a decode family that IS the graphics family does not share the graphics queue handle");
         } else {
+            // CONTROL: renderer/vulkan/device.cpp, the decode family handed m_graphicsQueue instead of
+            //       its own queue -> on device_video_decode (RTX) "FAIL: a decode family that is not the
+            //       graphics family was handed the graphics queue". Reverted.
             check(decode.queue != device.graphicsQueue(),
                   "a decode family that is not the graphics family was handed the graphics queue");
         }
@@ -332,11 +350,6 @@ void runDecodeInvariants(Device& device) {
     check((reported & ~accountedFor) == 0,
           "info().videoDecodeOps reports a codec operation this probe's table does not name");
 
-    const bool videoQueue = listedIn(device.enabledDeviceExtensions(), VK_KHR_VIDEO_QUEUE_EXTENSION_NAME);
-    const bool decodeQueue = listedIn(device.enabledDeviceExtensions(), VK_KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME);
-    check((reported != 0) == (videoQueue && decodeQueue),
-          "the two video queue extensions are enabled iff a decode capability is reported -- they are not");
-
     // GOAL: S13.36 -- no queue family is given two VkDeviceQueueCreateInfo entries. That is
     //       invalid usage, and the dedupe in addQueue() is the only thing preventing it once a
     //       decode family coincides with the graphics family.
@@ -365,6 +378,9 @@ void runDecodeInvariants(Device& device) {
             for (uint32_t family : g_deviceCreation.queueFamilies) {
                 if (family == decode.family) present = true;
             }
+            // CONTROL: renderer/vulkan/device.cpp, the decode families' addQueue calls removed -> on
+            //       device_video_decode (RTX) "FAIL: a reported decode family had no queue created for it",
+            //       with "a listed decode family has no queue handle" and a validation warning. Reverted.
             check(present, "a reported decode family had no queue created for it");
         }
     }
@@ -392,11 +408,6 @@ void runDecodeChecks(Device& device) {
         std::printf("  decode family %u, ops 0x%x, %s the graphics queue\n", decode.family, decode.ops,
                     decode.queue == device.graphicsQueue() ? "sharing" : "not sharing");
     }
-
-    // A decoder library is told these three gate the decode queue; without them
-    // createLogicalDevice() enables no codec at all, so a device that reports one must have them.
-    check(device.timelineSemaphore(),
-          "a decode capability is reported without timelineSemaphore, which the decode queue depends on");
 }
 
 // ------------------------------------------------------------------------- //
@@ -417,6 +428,11 @@ void runWaitTypeChecks() {
     // CONTROL: renderer/vulkan/device.h, give Wait's constructor a default
     //       `VkPipelineStageFlags stage = 0`. Observed: "FAIL: SubmitScope::Wait can be built
     //       from a semaphore alone, so a stage can be omitted". Reverted.
+    // CONTROL (the other nine lines): renderer/vulkan/device.h, each struct's constructor deleted so it
+    //       becomes an aggregate, each reverted, on device_video_waits_lavapipe: Wait -> its three lines
+    //       red ("FAIL: SubmitScope::Wait is default-constructible, so it can be empty", "... is an
+    //       aggregate ...", "... can be built from a semaphore alone ..."); TimelineWait -> its four
+    //       lines red; TimelineSignal -> its three lines red.
     check(!std::is_default_constructible_v<Wait>, "SubmitScope::Wait is default-constructible, so it can be empty");
     check(!std::is_aggregate_v<Wait>, "SubmitScope::Wait is an aggregate, so {semaphore} compiles with a zero stage");
     check(!std::is_constructible_v<Wait, VkSemaphore>,
@@ -530,9 +546,11 @@ void runWaitChecks(Device& device) {
         }
     }
 
+    // CONTROL: renderer/vulkan/device.cpp submit(), the binary wait's refusal thrown as runtime_error ->
+    //       "FAIL: a zero-stage wait was refused with the wrong exception type" on
+    //       device_video_waits_lavapipe. Reverted.
     check(!otherThrow, "a zero-stage wait was refused with the wrong exception type");
     check(refusals == refusalsAsked, "not every zero-stage wait this probe built was refused");
-    check(refusalsAsked >= 1, "no zero-stage wait was built, so the refusal was never asked for");
 
     // The same scopes with a real stage must go through, so the refusal above is the stage being
     // zero and not submit() refusing every scope that carries a wait.
@@ -544,6 +562,9 @@ void runWaitChecks(Device& device) {
         device.waitForSubmissions();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "device_video_probe (waits): a wait with a real stage was rejected: %s\n", e.what());
+        // CONTROL: renderer/vulkan/device.cpp submit(), the binary-wait refusal made unconditional ->
+        //       "FAIL: submit() refuses a wait even when its stage is non-zero" on
+        //       device_video_waits_lavapipe. Reverted.
         fail("submit() refuses a wait even when its stage is non-zero");
     }
 

@@ -536,6 +536,9 @@ int main() {
                 _exit(ok ? 0 : 1);
             });
         });
+        // CONTROL: renderer/vulkan/device.h adoptGpuThread() emptied -> on device_affinity_probe_lavapipe
+        //       "FAIL: after adoptGpuThread the adopting thread is allowed through" (and "... the original
+        //       creating thread is refused"). Reverted.
         const char* const what = "after adoptGpuThread the adopting thread is allowed through";
         if (adopted.harnessFailed) {
             harnessFault(what, adopted.harnessError.c_str());
@@ -599,6 +602,10 @@ int main() {
                 const wallpaperx::ExportedFrame frame = wallpaperx::exportFrame(*device, target);
                 if (frame.fd >= 0) close(frame.fd);
                 targets.destroy(kMonitor);
+                // CONTROL: renderer/vulkan/device.cpp assertGpuThread made to throw for "exportFrame" on
+                //       the creating thread -> "FAIL: the creating thread performs the same four calls
+                //       without aborting", "threw instead: refused", on device_affinity_probe_lavapipe.
+                //       Reverted.
                 check(true, "the creating thread performs the same four calls without aborting");
             } catch (const std::exception& e) {
                 check(false, "the creating thread performs the same four calls without aborting");
@@ -643,7 +650,7 @@ int main() {
     }
 
     // Deliberately NOT a ctest skip. A host that cannot run these cases cannot run
-    // anything else in renderer/tests either -- device_probe, offscreen_probe and the
+    // anything else in renderer/tests either -- device_probe, frame_export_probe and the
     // rest all fail outright in that situation, and reporting this one as "Skipped"
     // would single it out as optional while its siblings went red for the same cause.
     // The messages above name the real reason; only the grade is shared.

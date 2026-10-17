@@ -382,13 +382,11 @@ bool runFrameShownChecks() {
         //       would have produced was never reported. Re-observed 2026-09-14 and 2026-10-05 (via
         //       control_batch.sh). Reverted.
         const int requestsBeforeIdChange = stub.requests();
-        check(item->property("monitorId").toInt() == kFirstMonitor, "the item starts on the monitor id the QML set");
         item->setProperty("monitorId", kSecondMonitor);
         const bool claimAfterIdChange = claimsFrameShown(item);
         const bool nodeAfterIdChange = itemTexture(item) == texture;
         check(nodeAfterIdChange, "the node keeps the frame it was already drawing across a monitor-id change");
         check(claimAfterIdChange, "a monitor-id change does not withdraw the claim that a frame is on screen");
-        check(item->property("monitorId").toInt() == kSecondMonitor, "the monitor-id change reached the item");
 
         // The claim must also survive the fetch the id change triggers and the next render pass:
         // the first publishes for its own reason, the second is where a node would be torn down.

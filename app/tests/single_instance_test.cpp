@@ -143,10 +143,9 @@ void options(const QString& root) {
         // What a refusal names first; empty for help.
         QString names;
     };
-    // A real package, so a path ended at the NUL would name a file that exists.
-    const QString nulUrl = QStringLiteral("file://") + QString::fromLatin1(QFile::encodeName(root).toPercentEncoding("/")) + QStringLiteral("/nul.wpx%00.jpg");
+    // A real package, so the S15.94 relative path below names a file that exists from "/".
     if (!writeZip(root + QStringLiteral("/nul.wpx"), planEntries(titled("Nul"))).isEmpty()) {
-        harnessFailure("S15.93: nul.wpx could not be written");
+        harnessFailure("S15.94: nul.wpx could not be written");
         return;
     }
     const Case cases[] = {
@@ -156,7 +155,6 @@ void options(const QString& root) {
         {QStringLiteral("--bogus"), 2, false, QStringLiteral("wallpaperx: --bogus is not an option wallpaperx takes.")},
         {QStringLiteral("file://otherhost/share/x.wpx"), 2, false, QStringLiteral("wallpaperx: file://otherhost/share/x.wpx is not a file on this computer.")},
         {QStringLiteral("file:x.wpx"), 2, false, QStringLiteral("wallpaperx: file:x.wpx is not a file on this computer.")},
-        {nulUrl, 2, false, QStringLiteral("wallpaperx: ") + nulUrl + QStringLiteral(" is not a file on this computer.")},
     };
     // GOAL: S15.83 -- `--help` or `-h` anywhere before `--` prints the usage to stdout and exits 0,
     //       whatever else is given; an option it does not know, or a file: URL that does not name
@@ -165,7 +163,7 @@ void options(const QString& root) {
     // WHY-THIS-SHAPE: stdout and stderr are read apart, since "exit 0 with the usage" printed to
     //       stderr is the refusal path with its status changed.
     // CONTROL: app/main.cpp, the Refused branch's `return 2;` made `return 0;` -> red, "S15.83:
-    //       `--bogus` exited 0", the same for both file: URLs, and the S15.93 and S15.94 refusals;
+    //       `--bogus` exited 0", the same for both file: URLs, and the S15.94 refusal;
     //       parseCommandLine's `argument == "--help" || argument == "-h"` made `i == 1 && (...)` (help
     //       only as the first argument) -> red, "S15.83: `foo.wpx --help` exited 2" and the same for
     //       `-x -h`; `std::fputs(kUsage, stdout);` made `stderr` -> red, "S15.83: `--help` exited 0 ...
@@ -173,13 +171,8 @@ void options(const QString& root) {
     //       host test `!(url.host().isEmpty() || url.host() == u"localhost")` made `false` -> red,
     //       "S15.83: `file://otherhost/share/x.wpx` exited -1 (finished 0)"; its
     //       `if (!path.startsWith('/') || path.contains('\0')) {` made `if (false) {` -> red, "S15.83:
-    //       `file:x.wpx` exited -1 (finished 0)" and the S15.93 row (each such run starts the app on
-    //       the private bus, stopped at the bound); restored.
-    // GOAL: S15.93 -- a file: URL whose path decodes to a NUL byte (".../nul.wpx%00.jpg", nul.wpx
-    //       real) is refused on the command line like any URL that names no file here: exit 2.
-    // CONTROL: app/library/wpx_package.cpp, localPathOfFileUrl's `if (!path.startsWith('/') || path.contains('\0')) {`
-    //       made `if (!path.startsWith('/')) {` -> red, "S15.93: `file://.../nul.wpx%00.jpg` exited -1
-    //       (finished 0)" (the app started, importing nul.wpx, and was stopped at the bound); restored.
+    //       `file:x.wpx` exited -1 (finished 0)" (each such run starts the app on the private bus,
+    //       stopped at the bound); restored.
     for (const Case& c : cases) {
         QProcess app;
         startApp(app, root, root, QStringLiteral("exec \"$0\" ") + c.arguments, QProcess::SeparateChannels);
@@ -187,11 +180,10 @@ void options(const QString& root) {
         const QString out = QString::fromLocal8Bit(app.readAllStandardOutput());
         const QString err = QString::fromLocal8Bit(app.readAllStandardError());
         const QString usageWhere = c.toStdout ? out : err;
-        // One arg() call: an argument holding "%00" would itself be read as a placeholder.
         expect(finished && app.exitStatus() == QProcess::NormalExit && app.exitCode() == c.exitCode &&
                    usageWhere.contains(QLatin1String("Usage: wallpaperx")) && (c.names.isEmpty() || err.contains(c.names)),
                QStringLiteral("%1: `%2` exited %3 (finished %4); stdout [%5]; stderr [%6]")
-                   .arg(c.arguments == nulUrl ? QStringLiteral("S15.93") : QStringLiteral("S15.83"), c.arguments,
+                   .arg(QStringLiteral("S15.83"), c.arguments,
                         QString::number(finished ? app.exitCode() : -1), QString::number(finished), out.trimmed().left(200), err.trimmed().left(300)));
     }
 

@@ -135,8 +135,6 @@ public:
     // caller then refuses or abandons leaves the published frame exactly where it was.
     const OffscreenTarget* nextUnheld(int monitorId, const std::vector<uint64_t>& held) const;
 
-    uint32_t depth(int monitorId) const;
-
     // Renders `renderer` into `target`, submits it, and publishes the result: one
     // command buffer holding the acquire back from the previous publish, the render,
     // and the release that hands the finished frame to an external consumer.

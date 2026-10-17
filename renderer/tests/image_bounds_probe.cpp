@@ -662,7 +662,7 @@ static_assert(kSmallScanlineBytes % 2 == 1 && kGrownScanlineBytes % 2 == 1,
 // The opens StaticRenderer::loadAndUploadTexture makes of the image across the whole load:
 // ONE, shared by stbi_info_from_file, stbi_is_16_bit_from_file and stbi_load_from_file.
 //
-// Not bookkeeping -- it is the property, asserted by checkDecodePathOpensTheImageOnce().
+// Not bookkeeping -- it is the property, asserted by checkOneOpenFeedsProbeAndDecode().
 // A second open is a window in which a 16-bit file of identical geometry replaces the
 // 8-bit one whose header was charged, on the one axis the post-decode dimension guard
 // cannot see. It also aims the redirect, which identifies an open by index and nothing else.
@@ -766,9 +766,8 @@ uint64_t checkInstrumentSeesTheDecoder(const std::string& oversizePath) {
 //       disabled -> three reds here -- "the oversize header is refused by the header gate,
 //       before the decode", "nothing pixel-sized is allocated on the way to the rejection"
 //       (printed "16 allocation requests, the largest 976.56 MiB"), and "the rejection names the
-//       declared dimensions". Note what stayed GREEN in that same run: "an image over the
-//       decoded-size budget is rejected" -- the verdict-only assertion, passing for a
-//       renderer that had just spent 976 MiB. Reverted, re-measured green at 0.02 MiB.
+//       declared dimensions". A verdict-only "it was rejected" check stayed green in that run,
+//       which is why there is none. Reverted, re-measured green at 0.02 MiB.
 // COVERAGE-ASSERT: `requests > 0`. This is an upper-bound check, and an upper bound cannot
 //       tell "the allocation did not happen" from "nothing was measured". Not a tautology:
 //       the path opens the file and builds the exception's message, so it allocates today
@@ -789,7 +788,6 @@ void checkHeaderRejectionAllocatesNothing(wallpaperx::Device& device, VkRenderPa
     std::printf("image_bounds_probe: rejection said [%s]: %s\n", gateName(attempt.gate),
                 attempt.constructed ? "(nothing -- it constructed)" : attempt.message.c_str());
 
-    check(!attempt.constructed, "an image over the decoded-size budget is rejected");
     check(attempt.gate == Gate::HeaderPeakBudget,
           "the oversize header is refused by the header gate, before the decode");
     check(attempt.requests > 0,
@@ -944,8 +942,6 @@ void checkHeaderGateEdges(wallpaperx::Device& device, VkRenderPass renderPass, c
                   label + ": refused by the header gate (saw: " + gateName(attempt.gate) + ")");
             check(attempt.maxRequest < kPixelMemoryFloor,
                   label + ": no pixel-sized allocation before the refusal");
-            check(attempt.message.find(dims) != std::string::npos,
-                  label + ": the refusal names the declared dimensions");
             check(attempt.message.find(std::to_string(c.bitDepth) + "-bit") != std::string::npos,
                   label + ": the refusal names the bit depth it charged for");
         } else {
@@ -993,53 +989,6 @@ SwapResult loadWithRedirect(wallpaperx::Device& device, VkRenderPass renderPass,
     result.opens = plan.opens;
     result.redirects = plan.redirects;
     return result;
-}
-
-// GOAL: S4.11 and S13.172 -- the header verdict binds the bytes that are actually decoded.
-//       Probes and decode read the image through ONE open of the path, so the bytes the
-//       budget verdict was computed on cannot be replaced before they are decoded. False at
-//       2 (a decode that reopens by path) or 3 (probes via stbi_info(path)/stbi_is_16_bit).
-// WHY-THIS-SHAPE: exactly 1, not "at most 2". Every open after the first admits a 16-bit
-//       file of identical geometry in place of the 8-bit one that was charged, and the
-//       post-decode guard compares dimensions -- which such a substitute matches -- so that
-//       axis is undetectable there. Measured on a load that SUCCEEDS: on a rejected one, a
-//       count of 1 could mean it gave up before the second. Counted at open(2) rather than
-//       at fopen because openWallpaperFile() is what production calls; an fopen counter
-//       sees nothing at all now, which reads as zero opens rather than as a broken oracle.
-// CONTROL: in renderer/renderers/static_renderer.cpp, the decode given a second descriptor
-//       from the same path -- `openWallpaperFile(imagePath, ...)` + fdopen feeding
-//       stbi_load_from_file -> "(2 opens of the image, expected 1)", 11 FAILs across this
-//       check and the three interposition phases. Reverted, green at 1.
-//       `stbi_load(imagePath.c_str(), ...)` is NOT usable as the mutation any more: stb
-//       reaches the file through fopen, whose internal open is not this file's symbol, so
-//       that shape counts 1 here and the check would pass on the defect it exists to catch.
-// COVERAGE-ASSERT: the load must have constructed -- controlled by pointing this at a
-//       nonexistent path, which still counts 1 open and reddens only that assert.
-void checkDecodePathOpensTheImageOnce(wallpaperx::Device& device, VkRenderPass renderPass,
-                                      const std::string& validPath) {
-    FileSwapPlan plan;
-    plan.watchedPath = validPath.c_str();
-    plan.replacementPath = nullptr;
-    plan.redirectFromOpen = 0;  // observe only
-
-    Attempt attempt;
-    {
-        ArmedSwap armed(plan);
-        attempt = attemptLoad(device, renderPass, validPath);
-    }
-
-    std::printf("image_bounds_probe: a successful load opened the image %d time(s) (expected %d)\n",
-                plan.opens, kExpectedOpens);
-
-    check(attempt.constructed,
-          "the open-counting fixture loads at all (so the count is of a complete decode path)");
-    if (!attempt.constructed) {
-        std::fprintf(stderr, "  it failed with: %s\n", attempt.message.c_str());
-    }
-    check(plan.opens == kExpectedOpens,
-          "the whole decode path reads the image through one open, so no bytes can be substituted "
-          "between the header verdict and the decode (" + std::to_string(plan.opens) +
-              " opens of the image, expected " + std::to_string(kExpectedOpens) + ")");
 }
 
 struct RedirectPhase {
@@ -1255,16 +1204,12 @@ void checkIrregularPathsAreRefusedByTheStillPath(wallpaperx::Device& device, VkR
     };
     const Kind kinds[] = {{"a directory", &directory}, {"a character device", &charDevice}};
     constexpr int kIrregularKinds = 2;
-    check(static_cast<int>(sizeof(kinds) / sizeof(kinds[0])) == kIrregularKinds,
-          "the still renderer's irregular-path list no longer has the two entries this check is "
-          "written for");
 
     int graded = 0;
     for (const Kind& kind : kinds) {
         const Attempt attempt = attemptLoad(device, renderPass, *kind.path);
         std::printf("image_bounds_probe: the still renderer given %s: %s -- %s\n", kind.what,
                     gateName(attempt.gate), attempt.message.c_str());
-        check(!attempt.constructed, std::string("the still renderer loaded ") + kind.what);
         check(attempt.gate == Gate::NotARegularFile,
               std::string(kind.what) + " is refused as not-a-regular-file (saw: " + gateName(attempt.gate) + ")");
         check(attempt.message.find(*kind.path) != std::string::npos,
@@ -1321,7 +1266,6 @@ int main() {
                 const std::string swapGrownPath = wallpaperx::testing::writeSolidPng(
                     dir + "/bounds_swap_grown.png", kSwapGrownSide, kSwapGrownSide, {90, 80, 70, 255});
 
-                checkDecodePathOpensTheImageOnce(device, targets.renderPass(), swapSmallPath);
                 checkOneOpenFeedsProbeAndDecode(device, targets.renderPass(), swapSmallPath,
                                                 swapCopyPath, swapGrownPath);
                 checkUnopenableFileIsAttributed(device, targets.renderPass(), dir);

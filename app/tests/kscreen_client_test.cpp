@@ -397,6 +397,9 @@ void selection() {
            QStringLiteral("S15.8: select(DP-3) did not select it with one selectionChanged; ") + summary(c));
 
     // GOAL: S15.8 -- a chosen screen survives a re-read that still lists it.
+    // CONTROL: app/kde/kscreen_client.cpp, settled()'s `if (selectedMonitor().outputName.isEmpty())`
+    //       made `if (true)`, so every Ready re-read clears the choice -> red, "a re-read listing DP-3
+    //       lost the selection" (with S15.16/18/19/334 lines); control_batch.sh 2026-10-14; restored.
     const int reads = rig->fake->configCalls;
     rig->fake->emitConfigChanged();
     if (!waitFor([&] { return rig->fake->configCalls > reads; }, kWaitMs) || !rig->quiesce("S15.8 re-read")) {

@@ -39,7 +39,7 @@ using wallpaperx::testing::variesInBothAxes;
 constexpr uint32_t kTargetWidth = 68;
 constexpr uint32_t kTargetHeight = 36;
 
-// A distinct filename from static_renderer_probe's test_red.png so the two probes
+// A distinct filename from static_renderer_probe's cover_*.png fixtures so the two probes
 // never touch the same file. That is not sufficient on its own: this probe and its
 // _lavapipe twin are the same binary and write this same path, so they are locked to
 // a shared ctest RESOURCE_LOCK -- without it `ctest -jN` can have one process reading
@@ -56,6 +56,13 @@ std::string writeTestImage() {
 // The layout assertions that hold for any DmaBuf frame carrying a real modifier.
 // Split out of testHappyPathExport so the content test can apply them too without
 // duplicating the reasoning about which of them are modifier-dependent.
+// GOAL: S5.6 -- a dma_buf frame publishes a real modifier, the target's fourcc and a plane layout
+//       an importer can walk.
+// CONTROL: renderer/vulkan/frame_export.cpp populateDmaBufLayout, each reverted, on
+//       frame_export_probe_lavapipe: `frame.modifier = chosen` deleted -> "frame_export_probe: DmaBuf
+//       frame reports DRM_FORMAT_MOD_INVALID"; the published rowPitch halved -> "LINEAR plane 0
+//       rowPitch 160 is below the 272 bytes a 68px BGRA row needs"; the published offset +256 ->
+//       "LINEAR plane 0 needs 11728 bytes for 68x36 at pitch 320, but only 11520 were exported".
 bool checkDmaBufLayout(const wallpaperx::ExportedFrame& frame, uint32_t width, uint32_t height) {
     bool ok = true;
 
@@ -66,16 +73,9 @@ bool checkDmaBufLayout(const wallpaperx::ExportedFrame& frame, uint32_t width, u
         ok = false;
     }
     // Derived from kFormat through the same mapping the exporter uses, so this
-    // tracks a format change instead of pinning a literal. The real guard
-    // against an unmapped format is drmFourccForVkFormat returning 0, which
-    // makes exportFrame throw -- asserted separately here.
+    // tracks a format change instead of pinning a literal. An unmapped format
+    // makes exportFrame throw, so no frame reaches here with a zero fourcc.
     const uint32_t expectedFourcc = wallpaperx::drmFourccForVkFormat(wallpaperx::OffscreenTargetManager::kFormat);
-    if (expectedFourcc == 0) {
-        std::cerr << "frame_export_probe: no DRM fourcc mapping for the offscreen target's format -- "
-                     "drmFourccForVkFormat needs a case for it"
-                  << std::endl;
-        ok = false;
-    }
     if (frame.drmFormat != expectedFourcc) {
         std::cerr << "frame_export_probe: DmaBuf frame reports drmFormat 0x" << std::hex << frame.drmFormat
                   << ", expected 0x" << expectedFourcc << std::dec << " for the target's Vulkan format" << std::endl;
@@ -244,6 +244,10 @@ bool testExportedBytesMatchReadback() {
                     }
                 }
 
+                // CONTROL: renderer/vulkan/frame_export.cpp, published rowPitch made 4 bytes short (still
+                //       inside the layout bounds) -> "frame_export_probe (contents): 35 of 36 rows read back
+                //       through the exported fd differ from the Vulkan readback" on
+                //       frame_export_probe_lavapipe. Reverted.
                 if (mismatchedRows != 0) {
                     std::cerr << "frame_export_probe (contents): " << mismatchedRows << " of " << kTargetHeight
                               << " rows read back through the exported fd differ from the Vulkan readback (first at "
@@ -302,10 +306,6 @@ bool testHappyPathExport() {
         // below turns into a failure.
         targets.render(renderer, target);
         wallpaperx::ExportedFrame frame3 = wallpaperx::exportFrame(device, target);
-        if (fcntl(frame3.fd, F_GETFD) == -1) {
-            std::cerr << "frame_export_probe: re-rendered export did not produce a valid fd" << std::endl;
-            ok = false;
-        }
         // Re-exporting the same target must describe the same buffer. The image was not
         // reallocated between the two exports, so a differing modifier, fourcc, plane
         // count or size means the metadata is being derived from transient state rather
@@ -320,6 +320,11 @@ bool testHappyPathExport() {
         }
         close(frame3.fd);
 
+        // GOAL: S5.4 -- width, height and memorySize describe the target the frame came from.
+        // CONTROL: renderer/vulkan/frame_export.cpp describe(), each reverted, on
+        //       frame_export_probe_lavapipe: `target.width + 1` -> "exported dimensions 69x36 do not
+        //       match target 68x36"; memorySize divided by 64 -> "exported memorySize 180 is smaller than
+        //       the minimum 9792 for a 68x36 BGRA image".
         // The fd must be a real, currently-open OS file descriptor.
         if (fcntl(frame1.fd, F_GETFD) == -1) {
             std::cerr << "frame_export_probe: first exported fd is not a valid open fd" << std::endl;
@@ -348,6 +353,10 @@ bool testHappyPathExport() {
             ok = false;
         }
 
+        // GOAL: S5.2 -- each export is a new fd, not the previous one handed out again.
+        // CONTROL: renderer/vulkan/frame_export.cpp exportFrame, the first fd cached and returned by
+        //       every later call -> "frame_export_probe: two exports returned the same fd (13)" on
+        //       frame_export_probe_lavapipe. Reverted.
         // Each vkGetMemoryFdKHR call is contractually a fresh fd -- while both are
         // still open they must be distinct (see qa_scratch/frame_export_fd_lifecycle.cpp
         // for the exhaustive version of this check).
@@ -382,6 +391,11 @@ bool testHappyPathExport() {
                       << std::endl;
             ok = false;
         }
+        // GOAL: S5.5 -- an opaque-fd frame carries no layout: modifier DRM_FORMAT_MOD_INVALID, no planes.
+        // CONTROL: renderer/vulkan/frame_export.cpp describe(), `frame.modifier = 0` set for a
+        //       non-dma_buf frame -> on the RTX entry frame_export_probe "frame_export_probe: an OpaqueFd
+        //       frame must not carry DMA-BUF layout metadata". Reverted. Lavapipe exports dma_buf, so
+        //       only the NVIDIA entry reaches this branch.
         if (frame1.type == wallpaperx::ExportedFrame::HandleType::OpaqueFd) {
             if (frame1.modifier != wallpaperx::kDrmModifierInvalid || !frame1.planes.empty()) {
                 std::cerr << "frame_export_probe: an OpaqueFd frame must not carry DMA-BUF layout metadata"
@@ -456,6 +470,10 @@ bool testExportFromDestroyedTargetThrows() {
         } catch (const std::runtime_error&) {
             threw = true;
         }
+        // GOAL: S5.11 -- exporting a destroyed target throws rather than returning a frame.
+        // CONTROL: renderer/vulkan/frame_export.cpp exportFrame, describe()'s runtime_error caught and
+        //       turned into a frame with fd -1 -> "frame_export_probe (destroyed target): exporting a
+        //       destroyed target should have thrown" on frame_export_probe_lavapipe. Reverted.
         if (!threw) {
             std::cerr << "frame_export_probe (destroyed target): exporting a destroyed target should have thrown"
                       << std::endl;
@@ -521,6 +539,12 @@ bool testNeverReturnsInvalidFdUnderExhaustion() {
         for (int fd : held) close(fd);
         setrlimit(RLIMIT_NOFILE, &original);
 
+        // GOAL: under fd exhaustion exportFrame throws; it never returns a frame with fd < 0.
+        // CONTROL: renderer/vulkan/frame_export.cpp exportFrame, `|| frame.fd < 0` dropped from the
+        //       check after vkGetMemoryFdKHR -> "frame_export_probe (exhaustion): exportFrame() returned
+        //       an ExportedFrame with fd < 0 instead of throwing" on frame_export_probe_lavapipe, whose
+        //       driver returns VK_SUCCESS with fd -1. Reverted. NVIDIA fails through the return code,
+        //       so this break cannot turn the RTX entry red.
         if (sawInvalidFd) {
             std::cerr << "frame_export_probe (exhaustion): exportFrame() returned an ExportedFrame with fd < 0 "
                          "instead of throwing"

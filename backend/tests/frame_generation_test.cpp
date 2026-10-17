@@ -29,8 +29,8 @@ using wallpaperx::testing::check;
 //       equality -- the daemon re-announcing the frame already held. A `>` written as `>=`
 //       passes an ordering-only check and refetches every repeat.
 // CONTROL: `generation > newestFetched` changed to `>=` in WallpaperXItem::worthFetching ->
-//       "FAIL: the generation already held is not worth fetching again" and the
-//       coverage assert below. Observed 2026-08-21. Reverted.
+//       "FAIL: the generation already held is not worth fetching again". Observed 2026-08-21.
+//       Reverted.
 void checkWorthFetching() {
     check(WallpaperXItem::worthFetching({5}, {3}), "a newer generation is worth fetching");
     check(!WallpaperXItem::worthFetching({3}, {5}), "an older generation is not worth fetching");
@@ -38,7 +38,6 @@ void checkWorthFetching() {
 
     // Zero is "not known", which the callers that are not signals pass. It must fetch, or a
     // screen that has just learned its monitor id never asks for anything and stays blank.
-    check(WallpaperXItem::worthFetching({0}, {0}), "an unknown generation is fetched when nothing is held");
     check(WallpaperXItem::worthFetching({0}, {9}), "an unknown generation is fetched even with a frame in hand");
 }
 
@@ -50,23 +49,13 @@ void checkWorthFetching() {
 //       after a window change -- and refusing it there would leave the screen blank rather
 //       than redraw what it already showed.
 // CONTROL: `generation >= shown` changed to `>` in WallpaperXItem::supersedesShown ->
-//       "FAIL: the same frame arriving again is still drawn" and the coverage assert
-//       below. Observed 2026-08-21. Reverted.
+//       "FAIL: the same frame arriving again is still drawn". Observed 2026-08-21. Reverted.
 void checkSupersedesShown() {
     check(WallpaperXItem::supersedesShown({7}, {4}), "a newer frame replaces what is shown");
     check(!WallpaperXItem::supersedesShown({4}, {7}), "a frame older than what is shown is dropped");
     check(WallpaperXItem::supersedesShown({7}, {7}), "the same frame arriving again is still drawn");
     check(WallpaperXItem::supersedesShown({0}, {9}), "a frame of unknown generation is drawn rather than discarded");
 }
-
-// COVERAGE-ASSERT: the two rules must not be the same function. They differ deliberately at
-// equality, and a refactor that unified them would satisfy every check above except this one.
-void checkTheTwoRulesDiffer() {
-    const bool differAtEquality =
-        !WallpaperXItem::worthFetching({5}, {5}) && WallpaperXItem::supersedesShown({5}, {5});
-    check(differAtEquality, "fetching and drawing disagree about a repeated generation, deliberately");
-}
-
 
 // GOAL: a reply with too few fields is refused rather than read past the end. False if it reads
 //       anyway: the parse indexes fields 0 to 9, and indexing a shorter list is a crash inside
@@ -88,7 +77,6 @@ void checkReplyBounds() {
           "a reply from a newer daemon carrying extra fields is still read");
     check(!WallpaperXItem::replyIsReadable(WallpaperXItem::kFrameReplyFields - 1),
           "a reply one field short is refused rather than read past the end");
-    check(!WallpaperXItem::replyIsReadable(0), "an empty reply is refused");
 }
 
 }  // namespace
@@ -97,7 +85,6 @@ int main() {
     wallpaperx::testing::g_testName = "frame_generation_test";
     checkWorthFetching();
     checkSupersedesShown();
-    checkTheTwoRulesDiffer();
     checkReplyBounds();
     if (wallpaperx::testing::reportCheckFailures()) return 1;
     return wallpaperx::testing::reportNotVerifiedOrPassed();

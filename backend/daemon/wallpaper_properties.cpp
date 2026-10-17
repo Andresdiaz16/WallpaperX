@@ -42,9 +42,8 @@ std::string propertyError(const std::string& key, const PropertyValue& value) {
     }
     const double* number = std::get_if<double>(&value);
     if (number != nullptr && !std::isfinite(*number)) return "property " + key + " is not a finite number";
-    if (key == kSpeed && (number == nullptr || *number <= 0 || *number > kMaxPlaybackSpeed)) {
-        static_assert(kMaxPlaybackSpeed == 2.0, "the message below names the bound");
-        return "property speed must be a number above 0 and at most 2";
+    if (key == kSpeed && (number == nullptr || !std::ranges::contains(kPlaybackSpeeds, *number))) {
+        return "property speed must be " + playbackSpeedsText("or");
     }
     if (key == kMute && !std::holds_alternative<bool>(value)) return "property mute must be a boolean";
     if (key == kVolume && (number == nullptr || *number < 0 || *number > 1)) {
@@ -86,16 +85,22 @@ std::string propertiesError(const WallpaperProperties& properties) {
     return {};
 }
 
-WallpaperProperties usableProperties(const WallpaperProperties& properties, int& dropped, int& clampedVolumes) {
+WallpaperProperties usableProperties(const WallpaperProperties& properties, int& dropped, int& clampedVolumes,
+                                     int& snappedSpeeds) {
     WallpaperProperties usable;
     for (const auto& [key, read] : properties) {
         PropertyValue value = read;
         double* volume = key == kVolume ? std::get_if<double>(&value) : nullptr;
         const bool clamped = volume != nullptr && std::isfinite(*volume) && (*volume < 0 || *volume > 1);
         if (clamped) *volume = std::clamp(*volume, 0.0, 1.0);
+        double* speed = key == kSpeed ? std::get_if<double>(&value) : nullptr;
+        const bool snapped = speed != nullptr && std::isfinite(*speed) && *speed > 0 &&
+                             !std::ranges::contains(kPlaybackSpeeds, *speed);
+        if (snapped) *speed = nearestPlaybackSpeed(*speed);
         if (usable.size() < kMaxProperties && propertyError(key, value).empty()) {
             usable.emplace(key, std::move(value));
             if (clamped) ++clampedVolumes;
+            if (snapped) ++snappedSpeeds;
         } else {
             ++dropped;
         }
@@ -105,10 +110,8 @@ WallpaperProperties usableProperties(const WallpaperProperties& properties, int&
 
 double playbackSpeed(const WallpaperProperties& properties) {
     const auto it = properties.find(kSpeed);
-    if (it == properties.end()) return 1.0;
-    const double* speed = std::get_if<double>(&it->second);
-    if (speed == nullptr || !std::isfinite(*speed)) return 1.0;
-    return std::clamp(*speed, kMinPlaybackSpeed, kMaxPlaybackSpeed);
+    const double* speed = it == properties.end() ? nullptr : std::get_if<double>(&it->second);
+    return speed == nullptr ? 1.0 : nearestPlaybackSpeed(*speed);
 }
 
 bool wallpaperMuted(const WallpaperProperties& properties) {

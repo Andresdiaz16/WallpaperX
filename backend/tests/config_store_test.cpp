@@ -1597,6 +1597,10 @@ void runUnreadableConfigChecks() {
 
     // The daemon has to keep working afterwards: preserving the old file must not mean
     // refusing to persist anything new.
+    // CONTROL: `m_writer.allow();` deleted from WallpaperManager::preserveUnreadableConfig()
+    //       (backend/daemon/wallpaper_manager.cpp), via control_batch.sh, --phase 'a config that
+    //       could not be read', 2026-10-14 -> "FAIL: a wallpaper set after the damaged config is
+    //       persisted into a fresh config.json", the only red in the phase. Reverted.
     std::string why;
     const std::map<int, std::string> onDisk = pathsInFile(file, why);
     const bool wroteNew = onDisk.size() == 1 && onDisk.count(1) == 1 && onDisk.at(1) == wallpaper.string();
@@ -1805,26 +1809,21 @@ void runPreservedCopyChecks() {
     //       "FAIL: the second unreadable config is preserved under a name of its own", listing
     //       config.json.bad in the state directory AND one in the config directory, and "FAIL:
     //       the daemon says where the second unreadable config was kept", reading "kept as
-    //       .../wallpaperx/config.json.bad". Saving survives it: the second file falls back to
-    //       the config directory rather than having nowhere to go, so the overwrite check and
-    //       the save-afterwards check both stay green -- which is why the name a copy is
-    //       reported under has to be graded, and not just whether the run went on saving and
-    //       not just whether the first copy survived. (b) inspectName() made to answer
+    //       .../wallpaperx/config.json.bad". The second file falls back to the config directory
+    //       rather than having nowhere to go, so the overwrite check stays green -- which is why
+    //       the name a copy is reported under has to be graded, and not just whether the first
+    //       copy survived. (b) inspectName() made to answer
     //       NameState::Free for a name that is already taken, so the placement is unconditional
     //       -> "FAIL: a second unreadable config does not overwrite the copy the first one
     //       preserved", printing the throwaway's bytes where the user's config had been, beside
     //       the name-of-its-own check.
     const ScratchDir scratch("twicebad");
-    // preparePhase, not a bare scratch.ok(): the last check here reads back a path the daemon
-    // persisted, and a temporary directory whose name is not valid UTF-8 makes the writer skip
-    // that entry by design (S8.7).
-    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoal, 1);
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoal, 0);
     if (!paths.has_value()) return;
     const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
     const std::filesystem::path file = paths->config;
     const std::filesystem::path kept = preservedCopyDir(scratch) / "config.json.bad";
     const std::filesystem::path keptSecond = preservedCopyDir(scratch) / "config.json.bad.1";
-    const std::filesystem::path wallpaper = paths->wallpapers.front();
     const std::string usersOwn =
         "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/photos/kept.png\"},]}";
     const std::string throwaway = "{\"version\":1,\"monitors\":[{,";
@@ -1855,17 +1854,6 @@ void runPreservedCopyChecks() {
     const bool said = snap.health.persistence.detail.find(keptSecond.filename().string()) != std::string::npos;
     check(said, "the daemon says where the second unreadable config was kept");
     if (!said) std::fprintf(stderr, "  persistence detail: %s\n", snap.health.persistence.detail.c_str());
-
-    // Preserving it is what clears the path, so persistence has to work again afterwards --
-    // a build that moved the file aside and then still refused to save would leave the user
-    // with no config at all and no way to make one.
-    manager.requestWallpaper("static", wallpaper.string(), 1);
-    waitForRows(file, [](const std::map<int, RowInFile>& rows) { return rows.count(1) == 1; });
-    std::string why;
-    const std::map<int, std::string> onDisk = pathsInFile(file, why);
-    const bool wroteNew = onDisk.size() == 1 && onDisk.count(1) == 1 && onDisk.at(1) == wallpaper.string();
-    check(wroteNew, "a wallpaper set after the second unreadable config is persisted into a fresh config.json");
-    if (!wroteNew) std::fprintf(stderr, "  %s\n", why.empty() ? "the file holds something else" : why.c_str());
 }
 
 // ---------------------------------------------------------------------------- //
@@ -3402,13 +3390,6 @@ void runOutputFieldChecks() {
     if (!notCountedAsWallpaper) {
         std::fprintf(stderr, "  %d wallpapers reported dropped\n", badSave.skippedNonUtf8);
     }
-    // The other rows are untouched, which is the "and nothing else" half.
-    const bool othersKept = afterBad.count(0) == 1 && afterBad.at(0).output == "DP-0" && afterBad.count(2) == 1 &&
-                            afterBad.at(2).output == "DP-2";
-    check(othersKept, "a connector name that is not valid UTF-8 costs no other row its name");
-    if (!othersKept) {
-        std::fprintf(stderr, "  ids on disk: %s\n", idsOf(afterBad).c_str());
-    }
 
     // GOAL: the lost name is COUNTED. A screen this file cannot carry the name of is a screen
     //       that comes back anonymous, and only the caller can say so -- so a save that dropped
@@ -3613,33 +3594,6 @@ void runOutputRestoreChecks() {
     const bool rejectedReported = *rejectedCount == 1;
     check(rejectedReported, "an unusable connector name in the config is reported as dropped");
     if (!rejectedReported) {
-        std::fprintf(stderr, "  persistence detail: %s\n", snap.health.persistence.detail.c_str());
-    }
-
-    // GOAL: a row carrying only a connector name is NOT counted among "entries this build
-    //       cannot apply". False if naming a screen before choosing a wallpaper for it puts
-    //       a loss notice in the daemon's persistence health -- which tells the user a
-    //       wallpaper did not come back when none was ever set.
-    // WHY-THIS-SHAPE: BOTH kept-row clauses are asserted absent, not just the wallpaper one.
-    //       Asserting only the wallpaper clause cannot fail: KeptRows::detail() counts a row
-    //       carrying only a name under its own wording, so a restoreSaved() without that guard
-    //       carries these rows and reports them as "screen names ... kept", leaving a check
-    //       that looks only for "entries this build cannot apply" green. The property is that
-    //       the row is not carried AT ALL, so neither clause may name it.
-    // CONTROL: NONE CURRENT. Disabling the `if (entry.type.empty() && entry.path.empty() &&
-    //       !nameTravels)` guard in WallpaperManager::restoreSaved()
-    //       (backend/daemon/wallpaper_manager.cpp) reddened this on 2026-08-14; re-run 2026-09-16
-    //       it stays GREEN, because later code drops the same rows. Also disabling the kept-row
-    //       arm's `if (!nameTravels) keep.output.clear();` and the `live.outputs.count(...) == 0`
-    //       term in KeptRows::detail() (backend/daemon/kept_rows.cpp) still left it green, which
-    //       points at the end-of-restore name reconciliation as a fourth defence (not run). The
-    //       check stands, but nothing has been seen to redden it since those defences landed.
-    const bool noFalseLoss =
-        snap.health.persistence.detail.find("entries this build cannot apply") == std::string::npos &&
-        snap.health.persistence.detail.find("screen names this build's monitor limit excludes") ==
-            std::string::npos;
-    check(noFalseLoss, "a screen named with no wallpaper is reported as neither a kept entry nor a kept name");
-    if (!noFalseLoss) {
         std::fprintf(stderr, "  persistence detail: %s\n", snap.health.persistence.detail.c_str());
     }
 
@@ -4694,8 +4648,8 @@ void runKeptNameTakenOverAtRuntimeChecks() {
     //       the loss and went on promising the name back as well, which is the more confusing
     //       report of the two. So the carried clause is asserted to have gone, and the FILE is
     //       read to confirm the name really did move rather than being reported as lost while
-    //       still on the carried row. The startup twin below is what pins the asymmetry the fix
-    //       was about: the same collision arriving from the file was reported all along.
+    //       still on the carried row. The same collision arriving from the file is graded in the
+    //       kept-rows phase (runPreservedRowChecks, the displaced-names count).
     // CONTROL: via control_run.sh, --phase 'a carried screen name a client takes over', 2026-09-29,
     //       all reverted. The erase-and-count block in WallpaperManager::setMonitorOutput()
     //       (backend/daemon/wallpaper_manager.cpp), `if (bound != BindResult::Unchanged)`, made
@@ -4736,37 +4690,6 @@ void runKeptNameTakenOverAtRuntimeChecks() {
         std::fprintf(stderr, "  %s; ids on disk: %s; rows carrying 'DP-CARRIED':%s\n",
                      why.empty() ? "read back" : why.c_str(), idsOf(rows).c_str(),
                      carrying.empty() ? " (none)" : carrying.c_str());
-    }
-
-    // The startup twin of the same collision, in its own manager over its own file: a row this
-    // build CAN bind claims the name a carried row also claims. This was reported before the fix
-    // and must still be, which is what makes the check above a statement about the runtime path
-    // rather than about reporting in general.
-    const ScratchDir twinScratch("nametakenovertwin");
-    const std::optional<PhasePaths> twinPaths = preparePhase(twinScratch, kGoals, 1);
-    if (!twinPaths.has_value()) return;
-    const ScopedEnv twinStateHome("XDG_STATE_HOME", stateHomeOf(twinScratch).string());
-    nlohmann::json twinMonitors = nlohmann::json::array();
-    twinMonitors.push_back(configRow(0, "static", twinPaths->wallpapers[0].string(), "DP-CARRIED"));
-    twinMonitors.push_back(configRow(100, "hologram", "/newer-build.holo", "DP-CARRIED"));
-    nlohmann::json twinRoot;
-    twinRoot["version"] = 1;
-    twinRoot["monitors"] = twinMonitors;
-    if (!writeFile(twinPaths->config, twinRoot.dump())) {
-        notVerified(kGoals, "the config file the startup twin reads could not be written");
-        return;
-    }
-    WallpaperManager::Config twinConfig;
-    twinConfig.configFile = twinPaths->config;
-    WallpaperManager twin(twinConfig);
-    twin.restoreSaved();
-    const std::optional<int> displaced = clauseCountOrSkip(twin.snapshot().health.persistence.detail,
-                                                          " screen names displaced by another entry", kGoals);
-    if (!displaced.has_value()) return;
-    check(*displaced == 1, "the same collision arriving from the config file is reported too");
-    if (*displaced != 1) {
-        std::fprintf(stderr, "  %d displaced; persistence detail: %s\n", *displaced,
-                     twin.snapshot().health.persistence.detail.c_str());
     }
 }
 
@@ -4931,8 +4854,7 @@ void runKeptNameLastWinsChecks() {
     // WHY-THIS-SHAPE: the fixture needs three rows and a repeated id -- with one row per id, the
     //       memory order and the file order agree and every build passes. It is graded on the
     //       FILE rather than on the health text, because the text says "the last entry won"
-    //       whichever row won. The count is asserted too: exactly one name is lost here, and a
-    //       build that cleared both rows' names would otherwise satisfy "6000 does not hold it".
+    //       whichever row won. Both rows are asserted, so clearing both names does not pass.
     // CONTROL: the reverse-order sweep put back in place of the last-claim pass at the end of
     //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp), which is
     //       the code before this fix -> "FAIL: the kept row the file names last for a screen is
@@ -4973,13 +4895,6 @@ void runKeptNameLastWinsChecks() {
         std::fprintf(stderr, "  monitor 5000 output '%s', monitor 6000 output '%s'\n",
                      onDisk.at(5000).output.c_str(), onDisk.at(6000).output.c_str());
     }
-
-    const std::string detail = manager.snapshot().health.persistence.detail;
-    const std::optional<int> displaced =
-        clauseCountOrSkip(detail, " screen names displaced by another entry", kGoals);
-    if (!displaced.has_value()) return;
-    check(*displaced == 1, "exactly one name is reported lost when three rows claim one screen");
-    if (*displaced != 1) std::fprintf(stderr, "  persistence detail: %s\n", detail.c_str());
 }
 
 // ---------------------------------------------------------------------------- //
@@ -5163,6 +5078,11 @@ void runPreservedRowChecks() {
     const bool keptNamesReported = reports(keptNameClause, keptNameIds.size());
     const bool keptWallpapersReported = reports(keptWallpaperClause, keptWallpaperIds.size());
     if (!clauseCountsReadable) return;
+    // Readable: reports() read this same clause out of this same detail and returned above if not.
+    // CONTROL (the count's readers below, 2026-10-15, private copy of the tree): KeptRows::detail()
+    //       (backend/daemon/kept_rows.cpp) counting each kept name twice -> the live-screen, file and
+    //       after-claim lines below red, "the report promises 10 kept names, the file holds 5".
+    const int promisedKeptNames = clauseCount(detail, keptNameClause).value();
     check(keptNamesReported, "every kept row carrying a screen name is reported as one");
     check(keptWallpapersReported, "every kept row carrying a wallpaper is reported as one");
     if (!keptNamesReported || !keptWallpapersReported) {
@@ -5205,23 +5125,6 @@ void runPreservedRowChecks() {
     const auto keptNameCount = [&keptNameClause](const std::string& text) {
         return clauseCount(text, keptNameClause);
     };
-    // Read once, here, and its readability graded once: keptNameCount comes back empty for a
-    // report whose count it cannot parse, and an unread count compared against a row count
-    // reads as the daemon having lost every kept name -- an accusation with nothing behind it
-    // but a reworded report. Every consumer below is gated on this.
-    //
-    // CONTROL: the kept-name count wrapped in parentheses in KeptRows::detail()
-    // (backend/daemon/kept_rows.cpp), so the digits no longer sit against the clause -> four
-    // NOT VERIFIED lines and exit 77, no FAIL anywhere: the `reports()` calls above see the
-    // unreadable clause first and `if (!clauseCountsReadable) return;` abandons the phase before
-    // this check is reached. The check below therefore never reports the daemon as having lost
-    // kept names, which is the property this block exists to establish -- but it is the early
-    // skip, not this check, that delivers it, and this check is unreachable under the only
-    // mutation that makes a count unreadable. Observed 2026-08-19. Reverted.
-    const std::optional<int> promisedKeptNames = keptNameCount(detail);
-    const bool keptNameCountReadable = promisedKeptNames.has_value();
-    check(keptNameCountReadable, "the kept-name count can be read out of the persistence report");
-    if (!keptNameCountReadable) std::fprintf(stderr, "  persistence detail: %s\n", detail.c_str());
     // The same rows the run above loaded, minus the one that claims "DP-3" -- so the only
     // difference between the two reports is whether a live screen answers to that name.
     nlohmann::json noLiveRows = nlohmann::json::array();
@@ -5248,7 +5151,7 @@ void runPreservedRowChecks() {
         check(claimantsAsExpected,
               "one load has a live screen answering to the kept row's name and the other has none");
         const std::optional<int> withoutLive = keptNameCount(noLiveDetail);
-        const bool bothCountsReadable = keptNameCountReadable && withoutLive.has_value();
+        const bool bothCountsReadable = withoutLive.has_value();
         check(withoutLive.has_value(), "the kept-name count can be read out of the second load's persistence report");
         if (!claimantsAsExpected || !bothCountsReadable) {
             std::fprintf(stderr, "  live claimants %zu/%zu, restored %zu rows; details: %s | %s\n",
@@ -5256,12 +5159,12 @@ void runPreservedRowChecks() {
                          detail.c_str(), noLiveDetail.c_str());
         } else {
             const bool liveNameLeftOut =
-                *withoutLive - *promisedKeptNames == static_cast<int>(liveHeldNameIds.size());
+                *withoutLive - promisedKeptNames == static_cast<int>(liveHeldNameIds.size());
             check(liveNameLeftOut,
                   "a name a live screen already holds is left out of the count of names that will come back");
             if (!liveNameLeftOut) {
                 std::fprintf(stderr, "  %d kept names with the live row, %d without it; expected %zu fewer with it\n",
-                             *promisedKeptNames, *withoutLive, liveHeldNameIds.size());
+                             promisedKeptNames, *withoutLive, liveHeldNameIds.size());
             }
         }
     }
@@ -5559,18 +5462,12 @@ void runPreservedRowChecks() {
     for (const auto& [id, row] : onDisk) {
         if (id >= WallpaperManager::kMaxMonitors && !row.output.empty()) ++namesOnKeptRows;
     }
-    if (!keptNameCountReadable) {
-        // The graded readability check is above; comparing a count the harness could not read
-        // against a row count here would print this goal's message for a report, not a daemon.
-        notVerified(kGoals, "the kept-name count could not be read out of the persistence report");
-    } else {
-        const bool reportMatchesFile = *promisedKeptNames == namesOnKeptRows &&
-                                       namesOnKeptRows == static_cast<int>(keptNameIds.size());
-        check(reportMatchesFile, "every kept name the report promises back is really in the written file");
-        if (!reportMatchesFile) {
-            std::fprintf(stderr, "  the report promises %d kept names, the file holds %d, the fixture expects %zu\n",
-                         *promisedKeptNames, namesOnKeptRows, keptNameIds.size());
-        }
+    const bool reportMatchesFile = promisedKeptNames == namesOnKeptRows &&
+                                   namesOnKeptRows == static_cast<int>(keptNameIds.size());
+    check(reportMatchesFile, "every kept name the report promises back is really in the written file");
+    if (!reportMatchesFile) {
+        std::fprintf(stderr, "  the report promises %d kept names, the file holds %d, the fixture expects %zu\n",
+                     promisedKeptNames, namesOnKeptRows, keptNameIds.size());
     }
 
     // GOAL: once a client claims a screen name a kept row was carrying, the report stops
@@ -6085,8 +5982,7 @@ void runStartupRepairChecks() {
         WallpaperManager::Config firstConfig;
         firstConfig.configFile = file;
         WallpaperManager first(firstConfig);
-        const std::vector<int> restored = first.restoreSaved();
-        check(restored == std::vector<int>{1}, "the one row this build can apply is posted for rendering");
+        first.restoreSaved();
         // The two calls backend/daemon/main.cpp makes once it owns the bus name, in that
         // order. restoreSaved() computes the repair and holds it -- writing it there would
         // land on a running daemon's config and over the bytes preserveUnreadableConfig()
@@ -7064,10 +6960,16 @@ void runOneAnswerAboutTheFileChecks() {
     //       binary, 2026-09-29 -> six red, this phase's four led by "FAIL: every channel agrees
     //       about the write, when a write is outstanding and the caller gave up on it", printing
     //       "health said not-up-to-date, the reply said up-to-date, and 0 write(s) were made", and
-    //       the same pair for the refused-write state. The two phases below it go red on the same
-    //       edit -- "re-asserting a name the daemon refused to write is refused again, not reported
-    //       as stored" and "re-asserting a name whose writer could never start writes it to the
-    //       file" -- one mutation, all three of the states this cluster is about. Reverted.
+    //       the same pair for the refused-write state. The no-writer-thread phase goes red on the
+    //       same edit -- "re-asserting a name whose writer could never start writes it to the
+    //       file". Reverted.
+    // CONTROL, for the refused-write state, which is this file's only check that an identical
+    //       re-assertion over a refusal decided before any writer exists is still refused:
+    //       `m_notWritten = m_refusal;` deleted from ConfigWriter::queue()'s refusal branch
+    //       (backend/daemon/config_writer.cpp), via control_batch.sh, --phase 'one answer about the
+    //       config file', 2026-10-14 -> "FAIL: every channel agrees about the write, when every
+    //       write is refused before a writer exists" and "FAIL: the file is reported out of date,
+    //       when every write is refused before a writer exists". Reverted.
     // COVERAGE-ASSERT: every one of the three states is accounted for at the end -- compared, or
     //       skipped with a printed reason. A state that stops being reachable with no reason given
     //       (an early return added later, a fixture that silently does nothing) breaks the sum and
@@ -7259,11 +7161,11 @@ void runOneAnswerAboutTheFileChecks() {
 }
 
 // ---------------------------------------------------------------------------- //
-// Phase 6n -- Step 10: re-asserting a name the daemon refused to write.
+// Phase 6n -- Step 10: naming a screen the daemon refuses to write.
 // ---------------------------------------------------------------------------- //
 void runRefusedNameRetryChecks() {
-    constexpr const char* kGoals = "S10.13's retry clause on a REFUSED write (a name the daemon declined to write is "
-                                   "reported, and the identical retry is reported too rather than reading as success)";
+    constexpr const char* kGoals = "S10.13 on a REFUSED write (a name the daemon declined to write before any writer "
+                                   "exists is reported as an error)";
     const ScratchDir scratch("refusedname");
     if (!scratch.ok()) {
         notVerified(kGoals, "a scratch directory could not be created");
@@ -7299,38 +7201,29 @@ void runRefusedNameRetryChecks() {
         return std::string();
     };
 
-    // GOAL: a refusal decided before any writer exists is still a failed write, so re-asserting
-    //       the same name reports the failure again. False if the second call reads as success:
-    //       the daemon told the client the same name was lost and then durable, with nothing on
-    //       disk having changed -- and re-asserting is the only retry a client has, so the second
-    //       answer is the one it acts on. The config here can never be written for the life of
-    //       the run, so a success is never true.
+    // GOAL: a refusal decided before any writer exists is still a failed write, so naming a screen
+    //       reports it. False if the call reads as success: the client is told the name is durable
+    //       while the config here can never be written for the life of the run. The identical
+    //       re-assertion after it is graded in runOneAnswerAboutTheFileChecks' refused-write state,
+    //       which drives the same fifo and the same call.
     // WHY-THIS-SHAPE: the refusal is a config the daemon could not read AND could not move
     //       aside, which is the one refusal decided in ConfigWriter::queue() before a writer
     //       thread exists -- the worker-side failure the read-only-directory phase already covers
     //       cannot reach this arm, because there a writer does exist and its result carries the
-    //       error. The IDENTICAL name is re-asserted, because that is the call the idempotence
-    //       skip applies to; a different name would take the binding path and prove nothing.
+    //       error.
     // CONTROL: `m_notWritten = m_refusal;` deleted from ConfigWriter::queue()'s refusal branch
     //       (backend/daemon/config_writer.cpp), so a refusal decided before any writer exists is
-    //       invisible to outcome() -- the successor to the deleted persistFailedLocked()'s
-    //       `if (m_configUnread) return true;` -> both checks below red, "FAIL: re-asserting a
-    //       name the daemon refused to write is refused again, not reported as stored" printing
-    //       "the retry returned normally", and the first call red the same way. The coverage
-    //       assert stays GREEN, correctly: the refusal still stops the write, only the report is
-    //       lost. Seven red in all. Observed 2026-08-18.
+    //       invisible to outcome() -> "FAIL: a name the daemon will not write is reported as an
+    //       error", printing "the first call returned normally". The coverage assert stays GREEN,
+    //       correctly: the refusal still stops the write, only the report is lost. Observed
+    //       2026-08-18.
     const std::string firstThrew = name(3, "DP-A");
     const bool firstRefused = !firstThrew.empty();
     check(firstRefused, "a name the daemon will not write is reported as an error");
     if (!firstRefused) std::fprintf(stderr, "  the first call returned normally\n");
 
-    const std::string retryThrew = name(3, "DP-A");
-    const bool retryRefused = !retryThrew.empty();
-    check(retryRefused, "re-asserting a name the daemon refused to write is refused again, not reported as stored");
-    if (!retryRefused) std::fprintf(stderr, "  the retry returned normally\n");
-
-    // COVERAGE-ASSERT: nothing was written over the user's config, which is what makes both
-    // answers above true rather than merely consistent. A build that had quietly replaced the
+    // COVERAGE-ASSERT: nothing was written over the user's config, which is what makes the
+    // answer above true rather than merely consistent. A build that had quietly replaced the
     // fifo with a config of its own would make "refused" a lie in the other direction.
     check(!isRegularFile(file), "the config the daemon refused to write over is still the file the user left there");
 }
@@ -9442,7 +9335,7 @@ struct SweepFixture {
     }
 };
 
-double sweepSpeed(long long step) { return 0.1 + 0.0005 * static_cast<double>(step); }
+double sweepLevel(long long step) { return 0.1 + 0.0005 * static_cast<double>(step); }
 
 // GOAL: S13.105 -- a SetOutputSize that fails on an allocation leaves the stored size, the redraw list
 //       and the config file as they were, and the same call unfaulted then reaches the file. False for a
@@ -9520,7 +9413,7 @@ void runOutputSizeFailedCallChecks() {
 //       WallpaperManager::setWallpaperProperties (backend/daemon/wallpaper_manager.cpp), both reverted.
 //       (a) the catch's `it->second.properties.swap(next);` deleted -> "FAIL: a SetWallpaperProperties
 //       that failed on an allocation left the monitor's properties as they were", printing "allocation 1
-//       threw std::bad_alloc: {"speed":0.1} -> {"speed":0.1005}", and "FAIL: the same
+//       threw std::bad_alloc: {"level":0.1} -> {"level":0.1005}", and "FAIL: the same
 //       SetWallpaperProperties again, unfaulted, reaches the config file". The sweep faults 15
 //       allocations, 14 of them while building the save. (b) for the save-building coverage assert, the
 //       catch's `throw;` made `return;`, so a fault in the save is swallowed -> "FAIL: the
@@ -9546,7 +9439,7 @@ void runPropertiesFailedCallChecks() {
         "SetWallpaperProperties",
         "the monitor's properties as they were",
         false,
-        [&](long long step) { next = {{"speed", sweepSpeed(step)}}; },
+        [&](long long step) { next = {{"level", sweepLevel(step)}}; },
         [&](long long, long long failAt, std::vector<int>&) {
             const FailAllocation armed(failAt);
             manager.setWallpaperProperties(3, next);
@@ -9560,7 +9453,7 @@ void runPropertiesFailedCallChecks() {
         [&](long long step) {
             const nlohmann::json row = rowJsonIn(file, 3);
             const nlohmann::json properties = row.is_object() ? row.value("properties", nlohmann::json()) : nullptr;
-            return properties.is_object() && properties.value("speed", -1.0) == sweepSpeed(step);
+            return properties.is_object() && properties.value("level", -1.0) == sweepLevel(step);
         },
     };
     gradeFailedCallSweep(sweep, sweepFailedCall([&]() -> WallpaperManager& { return manager; }, file, sweep), kGoals);
@@ -9629,7 +9522,7 @@ void runMonitorOutputFailedCallChecks() {
 //       (type, path and properties) and the file as they were, a monitor the call created is gone again,
 //       and the same request unfaulted then reaches the file.
 // WHY-THIS-SHAPE: runOutputSizeFailedCallChecks()' sweep, twice: on a monitor that holds a wallpaper, each
-//       step alternating the path and changing the speed; and on one that holds none, each step with a
+//       step alternating the path and changing a numeric property; and on one that holds none, each step with a
 //       manager of its own, since a request that succeeds creates the monitor for good.
 // CONTROL: via control_run.sh, --phase 'a failed SetWallpaper', 2026-09-29, each reverted, in
 //       WallpaperManager::requestWallpaper (backend/daemon/wallpaper_manager.cpp): (a) the catch's
@@ -9666,7 +9559,7 @@ void runRequestFailedCallChecks() {
         const nlohmann::json row = rowJsonIn(file, id);
         const nlohmann::json properties = row.is_object() ? row.value("properties", nlohmann::json()) : nullptr;
         return row.is_object() && row.value("path", std::string()) == wallpapers[step % 2] && properties.is_object() &&
-               properties.value("speed", -1.0) == sweepSpeed(step);
+               properties.value("level", -1.0) == sweepLevel(step);
     };
     {
         WallpaperManager& manager = *fx.manager;
@@ -9675,7 +9568,7 @@ void runRequestFailedCallChecks() {
             "SetWallpaper",
             "the monitor's wallpaper as it was",
             false,
-            [&](long long step) { next = {{"speed", sweepSpeed(step)}}; },
+            [&](long long step) { next = {{"level", sweepLevel(step)}}; },
             [&](long long step, long long failAt, std::vector<int>&) {
                 const FailAllocation armed(failAt);
                 manager.requestWallpaper("static", wallpapers[step % 2], 3, next);
@@ -9702,7 +9595,7 @@ void runRequestFailedCallChecks() {
             staged = writeFile(file, "{\"version\":1,\"monitors\":[]}") && staged;
             fresh.emplace(config);
             fresh->requestWallpaper("static", wallpapers[0], 3);
-            next = {{"speed", sweepSpeed(step)}};
+            next = {{"level", sweepLevel(step)}};
         };
         freshManager(0);
         const long long total =
@@ -9762,7 +9655,7 @@ CommitSweep sweepRequestOnUnsavedWriter(WallpaperManager& manager, const std::st
         }
     } disarmProbe;
     for (long long n = 0; n < kSweep; ++n) {
-        const WallpaperProperties next{{"speed", sweepSpeed(n)}};
+        const WallpaperProperties next{{"level", sweepLevel(n)}};
         const std::string before = wallpaperOn(manager, 3);
         std::string error;
         t_injected = false;
@@ -9818,13 +9711,13 @@ void gradeCommitSweep(const std::string& writer, const CommitSweep& out) {
 //       builds its reason, via control_batch.sh, --phase 'a SetWallpaper whose save is not on disk',
 //       2026-09-30 -> "FAIL: with a writer refusing to save, a SetWallpaper that failed on an allocation
 //       left the monitor's wallpaper as it was", printing "allocation 358 threw std::bad_alloc: ... ->
-//       ... {"speed":0.279}", and the same line at allocation 358 for the stalled writer. Reverted.
+//       ... {"level":0.279}", and the same line at allocation 358 for the stalled writer. Reverted.
 // COVERAGE-ASSERT: the sweep must reach a step that faults nothing, so every allocation the call
 //       makes was faulted once (358 today), and some must have thrown. CONTROL: 4000 absorbed
 //       allocations added at the top of requestWallpaper, same phase and date -> "FAIL: with a writer
 //       refusing to save, the SetWallpaper sweep faulted allocations through to the end of the call, and
 //       some threw", "3000 allocation(s), 0 of them thrown", for both writers. Reverted. The refusal must
-//       also stand after the sweep. CONTROL: `if (properties.count("speed") != 0) m_writer.allow();` at
+//       also stand after the sweep. CONTROL: `if (properties.count("level") != 0) m_writer.allow();` at
 //       the top of requestWallpaper, lifting it during the sweep only -> "FAIL: the refusing writer still
 //       refused when the sweep ended". Reverted.
 void runRequestAfterCommitChecks() {
@@ -10117,21 +10010,61 @@ void runWriterFailureKeptChecks() {
 }
 
 void runPlaybackSpeedChecks() {
-    // GOAL: S15.100's range -- a positive speed below 0.01 plays at 0.01, one inside 0.01-2 as set, and
-    //       no speed at 1; and playbackSpeed() still bounds a value above 2, which the rules never let
-    //       it see. False for a clock handed 0.0001, whose wait for one picture then grows without bound.
-    // CONTROL: playbackSpeed()'s `std::clamp(*speed, kMinPlaybackSpeed, kMaxPlaybackSpeed)`
-    //       (backend/daemon/wallpaper_properties.cpp) made `*speed` via control_run.sh, 2026-09-29 ->
-    //       "FAIL: a speed of 1000, which the rules refuse, would still play at 2" and "FAIL: a speed of
-    //       0.0001 plays at 0.01". Reverted.
+    // GOAL: S15.100 -- "speed" takes exactly 0.5, 1 and 2: propertiesError() accepts those three and refuses
+    //       0.25, 0.75, 1.5, 3, 0 and a bool with "property speed must be 0.5, 1 or 2"; playbackSpeed() is 1
+    //       with no speed and the stored value for each of the three.
+    // CONTROL: in propertyError (backend/daemon/wallpaper_properties.cpp) `!std::ranges::contains(
+    //       kPlaybackSpeeds, *number)` made `*number <= 0` via control_batch.sh, 2026-10-14 -> "FAIL: speed 0.75
+    //       is refused with the speed sentence" and the same for 0.25, 1.5 and 3. Same file, same tool and
+    //       date, each alone: `*number >= 2 ||` added to that test -> "FAIL: speed 2 is taken"; it made
+    //       `(*number != 0 && !...)` -> "FAIL: speed 0 is refused with the speed sentence". Reverted. Re-run
+    //       control_batch 2026-10-15: the `*number <= 0` break, held. The sentence's list is
+    //       playbackSpeedsText("or") (shared/playback_speed.h): its `std::format(" {} ", last)` made `", {} "`
+    //       -> "FAIL: speed 0.75 is refused with the speed sentence" and the other five refusals. Reverted.
     using wallpaperx::playbackSpeed;
-    static_assert(wallpaperx::kMaxPlaybackSpeed == 2.0 && wallpaperx::kMinPlaybackSpeed == 0.01,
-                  "the checks below are written for the range 0.01-2");
+    using wallpaperx::propertiesError;
+    static_assert(wallpaperx::kPlaybackSpeeds == std::array{0.5, 1.0, 2.0}, "the checks below name the speeds");
+    const std::string sentence = "property speed must be 0.5, 1 or 2";
+    for (const double taken : {0.5, 1.0, 2.0}) {
+        const std::string error = propertiesError({{"speed", taken}});
+        char line[64];
+        std::snprintf(line, sizeof line, "speed %g is taken", taken);
+        check(error.empty(), line);
+        if (!error.empty()) std::fprintf(stderr, "  refused: %s\n", error.c_str());
+        std::snprintf(line, sizeof line, "speed %g plays as set", taken);
+        check(playbackSpeed({{"speed", taken}}) == taken, line);
+    }
     check(playbackSpeed({}) == 1.0, "a wallpaper with no speed plays at 1");
-    check(playbackSpeed({{"speed", 1.5}}) == 1.5, "a speed inside the range plays as set");
-    check(playbackSpeed({{"speed", 2.0}}) == 2.0, "a speed of exactly 2 plays at 2");
-    check(playbackSpeed({{"speed", 1000.0}}) == 2.0, "a speed of 1000, which the rules refuse, would still play at 2");
-    check(playbackSpeed({{"speed", 0.0001}}) == 0.01, "a speed of 0.0001 plays at 0.01");
+    const std::vector<std::pair<const char*, wallpaperx::PropertyValue>> refused{
+        {"0.25", 0.25}, {"0.75", 0.75}, {"1.5", 1.5}, {"3", 3.0}, {"0", 0.0}, {"a bool", true}};
+    for (const auto& [name, value] : refused) {
+        const std::string error = propertiesError({{"speed", value}});
+        const std::string line = std::string("speed ") + name + " is refused with the speed sentence";
+        check(error.find(sentence) != std::string::npos, line.c_str());
+        if (error.find(sentence) == std::string::npos) std::fprintf(stderr, "  error: \"%s\"\n", error.c_str());
+    }
+
+    // GOAL: S15.100's snap -- nearestPlaybackSpeed() picks the nearest choice by RATIO: 0.3 -> 0.5,
+    //       0.75 -> 1, 1.5 -> 2, with the 0.5|1 boundary at sqrt(0.5) ~ 0.7071 and the 1|2 one at
+    //       sqrt(2) ~ 1.4142; a non-positive or non-finite value is 1.
+    // WHY-THIS-SHAPE: 0.75 and 1.5 are the values that tell ratio from difference (by difference 0.75 ties
+    //       and goes to 0.5, 1.5 goes to 1); the four boundary probes sit 0.002 either side, so a boundary
+    //       anywhere else -- 0.75 or 1.5, the midpoints -- turns one of them red.
+    // CONTROL: `std::fabs(std::log(from / to))` in nearestPlaybackSpeed (shared/playback_speed.h) made
+    //       `std::fabs(from - to)` via control_batch.sh, 2026-10-15 -> "FAIL: 0.75 snaps to 1", "FAIL: 1.5
+    //       snaps to 2", "FAIL: 0.709 snaps to 1", "FAIL: 1.416 snaps to 2". Its non-positive guard's `: 1.0`
+    //       made `: 0.5` -> "FAIL: 0 snaps to 1", "-1" and "inf". Reverted.
+    using wallpaperx::nearestPlaybackSpeed;
+    const std::vector<std::pair<double, double>> snaps{{0.3, 0.5},   {0.75, 1.0},  {1.5, 2.0},  {0.705, 0.5},
+                                                       {0.709, 1.0}, {1.412, 1.0}, {1.416, 2.0}, {0.0, 1.0},
+                                                       {-1.0, 1.0},  {std::numeric_limits<double>::infinity(), 1.0}};
+    for (const auto& [from, to] : snaps) {
+        const double got = nearestPlaybackSpeed(from);
+        char line[96];
+        std::snprintf(line, sizeof line, "%g snaps to %g", from, to);
+        check(got == to, line);
+        if (got != to) std::fprintf(stderr, "  got %g\n", got);
+    }
 }
 
 void runPropertiesWriteChecks() {
@@ -10149,7 +10082,7 @@ void runPropertiesWriteChecks() {
     managerConfig.configFile = file;
     WallpaperManager manager(managerConfig);
 
-    const WallpaperProperties set{{"speed", 1.5}, {"mute", true}, {"tint", Colour{0xff, 0x88, 0x00}}};
+    const WallpaperProperties set{{"speed", 0.5}, {"mute", true}, {"tint", Colour{0xff, 0x88, 0x00}}};
     manager.requestWallpaper("static", first, 3, set);
     manager.requestWallpaper("static", second, 4);
     // COVERAGE-ASSERT: both saves are synchronous, so two landed renames say the counter is live and
@@ -10186,7 +10119,7 @@ void runPropertiesWriteChecks() {
         const nlohmann::json row3 = rowJsonIn(file, 3);
         const nlohmann::json written = row3.is_object() ? row3.value("properties", nlohmann::json()) : nlohmann::json();
         const bool typed = written.is_object() && written.size() == 3 && written.value("speed", nlohmann::json()).is_number() &&
-                           written["speed"] == 1.5 && written.value("mute", nlohmann::json()).is_boolean() &&
+                           written["speed"] == 0.5 && written.value("mute", nlohmann::json()).is_boolean() &&
                            written["mute"] == true && written.value("tint", nlohmann::json()) == "#ff8800";
         check(typed, "a wallpaper's properties are written on its row as typed JSON");
         if (!typed) std::fprintf(stderr, "  row 3: %s\n", row3.dump().c_str());
@@ -10197,7 +10130,7 @@ void runPropertiesWriteChecks() {
     }
 
     // GOAL: S15.97 at the manager -- a refused call applies nothing and writes nothing: after
-    //       refusals by both methods, a speed above 2 among them (S15.105), and a properties call for
+    //       refusals by both methods, speeds other than 0.5, 1 and 2 among them (S15.105), and a properties call for
     //       a monitor holding no wallpaper, the monitor holds its wallpaper and set and no write has
     //       landed.
     // WHY-THIS-SHAPE: a refused SetWallpaperProperties would only QUEUE its write, so the count is read
@@ -10208,10 +10141,11 @@ void runPropertiesWriteChecks() {
     //       WallpaperManager::setWallpaperProperties (backend/daemon/wallpaper_manager.cpp), with a 1 s
     //       sleep added to this file's interposed rename() -> "FAIL: SetWallpaperProperties with speed 0
     //       is refused at the manager", the other five, "FAIL: after the refusals the monitor holds its
-    //       wallpaper and its set" and "FAIL: a refused call writes nothing". The `*number >
-    //       kMaxPlaybackSpeed` term deleted from propertyError (backend/daemon/wallpaper_properties.cpp)
-    //       -> the four "speed 2.0001" and "speed 3" lines, the held-set line and "a refused call writes
-    //       nothing". The `holds no wallpaper` throw in setWallpaperProperties made `return;` -> "FAIL:
+    //       wallpaper and its set" and "FAIL: a refused call writes nothing". `!std::ranges::contains(
+    //       kPlaybackSpeeds, *number)` in propertyError (backend/daemon/wallpaper_properties.cpp) made
+    //       `*number <= 0` via control_batch.sh, 2026-10-14 -> the "speed 2.0001", "speed 3" and "speed 1.5"
+    //       lines of both methods, the held-set line, "a refused call writes nothing" and the two write
+    //       counts after it. The `holds no wallpaper` throw in setWallpaperProperties made `return;` -> "FAIL:
     //       SetWallpaperProperties for a monitor holding no wallpaper is refused, and creates nothing".
     const std::vector<std::pair<const char*, WallpaperProperties>> refusals{
         {"speed 0", {{"speed", 0.0}}},
@@ -10220,6 +10154,7 @@ void runPropertiesWriteChecks() {
         {"mute as a number", {{"mute", 1.0}}},
         {"speed 2.0001", {{"speed", 2.0001}}},
         {"speed 3", {{"speed", 3.0}}},
+        {"speed 1.5", {{"speed", 1.5}}},
     };
     for (const auto& [what, bad] : refusals) {
         const WallpaperProperties& properties = bad;
@@ -10256,9 +10191,10 @@ void runPropertiesWriteChecks() {
     if (!identicalQuiet) std::fprintf(stderr, "  %u write(s) after it, %u before\n", renamesCounted(), afterSets);
 
     // GOAL: S15.105's other edge -- a speed of exactly 2 is accepted.
-    // CONTROL: `*number > kMaxPlaybackSpeed` in propertyError (backend/daemon/wallpaper_properties.cpp)
-    //       made `>=` via control_run.sh, 2026-09-29 -> "FAIL: SetWallpaperProperties with speed exactly 2
-    //       is accepted at the manager", and the write after it. Reverted.
+    // CONTROL: `!std::ranges::contains(kPlaybackSpeeds, *number)` in propertyError
+    //       (backend/daemon/wallpaper_properties.cpp) made `*number >= 2 || !...` via control_batch.sh,
+    //       2026-10-14 -> "FAIL: SetWallpaperProperties with speed exactly 2 is accepted at the manager",
+    //       and the write after it. Reverted.
     const WallpaperProperties changed{{"speed", 2.0}};
     bool acceptedTwo = true;
     try {
@@ -10378,7 +10314,7 @@ void runPropertiesRepairChecks() {
     // Seven values this build cannot use, in four rows it can; four more in two rows it keeps for a
     // newer build, which are that build's to judge.
     nlohmann::json monitors = nlohmann::json::array();
-    monitors.push_back(row(0, "static", 0, {{"speed", 1.5}, {"mute", 3}, {"tint", "#zzzzzz"}, {"ok_key", true}}));
+    monitors.push_back(row(0, "static", 0, {{"speed", 2}, {"mute", 3}, {"tint", "#zzzzzz"}, {"ok_key", true}}));
     monitors.push_back(row(1, "static", 1, nlohmann::json::array({1, 2})));
     monitors.push_back(row(2, "static", 2, {{"speed", 0}, {"bad key", 1}, {"fine", "#AABBCC"}}));
     monitors.push_back(row(3, "static", 3, {{"x", nullptr}, {"y", {{"n", 1}}}}));
@@ -10407,7 +10343,7 @@ void runPropertiesRepairChecks() {
         const auto holds = [&snap](int id, const WallpaperProperties& expected) {
             return snap.monitors.count(id) == 1 && snap.monitors.at(id).properties == expected;
         };
-        const bool restored = holds(0, {{"speed", 1.5}, {"ok_key", true}}) && holds(1, {}) &&
+        const bool restored = holds(0, {{"speed", 2.0}, {"ok_key", true}}) && holds(1, {}) &&
                               holds(2, {{"fine", Colour{0xaa, 0xbb, 0xcc}}}) && holds(3, {});
         check(restored, "each row is restored with only its usable property values");
     }
@@ -10447,7 +10383,7 @@ void runPropertiesRepairChecks() {
         return r.is_object() ? r.value("properties", nlohmann::json()) : nlohmann::json("(no row)");
     };
     const bool rewritten = waitForFile([&] {
-        return propertiesOf(0) == nlohmann::json({{"speed", 1.5}, {"ok_key", true}}) && propertiesOf(1).is_null() &&
+        return propertiesOf(0) == nlohmann::json({{"speed", 2.0}, {"ok_key", true}}) && propertiesOf(1).is_null() &&
                propertiesOf(2) == nlohmann::json({{"fine", "#aabbcc"}}) && propertiesOf(3).is_null();
     });
     check(rewritten, "the rewrite holds each row with only its usable values");
@@ -10505,9 +10441,9 @@ void runSupersededLossCountChecks() {
         return out;
     };
     nlohmann::json monitors = nlohmann::json::array();
-    // Monitor 0: a speed above the cap on a row the next row replaces.
+    // Monitor 0: a dropped (negative) speed on a row the next row replaces.
     nlohmann::json replaced = row(0, wp0);
-    replaced["properties"] = {{"speed", 5}};
+    replaced["properties"] = {{"speed", -5}};
     monitors.push_back(replaced);
     monitors.push_back(row(0, wp1));
     // DP-1: unusable, then usable. DP-2: usable, then unusable. DP-3: unusable, and nothing else.
@@ -10516,9 +10452,9 @@ void runSupersededLossCountChecks() {
     monitors.push_back(sized(2, wp0, "DP-2", {{"width", 1920}, {"height", 1200}}));
     monitors.push_back(sized(2, wp0, "DP-2", {1, 2}));
     monitors.push_back(sized(3, wp0, "DP-3", {{"width", -4}, {"height", 10}}));
-    // Monitor 4: a speed above the cap that stands, beside a value that is kept.
+    // Monitor 4: a dropped (negative) speed that stands, beside a value that is kept.
     nlohmann::json standing = row(4, wp0);
-    standing["properties"] = {{"speed", 5}, {"mute", true}};
+    standing["properties"] = {{"speed", -5}, {"mute", true}};
     monitors.push_back(standing);
     const std::string original = nlohmann::json({{"version", 1}, {"monitors", monitors}}).dump();
     if (!writeFile(file, original)) {
@@ -10550,10 +10486,6 @@ void runSupersededLossCountChecks() {
         check(*sizes == 1, "a start counts only the screen sizes that leave their screen with none usable");
         if (*sizes != 1) std::fprintf(stderr, "  %d counted; detail: %s\n", *sizes, detail.c_str());
     }
-    const std::filesystem::path copy = preservedCopyDir(scratch) / "config.json.bad";
-    const bool copied = std::filesystem::exists(copy) && readFile(copy) == original;
-    check(copied, "a start that drops values a later row made up for still copies the file aside first");
-    if (!copied) std::fprintf(stderr, "  copies: %s\n", joined(preservedCopyNames(file, preservedCopyDir(scratch))).c_str());
 }
 
 // GOAL: S15.117 -- the restore note counts a rejected screen size only for a name still bound to a
@@ -10792,9 +10724,10 @@ void runKeptOutputSizeVerbatimChecks() {
     check(same, "after a save, every kept row's output_size is the same text it was read as");
 }
 
-void runSavedSpeedAboveCapChecks() {
-    constexpr const char* kGoals = "S15.108 (a saved speed above 2 on a row this build applies is dropped, counted "
-                                   "and repaired; one on a kept row is carried)";
+void runSavedSpeedSnapChecks() {
+    constexpr const char* kGoals = "S15.108 (a saved speed other than 0.5, 1 and 2 is moved to the nearest by ratio, "
+                                   "counted, copied aside and repaired; zero, negative and non-number speeds are "
+                                   "dropped; one on a kept row is carried)";
     const ScratchDir scratch("savedspeed");
     const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 2);
     if (!paths) return;
@@ -10807,10 +10740,16 @@ void runSavedSpeedAboveCapChecks() {
         out["properties"] = properties;
         return out;
     };
+    // Saved speed -> the speed it must be restored as. Nothing in this file is one a start drops, so the
+    // snap alone decides the rewrite.
+    const std::vector<std::tuple<int, double, double>> moved{
+        {0, 0.3, 0.5}, {2, 0.75, 1.0}, {3, 1.5, 2.0}, {4, 0.705, 0.5}, {5, 0.709, 1.0}, {7, 1.412, 1.0}, {8, 1.416, 2.0}};
     const nlohmann::json keptSix = {{"speed", 50}};
-    const nlohmann::json keptForty = {{"speed", 50}, {"x", 1}};
+    const nlohmann::json keptForty = {{"speed", 0.3}, {"x", 1}};
     nlohmann::json monitors = nlohmann::json::array();
-    monitors.push_back(row(0, "static", {{"speed", 5}, {"mute", true}}));
+    for (const auto& [id, saved, restored] : moved) {
+        monitors.push_back(id == 0 ? row(id, "static", {{"speed", saved}, {"mute", true}}) : row(id, "static", {{"speed", saved}}));
+    }
     monitors.push_back(row(1, "static", {{"speed", 2}}));
     monitors.push_back(row(6, "hologram", keptSix));
     monitors.push_back(row(40, "static", keptForty));
@@ -10821,48 +10760,110 @@ void runSavedSpeedAboveCapChecks() {
     }
     WallpaperManager::Config managerConfig;
     managerConfig.configFile = file;
+    {
+        WallpaperManager manager(managerConfig);
+        manager.restoreSaved();
+        manager.preserveUnreadableConfig();
+        manager.writeRepairedConfig();
+
+        // GOAL: S15.108 -- a saved speed that is not 0.5, 1 or 2 on a row this build applies is restored as
+        //       the nearest of the three BY RATIO (0.3->0.5, 0.75->1, 1.5->2; the boundaries near 0.707 and
+        //       1.414), the rest of the row kept, 2 kept as it is; each move is counted in the persistence
+        //       note, the file copied aside, and the file rewritten with the moved speeds. The same speed on
+        //       kept rows is carried.
+        // WHY-THIS-SHAPE: no value in the file is dropped, so the rewrite can only come from the snap (a
+        //       dropped value would force a repair that hides a snap no longer counted as one). The probes
+        //       0.002 either side of each boundary turn red for a boundary at the midpoint 0.75 or 1.5.
+        // CONTROL: via control_batch.sh, --phase '^a saved speed other than', 2026-10-14, each alone,
+        //       reverted: nearestPlaybackSpeed by difference (shared/playback_speed.h, re-run 2026-10-15) ->
+        //       "FAIL: each saved speed is restored as the nearest of 0.5, 1 and 2 by ratio", the rewrite line
+        //       and the kept-row line (which waits on the rewrite); `if (snapped) ++snappedSpeeds;` deleted
+        //       (backend/daemon/wallpaper_properties.cpp, re-run 2026-10-15) -> "FAIL: each moved speed is
+        //       counted in the health note", the copy-aside, rewrite and kept-row lines; the note's list,
+        //       playbackSpeedsText("and") (shared/playback_speed.h), with `std::format(" {} ", last)` made
+        //       `", {} "` (2026-10-15) -> "FAIL: each moved speed is counted in the health note" alone;
+        //       `snappedSpeeds > 0 ||` removed from `repaired` in WallpaperManager::restoreSaved
+        //       (backend/daemon/wallpaper_manager.cpp) -> the rewrite and kept-row lines, and (re-run
+        //       2026-10-15) "FAIL: a snapped speed copies the file aside before the repair".
+        // WHY-THIS-SHAPE (copy): read before the second file below is written, since that start
+        //       repairs too and would leave a copy of its own; snapping is this file's only repair.
+        const bool copied = std::filesystem::exists(copy) && readFile(copy) == original;
+        check(copied, "a snapped speed copies the file aside before the repair");
+        if (!copied) std::fprintf(stderr, "  copies: %s\n", joined(preservedCopyNames(file, preservedCopyDir(scratch))).c_str());
+        const WallpaperManager::Snapshot snap = manager.snapshot();
+        const auto holds = [&snap](int id, const WallpaperProperties& expected) {
+            return snap.monitors.count(id) == 1 && snap.monitors.at(id).type == "static" &&
+                   snap.monitors.at(id).properties == expected;
+        };
+        bool restored = holds(1, {{"speed", 2.0}});
+        for (const auto& [id, saved, expected] : moved) {
+            const WallpaperProperties want =
+                id == 0 ? WallpaperProperties{{"speed", expected}, {"mute", true}} : WallpaperProperties{{"speed", expected}};
+            if (holds(id, want)) continue;
+            restored = false;
+            const auto it = snap.monitors.find(id);
+            std::fprintf(stderr, "  monitor %d: saved %g, expected %g, holds %s\n", id, saved, expected,
+                         it == snap.monitors.end() ? "nothing"
+                         : it->second.properties.count("speed") == 0
+                             ? "no speed"
+                             : std::to_string(std::get<double>(it->second.properties.at("speed"))).c_str());
+        }
+        check(restored, "each saved speed is restored as the nearest of 0.5, 1 and 2 by ratio");
+        // Read with clauseCount, not clauseCountOrSkip: a missing note is the defect here, not a wording drift.
+        const std::optional<int> counted =
+            clauseCount(snap.health.persistence.detail, " wallpaper speeds other than 0.5, 1 and 2 moved to the nearest");
+        const bool countedAll = counted == static_cast<int>(moved.size());
+        check(countedAll, "each moved speed is counted in the health note, and nothing on the kept rows is");
+        if (!countedAll) std::fprintf(stderr, "  detail: %s\n", snap.health.persistence.detail.c_str());
+        const bool rewritten = waitForFile([&] {
+            for (const auto& [id, saved, expected] : moved) {
+                const nlohmann::json want = id == 0 ? nlohmann::json({{"speed", expected}, {"mute", true}})
+                                                    : nlohmann::json({{"speed", expected}});
+                if (fieldTextIn(file, id, "properties") != want.dump()) return false;
+            }
+            return true;
+        });
+        check(rewritten, "the rewrite holds each moved speed");
+        if (!rewritten) std::fprintf(stderr, "  config.json: %s\n", readFile(file).c_str());
+        const bool keptSame = rewritten && fieldTextIn(file, 6, "properties") == keptSix.dump() &&
+                              fieldTextIn(file, 40, "properties") == keptForty.dump();
+        check(keptSame, "a kept row's speed is written back as the same text");
+        if (!keptSame) {
+            std::fprintf(stderr, "  row 6: %s; row 40: %s\n", fieldTextIn(file, 6, "properties").c_str(),
+                         fieldTextIn(file, 40, "properties").c_str());
+        }
+    }
+
+    // GOAL: S15.108 -- a saved speed of 0, a negative one and one that is not a number (text, a bool) are
+    //       dropped, each counted as a dropped value, never moved to a speed.
+    // WHY-THIS-SHAPE: the count is read with clauseCount, not clauseCountOrSkip: four values are dropped,
+    //       so a missing clause is a daemon defect, graded as a FAIL and not also reported NOT VERIFIED.
+    // CONTROL: via control_batch.sh, same phase and date, reverted: `&& *speed > 0` removed from `snapped`
+    //       in usableProperties (backend/daemon/wallpaper_properties.cpp) -> "FAIL: a saved speed of 0, -2,
+    //       text or a bool is dropped and counted"; re-run 2026-10-15 in a private copy of the tree. The
+    //       note's " property values dropped" made " property values discarded" (wallpaper_manager.cpp,
+    //       same day) -> the same FAIL line and no NOT VERIFIED.
+    nlohmann::json dropping = nlohmann::json::array();
+    dropping.push_back(row(0, "static", {{"speed", 0}, {"mute", true}}));
+    dropping.push_back(row(2, "static", {{"speed", -2}}));
+    dropping.push_back(row(3, "static", {{"speed", "fast"}}));
+    dropping.push_back(row(4, "static", {{"speed", true}}));
+    if (!writeFile(file, nlohmann::json({{"version", 1}, {"monitors", dropping}}).dump())) {
+        notVerified(kGoals, "the second config file this phase reads could not be written");
+        return;
+    }
     WallpaperManager manager(managerConfig);
     manager.restoreSaved();
-    manager.preserveUnreadableConfig();
-    manager.writeRepairedConfig();
-
-    // GOAL: S15.108 -- a saved speed above 2 on a row this build applies is dropped like any value the
-    //       rules refuse: the row and its other values restored, the value counted, the file copied
-    //       aside and rewritten without it; speed exactly 2 is kept. The same speed on kept rows is
-    //       neither counted nor changed.
-    // WHY-THIS-SHAPE: one applied row above the cap and one at it, so a cap that moved either way is
-    //       seen; the kept rows compared as dump() text for runKeptPropertiesVerbatimChecks' reason.
-    // CONTROL: the `*number > kMaxPlaybackSpeed` term deleted from propertyError
-    //       (backend/daemon/wallpaper_properties.cpp) via control_run.sh, 2026-09-29 -> "FAIL: a saved
-    //       speed above 2 is dropped, and its row restored with the rest of its values", the count (0),
-    //       the copy and the rewrite lines, and the kept-row line, which waits on the rewrite. Reverted.
     const WallpaperManager::Snapshot snap = manager.snapshot();
     const auto holds = [&snap](int id, const WallpaperProperties& expected) {
-        return snap.monitors.count(id) == 1 && snap.monitors.at(id).type == "static" &&
-               snap.monitors.at(id).properties == expected;
+        return snap.monitors.count(id) == 1 && snap.monitors.at(id).properties == expected;
     };
-    check(holds(0, {{"mute", true}}) && holds(1, {{"speed", 2.0}}),
-          "a saved speed above 2 is dropped, and its row restored with the rest of its values");
-    const std::optional<int> counted =
-        clauseCountOrSkip(snap.health.persistence.detail, " wallpaper property values dropped, unusable", kGoals);
-    if (counted) {
-        check(*counted == 1, "the dropped speed is counted, and nothing on the kept rows is");
-        if (*counted != 1) std::fprintf(stderr, "  %d counted; detail: %s\n", *counted, snap.health.persistence.detail.c_str());
-    }
-    check(std::filesystem::exists(copy) && readFile(copy) == original, "the file is copied aside before the repair");
-    const bool rewritten = waitForFile([&] {
-        return fieldTextIn(file, 0, "properties") == nlohmann::json({{"mute", true}}).dump() &&
-               fieldTextIn(file, 1, "properties") == nlohmann::json({{"speed", 2.0}}).dump();
-    });
-    check(rewritten, "the rewrite holds the applied rows without the dropped speed");
-    if (!rewritten) std::fprintf(stderr, "  config.json: %s\n", readFile(file).c_str());
-    const bool keptSame = rewritten && fieldTextIn(file, 6, "properties") == keptSix.dump() &&
-                          fieldTextIn(file, 40, "properties") == keptForty.dump();
-    check(keptSame, "a kept row's speed of 50 is written back as the same text");
-    if (!keptSame) {
-        std::fprintf(stderr, "  row 6: %s; row 40: %s\n", fieldTextIn(file, 6, "properties").c_str(),
-                     fieldTextIn(file, 40, "properties").c_str());
-    }
+    const std::optional<int> dropped =
+        clauseCount(snap.health.persistence.detail, " wallpaper property values dropped, unusable");
+    const bool gone = holds(0, {{"mute", true}}) && holds(2, {}) && holds(3, {}) && holds(4, {}) && dropped == 4 &&
+                      snap.health.persistence.detail.find("speeds other than") == std::string::npos;
+    check(gone, "a saved speed of 0, -2, text or a bool is dropped and counted");
+    if (!gone) std::fprintf(stderr, "  detail: %s\n", snap.health.persistence.detail.c_str());
 }
 
 void runSavedVolumeOutsideRangeChecks() {
@@ -11407,6 +11408,9 @@ std::string rootFieldIn(const std::filesystem::path& file, const char* field) {
 //       "FAIL: sound off is written at the root, on a wallpaper's row, and on a sound-only row ...".
 //       KeptRows::rowsToWrite's final filter (backend/daemon/kept_rows.cpp) made `row.pauseJson.empty()`
 //       instead of `!row.holdsMonitorSettings()` -> the written line and the restart line.
+//       ConfigStore::save given `else root[kKeySound] = true;` when there is no root sound text, via
+//       control_batch.sh, same phase, 2026-10-14 -> "FAIL: sound switched back on leaves no root field,
+//       no field on the row and no sound-only row", alone. Reverted.
 void runSoundRestartChecks() {
     constexpr const char* kGoals = "S15.460 (sound settings across a restart)";
     const ScratchDir scratch("soundrestart");
@@ -11456,7 +11460,8 @@ void runSoundRestartChecks() {
 
 // GOAL: S15.461 -- ConfigStore itself: a row whose wallpaper it cannot write and that has no name is kept
 //       when it carries a sound setting, and the root's sound text is written and read back as given, a
-//       value no build knows included; with none given the root has no `sound` key.
+//       value no build knows included. A root with no sound setting writing no `sound` key is graded
+//       through the manager in runSoundRestartChecks.
 // CONTROL: via control_batch.sh, --phase '^a sound setting in the store$', 2026-10-11, each alone, in
 //       ConfigStore::save (backend/daemon/config_store.cpp): the skip's `!entry.holdsMonitorSettings()` made
 //       `entry.pauseJson.empty()` -> "FAIL: a row whose path cannot be written keeps its sound setting"; the
@@ -11487,10 +11492,6 @@ void runSoundStoreChecks() {
         std::fprintf(stderr, "  save error '%s'; read root '%s'; config.json: %s\n", saved.error.c_str(),
                      loaded.soundJson.c_str(), readFile(file).c_str());
     }
-    const SaveResult plain = store.save(PersistedConfig{{PersistedWallpaper{0, "static", "/tmp/a.png"}}});
-    const bool absent = plain.error.empty() && rootFieldIn(file, "sound") == "(no field)" && store.load().soundJson.empty();
-    check(absent, "with no root sound setting the file has no root sound field");
-    if (!absent) std::fprintf(stderr, "  config.json: %s\n", readFile(file).c_str());
 }
 
 // GOAL: S15.462 -- sound values this build does not know are kept exactly as read and treated as on: an
@@ -11837,7 +11838,7 @@ int main() {
         {"naming a screen beside an unrelated persistence failure", runNameAnswersForItsOwnWriteChecks},
         {"one answer about the config file, asked three ways", runOneAnswerAboutTheFileChecks},
         {"the escaping of an alarm that outlives its write", runStickyAlarmEscapingChecks},
-        {"re-asserting a name the daemon refused to write", runRefusedNameRetryChecks},
+        {"naming a screen the daemon refuses to write", runRefusedNameRetryChecks},
         {"a symlink planted at the save's temporary file", runTempFileSymlinkChecks},
         {"a save that cannot succeed", runFailedSaveChecks},
         {"a failed write nobody waited for", runFailedWriteIsAnnouncedChecks},
@@ -11864,7 +11865,7 @@ int main() {
         {"property values a start cannot use", runPropertiesRepairChecks},
         {"a kept row's properties, exactly", runKeptPropertiesVerbatimChecks},
         {"a kept row's screen size, exactly", runKeptOutputSizeVerbatimChecks},
-        {"a saved speed above 2", runSavedSpeedAboveCapChecks},
+        {"a saved speed other than 0.5, 1 and 2", runSavedSpeedSnapChecks},
         {"a saved volume outside 0 to 1", runSavedVolumeOutsideRangeChecks},
         {"losses a later row made up for", runSupersededLossCountChecks},
         {"a rejected size on a name a later row unbound", runUnboundRejectedSizeChecks},

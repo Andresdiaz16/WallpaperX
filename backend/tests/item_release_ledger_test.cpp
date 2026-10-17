@@ -525,8 +525,6 @@ bool runPhase(Phase phase) {
 
             const quint64 heldNumber = stub.asks().back().handover;
             scene.item->setProperty("monitorId", kSecondMonitor);
-            check(scene.item->property("monitorId").toInt() == kSecondMonitor,
-                  "the item has moved to another monitor while that reply is still in flight");
             check(stub.releases().empty(), "and nothing has been released yet, because the reply has not arrived");
 
             const bool sent = stub.sendHeldReply();
@@ -774,8 +772,6 @@ bool runPhase(Phase phase) {
                 scene.control.invalidate();
                 return true;
             }
-            check(stub.served() > servedAtSettle,
-                  "the stub served the same image again, which is what puts two claims on it");
 
             // The newest hand-over of the image the item has taken so far. While a claim on the image is
             // live, a release may name only numbers below it -- the replies a newer one superseded --

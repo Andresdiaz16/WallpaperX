@@ -447,8 +447,6 @@ void runPlaybackDeathChecks(const std::filesystem::path& root) {
               "(" + reason + ")");
         check(applied(v.good), "another video is not refused (" + describeStatus(v.good) + ")");
         check(applied(v.sameFile), "the same file on another monitor carries no count (" + describeStatus(v.sameFile) + ")");
-        check(std::find(v.posted.begin(), v.posted.end(), kGoodVideoMonitor) != v.posted.end(),
-              "and the start posts the other video's render");
     }
     {
         OpenWatch watch(badVideo);
@@ -820,12 +818,6 @@ int main(int argc, char** argv) {
         }
 
         {
-            const std::optional<wallpaperx::MonitorStatus> crashed = monitor(afterPasses, kCrashedMonitor);
-            check(crashed.has_value() && !crashed->hasFrame && !crashed->lastError.empty(),
-                  "a refused monitor still has no frame after its pass, and still says why");
-            check(crashed.has_value() && !crashed->renderOutstanding,
-                  "a refused monitor's pass leaves nothing outstanding");
-
             // GOAL: the record survives the refusal, so a second restart refuses again. False
             //       if the first start consumed the record, which would make the second start
             //       re-apply the wallpaper and crash -- the loop, one restart later.

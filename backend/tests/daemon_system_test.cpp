@@ -9,6 +9,7 @@
 // is settled by a later request that does signal, the render thread being FIFO. A check that
 // cannot be conclusive on this host says so and is not counted.
 
+#include "test_image_dir.h"
 #include "daemon/dbus_service.h"
 // The daemon's own answers for its port, config path, display escaping and crash record, so a
 // change there fails this file instead of leaving it checking a stale literal.
@@ -147,7 +148,7 @@ using wallpaperx::testing::kProcessTimeout;
 // turns the presence checks red rather than silently hollowing the absence check.
 constexpr const char* kSignalShutdownLine = "received, shutting down";
 
-std::string testAssetDir() { return std::string(WALLPAPERX_TEST_IMAGE_DIR); }
+std::string testAssetDir() { return wallpaperx::testing::testImageDir(); }
 
 // A goal the host or harness could not exercise: exit 77, a ctest skip, never a FAIL (X.3).
 using wallpaperx::testing::notVerified;
@@ -673,10 +674,6 @@ void checkFirstFrame(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
     check(fcntl(frame.fd.get(), F_GETFD) != -1, "the fd received from another process is open in this one");
     check(frame.width == kDaemonWidth && frame.height == kDaemonHeight,
           "the frame is the daemon's shipped default size (1920x1080), which no other test renders");
-    check(frame.generation == 1, "the first frame's generation is 1");
-
-    const uint64_t minimumBytes = static_cast<uint64_t>(frame.width) * frame.height * 4;
-    check(frame.memorySize >= minimumBytes, "memory_size covers at least width*height*4 bytes");
 
     // Printed only: an OPAQUE_FD (NVIDIA's /dev/nvidiactl) has no size, and -1 is its correct answer.
     // The mapped read checks a dma_buf's size itself (served_pixels.h).

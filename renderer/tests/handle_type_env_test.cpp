@@ -63,6 +63,14 @@ int main(int argc, char** argv) {
     // "dmabuf" changes the answer and anything else does not. Asking about a vendor whose
     // default is already DMA_BUF would let the dmabuf case pass without the override
     // being read at all.
+    // GOAL: S3.2 -- the two-argument overload the shipping code calls reads WALLPAPERX_FORCE_HANDLE_TYPE,
+    //       and an unset variable means no override.
+    // CONTROL: renderer/vulkan/memory_export.cpp, the wrapper passing nullptr instead of the cached
+    //       value -> handle_type_env_dmabuf "FAIL: the two-argument overload honours
+    //       WALLPAPERX_FORCE_HANDLE_TYPE for NVIDIA", handle_type_env_opaque "FAIL: forcing opaque must
+    //       not throw for a device without dma_buf support". Separately, an empty value passed as
+    //       "opaque" -> handle_type_env_default "FAIL: a device without dma_buf support yields a handle
+    //       type only when opaque was forced". Both reverted.
     const VkExternalMemoryHandleTypeFlagBits expected =
         forcedDmaBuf ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
     const VkExternalMemoryHandleTypeFlagBits actual =

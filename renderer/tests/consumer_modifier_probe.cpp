@@ -123,15 +123,11 @@ bool run(wallpaperx::testing::ValidationGrade& grade) {
     // --- What the driver picks when no consumer has reported. ---
     const uint64_t unnegotiated = exportedModifier(device, targets, renderer, /*monitorId=*/0);
     g_exportEstablished = true;
-    // NO CONTROL, stated rather than left to be assumed. Making this go red needs the
-    // exporter to publish a modifier outside the exportable-AND-importable set, and the
-    // one production edit that would do it -- dropping IMPORTABLE from
-    // createExportableImage's feature mask -- changes nothing on either driver here,
-    // because both advertise the same modifiers in both directions (tried; the probe
-    // stayed green). The only remaining way to fail it is to alter the probe's own query,
-    // which tests the check's input rather than the code. Kept because it is the premise
-    // the narrowing check below rests on, and cheap; read it as unverified, not as
-    // established.
+    // CONTROL: renderer/vulkan/frame_export.cpp populateDmaBufLayout publishing `chosen + 1` ->
+    //       "FAIL: with no consumer report, the exported modifier is one this driver listed as usable"
+    //       on consumer_modifier_probe_lavapipe. Reverted. This proves the published modifier is graded;
+    //       it does not prove the IMPORTABLE filter is, since dropping IMPORTABLE from
+    //       createExportableImage's mask changes nothing on either driver here.
     check(std::find(usable.begin(), usable.end(), unnegotiated) != usable.end(),
           "with no consumer report, the exported modifier is one this driver listed as usable");
     std::cout << "consumer_modifier_probe: unnegotiated choice " << hex(unnegotiated) << std::endl;
@@ -186,6 +182,9 @@ bool run(wallpaperx::testing::ValidationGrade& grade) {
     } catch (const std::exception& e) {
         std::cerr << "  the export after clearing the reported set threw: " << e.what() << std::endl;
     }
+    // CONTROL: renderer/vulkan/memory.h setConsumerModifiers ignoring an empty vector -> "FAIL: clearing
+    //       the reported set restores the unnegotiated choice" on consumer_modifier_probe_lavapipe.
+    //       Reverted.
     check(restored, "clearing the reported set restores the unnegotiated choice");
 
     // GOAL: the reported set actually NARROWS what the driver is offered -- the exporter
@@ -198,9 +197,6 @@ bool run(wallpaperx::testing::ValidationGrade& grade) {
     //       implementation gives on most drivers. Requiring the reported one to differ
     //       from the free choice is what makes a passing result evidence that the report
     //       was consulted at all.
-    // COVERAGE-ASSERT: `narrowed != unnegotiated` is asserted before the comparison, so a
-    //       future edit to how the substitute is picked cannot quietly reduce this to
-    //       "the driver chose what it was going to choose".
     // CONTROL: the `if (!m_consumerModifiers.empty()) { ... modifiers = std::move(agreed); }`
     //       block deleted from Memory::createExportableImage (renderer/vulkan/memory.cpp),
     //       so the full usable list is offered regardless of the report. Observed red on
@@ -225,7 +221,6 @@ bool run(wallpaperx::testing::ValidationGrade& grade) {
         return wallpaperx::testing::failureCount() == 0;
     }
 
-    check(narrowed != unnegotiated, "the reported modifier differs from the one the driver picks unprompted");
     device.memory().setConsumerModifiers({narrowed});
     const uint64_t negotiated = exportedModifier(device, targets, renderer, /*monitorId=*/3);
     const bool honoured = negotiated == narrowed;

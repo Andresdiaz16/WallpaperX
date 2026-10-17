@@ -26,12 +26,14 @@ pkg_check_modules(SHADERC  REQUIRED shaderc)
 # ffmpeg — decode for the video renderer. libavcodec decodes into the Vulkan device
 # this renderer already owns (AVVulkanDeviceContext takes an existing VkDevice and
 # returns VkImages), which is why no second GPU context is needed for video.
-# libswresample brings a video's sound to the one format its PipeWire stream takes.
+# libswresample brings a video's sound to the one format its PipeWire stream takes, and
+# libavfilter's atempo stretches it to another speed with its pitch kept.
 pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET
     libavcodec>=61
     libavformat>=61
     libavutil>=59
     libswresample>=5
+    libavfilter>=10
 )
 
 # VulkanMemoryAllocator — vendored single header
@@ -202,9 +204,6 @@ target_link_libraries(wallpaperx-memory-export-test PRIVATE wallpaperx-renderer)
 
 add_executable(wallpaperx-gpu-fault-test tests/gpu_fault_test.cpp)
 target_link_libraries(wallpaperx-gpu-fault-test PRIVATE wallpaperx-renderer)
-
-add_executable(wallpaperx-offscreen-probe tests/offscreen_probe.cpp)
-target_link_libraries(wallpaperx-offscreen-probe PRIVATE wallpaperx-renderer)
 
 add_executable(wallpaperx-device-affinity-probe tests/device_affinity_probe.cpp)
 target_link_libraries(wallpaperx-device-affinity-probe PRIVATE wallpaperx-renderer)
@@ -481,6 +480,13 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
     else()
         message(STATUS "  ffmpeg CLI: no libaom-av1 encoder -- the AV1 size-change fixture is not generated")
     endif()
+    # VP9, whose decoder applies no skip level, for the deepest level the decoder offers it.
+    set(WALLPAPERX_VP9_RECIPES "")
+    if(WALLPAPERX_FFMPEG_ENCODERS MATCHES "libvpx-vp9")
+        set(WALLPAPERX_VP9_RECIPES "counter_vp9.webm|128x96|30|1|0|-c:v libvpx-vp9 -deadline realtime -cpu-used 8 -g 24")
+    else()
+        message(STATUS "  ffmpeg CLI: no libvpx-vp9 encoder -- the VP9 fixture is not generated")
+    endif()
     # name|size|pictures per second|seconds|offset|encoder arguments
     set(WALLPAPERX_COUNTER_RECIPES
         ${WALLPAPERX_SIZE_CHANGE_PARTS}
@@ -522,6 +528,7 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         "counter_sparse_h264.mp4|128x96|30|62|0|-c:v libx264 -threads 1 -crf 18 -g 900 -sc_threshold 0 -bf 3"
         "counter_sparse_m2.mkv|128x96|30|62|0|-c:v mpeg2video -g 600 -bf 0 -q:v 2 -sc_threshold 1000000000 -f matroska"
         ${WALLPAPERX_AV1_START_RECIPES}
+        ${WALLPAPERX_VP9_RECIPES}
         # Pairs that differ only in length, 20 and 3000 pictures, for a loop boundary's cost. 128x96
         # still decodes on the GPU and keeps 3000 pictures quick.
         "counter_loop_short.mp4|128x96|30|0.65|0|${COUNTER_H264} -bf 3"
@@ -746,7 +753,6 @@ set_tests_properties(tier_selection memory_export gpu_fault
                      PROPERTIES LABELS "novulkan")
 
 wallpaperx_add_test(NAME device_probe COMMAND wallpaperx-device-probe)
-wallpaperx_add_test(NAME offscreen_probe COMMAND wallpaperx-offscreen-probe)
 wallpaperx_add_test(NAME device_affinity_probe COMMAND wallpaperx-device-affinity-probe)
 wallpaperx_add_test(NAME static_renderer_probe COMMAND wallpaperx-static-renderer-probe)
 wallpaperx_add_test(NAME image_bounds_probe COMMAND wallpaperx-image-bounds-probe)
@@ -980,7 +986,6 @@ set_tests_properties(modifier_roundtrip_probe modifier_sensitivity_probe
 
 if(WALLPAPERX_LAVAPIPE_ICD)
     wallpaperx_add_test(NAME device_probe_lavapipe COMMAND wallpaperx-device-probe)
-    wallpaperx_add_test(NAME offscreen_probe_lavapipe COMMAND wallpaperx-offscreen-probe)
     wallpaperx_add_test(NAME device_affinity_probe_lavapipe COMMAND wallpaperx-device-affinity-probe)
     wallpaperx_add_test(NAME static_renderer_probe_lavapipe COMMAND wallpaperx-static-renderer-probe)
     wallpaperx_add_test(NAME image_bounds_probe_lavapipe COMMAND wallpaperx-image-bounds-probe)
@@ -1024,7 +1029,6 @@ if(WALLPAPERX_LAVAPIPE_ICD)
     wallpaperx_add_test(NAME validation_grade_absent_lavapipe COMMAND wallpaperx-validation-grade-probe absent)
     set_tests_properties(
         device_probe_lavapipe
-        offscreen_probe_lavapipe
         device_affinity_probe_lavapipe
         static_renderer_probe_lavapipe
         image_bounds_probe_lavapipe

@@ -59,6 +59,8 @@ qt_add_executable(wallpaperx
 
 # The generated QML type registration includes these headers by bare name.
 target_include_directories(wallpaperx PRIVATE kde library daemon)
+# playback_speed.h, which the daemon includes too.
+target_include_directories(wallpaperx PRIVATE ../shared)
 
 target_link_libraries(wallpaperx PRIVATE
     Qt6::Core

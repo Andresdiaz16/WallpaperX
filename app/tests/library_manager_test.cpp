@@ -161,6 +161,10 @@ void states(const QString& root) {
     m.rescan();
     // Each wait or call is made before its expect(): the message argument may be built first.
     const bool cameBack = readyWith(m, 1);
+    // CONTROL: app/library/library_manager.cpp:132, rescan's Ready settle given `m_unavailableReason`,
+    //       control_batch 2026-10-15, app_library_manager '^states$' -> "FAIL: S15.36: after the library folder
+    //       came back it is state 1, "…/states is not a folder.", [Ocean Waves]", with the handler-record line;
+    //       restored, green.
     expect(cameBack && m.unavailableReason().isEmpty(),
            QStringLiteral("S15.36: after the library folder came back it is state %1, \"%2\", [%3]")
                .arg(int(m.state())).arg(m.unavailableReason(), titles(m.wallpapers())));
@@ -209,6 +213,9 @@ void states(const QString& root) {
     if (!setMode(closed, 0755)) {
         harnessFailure("S15.36: the mode-000 folder could not be made readable again");
     }
+    // CONTROL: app/library/wpx_package.cpp:795 and :837, scanLibrary's `systemError(error)` made `QString()`,
+    //       control_batch 2026-10-15, app_library_manager '^states$' -> "FAIL: S15.36: a folder that cannot be
+    //       listed read as state 2, "…/closed cannot be read: .""; restored, green.
     expect(deniedSettled && denied.state() == LibraryManager::State::Unavailable &&
                denied.unavailableReason() == closed + QStringLiteral(" cannot be read: Permission denied."),
            QStringLiteral("S15.36: a folder that cannot be listed read as state %1, \"%2\"").arg(int(denied.state())).arg(denied.unavailableReason()));
@@ -443,19 +450,27 @@ void selectionAndValues(const QString& root) {
     expect(m.propertyValues() == defaults, QStringLiteral("S15.40: the defaults read %1").arg(describe(m.propertyValues())));
 
     c.values = 0;
-    const bool tookSpeed = m.setPropertyValue(QStringLiteral("speed"), 1.8);
-    expect(tookSpeed && m.propertyValues().value(QStringLiteral("speed")) == QVariant(1.8) && c.values == 1,
-           QStringLiteral("S15.40: an accepted edit of speed to 1.8 read %1 with %2 signal(s)").arg(describe(m.propertyValues())).arg(c.values));
+    // CONTROL: app/library/wpx_package.cpp, control_batch 2026-10-15: the speed choices' `>=`/`<=` range
+    //       test made `>`/`<` (2, the range's max, no longer offered) -> red, "S15.40: an accepted edit of
+    //       speed to 2 read {mute=true, speed=1, tint=#ffffff, volume=1} with 0 signal(s)"; restored.
+    // CONTROL: app/library/library_manager.cpp:262, setPropertyValue emitting propertyValuesChanged a second time,
+    //       control_batch 2026-10-15, app_library_manager '^selectionAndValues$' -> "FAIL: S15.40: an accepted edit
+    //       of speed to 2 read {mute=true, speed=2, tint=#ffffff, volume=1} with 2 signal(s)"; restored, green.
+    const bool tookSpeed = m.setPropertyValue(QStringLiteral("speed"), 2.0);
+    expect(tookSpeed && m.propertyValues().value(QStringLiteral("speed")) == QVariant(2.0) && c.values == 1,
+           QStringLiteral("S15.40: an accepted edit of speed to 2 read %1 with %2 signal(s)").arg(describe(m.propertyValues())).arg(c.values));
 
     // GOAL: S15.40 -- an edit the property cannot hold is refused: false, no value changed, no
-    //       propertyValuesChanged.
+    //       propertyValuesChanged. Speed 0.75 is inside the declared range but is not a playback speed.
     // CONTROL: app/library/library_manager.cpp, setPropertyValue()'s `if (!accepted) { return false; }`
     //       made `if (!accepted) { changeSelection([&] { m_edits.insert(key, value); }); return true; }`
     //       -> red, "S15.40: the refused edit speed = 9 returned 1", and each row after it, the two volume
-    //       rows included (control_batch, re-run 2026-10-11); restored.
+    //       rows included (control_batch, re-run 2026-10-11); restored. The 0.75 row alone, control_batch
+    //       2026-10-14: accept()'s `!offered.contains(number)` (app/library/wpx_package.cpp) made `false` ->
+    //       red, "S15.40: the refused edit speed = 0.75 returned 1".
     const QVariantMap before = m.propertyValues();
     const std::pair<const char*, QVariant> refused[] = {
-        {"speed", 9.0}, {"speed", QStringLiteral("1")}, {"speed", std::numeric_limits<double>::quiet_NaN()},
+        {"speed", 9.0}, {"speed", 0.75}, {"speed", QStringLiteral("1")}, {"speed", std::numeric_limits<double>::quiet_NaN()},
         {"nope", 1.0},  {"mute", 1},                     {"tint", QStringLiteral("red")},
         {"volume", 1.5}, {"volume", -0.1},
     };
@@ -468,7 +483,7 @@ void selectionAndValues(const QString& root) {
     }
     // CONTROL: app/library/wpx_package.cpp, accept()'s `if (value.typeId() == QMetaType::QColor) {`
     //       made `if (false) {` -> red, "S15.40: a QColor tint and mute=false read {mute=false,
-    //       speed=1.8, tint=#ffffff, volume=1}" (control_batch, re-run 2026-10-11); restored.
+    //       speed=2, tint=#ffffff, volume=1}" (control_batch, re-run 2026-10-11); restored.
     const bool tookColour = m.setPropertyValue(QStringLiteral("tint"), QColor(255, 0, 0));
     const bool tookMute = m.setPropertyValue(QStringLiteral("mute"), false);
     expect(tookColour && tookMute && m.propertyValues().value(QStringLiteral("tint")) == QVariant(QStringLiteral("#ff0000")) &&
@@ -488,9 +503,9 @@ void selectionAndValues(const QString& root) {
     //       re-selecting the open one keeps them.
     // CONTROL: app/library/library_manager.cpp, the `m_edits.clear();` inside select()'s
     //       changeSelection deleted -> red, "S15.38: re-select kept edits 1, the other wallpaper had
-    //       none 1; after coming back speed read 1.8" (control_batch, re-run 2026-10-11); restored.
-    const bool setSpeed = m.setPropertyValue(QStringLiteral("speed"), 1.8);
-    const bool reselect = setSpeed && m.select(ocean) && m.propertyValues().value(QStringLiteral("speed")) == QVariant(1.8);
+    //       none 1; after coming back speed read 2" (control_batch, re-run 2026-10-15); restored.
+    const bool setSpeed = m.setPropertyValue(QStringLiteral("speed"), 2.0);
+    const bool reselect = setSpeed && m.select(ocean) && m.propertyValues().value(QStringLiteral("speed")) == QVariant(2.0);
     const bool other = m.select(still) && m.propertyValues().isEmpty();
     const bool back = m.select(ocean);
     expect(reselect && other && back && m.propertyValues() == defaults,
@@ -505,13 +520,14 @@ void selectionAndValues(const QString& root) {
     //       moment, not only the end state, since the first emission after the rescan is the one a
     //       binding (and Apply) would read. The rewrite drops tint, not mute: a video with sound
     //       always offers mute (S15.473), so only a property it does not add can be dropped.
-    // CONTROL: app/library/library_manager.cpp, control_batch, re-run 2026-10-11: settle()'s pruning
+    // CONTROL: app/library/library_manager.cpp, control_batch, re-run 2026-10-15: settle()'s pruning
     //       `property.accept(m_edits.value(property.key))` made `std::optional<QVariant>(m_edits.value(property.key))`
-    //       -> red, "S15.40: after the rewrite ... the values read {mute=false, speed=1.8, volume=1, zoom=2}"
-    //       and "an emission exposed speed=1.8"; settle()'s `m_edits = std::move(edits);` made
-    //       `m_edits.clear();` -> red, "...the values read {mute=true, speed=1, volume=1, zoom=2}"; restored.
+    //       -> red, "S15.40: after the rewrite (reread 1) ... the values read {mute=false, speed=2, volume=1,
+    //       zoom=2}, not {mute=false, speed=1, volume=1, zoom=2}" and "1 emission(s) checked; an emission
+    //       exposed speed=2"; settle()'s `m_edits = std::move(edits);` made `m_edits.clear();` -> red,
+    //       "...the values read {mute=true, speed=1, volume=1, zoom=2}, not ..."; restored.
     // COVERAGE-ASSERT: at least one emission was checked.
-    if (!m.setPropertyValue(QStringLiteral("speed"), 1.8) || !m.setPropertyValue(QStringLiteral("mute"), false) ||
+    if (!m.setPropertyValue(QStringLiteral("speed"), 2.0) || !m.setPropertyValue(QStringLiteral("mute"), false) ||
         !m.setPropertyValue(QStringLiteral("tint"), QStringLiteral("#00ff00"))) {
         expect(false, QStringLiteral("S15.40: the edits before the rewrite were refused; values %1").arg(describe(m.propertyValues())));
         return;
@@ -549,11 +565,11 @@ void selectionAndValues(const QString& root) {
     //       is rewritten again so the old edit would fit, the value stays at the default, and a
     //       property dropped and restored comes back at its default, not at the old edit.
     // WHY-THIS-SHAPE: follows the S15.40 rewrite on the same open wallpaper, so the edits it made
-    //       (speed 1.8, tint green) are exactly the ones the narrowing refused or dropped; mute's edit,
+    //       (speed 2, tint green) are exactly the ones the narrowing refused or dropped; mute's edit,
     //       still valid throughout, stays.
-    // CONTROL: app/library/library_manager.cpp, control_batch, 2026-10-11: settle()'s pruning made to keep
-    //       every edit, as for S15.40 -> red, "S15.57: after the file was widened again (reread 1) the values
-    //       read {mute=false, speed=1.8, tint=#ffffff, volume=1}"; restored. (The 2026-10-02 control, filtering
+    // CONTROL: app/library/library_manager.cpp, control_batch, re-run 2026-10-15: settle()'s pruning made to
+    //       keep every edit, as for S15.40 -> red, "S15.57: after the file was widened again (reread 1) the
+    //       values read {mute=false, speed=2, tint=#ffffff, volume=1}, not {mute=false, speed=1, ...}"; restored. (The 2026-10-02 control, filtering
     //       in propertyValues() instead of pruning in settle(), was not re-run.)
     if (reread) {
         if (!writeBytes(oceanManifest, QByteArray(kPlanManifest))) {
@@ -572,11 +588,12 @@ void selectionAndValues(const QString& root) {
     //       and its edits are dropped; when the same folder comes back it is listed but not reopened.
     // WHY-THIS-SHAPE: the return is waited for by its listing, so "not reopened" is judged on a
     //       scan that saw the folder, not on one that had not happened yet.
-    // CONTROL: app/library/library_manager.cpp, settle()'s `m_selection.clear();` deleted -> red,
-    //       "S15.39: with its folder moved away the open wallpaper is still "…/ocean"" and "after
-    //       the folder came back ... "…/ocean" is open"; restored.
-    if (!m.setPropertyValue(QStringLiteral("speed"), 1.5)) {
-        expect(false, QStringLiteral("S15.39: speed 1.5 was refused on the open wallpaper; values %1").arg(describe(m.propertyValues())));
+    // CONTROL: app/library/library_manager.cpp, settle()'s `m_selection.clear();` deleted (control_batch,
+    //       2026-10-15) -> red, "S15.39: with its folder moved away (seen 1) the open wallpaper is still
+    //       "…/ocean", values {}, 1 selection signal(s)" and "after the folder came back (listed 1)
+    //       "…/ocean" is open with values {mute=true, speed=1, tint=#ffffff, volume=1}"; restored.
+    if (!m.setPropertyValue(QStringLiteral("speed"), 0.5)) {
+        expect(false, QStringLiteral("S15.39: speed 0.5 was refused on the open wallpaper; values %1").arg(describe(m.propertyValues())));
         return;
     }
     c = Counts{};
@@ -599,9 +616,10 @@ void selectionAndValues(const QString& root) {
 
     // GOAL: S15.39 -- when the open wallpaper turns broken, the selection and its edits are
     //       dropped; when it is repaired it is not reopened.
-    // CONTROL: app/library/library_manager.cpp, settle()'s `|| !kept->usable()` deleted -> red,
-    //       "S15.39: with its wallpaper.json broken the open wallpaper is still "…/ocean""; restored.
-    if (!m.select(ocean) || !m.setPropertyValue(QStringLiteral("speed"), 1.5)) {
+    // CONTROL: app/library/library_manager.cpp, settle()'s `|| !kept->usable()` deleted (control_batch,
+    //       2026-10-15) -> red, "S15.39: with its wallpaper.json broken (seen 1) the open wallpaper is still
+    //       "…/ocean", values {}" and "after the wallpaper was repaired (seen 1) "…/ocean" is open"; restored.
+    if (!m.select(ocean) || !m.setPropertyValue(QStringLiteral("speed"), 0.5)) {
         expect(false, QStringLiteral("S15.39: ocean could not be reopened before breaking it"));
         return;
     }

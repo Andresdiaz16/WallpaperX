@@ -467,11 +467,11 @@ void applyOrder() {
     //       `m_daemon.setWallpaper(...)` (Plasma asked first; control_batch, 2026-10-02) -> red,
     //       "S15.233: Apply sent [GetStatus,SetMonitorOutput,evaluateScript,SetWallpaperWithProperties,
     //       evaluateScript] and ended 2: Ocean Waves is on DP-1.". The values line: the added volume's default
-    //       made 0.5 in settleSoundProperties (app/library/wpx_package.cpp; control_batch, 2026-10-11) -> red,
-    //       "S15.233: SetWallpaperWithProperties carried ... {mute=true(bool), speed=1.5(double),
-    //       tint=#ffffff(QString), volume=0.5(double)}".
+    //       made 0.5 in settleSoundProperties (app/library/wpx_package.cpp; control_batch, 2026-10-15) -> red,
+    //       "S15.233: SetWallpaperWithProperties carried ssia{sv} .../ocean/assets/video.mp4 0 {mute=true(bool),
+    //       speed=2(double), tint=#ffffff(QString), volume=0.5(double)}".
     rig.library->select(rig.ocean);
-    rig.library->setPropertyValue(QStringLiteral("speed"), 1.5);
+    rig.library->setPropertyValue(QStringLiteral("speed"), 2.0);
     rig.log.clear();
     const bool finished = rig.apply();
     QStringList order;
@@ -490,7 +490,7 @@ void applyOrder() {
     const auto set = rig.sent("SetWallpaperWithProperties");
     expect(bind.size() == 1 && bind[0].signature == u"is" && bind[0].args == QVariantList{0, QStringLiteral("DP-1")},
            QStringLiteral("S15.233: the screen was bound as %1").arg(bind.isEmpty() ? QStringLiteral("(nothing)") : bind[0].signature + u' ' + bind[0].args.value(0).toString() + u' ' + bind[0].args.value(1).toString()));
-    const QVariantMap wantValues{{QStringLiteral("speed"), 1.5}, {QStringLiteral("mute"), true}, {QStringLiteral("tint"), QStringLiteral("#ffffff")},
+    const QVariantMap wantValues{{QStringLiteral("speed"), 2.0}, {QStringLiteral("mute"), true}, {QStringLiteral("tint"), QStringLiteral("#ffffff")},
                                  {QStringLiteral("volume"), 1.0}};
     const QVariantMap values = set.isEmpty() ? QVariantMap() : set[0].args.value(3).toMap();
     expect(set.size() == 1 && set[0].signature == u"ssia{sv}" && set[0].args.value(0).toString() == u"video" &&
@@ -820,11 +820,11 @@ void liveEdits() {
     // WHY-THIS-SHAPE: "nothing sent" is read after a marker call queued behind the edit has arrived
     //       (daemonDrained), not after a pause: the edit's call, had it been made, was queued first on
     //       the same connection and is at the stand-in by then.
-    // CONTROL: app/daemon/apply_controller.cpp, control_batch, 2026-10-02: `startLive(...)` added
+    // CONTROL: app/daemon/apply_controller.cpp, control_batch, re-run 2026-10-15: `startLive(...)` added
     //       right after apply()'s Working state (live before the daemon accepted) -> red, "S15.237:
     //       after a refused Apply an edit sent 1 call(s), live on "DP-1""; sendLive()'s setProperties
-    //       given only `speed` (re-run 2026-10-11, with volume expected too) -> red, "S15.237: with Plasma
-    //       refusing (live on "DP-1"), the edit after Apply sent [ia{sv} 0 {speed=0.75(double)}] (1 call(s))".
+    //       given only `speed` -> red, "S15.237: with Plasma refusing (live on "DP-1"), the edit after
+    //       Apply sent [ia{sv} 0 {speed=0.5(double)}] (1 call(s))".
     rig.library->setPropertyValue(QStringLiteral("speed"), 0.5);
     const bool beforeDrained = rig.daemonDrained();
     expect(beforeDrained && edits().isEmpty(), QStringLiteral("S15.237: an edit before any Apply sent %1 call(s)").arg(edits().size()));
@@ -832,7 +832,7 @@ void liveEdits() {
                                   {QStringLiteral("org.freedesktop.DBus.Error.InvalidArgs"), QStringLiteral("no")});
     const bool refusedApply = rig.apply();
     rig.daemonFake->refuse.clear();
-    rig.library->setPropertyValue(QStringLiteral("speed"), 0.6);
+    rig.library->setPropertyValue(QStringLiteral("speed"), 2.0);
     const bool refusedDrained = rig.daemonDrained();
     expect(refusedApply && refusedDrained && rig.applier->applyState() == Progress::Failed && rig.applier->liveOutput().isEmpty() && edits().isEmpty(),
            QStringLiteral("S15.237: after a refused Apply an edit sent %1 call(s), live on \"%2\"").arg(edits().size()).arg(rig.applier->liveOutput()));
@@ -842,10 +842,10 @@ void liveEdits() {
     rig.shellFake->state.widgetsLocked = false;
     // Held from here, so S15.238's burst below is made while this edit's call is unanswered.
     rig.daemonFake->hold.insert(QStringLiteral("SetWallpaperProperties"));
-    rig.library->setPropertyValue(QStringLiteral("speed"), 0.75);
+    rig.library->setPropertyValue(QStringLiteral("speed"), 0.5);
     const bool sentOne = waitUntil([&] { return !edits().isEmpty(); }, kWaitMs);
     const bool afterDrained = rig.daemonDrained();
-    const QVariantMap want{{QStringLiteral("speed"), 0.75}, {QStringLiteral("mute"), true}, {QStringLiteral("tint"), QStringLiteral("#ffffff")},
+    const QVariantMap want{{QStringLiteral("speed"), 0.5}, {QStringLiteral("mute"), true}, {QStringLiteral("tint"), QStringLiteral("#ffffff")},
                            {QStringLiteral("volume"), 1.0}};
     const QVariantMap got = edits().isEmpty() ? QVariantMap() : edits().back().args.value(1).toMap();
     expect(applied && sentOne && afterDrained && rig.applier->applyState() == Progress::Failed && rig.applier->liveOutput() == u"DP-1" &&
@@ -858,7 +858,9 @@ void liveEdits() {
     // GOAL: S15.238 -- one edit in flight at a time, and the latest next: ten edits made while the
     //       daemon holds its reply to the last call send nothing; when it answers, exactly one more
     //       call carries the last value.
-    // WHY-THIS-SHAPE: the 0.75 edit's reply is held from before that edit was made, so the burst is
+    // WHY-THIS-SHAPE: the burst edits the volume, not the speed: ten distinct values need a float that
+    //       is not limited to three, so the last is told apart from every other. The 0.5 speed edit's
+    //       reply is held from before that edit was made, so the burst is
     //       provably made while a call is unanswered. Draining toward the stand-in (daemonDrained)
     //       says nothing about replies coming back to the client, so an unheld reply could land
     //       mid-burst. "Exactly one more" is read once the app has handled the reply to that one
@@ -869,7 +871,7 @@ void liveEdits() {
     //       call was unanswered sent 10 call(s)" and "after the reply 10 call(s) were sent".
     rig.daemonFake->calls.clear();
     for (int i = 1; i <= 10; ++i) {
-        rig.library->setPropertyValue(QStringLiteral("speed"), 0.1 * i + 0.05);
+        rig.library->setPropertyValue(QStringLiteral("volume"), 0.1 * i - 0.05);
     }
     const bool burstDrained = rig.daemonDrained();
     const qsizetype duringBurst = edits().size();
@@ -879,24 +881,24 @@ void liveEdits() {
     rig.daemonFake->release();
     const bool next = waitUntil([&] { return !edits().isEmpty(); }, kWaitMs);
     const bool quiet = next && rig.repliesHandled() && rig.daemonDrained();
-    const double last = edits().isEmpty() ? -1 : edits().back().args.value(1).toMap().value(QStringLiteral("speed")).toDouble();
-    expect(next && quiet && edits().size() == 1 && qFuzzyCompare(last, 1.05),
-           QStringLiteral("S15.238: after the reply %1 call(s) were sent (settled %2), the last with speed %3")
+    const double last = edits().isEmpty() ? -1 : edits().back().args.value(1).toMap().value(QStringLiteral("volume")).toDouble();
+    expect(next && quiet && edits().size() == 1 && qFuzzyCompare(last, 0.95),
+           QStringLiteral("S15.238: after the reply %1 call(s) were sent (settled %2), the last with volume %3")
                .arg(edits().size()).arg(quiet).arg(last));
 
     // GOAL: S15.241 -- a refused edit is shown, naming the screen and the daemon's reason, and the
     //       next accepted edit clears it.
     // CONTROL: app/daemon/apply_controller.cpp, `m_liveError = error;` in sendLive's reply made
-    //       `m_liveError = QString();` (control_batch, 2026-10-02) -> red, "S15.241: the refused edit
+    //       `m_liveError = QString();` (control_batch, re-run 2026-10-15) -> red, "S15.241: the refused edit
     //       showed """.
     rig.daemonFake->refuse.insert(QStringLiteral("SetWallpaperProperties"),
                                   {QStringLiteral("org.freedesktop.DBus.Error.InvalidArgs"), QStringLiteral("monitor 0 holds no wallpaper")});
-    rig.library->setPropertyValue(QStringLiteral("speed"), 1.2);
+    rig.library->setPropertyValue(QStringLiteral("speed"), 2.0);
     const QString wantError = QStringLiteral("A change was not applied to DP-1. The WallpaperX service refused it: monitor 0 holds no wallpaper");
     const bool shown = waitUntil([&] { return !rig.applier->liveError().isEmpty(); }, kWaitMs);
     expect(shown && rig.applier->liveError() == wantError, QStringLiteral("S15.241: the refused edit showed \"%1\"").arg(rig.applier->liveError()));
     rig.daemonFake->refuse.clear();
-    rig.library->setPropertyValue(QStringLiteral("speed"), 1.3);
+    rig.library->setPropertyValue(QStringLiteral("speed"), 1.0);
     expect(waitUntil([&] { return rig.applier->liveError().isEmpty(); }, kWaitMs),
            QStringLiteral("S15.241: an accepted edit left \"%1\" shown").arg(rig.applier->liveError()));
 
@@ -904,10 +906,10 @@ void liveEdits() {
     //       again, so a save that failed behind the accepted edit just made is shown.
     // WHY-THIS-SHAPE: S15.241's accepted edit left a re-read of its own in flight, and the stand-in
     //       builds each reply when it sends it, so that read would carry the failure set here with
-    //       no help from the 1.4 edit. It is drained first: the marker follows it on the same
+    //       no help from the speed edit below. It is drained first: the marker follows it on the same
     //       connection, so it was answered "ok" before the failure is set. The status must then be
     //       read again after the flip. The wait's deadline fails the check.
-    // CONTROL: app/daemon/apply_controller.cpp, control_batch, 2026-10-04: sendLive()'s
+    // CONTROL: app/daemon/apply_controller.cpp, control_batch, re-run 2026-10-15: sendLive()'s
     //       `m_daemon.refresh();` in the idle branch deleted -> red, "S15.242: after an accepted edit
     //       the persistence problem reads "" (settled 1, 0 status read(s) since the failure)"; the
     //       refresh moved inside `if (m_liveError != error)` (re-read only when the shown error
@@ -916,7 +918,7 @@ void liveEdits() {
     const bool settled = rig.daemonDrained();
     rig.daemonFake->calls.clear();
     rig.daemonFake->persistence = QStringLiteral("fail");
-    rig.library->setPropertyValue(QStringLiteral("speed"), 1.4);
+    rig.library->setPropertyValue(QStringLiteral("speed"), 2.0);
     const bool reread = waitUntil([&] { return !rig.client->persistenceProblem().isEmpty(); }, kWaitMs);
     expect(settled && reread && !rig.sent("GetStatus").isEmpty() &&
                rig.client->persistenceProblem() ==
@@ -927,10 +929,10 @@ void liveEdits() {
 
     // GOAL: S15.239 -- the link ends when the wallpaper is closed or another is opened: reopening it
     //       without Apply, or editing the other one, sends nothing.
-    // WHY-THIS-SHAPE: drained before the call log is cleared, so a call the 1.4 edit queued cannot
+    // WHY-THIS-SHAPE: drained before the call log is cleared, so a call S15.242's edit queued cannot
     //       land after the clear and read as an edit made after reopening.
     // CONTROL: app/daemon/apply_controller.cpp, `endLiveUnlessOpen();` in the selectionChanged
-    //       handler deleted (control_batch, 2026-10-04) -> red, "S15.239: closed and reopened, live on
+    //       handler deleted (control_batch, re-run 2026-10-15) -> red, "S15.239: closed and reopened, live on
     //       "DP-1", an edit sent 0 call(s)" (the edit queued behind the in-flight send of the cleared
     //       values) and "with another wallpaper opened, live on "DP-1", its edit sent 1 call(s)".
     rig.library->clearSelection();
@@ -938,14 +940,14 @@ void liveEdits() {
     rig.library->select(rig.ocean);
     const bool earlierArrived = rig.daemonDrained();
     rig.daemonFake->calls.clear();
-    rig.library->setPropertyValue(QStringLiteral("speed"), 1.9);
+    rig.library->setPropertyValue(QStringLiteral("speed"), 2.0);
     const bool reopenDrained = rig.daemonDrained();
     expect(earlierArrived && closedEnded && reopenDrained && rig.applier->liveOutput().isEmpty() && edits().isEmpty(),
            QStringLiteral("S15.239: closed and reopened, live on \"%1\", an edit sent %2 call(s)").arg(rig.applier->liveOutput()).arg(edits().size()));
     const bool reapplied = rig.apply();
     rig.library->select(rig.river);
     rig.daemonFake->calls.clear();
-    rig.library->setPropertyValue(QStringLiteral("speed"), 1.1);
+    rig.library->setPropertyValue(QStringLiteral("speed"), 2.0);
     const bool otherDrained = rig.daemonDrained();
     expect(reapplied && otherDrained && rig.applier->liveOutput().isEmpty() && edits().isEmpty(),
            QStringLiteral("S15.239: with another wallpaper opened, live on \"%1\", its edit sent %2 call(s)").arg(rig.applier->liveOutput()).arg(edits().size()));
@@ -954,12 +956,12 @@ void liveEdits() {
     // WHY-THIS-SHAPE: the daemon's reply to SetWallpaperWithProperties is held, so the edit is
     //       provably made while Apply is running.
     // CONTROL: app/daemon/apply_controller.cpp, startLive()'s `sendLive();` deleted (control_batch,
-    //       2026-10-02) -> red, "S15.240: the edit made during Apply was sent as [] (held 1, landed 1)".
+    //       re-run 2026-10-15) -> red, "S15.240: the edit made during Apply was sent as [] (held 1, landed 1)".
     rig.library->select(rig.ocean);
     rig.daemonFake->hold.insert(QStringLiteral("SetWallpaperWithProperties"));
     rig.applier->apply();
     const bool heldSet = waitUntil([&] { return !rig.daemonFake->held.isEmpty(); }, kWaitMs);
-    rig.library->setPropertyValue(QStringLiteral("speed"), 1.25);
+    rig.library->setPropertyValue(QStringLiteral("speed"), 2.0);
     rig.daemonFake->calls.clear();
     rig.daemonFake->hold.clear();
     rig.daemonFake->release();
@@ -969,7 +971,7 @@ void liveEdits() {
     for (const FakeCall& c : edits()) {
         speeds.append(c.args.value(1).toMap().value(QStringLiteral("speed")).toString());
     }
-    expect(heldSet && landed && editSent && speeds == QStringList{QStringLiteral("1.25")},
+    expect(heldSet && landed && editSent && speeds == QStringList{QStringLiteral("2")},
            QStringLiteral("S15.240: the edit made during Apply was sent as [%1] (held %2, landed %3)").arg(joined(speeds)).arg(heldSet).arg(landed));
 }
 
@@ -1487,14 +1489,14 @@ void liveAcrossApplies() {
     //       so a second call the edit caused would have arrived.
     // CONTROL: app/daemon/apply_controller.cpp, `if (m_live) { m_live.reset(); m_liveError.clear();
     //       emit liveChanged(); }` put back before `m_applyWallpaper = ...` in apply() (control_batch,
-    //       2026-10-04) -> red, "S15.256: after an Apply to HDMI-A-1 refused at SetMonitorOutput
+    //       re-run 2026-10-15) -> red, "S15.256: after an Apply to HDMI-A-1 refused at SetMonitorOutput
     //       (failed 1), live on "" and an edit on DP-1 sent [], not [0]" and the same at
     //       SetWallpaperWithProperties.
     struct Refusal {
         const char* at;
         double speed;
     };
-    for (const Refusal r : {Refusal{"SetMonitorOutput", 0.7}, Refusal{"SetWallpaperWithProperties", 0.8}}) {
+    for (const Refusal r : {Refusal{"SetMonitorOutput", 0.5}, Refusal{"SetWallpaperWithProperties", 2.0}}) {
         rig.kscreen->select(QStringLiteral("HDMI-A-1"));
         d.refuse.insert(QString::fromLatin1(r.at), {QStringLiteral("org.freedesktop.DBus.Error.InvalidArgs"), QStringLiteral("no")});
         const bool failed = rig.apply() && rig.applier->applyState() == Progress::Failed;
@@ -1518,14 +1520,14 @@ void liveAcrossApplies() {
     // GOAL: S15.257 -- an Apply to another screen that succeeds moves the link there: HDMI-A-1 is
     //       live, and an edit goes to its id only.
     // CONTROL: app/daemon/apply_controller.cpp, startLive() assigning m_live only when it is empty
-    //       (control_batch, 2026-10-04) -> red, "S15.257: after Ocean Waves was applied to HDMI-A-1,
-    //       live on "DP-1" and an edit sent to [0], not [1]".
+    //       (control_batch, re-run 2026-10-15) -> red, "S15.257: after Ocean Waves was applied to HDMI-A-1
+    //       (Ocean Waves is on HDMI-A-1.), live on "DP-1" and an edit sent to [0], not [1]".
     rig.kscreen->select(QStringLiteral("HDMI-A-1"));
     const bool moved = rig.apply() && rig.applier->applyState() == Progress::Done;
     const int hdmi = d.outputs.value(QStringLiteral("HDMI-A-1"), -1);
     const bool quiet = settled();
     d.calls.clear();
-    rig.library->setPropertyValue(QStringLiteral("speed"), 0.9);
+    rig.library->setPropertyValue(QStringLiteral("speed"), 0.5);
     const bool after = settled();
     QStringList sentTo;
     for (const FakeCall& c : edits()) {
@@ -1544,13 +1546,14 @@ void liveAcrossApplies() {
     //       Apply's SetWallpaperWithProperties, carrying the snapshot from before the edit, lands
     //       after it. Only a resend after the Apply lands puts the edit back on top.
     // CONTROL: app/daemon/apply_controller.cpp, startLive() recording m_library.propertyValues() as
-    //       sent instead of the Apply's snapshot (control_batch, 2026-10-04) -> red, "S15.258: the
-    //       daemon received [... SetWallpaperWithProperties 1 0.9]; the last should carry speed 1.6".
+    //       sent instead of the Apply's snapshot (control_batch, re-run 2026-10-15) -> red, "S15.258: the
+    //       daemon received [SetWallpaperProperties 1 2, SetWallpaperWithProperties 1 0.5]; the last should
+    //       carry speed 2 (bind held 1, edit first 1, landed 1)".
     d.calls.clear();
     d.hold.insert(QStringLiteral("GetStatus"));
     rig.applier->apply();
     const bool bindHeld = waitUntil([&] { return !d.held.isEmpty(); }, kWaitMs);
-    rig.library->setPropertyValue(QStringLiteral("speed"), 1.6);
+    rig.library->setPropertyValue(QStringLiteral("speed"), 2.0);
     const bool editFirst = waitUntil([&] { return !edits().isEmpty(); }, kWaitMs);
     d.hold.clear();
     d.release();
@@ -1559,8 +1562,8 @@ void liveAcrossApplies() {
     const auto applyCall = std::ranges::find_if(calls, [](const QString& c) { return c.startsWith(u"SetWallpaperWithProperties "); });
     const qsizetype applyAt = applyCall == calls.end() ? -1 : applyCall - calls.begin();
     expect(bindHeld && editFirst && landed && rig.applier->applyState() == Progress::Done && applyAt > 0 &&
-               !calls.isEmpty() && calls.back().endsWith(QStringLiteral(" 1.6")),
-           QStringLiteral("S15.258: the daemon received [%1]; the last should carry speed 1.6 (bind held %2, edit first %3, landed %4)")
+               !calls.isEmpty() && calls.back().endsWith(QStringLiteral(" 2")),
+           QStringLiteral("S15.258: the daemon received [%1]; the last should carry speed 2 (bind held %2, edit first %3, landed %4)")
                .arg(calls.join(QStringLiteral(", "))).arg(bindHeld).arg(editFirst).arg(landed));
 }
 

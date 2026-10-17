@@ -564,6 +564,12 @@ int run(Mode mode) {
     if (mode == Mode::RoundTrip) {
         const Outcome real = roundTrip(renderFreshTarget(targets, renderer, 0), /*useWrongModifier=*/false);
         if (!real.error.empty()) {
+            // CONTROL: renderer/vulkan/frame_export.cpp populateDmaBufLayout publishing no planes ->
+            //       "FAIL: a Vulkan importer accepts the published layout: the exported dma_buf frame
+            //       carries no plane layout" on modifier_roundtrip_probe_lavapipe. Reverted. That is the
+            //       probe's own pre-import refusal; no break was found that makes the driver refuse
+            //       (an unlisted modifier and a halved pitch both import on Lavapipe; the halved pitch
+            //       reddens the pixel check instead, 35 of 36 rows).
             check(false, "a Vulkan importer accepts the published layout: " + real.error);
             return failureCount();
         }
@@ -588,6 +594,10 @@ int run(Mode mode) {
         // 16 KiB allocation with a 64 KiB dma_buf). The defect is the other direction: a
         // consumer sizing its allocation from an under-reported value reads past the end
         // of the object.
+        // CONTROL: renderer/vulkan/frame_export.cpp, memorySize divided by 64 -> "FAIL: the exporter's
+        //       published memorySize is at least what an importing device needs for the same image",
+        //       "published memorySize 180 but the importing device requires 11520", on
+        //       modifier_roundtrip_probe_lavapipe. Reverted.
         check(real.memorySize >= real.requiredSize,
               "the exporter's published memorySize is at least what an importing device needs for the same image");
         if (real.memorySize < real.requiredSize) {
@@ -604,10 +614,12 @@ int run(Mode mode) {
         // under-report is caught above, and a memorySize larger than the real object is
         // caught by the lseek gate in dbus_service_test before it can SIGBUS an mmap.
         std::cout << "modifier_roundtrip_probe: importer requires " << real.requiredSize << " for the same image ("
-                  << (real.memorySize == real.requiredSize
-                          ? "exactly the published memorySize"
-                          : "published memorySize is larger by " + std::to_string(real.memorySize - real.requiredSize) +
-                                " bytes")
+                  << (real.memorySize == real.requiredSize ? "exactly the published memorySize"
+                      : real.memorySize > real.requiredSize
+                          ? "published memorySize is larger by " + std::to_string(real.memorySize - real.requiredSize) +
+                                " bytes"
+                          : "published memorySize is SMALLER by " +
+                                std::to_string(real.requiredSize - real.memorySize) + " bytes")
                   << ")" << std::endl;
         return failureCount();
     }
@@ -659,6 +671,11 @@ int run(Mode mode) {
                                            control.stage == ImportedImage::Stage::Allocate ||
                                            control.stage == ImportedImage::Stage::Bind;
     const bool importedAndWrong = control.error.empty() && control.rows != 0;
+    // CONTROL: renderer/vulkan/frame_export.cpp exportFrame handing out a fresh memfd instead of the
+    //       image's fd -> on the RTX entry modifier_sensitivity_probe "FAIL: importing with a different but
+    //       equally usable modifier yields wrong pixels, or is rejected because of the modifier it was
+    //       told ...", the import stopping at a stage the modifier had no part in. Reverted. This proves
+    //       the stage gate grades; that the driver honours the modifier is the driver's property.
     check(importedAndWrong || modifierChangedTheOutcome,
           "importing with a different but equally usable modifier yields wrong pixels, or is rejected because of the "
           "modifier it was told -- otherwise nothing about modifier sensitivity was tested");

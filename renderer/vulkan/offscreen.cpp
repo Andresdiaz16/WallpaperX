@@ -369,8 +369,4 @@ const OffscreenTarget* OffscreenTargetManager::nextUnheld(int monitorId, const s
     return nullptr;
 }
 
-uint32_t OffscreenTargetManager::depth(int monitorId) const {
-    return static_cast<uint32_t>(m_targets.at(monitorId).images.size());
-}
-
 }

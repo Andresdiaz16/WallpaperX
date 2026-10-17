@@ -12,6 +12,7 @@
 // still reads as coverage, and two copies had already lost two CONTROL annotations between
 // them.
 
+#include "test_image_dir.h"
 #include "kde/frame_import.h"
 #include "renderers/static_renderer.h"
 #include "support/test_image.h"
@@ -74,12 +75,11 @@ inline constexpr int kSecondMonitor = 1;
 // shape the daemon cannot produce, and the acquire half of its reply could not exist at all.
 //
 // The renderer is a local: targets.render() waits for the submission, so nothing of it is needed
-// afterwards. `fixtureName` keeps each caller's PNG on a path of its own -- these binaries share
-// WALLPAPERX_TEST_IMAGE_DIR.
+// afterwards. `fixtureName` keeps each caller's PNG on a path of its own within its process.
 inline void publishOneFrame(wallpaperx::Device& device, wallpaperx::OffscreenTargetManager& targets,
                             const wallpaperx::OffscreenTarget& target, const char* fixtureName) {
     const std::string imagePath =
-        wallpaperx::testing::writeGradientPng(std::string(WALLPAPERX_TEST_IMAGE_DIR) + "/" + fixtureName, 16, 16);
+        wallpaperx::testing::writeGradientPng(wallpaperx::testing::testImageDir() + "/" + fixtureName, 16, 16);
     wallpaperx::StaticRenderer renderer(device, targets.renderPass(), imagePath, WALLPAPERX_SHADER_DIR);
     targets.render(renderer, target);
 }
@@ -90,7 +90,7 @@ inline void publishSolidFrame(wallpaperx::Device& device, wallpaperx::OffscreenT
                               const wallpaperx::OffscreenTarget& target, const std::string& fixtureName,
                               std::array<unsigned char, 4> rgba) {
     const std::string imagePath =
-        wallpaperx::testing::writeSolidPng(std::string(WALLPAPERX_TEST_IMAGE_DIR) + "/" + fixtureName, 16, 16, rgba);
+        wallpaperx::testing::writeSolidPng(wallpaperx::testing::testImageDir() + "/" + fixtureName, 16, 16, rgba);
     wallpaperx::StaticRenderer renderer(device, targets.renderPass(), imagePath, WALLPAPERX_SHADER_DIR);
     targets.render(renderer, target);
 }
@@ -178,13 +178,12 @@ public:
     // picture, and a hold armed from outside races that request.
     void holdServeNumber(int number) { m_holdAtServe = number; }
 
-    // What goes beside the memory descriptor on every further reply, in place of the daemon's
-    // acquire. `None` is what a driver that cannot export one sends; `Unusable` is a descriptor the
-    // importer cannot wait on -- a memfd, which is no semaphore -- so the picture's memory imports
-    // and its hand-over fails, the one way a hand-over failure can be staged from outside the item.
+    // What goes beside the memory descriptor, in place of the daemon's acquire. `None` is what a
+    // driver that cannot export one sends; `Unusable` is a descriptor the importer cannot wait on --
+    // a memfd, which is no semaphore -- so the picture's memory imports and its hand-over fails, the
+    // one way a hand-over failure can be staged from outside the item.
     enum class Acquire { Real, None, Unusable };
-    void sendAcquire(Acquire mode) { m_acquireFrom = {{1, mode}}; }
-    // The same, from the reply served as number `serveNumber` on (counting from one), leaving the
+    // From the reply served as number `serveNumber` on (counting from one), leaving the
     // replies before it as they were scheduled. Decided per reply as it is built, for
     // holdServeNumber()'s reason: the item's own re-asks do not wait for the test.
     void sendAcquireFrom(int serveNumber, Acquire mode) { m_acquireFrom[serveNumber] = mode; }
@@ -255,8 +254,6 @@ public:
     qint64 nowMs() const { return m_clock.elapsed(); }
     // Replies that left the memory out.
     int memoryOmitted() const { return m_memoryOmitted; }
-    // Numbers this stub's frames from `offset` + 1 instead of 1. Set before the first serve.
-    void numberGenerationsFrom(quint64 offset) { m_generationOffset = offset; }
     // Numbers this stub's hand-overs from `offset` + 1 instead of 1. Set before the first serve.
     void numberHandoversFrom(quint64 offset) { m_lastHandover = offset; }
     // The highest hand-over number this stub has issued.
@@ -273,9 +270,8 @@ public:
     //
     // Off by default: the plain stub serves its sequence whatever was released, which hides a
     // leaked hold -- a later serve and release of the same id clears it. A serveNext() image the
-    // caller still holds is refused, not replaced, and counted in forcedHeld().
+    // caller still holds is refused, not replaced.
     void respectHolds(QDBusConnection announceOn) { m_announceOn = std::move(announceOn); }
-    int forcedHeld() const { return m_forcedHeld; }
 
     // Refuses a reply as TooManyDescriptors, as the daemon does, once the descriptors it would carry
     // and those earlier replies carried that no release has covered would pass `cap`. A release
@@ -350,7 +346,6 @@ public:
         if (message.member() == QLatin1String("SetImportModifiers")) {
             ModifierReportArgs args = readModifierReport(message.arguments());
             if (!args.ok) {
-                ++m_malformedModifierReports;
                 return connection.send(message.createErrorReply(QStringLiteral("org.freedesktop.DBus.Error.InvalidArgs"),
                                                                 QStringLiteral("this stub could not read the report")));
             }
@@ -387,8 +382,7 @@ public:
         if (m_announceOn && forced != nullptr &&
             isHeld(m_bufferIdOverride != 0 ? m_bufferIdOverride : forced->bufferId)) {
             // A staged image the caller still holds: serving another in its place would grade a reply
-            // the test never staged, so the conflict is refused and counted for the test to report.
-            ++m_forcedHeld;
+            // the test never staged, so the conflict is refused.
             return connection.send(message.createErrorReply(QStringLiteral("io.wallpaperx.Daemon.Error.NoFreeImage"),
                                                             QStringLiteral("this stub's staged image is held")));
         }
@@ -586,8 +580,6 @@ public:
     int requests() const { return m_requests; }
     // Requests whose arguments this stub could not read, answered InvalidArgs.
     int malformedRequests() const { return m_malformedRequests; }
-    // The same for SetImportModifiers.
-    int malformedModifierReports() const { return m_malformedModifierReports; }
     int served() const { return m_served; }
     int handleType() const { return m_handleType; }
     // The DRM format modifier of the last frame served: the layout a withdrawal would name.
@@ -778,8 +770,6 @@ private:
     int m_descriptorCap = 0;
     std::vector<Charge> m_charges;
     int m_descriptorRefusals = 0;
-    int m_forcedHeld = 0;
-    int m_malformedModifierReports = 0;
     int m_refusedMonitor = kFirstMonitor;
 
     bool isHeld(quint64 bufferId) const {

@@ -273,8 +273,8 @@ void malformedManifests() {
     expect(checked == 39, QStringLiteral("S15.32: %1 malformed manifests were checked, not 39").arg(checked));
 }
 
-// What the daemon makes of a wallpaper.json's properties: its own propertiesError() on every default,
-// and for a float "speed" on its min and max too, the two ends a slider can reach. Empty: accepted.
+// What the daemon makes of a wallpaper.json's properties as declared: its own propertiesError() on
+// every default, and on a "volume"'s min and max, the two ends its slider can reach. Empty: accepted.
 std::string daemonVerdict(const OrderedJson& properties) {
     std::vector<std::pair<std::string, DaemonValue>> defaults;
     std::string extremes;
@@ -282,8 +282,7 @@ std::string daemonVerdict(const OrderedJson& properties) {
         const std::string type = spec.value("type", "");
         if (type == "float") {
             defaults.emplace_back(key, spec.at("default").get<double>());
-            // The two the daemon bounds: a slider at either end of the declared range must be a value it takes.
-            if (key == "speed" || key == "volume") {
+            if (key == "volume") {
                 for (const char* end : {"min", "max"}) {
                     if (const std::string why = daemonPropertiesError({{key, spec.at(end).get<double>()}}); !why.empty()) {
                         extremes = why;
@@ -298,6 +297,40 @@ std::string daemonVerdict(const OrderedJson& properties) {
     }
     const std::string why = daemonPropertiesError(defaults);
     return why.empty() ? extremes : why;
+}
+
+DaemonValue toDaemon(const QVariant& value) {
+    if (value.typeId() == QMetaType::Bool) {
+        return value.toBool();
+    }
+    if (value.typeId() == QMetaType::Double) {
+        return value.toDouble();
+    }
+    return value.toString().toStdString();
+}
+
+// What the daemon makes of everything the app can send for a usable wallpaper: the whole set of
+// defaults as the app stored them, then that set with each offered choice in its property's place,
+// so rules on the whole set (the property count) apply to every probe. Empty: all accepted.
+std::string daemonVerdictOnOffered(const QList<WallpaperProperty>& properties) {
+    std::vector<std::pair<std::string, DaemonValue>> set;
+    for (const WallpaperProperty& property : properties) {
+        set.emplace_back(property.key.toStdString(), toDaemon(property.defaultValue));
+    }
+    if (std::string why = daemonPropertiesError(set); !why.empty()) {
+        return why;
+    }
+    for (std::size_t i = 0; i < set.size(); ++i) {
+        const DaemonValue stored = set[i].second;
+        for (const double choice : properties[static_cast<qsizetype>(i)].choices()) {
+            set[i].second = choice;
+            if (std::string why = daemonPropertiesError(set); !why.empty()) {
+                return why + " (the choice " + std::to_string(choice) + ")";
+            }
+        }
+        set[i].second = stored;
+    }
+    return {};
 }
 
 // S15.221-S15.225
@@ -327,13 +360,14 @@ void daemonPropertyRules() {
     //       that reason; a key of 64 allowed characters, and keys using every allowed character, are
     //       usable.
     // GOAL: S15.222 -- at most 64 properties: 64 are usable, 65 list it broken saying so.
-    // GOAL: S15.223 -- "speed" declaring a range that starts at or below 0 or ends above 2 is
-    //       refused, naming the range, not narrowed to fit; (0.1, 2] and the smallest positive
-    //       minimum are usable; "Speed" is another key and is not checked.
+    // GOAL: S15.223 -- "speed" is refused, naming its declared range, exactly when no playback speed
+    //       (0.5, 1 or 2) lies inside that range; a range holding at least one is usable, however far
+    //       it reaches past them; "Speed" is another key and is not restricted.
     // GOAL: S15.224 -- a "speed" that is not a float lists broken. ("mute" and "volume" are judged where
     //       the folder is read, knowing whether they are kept: soundPropertyRules.)
     // WHY-THIS-SHAPE: each refusal is paired with the usable case on the other side of its boundary
-    //       (64/65 characters and properties, min 0/smallest positive, max 2/2.0001), so neither a
+    //       (64/65 characters and properties; a range ending at 0.5 or starting at 2, inclusive, beside
+    //       ones just short of them, 0.4999 and 2.0001), so neither a
     //       validator that refuses too much nor one that refuses too little passes; each refusal's
     //       sentence is matched, so a refusal for some other reason is red.
     // CONTROL: app/library/wpx_package.cpp, each through control_batch, 2026-10-02 (the first re-run
@@ -341,11 +375,16 @@ void daemonPropertyRules() {
     //       `.arg(kMaxPropertyKeyBytes)` made `.arg(kMaxPropertyKeyBytes + 1)` -> red, "S15.221: a
     //       65-character key was accepted"; `[A-Za-z0-9_.-]` made `[ -~]` -> red, "S15.221: the key
     //       "my key" was accepted"; `> kMaxProperties` made `> kMaxProperties + 1` -> red, "S15.222: 65
-    //       properties was accepted"; `!(property.minimum > 0.0)` made `property.minimum < 0.0` -> red,
-    //       "S15.223: speed from 0 was accepted"; `> kMaxPlaybackSpeed` made `> 3` -> red, "S15.223: speed to
-    //       2.0001 was accepted"; the not-a-float test made `if (false)` -> red, "S15.224: a bool speed
-    //       was refused with "...allows 0 to 0, ...", not "...is not a float..."" (the range check
-    //       catches it, with the wrong sentence).
+    //       properties was accepted"; the not-a-float test made `if (false)` -> red, "S15.224: a bool
+    //       speed was refused with "...allows 0 to 0, ...", not "...is not a float..."" (the empty
+    //       choices catch it, with the wrong sentence). S15.223, control_batch 2026-10-14: choices()'s
+    //       `speed >= minimum && speed <= maximum` made `speed > minimum && speed < maximum` -> red,
+    //       "S15.223: speed from 0.1 to 0.5 was refused"; the `offered.isEmpty()` refusal made `false` (and
+    //       the snap skipped when nothing is offered), re-run control_batch 2026-10-15 -> red, "S15.223:
+    //       speed from 0.6 to 0.9 was accepted". The refusal's speed list is playbackSpeedsText("or")
+    //       (shared/playback_speed.h): its `std::format(" {} ", last)` made `", {} "` (control_batch
+    //       2026-10-15) -> red, "S15.223: speed from 0.6 to 0.9 was refused with "...0.5, 1, or 2 times
+    //       its speed.", not ...", and the 0.4999 and 2.0001 rows.
     // GOAL: S15.255 -- a key with a trailing newline, also after 64 allowed characters, and a colour
     //       default with one, are refused, as the daemon refuses them.
     // WHY-THIS-SHAPE: a pattern anchored with `^...$` matches before a final "\n"; graded against
@@ -365,15 +404,17 @@ void daemonPropertyRules() {
         {"S15.221", "digits and _.- as a key", one("0123456789_.-", flag), nullptr},
         {"S15.222", "64 properties", many(64), nullptr},
         {"S15.222", "65 properties", many(65), "wallpaper.json has 65 properties; WallpaperX takes at most 64."},
-        {"S15.223", "speed in (0.1, 2]", one("speed", spec(R"({"type": "float", "default": 1, "min": 0.1, "max": 2})")), nullptr},
-        {"S15.223", "speed from the smallest positive double", one("speed", spec(R"({"type": "float", "default": 1, "min": 5e-324, "max": 2})")), nullptr},
-        {"S15.223", "speed from 0", one("speed", spec(R"({"type": "float", "default": 1, "min": 0, "max": 2})")),
-         "Property \"speed\" in wallpaper.json allows 0 to 2, and WallpaperX plays video above 0 and at most 2 times its speed."},
-        {"S15.223", "speed from -1", one("speed", spec(R"({"type": "float", "default": 1, "min": -1, "max": 2})")),
-         "Property \"speed\" in wallpaper.json allows -1 to 2, and WallpaperX plays video above 0 and at most 2 times its speed."},
-        {"S15.223", "speed to 2.0001", one("speed", spec(R"({"type": "float", "default": 1, "min": 0.5, "max": 2.0001})")),
-         "Property \"speed\" in wallpaper.json allows 0.5 to 2.0001, and WallpaperX plays video above 0 and at most 2 times its speed."},
-        {"S15.223", "\"Speed\" from 0 to 5", one("Speed", spec(R"({"type": "float", "default": 1, "min": 0, "max": 5})")), nullptr},
+        {"S15.223", "speed from 0.1 to 2", one("speed", spec(R"({"type": "float", "default": 1, "min": 0.1, "max": 2})")), nullptr},
+        {"S15.223", "speed from -1 to 3", one("speed", spec(R"({"type": "float", "default": 1, "min": -1, "max": 3})")), nullptr},
+        {"S15.223", "speed from 0.1 to 0.5", one("speed", spec(R"({"type": "float", "default": 0.5, "min": 0.1, "max": 0.5})")), nullptr},
+        {"S15.223", "speed from 0.1 to 0.4999", one("speed", spec(R"({"type": "float", "default": 0.2, "min": 0.1, "max": 0.4999})")),
+         "Property \"speed\" in wallpaper.json allows 0.1 to 0.4999, and WallpaperX plays video at 0.5, 1 or 2 times its speed."},
+        {"S15.223", "speed from 0.6 to 0.9", one("speed", spec(R"({"type": "float", "default": 0.75, "min": 0.6, "max": 0.9})")),
+         "Property \"speed\" in wallpaper.json allows 0.6 to 0.9, and WallpaperX plays video at 0.5, 1 or 2 times its speed."},
+        {"S15.223", "speed from 2 to 5", one("speed", spec(R"({"type": "float", "default": 2, "min": 2, "max": 5})")), nullptr},
+        {"S15.223", "speed from 2.0001 to 5", one("speed", spec(R"({"type": "float", "default": 3, "min": 2.0001, "max": 5})")),
+         "Property \"speed\" in wallpaper.json allows 2.0001 to 5, and WallpaperX plays video at 0.5, 1 or 2 times its speed."},
+        {"S15.223", "\"Speed\" from 0 to 5 at 0.3", one("Speed", spec(R"({"type": "float", "default": 0.3, "min": 0, "max": 5})")), nullptr},
         {"S15.224", "a bool speed", one("speed", flag), "Property \"speed\" in wallpaper.json is not a float, and WallpaperX reads a video's speed as one."},
         {"S15.224", "a colour speed", one("speed", spec(R"({"type": "color", "default": "#ffffff"})")),
          "Property \"speed\" in wallpaper.json is not a float, and WallpaperX reads a video's speed as one."},
@@ -390,15 +431,26 @@ void daemonPropertyRules() {
             ++outside;
         }
     }
-    // GOAL: S15.225 -- the app lists a wallpaper usable exactly when the daemon would take its
-    //       properties: every default, and a speed's min and max, pass the daemon's own
-    //       propertiesError() (backend/daemon/wallpaper_properties.cpp, compiled in).
+    // GOAL: S15.225 -- everything the app can send for a usable wallpaper passes the daemon's own
+    //       propertiesError() (backend/daemon/wallpaper_properties.cpp, compiled in): every default as
+    //       the app stored it, and every choice it offers; and a wallpaper the app lists broken is one
+    //       whose declared defaults the daemon refuses too.
     // WHY-THIS-SHAPE: graded against the daemon's code rather than this table, so a rule changed on
-    //       either side alone is red here even where the table above was changed to match.
+    //       either side alone is red here even where the table above was changed to match. The usable
+    //       side is judged on the parsed values, not the declared ones: a declared speed default
+    //       between the choices is one the app moves, so the daemon refusing the declared 0.75 is right.
     // CONTROL: app/library/wpx_package.cpp isPropertyKey's `.arg(kMaxPropertyKeyBytes + 1)`
     //       (control_batch, 2026-10-04) -> red, "S15.225: a 65-character key: the app lists it usable,
     //       the daemon would refuse it (property name "kkk..." must be 1 to 64 ASCII letters, digits,
-    //       '_', '-' or '.')"; each break above gave its own S15.225 line beside its row's.
+    //       '_', '-' or '.')"; each break above gave its own S15.225 line beside its row's. The count
+//       (the whole set is sent, so the daemon's 64-property rule applies): `> kMaxProperties` made
+//       `> kMaxProperties + 1` (control_batch, 2026-10-15) -> red, "S15.225: 65 properties: the app
+//       lists it usable, the daemon would refuse it (at most 64 properties, got 65)". Choices:
+    //       both sides read kPlaybackSpeeds from shared/playback_speed.h, so the list cannot differ; what can
+    //       is choices() (app/library/wpx_package.cpp) offering a value off it. Its `within.append(speed)`
+    //       made `within.append(speed == 2.0 ? 1.5 : speed)` (control_batch 2026-10-15) -> red, "S15.225:
+    //       speed from 0.1 to 2: the app lists it usable, the daemon would refuse it (property speed must be
+    //       0.5, 1 or 2 (the choice 1.500000))".
     // COVERAGE-ASSERT: the row count, the 30 printable ASCII characters outside the rule among them.
     int checked = 0;
     for (const Row& row : rows) {
@@ -413,23 +465,132 @@ void daemonPropertyRules() {
             expect(parsed.error().endsWith(QString::fromUtf8(row.reason)),
                    QStringLiteral("%1: %2 was refused with \"%3\", not \"%4\"").arg(QLatin1StringView(row.goal), what, parsed.error(), QString::fromUtf8(row.reason)));
         }
-        const std::string daemon = daemonVerdict(row.properties);
+        const std::string daemon = parsed ? daemonVerdictOnOffered(parsed->properties) : daemonVerdict(row.properties);
         expect(parsed.has_value() == daemon.empty(),
                QStringLiteral("S15.225: %1: the app lists it %2, the daemon would %3")
                    .arg(what, parsed ? QStringLiteral("usable") : QStringLiteral("broken"),
                         daemon.empty() ? QStringLiteral("accept it") : QStringLiteral("refuse it (%1)").arg(QString::fromStdString(daemon))));
     }
-    expect(outside == 30 && checked == 20 + outside,
-           QStringLiteral("S15.221-S15.225: %1 rows were checked, %2 of them characters outside the rule; expected 50 and 30").arg(checked).arg(outside));
+    expect(outside == 30 && checked == 22 + outside,
+           QStringLiteral("S15.221-S15.225: %1 rows were checked, %2 of them characters outside the rule; expected 52 and 30").arg(checked).arg(outside));
+}
+
+// S15.223, S15.225
+void speedChoices() {
+    struct Row {
+        const char* what;
+        const char* key;
+        const char* spec;
+        QList<double> choices;
+        double stored; // the default the app keeps; NaN: the wallpaper is refused
+    };
+    const double refused = std::numeric_limits<double>::quiet_NaN();
+    // GOAL: S15.223 -- a "speed" offers exactly the playback speeds inside its declared range, ends
+    //       included; a declared default inside the range is stored as the nearest offered speed by
+    //       ratio (0.74 -> 1, 1.45 -> 2, 0.8 -> 0.5 when 1 is not offered); a default outside the range
+    //       is refused even when it is a playback speed; any other key offers no choices.
+    // WHY-THIS-SHAPE: 0.74 and 1.45 are where nearest-by-difference and nearest-by-ratio disagree, so
+    //       a snap by difference is red; 0.8 in a range offering only 0.5 is red for a snap to the
+    //       nearest of all three rather than of those offered.
+    // CONTROL: control_batch 2026-10-15, each alone, reverted. In parseProperty (app/library/wpx_package.cpp)
+    //       `nearestPlaybackSpeed(value.toDouble(), among)` made `nearestPlaybackSpeed(value.toDouble(),
+    //       kPlaybackSpeeds)` -> red, "S15.223: speed default 0.8 in 0.1 to 0.9 offers [] and stores Property
+    //       "speed" in wallpaper.json has a default outside its min and max."; the snap's range test deleted
+    //       -> red, "S15.223: speed default 2 in 0.5 to 1 offers [0.5, 1] and stores 1, not refused for its
+    //       default". In nearestPlaybackSpeed (shared/playback_speed.h) `std::fabs(std::log(from / to))` made
+    //       `std::fabs(from - to)` -> red, "S15.223: speed default 0.74 in 0.1 to 2 offers [0.5, 1, 2] and
+    //       stores 0.5", the 0.75 row likewise, and "speed default 1.45 ... stores 1".
+    // COVERAGE-ASSERT: the row count.
+    const Row rows[] = {
+        {"speed default 1 in 0.1 to 2", "speed", R"({"type": "float", "default": 1, "min": 0.1, "max": 2})", {0.5, 1.0, 2.0}, 1.0},
+        {"speed default 0.75 in 0.1 to 2", "speed", R"({"type": "float", "default": 0.75, "min": 0.1, "max": 2})", {0.5, 1.0, 2.0}, 1.0},
+        {"speed default 0.74 in 0.1 to 2", "speed", R"({"type": "float", "default": 0.74, "min": 0.1, "max": 2})", {0.5, 1.0, 2.0}, 1.0},
+        {"speed default 1.45 in 0.1 to 2", "speed", R"({"type": "float", "default": 1.45, "min": 0.1, "max": 2})", {0.5, 1.0, 2.0}, 2.0},
+        {"speed default 0.5 in 0.5 to 1", "speed", R"({"type": "float", "default": 0.5, "min": 0.5, "max": 1})", {0.5, 1.0}, 0.5},
+        {"speed default 0.8 in 0.1 to 0.9", "speed", R"({"type": "float", "default": 0.8, "min": 0.1, "max": 0.9})", {0.5}, 0.5},
+        {"speed default 1.6 in 1.5 to 3", "speed", R"({"type": "float", "default": 1.6, "min": 1.5, "max": 3})", {2.0}, 2.0},
+        {"speed default 2 in 0.5 to 1", "speed", R"({"type": "float", "default": 2, "min": 0.5, "max": 1})", {0.5, 1.0}, refused},
+        {"zoom default 0.75 in 0.1 to 2", "zoom", R"({"type": "float", "default": 0.75, "min": 0.1, "max": 2})", {}, 0.75},
+    };
+    const auto list = [](const QList<double>& values) {
+        QStringList out;
+        for (const double v : values) {
+            out.append(QString::number(v));
+        }
+        return u'[' + out.join(QStringLiteral(", ")) + u']';
+    };
+    int checked = 0;
+    for (const Row& row : rows) {
+        ++checked;
+        const auto parsed = parseManifest(edited([&](OrderedJson& j) {
+            j["properties"] = OrderedJson::object();
+            j["properties"][row.key] = OrderedJson::parse(row.spec);
+        }));
+        const WallpaperProperty* property = parsed && parsed->properties.size() == 1 ? &parsed->properties[0] : nullptr;
+        if (std::isnan(row.stored)) {
+            expect(!parsed && parsed.error().endsWith(u"has a default outside its min and max."),
+                   QStringLiteral("S15.223: %1 offers %2 and stores %3, not refused for its default")
+                       .arg(QLatin1String(row.what), property ? list(property->choices()) : QStringLiteral("[]"),
+                            property ? property->defaultValue.toString() : (parsed ? QString() : parsed.error())));
+            continue;
+        }
+        expect(property && property->choices() == row.choices && property->defaultValue == QVariant(row.stored),
+               QStringLiteral("S15.223: %1 offers %2 and stores %3")
+                   .arg(QLatin1String(row.what), property ? list(property->choices()) : QStringLiteral("[]"),
+                        property ? property->defaultValue.toString() : (parsed ? QString() : parsed.error())));
+        if (parsed) {
+            const std::string daemon = daemonVerdictOnOffered(parsed->properties);
+            expect(daemon.empty(), QStringLiteral("S15.225: %1: the app offers what the daemon would refuse (%2)")
+                                       .arg(QLatin1String(row.what), QString::fromStdString(daemon)));
+        }
+    }
+    expect(checked == 9, QStringLiteral("S15.223: %1 rows were checked, not 9").arg(checked));
+
+    // GOAL: S15.640 -- a declared speed default of 0 or below, inside its range, is stored as 1 when 1 is
+    //       offered: what the daemon plays for a speed that is not positive (config_store's "0 snaps to 1").
+    //       Where 1 is not offered it is still snapped among those offered: 0.5 for a range up to 0.6.
+    // WHY-THIS-SHAPE: a nearest-by-ratio search over a non-positive default takes the log of a negative
+    //       ratio, every comparison is false and the first offered speed, 0.5, wins; so 1 is asserted
+    //       literally, not as "some offered speed", which 0.5 also is.
+    // CONTROL: control_batch 2026-10-15, each alone, reverted. parseProperty's call (app/library/wpx_package.cpp)
+    //       made the earlier `min_element(among, ..., fabs(log(declared / s)))` -> red, "S15.640: speed
+    //       default 0 in -1 to 3 offers [0.5, 1, 2] and stores 0.5, not 1", the -2 and -0.5 rows likewise.
+    //       In nearestPlaybackSpeed (shared/playback_speed.h) the non-positive guard made `from = speed` ->
+    //       the same three; a `return 1.0` for a non-positive speed before the snap -> red, "S15.640: speed
+    //       default -1 in -2 to 0.6 offers [] and stores Property "speed" ... outside its min and max., not 0.5".
+    // COVERAGE-ASSERT: the row count.
+    const Row nonPositive[] = {
+        {"speed default 0 in -1 to 3", "speed", R"({"type": "float", "default": 0, "min": -1, "max": 3})", {0.5, 1.0, 2.0}, 1.0},
+        {"speed default -2 in -5 to 2", "speed", R"({"type": "float", "default": -2, "min": -5, "max": 2})", {0.5, 1.0, 2.0}, 1.0},
+        {"speed default -0.5 in -1 to 1", "speed", R"({"type": "float", "default": -0.5, "min": -1, "max": 1})", {0.5, 1.0}, 1.0},
+        {"speed default -1 in -2 to 0.6", "speed", R"({"type": "float", "default": -1, "min": -2, "max": 0.6})", {0.5}, 0.5},
+    };
+    int nonPositiveChecked = 0;
+    for (const Row& row : nonPositive) {
+        ++nonPositiveChecked;
+        const auto parsed = parseManifest(edited([&](OrderedJson& j) {
+            j["properties"] = OrderedJson::object();
+            j["properties"][row.key] = OrderedJson::parse(row.spec);
+        }));
+        const WallpaperProperty* property = parsed && parsed->properties.size() == 1 ? &parsed->properties[0] : nullptr;
+        expect(property && property->choices() == row.choices && property->defaultValue == QVariant(row.stored),
+               QStringLiteral("S15.640: %1 offers %2 and stores %3, not %4")
+                   .arg(QLatin1String(row.what), property ? list(property->choices()) : QStringLiteral("[]"),
+                        property ? property->defaultValue.toString() : (parsed ? QString() : parsed.error()))
+                   .arg(row.stored));
+    }
+    expect(nonPositiveChecked == 4, QStringLiteral("S15.640: %1 rows were checked, not 4").arg(nonPositiveChecked));
 }
 
 // S15.35, S15.53
 void acceptValues() {
-    WallpaperProperty speed;
+    WallpaperProperty zoom;
+    zoom.key = QStringLiteral("zoom");
+    zoom.type = WallpaperProperty::Type::Float;
+    zoom.minimum = 0.1;
+    zoom.maximum = 3.0;
+    WallpaperProperty speed = zoom;
     speed.key = QStringLiteral("speed");
-    speed.type = WallpaperProperty::Type::Float;
-    speed.minimum = 0.1;
-    speed.maximum = 3.0;
     WallpaperProperty mute;
     mute.type = WallpaperProperty::Type::Bool;
     WallpaperProperty tint;
@@ -442,15 +603,24 @@ void acceptValues() {
         std::optional<QVariant> want;
     };
     const Case cases[] = {
-        {"a float at exactly min", speed, 0.1, QVariant(0.1)},
-        {"a float at exactly max", speed, 3.0, QVariant(3.0)},
-        {"an int", speed, 2, QVariant(2.0)},
-        {"a float just below min", speed, std::nextafter(0.1, 0.0), std::nullopt},
-        {"a float just above max", speed, std::nextafter(3.0, 4.0), std::nullopt},
-        {"NaN", speed, std::numeric_limits<double>::quiet_NaN(), std::nullopt},
-        {"infinity", speed, std::numeric_limits<double>::infinity(), std::nullopt},
-        {"the string \"1\" for a float", speed, QStringLiteral("1"), std::nullopt},
-        {"a bool for a float", speed, true, std::nullopt},
+        {"a float at exactly min", zoom, 0.1, QVariant(0.1)},
+        {"a float at exactly max", zoom, 3.0, QVariant(3.0)},
+        {"a float between min and max", zoom, 0.75, QVariant(0.75)},
+        {"an int", zoom, 2, QVariant(2.0)},
+        {"a float just below min", zoom, std::nextafter(0.1, 0.0), std::nullopt},
+        {"a float just above max", zoom, std::nextafter(3.0, 4.0), std::nullopt},
+        {"NaN", zoom, std::numeric_limits<double>::quiet_NaN(), std::nullopt},
+        {"infinity", zoom, std::numeric_limits<double>::infinity(), std::nullopt},
+        {"the string \"1\" for a float", zoom, QStringLiteral("1"), std::nullopt},
+        {"a bool for a float", zoom, true, std::nullopt},
+        {"speed 0.5", speed, 0.5, QVariant(0.5)},
+        {"speed 1", speed, 1.0, QVariant(1.0)},
+        {"speed as the int 2", speed, 2, QVariant(2.0)},
+        {"speed 0.75", speed, 0.75, std::nullopt},
+        {"speed one ulp above 1", speed, std::nextafter(1.0, 2.0), std::nullopt},
+        {"speed at its min 0.1", speed, 0.1, std::nullopt},
+        {"speed at its max 3", speed, 3.0, std::nullopt},
+        {"true for speed", speed, true, std::nullopt},
         {"false for a bool", mute, false, QVariant(false)},
         {"the int 1 for a bool", mute, 1, std::nullopt},
         {"the string \"true\" for a bool", mute, QStringLiteral("true"), std::nullopt},
@@ -466,7 +636,8 @@ void acceptValues() {
     // GOAL: S15.35, S15.53 -- accept() takes exactly what a property can hold: a float in
     //       [min, max] inclusive (an int widened to double), a real bool, a "#rrggbb" or a valid
     //       QColor stored as lower-case "#rrggbb", a QColor's alpha dropped; nothing else, and the
-    //       text "#aarrggbb" still refused.
+    //       text "#aarrggbb" still refused. A float with choices (speed) takes only one of them,
+    //       even in range: not 0.75, not its own min or max, not one ulp off 1.
     // WHY-THIS-SHAPE: the boundaries are probed with nextafter, one ulp outside, so a check using
     //       a tolerance or `<=` on the wrong side goes red; the stored value is compared including its
     //       type, so returning the int unconverted also goes red.
@@ -478,7 +649,8 @@ void acceptValues() {
     //       "an int gave 2 (int)"; `if (value.typeId() == QMetaType::QColor) {` made `if (false) {`
     //       -> red, "a QColor gave a refusal"; the QColor path's `color.isValid() ?` made
     //       `color.isValid() && color.alpha() == 255 ?` -> red, "a QColor with alpha 128 gave a
-    //       refusal"; restored, green each time.
+    //       refusal"; restored, green each time. The choice rule, control_batch 2026-10-14: accept()'s
+    //       `!offered.contains(number)` made `false` -> red, "S15.35: speed 0.75 was accepted as 0.75".
     for (const Case& c : cases) {
         const auto got = c.property.accept(c.value);
         if (!c.want) {
@@ -1762,6 +1934,7 @@ int main(int argc, char* argv[]) {
     runPhase("manifestOrderAndFields", manifestOrderAndFields);
     runPhase("malformedManifests", malformedManifests);
     runPhase("daemonPropertyRules", daemonPropertyRules);
+    runPhase("speedChoices", speedChoices);
     runPhase("acceptValues", acceptValues);
     runPhase("badArchives", [&] { badArchives(root); });
     runPhase("scanFolder", [&] { scanFolder(root); });

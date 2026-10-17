@@ -38,6 +38,12 @@ bool probeTier(const char* forceEnv, std::optional<DescriptorTier> expectedTier)
                   << " | Descriptor tier: " << wallpaperx::toString(tier)
                   << std::endl;
 
+            // GOAL: S2.6 -- WALLPAPERX_FORCE_TIER reaches the real Device: classic yields Classic, and
+            //       buffer never yields Heap.
+            // CONTROL: renderer/vulkan/device.cpp determineTier, the override replaced by std::nullopt ->
+            //       on device_probe_lavapipe "device_probe (classic): forced tier not honored -- expected
+            //       Classic but got Heap" and "device_probe (buffer): forcing buffer must not select
+            //       Heap". Reverted.
             if (expectedTier && tier != *expectedTier) {
             std::cerr << "device_probe (" << label << "): forced tier not honored -- expected "
                       << wallpaperx::toString(*expectedTier) << " but got " << wallpaperx::toString(tier)
@@ -62,11 +68,10 @@ bool probeTier(const char* forceEnv, std::optional<DescriptorTier> expectedTier)
 
 int main() {
     bool ok = true;
-    // default + "heap" resolve to whatever the GPU supports ("heap" isn't a real
-    // override string), so only smoke-test them. Forcing classic MUST yield Classic
-    // on any hardware; buffer is checked for the "never Heap" invariant inside.
+    // The default resolves to whatever the GPU supports, so it is only smoke-tested. Forcing
+    // classic MUST yield Classic on any hardware; buffer is checked for the "never Heap"
+    // invariant inside.
     ok &= probeTier(nullptr, std::nullopt);
-    ok &= probeTier("heap", std::nullopt);
     ok &= probeTier("buffer", std::nullopt);
     ok &= probeTier("classic", DescriptorTier::Classic);
     return ok ? 0 : 1;

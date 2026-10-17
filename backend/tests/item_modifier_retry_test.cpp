@@ -373,27 +373,13 @@ int main(int argc, char** argv) {
                 return !stub.reports().empty();
             },
             kRoundMs);
-        check(reportedOnce, "the plugin reports its importable layouts for a dma_buf frame");
         if (stub.fdError()) {
             harnessFailure("the stub could not allocate the frame fd it answers with");
         }
 
-
-        // GOAL: the retry graded further down is caused by the ANNOUNCEMENT and not by the
-        //       passage of frames. Without this, a plugin that re-reported once per frame would
-        //       satisfy the retry check while violating everything the latch exists for.
-        // WHY-THIS-SHAPE: frames are served with no announcement emitted at all, and the count of
-        //       them is asserted rather than assumed -- "no second report arrived" is trivially
-        //       true of a run that served nothing, which is exactly the shape a stalled fetch
-        //       loop produces. Reaching the time bound ABANDONS the phase with a printed reason
-        //       rather than falling through into the announcement rounds.
-        // COVERAGE-ASSERT: kFramesBeforeAnnouncement frames must have been served and imported
-        //       before this is graded.
-        // CONTROL: `g_modifiersReported.store(false);` added beside `g_reportRefused.store(true)`
-        //       in the watcher's error path in sendImportModifiers (backend/kde/
-        //       wallpaperx_item.cpp) -- the per-frame retry loop the latch replaced. Observed
-        //       red, the only failure in that run: "the stub was sent 61 report(s) across 60
-        //       frame(s), none of them announced". Reverted.
+        // Frames are served with no announcement first, so the retry graded below follows the
+        // announcement rather than the passage of frames. That a refused report is not re-sent on
+        // those frames is S6.57, graded in item_modifier_report_test.
         const int framesBeforeAnnouncing = reportedOnce ? stub.served() : 0;
         const bool gaveItChances =
             reportedOnce && pumpUntil(
@@ -412,12 +398,6 @@ int main(int argc, char** argv) {
 
         bool retried = false;
         if (gaveItChances) {
-            check(stub.reports().size() == 1,
-                  "with no announcement, a refused report is not sent again on the frames that follow");
-            if (stub.reports().size() != 1) {
-                std::fprintf(stderr, "  the stub was sent %zu report(s) across %d frame(s), none of them announced\n",
-                             stub.reports().size(), stub.served() - framesBeforeAnnouncing);
-            }
 
             // GOAL: S6.61 -- a consumer whose report the daemon REFUSED reports again once the
             //       daemon announces that the layouts in force have changed. False leaves it

@@ -135,6 +135,8 @@ add_library(wallpaperx-daemon-lib STATIC
 
 target_include_directories(wallpaperx-daemon-lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
+    # playback_speed.h, which the app includes too.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared
     ${HTTPLIB_INCLUDE_DIR}
 )
 
@@ -177,14 +179,9 @@ if(EGL_FOUND AND OpenGL_OpenGL_FOUND)
     add_dependencies(wallpaperx-frame-import-probe wallpaperx-shaders)
     target_include_directories(wallpaperx-frame-import-probe PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
-    # Its own asset directory, not the renderer's: that one is a plain variable in the renderer's
-    # scope and arrives here empty, which showed up as a write to "/frame_import_gradient.png".
-    # A separate directory is also what keeps this probe off the path its lavapipe twin writes.
-    set(WALLPAPERX_IMPORT_ASSET_DIR ${CMAKE_CURRENT_BINARY_DIR}/import_test_assets)
-    file(MAKE_DIRECTORY ${WALLPAPERX_IMPORT_ASSET_DIR})
+    # Generated fixtures go to tests/test_image_dir.h's folder, private to each ctest entry.
     target_compile_definitions(wallpaperx-frame-import-probe PRIVATE
-        WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
-        WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_IMPORT_ASSET_DIR}")
+        WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}")
 
     # Registered even though it currently skips on this host: an unregistered probe is one
     # nobody runs, and the pairing it needs (a GL context on the same driver the Vulkan device
@@ -224,8 +221,7 @@ if(EGL_FOUND AND OpenGL_OpenGL_FOUND)
     target_include_directories(wallpaperx-frame-import-fd-test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
     target_compile_definitions(wallpaperx-frame-import-fd-test PRIVATE
-        WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
-        WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_IMPORT_ASSET_DIR}")
+        WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}")
     wallpaperx_add_test(NAME frame_import_fds COMMAND wallpaperx-frame-import-fd-test)
     set_tests_properties(frame_import_fds PROPERTIES
         ENVIRONMENT "WALLPAPERX_FORCE_HANDLE_TYPE=opaque"
@@ -438,9 +434,6 @@ target_link_options(wallpaperx-dbus-service-test PRIVATE "LINKER:--export-dynami
 # library: nothing WallpaperX ships CPU-maps an exported frame, only a test does.
 target_include_directories(wallpaperx-dbus-service-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
-target_compile_definitions(wallpaperx-dbus-service-test PRIVATE
-    WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
-)
 # The GL importer, to read an opaque-fd frame's pixels on the GPU that exported it
 # (tests/served_pixels.h); without it such a frame's contents are reported NOT VERIFIED.
 if(WALLPAPERX_HAVE_FRAME_IMPORT)
@@ -458,7 +451,6 @@ target_link_libraries(wallpaperx-http-server-test PRIVATE wallpaperx-daemon-lib)
 target_include_directories(wallpaperx-http-server-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
 target_compile_definitions(wallpaperx-http-server-test PRIVATE
-    WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
     # /health reports a version, and it must be the one this build actually is. Taken
     # from the same project(... VERSION) the daemon library compiles in, so a check that
     # http_server.cpp stopped deriving it from the build -- a hardcoded literal, say --
@@ -755,7 +747,6 @@ if(NOT DBUS_DAEMON_EXECUTABLE)
 endif()
 
 target_compile_definitions(wallpaperx-daemon-system-test PRIVATE
-    WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
     WALLPAPERX_DAEMON_BINARY="$<TARGET_FILE:wallpaperx-daemon>"
     WALLPAPERX_DBUS_DAEMON_BINARY="${DBUS_DAEMON_EXECUTABLE}"
     # The configuration every entry's bus runs on; the nested bus this test starts uses it too.
@@ -912,7 +903,7 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
     # `beeps_slow`: beeps_long's sound under those slow pictures, so a beep can be set against a picture
     # that stays on screen for two seconds; `tone_rate240` and `tone_rate120`: the tone under pictures
     # above and at the daemon's 120-a-second cap; `one_picture_tone`: one picture and three seconds of
-    # the tone, a file that plays its sound alone.
+    # the tone, a file that plays its sound alone; `beeps_rate240`: the beeps under 240 pictures a second.
     # Quoted so the commas stay in the filter. Fields, '@'-separated: name, sound, sound length,
     # picture length, pictures a second.
     foreach(sound
@@ -924,7 +915,8 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
             "wallpaper_beeps_slow.mp4@0.5*sin(2*PI*1000*t)*lt(mod(t,0.5),0.04)|0.3*sin(2*PI*440*t)@10@10@0.5"
             "wallpaper_tone_rate240.mp4@0.5*sin(2*PI*440*t)@4@4@240"
             "wallpaper_tone_rate120.mp4@0.5*sin(2*PI*440*t)@4@4@120"
-            "wallpaper_one_picture_tone.mp4@0.5*sin(2*PI*440*t)@3@1@1")
+            "wallpaper_one_picture_tone.mp4@0.5*sin(2*PI*440*t)@3@1@1"
+            "wallpaper_beeps_rate240.mp4@0.5*sin(2*PI*1000*t)*lt(mod(t,0.5),0.04)@2@2@240")
         string(REPLACE "@" ";" sound "${sound}")
         list(GET sound 0 sound_name)
         list(GET sound 1 sound_expr)
@@ -944,6 +936,21 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         )
         list(APPEND WALLPAPERX_BACKEND_SOUND_ASSETS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/${sound_name})
     endforeach()
+    # Lossless sound whose left channel is a ramp naming each frame's place in the file (0.4 s sawtooth,
+    # +-0.1) and whose right is a 440 Hz tone, so audio_playback_test can read where a speed change's join
+    # lands. pcm_f32le: a lossy codec would blur the ramp past the 1 ms the join is graded to.
+    add_custom_command(
+        OUTPUT ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_ramp.mkv
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error
+                -f lavfi -i color=c=gray:size=160x120:rate=10:duration=10
+                -f lavfi -i "aevalsrc=exprs='0.1*(2*mod(t,0.4)/0.4-1)|0.5*sin(2*PI*440*t)':s=48000:d=10"
+                -c:v libx264 -profile:v baseline -g 30 -pix_fmt yuv420p
+                -c:a pcm_f32le -ar 48000 -ac 2
+                ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_ramp.mkv
+        COMMENT "Generating video wallpaper fixture wallpaper_ramp.mkv"
+        VERBATIM
+    )
+    list(APPEND WALLPAPERX_BACKEND_SOUND_ASSETS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_ramp.mkv)
     # beeps_long's sound under twelve seconds of a moving pattern in main-profile H.264 with two B-frames
     # between references, never themselves referenced (b-pyramid none, no adaptive placement): two of every
     # three pictures are ones a decoder may skip, for audio_playback_test's picture-skipping phases.
@@ -960,6 +967,49 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         VERBATIM
     )
     list(APPEND WALLPAPERX_BACKEND_SOUND_ASSETS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_beeps_bframes.mp4)
+    # The beeps (beeps_long's two channels) under baseline H.264 with three key-picture layouts, for
+    # audio_playback_test's skip-level phases: `allkey`, every picture a key picture, so no level skips
+    # anything; `allkey10`, the same at 10 a second, so a pass's few pictures add little time of their own
+    # past their decode, and each decode can take longer than the sound's hand-over lead;
+    # `onekey`, one key picture a pass; `farkeys`, key pictures 6 s apart, past the daemon's 5 s ceiling on
+    # one gap. Fields, '@'-separated: name, length, pictures a second, x264 arguments.
+    foreach(keyed
+            "wallpaper_beeps_allkey.mp4@2@30@-g 1"
+            "wallpaper_beeps_allkey10.mp4@2@10@-g 1"
+            "wallpaper_beeps_onekey.mp4@2@30@-g 1000 -keyint_min 1000 -sc_threshold 0"
+            "wallpaper_beeps_farkeys.mp4@18@30@-g 1000 -keyint_min 1000 -sc_threshold 0 -force_key_frames 0,6,12 -forced-idr 1")
+        string(REPLACE "@" ";" keyed "${keyed}")
+        list(GET keyed 0 keyed_name)
+        list(GET keyed 1 keyed_length)
+        list(GET keyed 2 keyed_rate)
+        list(GET keyed 3 keyed_args)
+        separate_arguments(keyed_args UNIX_COMMAND "${keyed_args}")
+        add_custom_command(
+            OUTPUT ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/${keyed_name}
+            COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error
+                    -f lavfi -i color=c=gray:size=160x120:rate=${keyed_rate}:duration=${keyed_length}
+                    -f lavfi -i "aevalsrc=exprs='0.5*sin(2*PI*1000*t)*lt(mod(t,0.5),0.04)|0.3*sin(2*PI*440*t)':s=48000:d=${keyed_length}"
+                    -c:v libx264 -profile:v baseline ${keyed_args} -pix_fmt yuv420p
+                    -c:a aac -b:a 128k -ar 48000 -ac 2
+                    ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/${keyed_name}
+            COMMENT "Generating video wallpaper fixture ${keyed_name}"
+            VERBATIM
+        )
+        list(APPEND WALLPAPERX_BACKEND_SOUND_ASSETS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/${keyed_name})
+    endforeach()
+    # No sound; 30 pictures a second, with one timestamp jump of 6.03 s after the first second (pictures at
+    # 0 to 0.967 s, then 7 to 7.967 s): one gap past the daemon's 5 s ceiling between two packets in a row.
+    # MPEG-TS, which stores no sample durations, so the picture before the jump keeps its own 1/30 s.
+    add_custom_command(
+        OUTPUT ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_jump.ts
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error
+                -f lavfi -i "color=c=gray:size=160x120:rate=30:duration=2,settb=1/30,setpts='if(lt(N,30),N,N+180)'"
+                -fps_mode passthrough -c:v libx264 -profile:v baseline -g 30 -pix_fmt yuv420p -f mpegts
+                ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_jump.ts
+        COMMENT "Generating video wallpaper fixture wallpaper_jump.ts"
+        VERBATIM
+    )
+    list(APPEND WALLPAPERX_BACKEND_SOUND_ASSETS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_jump.ts)
     # The beeps at 30 pictures a second up to 1.9 s, then pictures at 1.91 s and 1.92 s, the last shown
     # 63 ms: a pass of 1.9833 s whose last picture is on screen longer than the one before. The short steps
     # put the point 100 ms before the pass's end before the 1.91 s picture is decoded, which on a constant
@@ -1056,11 +1106,7 @@ target_link_libraries(wallpaperx-video-wallpaper-test PRIVATE wallpaperx-daemon-
 # expectation, the PNG fixture writer and the validation grade.
 target_include_directories(wallpaperx-video-wallpaper-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
-# Its own asset directory, not the one dbus_service_test and http_server_test share: this
-# entry holds no lock with them, and a directory-scoped fixture written by one while another
-# reads it is how a parallel ctest turns into a failure that looks like a defect.
 target_compile_definitions(wallpaperx-video-wallpaper-test PRIVATE
-    WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/video_test_assets"
     WALLPAPERX_VIDEO_ASSET_DIR="${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}")
 if(WALLPAPERX_FFMPEG_EXECUTABLE)
     add_dependencies(wallpaperx-video-wallpaper-test wallpaperx-backend-video-fixtures)
@@ -1368,11 +1414,8 @@ set_tests_properties(qml_lint_surface PROPERTIES LABELS "novulkan"
 # desktop, and on a host with none the run would fail for a reason unrelated to the checks.
 if(Qt6QuickTest_FOUND)
     wallpaperx_add_test(NAME qml_states COMMAND $<TARGET_FILE:wallpaperx-qml-states-test>)
-    # RESOURCE_LOCK, and it is the same lock http_config and daemon_system carry rather than one
-    # of its own: this entry now binds 127.0.0.1:18462, the port main.qml's daemonOrigin names
-    # and the port those two put a real daemon on. Under ctest -jN without it, whichever started
-    # second would fail to bind -- here that is reported as a skip, and there as a daemon that
-    # could not serve its config port.
+    # No lock although it binds 127.0.0.1:18462, the port main.qml's daemonOrigin names: every
+    # entry runs in a network namespace of its own, so no other entry's port can collide with it.
     #
     # SKIP_REGULAR_EXPRESSION rather than SKIP_RETURN_CODE: Qt Quick Test exits 0 when cases
     # skip, so a host where something else already holds 18462 would otherwise show green for a
@@ -1389,7 +1432,6 @@ if(Qt6QuickTest_FOUND)
     # only that file. The entry runs in full in the unsanitized trees.
     set_tests_properties(qml_states PROPERTIES LABELS "novulkan;no-tsan"
                          ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
-                         RESOURCE_LOCK wallpaperx_bus_tests
                          SKIP_REGULAR_EXPRESSION "wallpaperx-qml-states: NO STUB DAEMON --")
 endif()
 
@@ -1456,22 +1498,13 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
                  COMMAND $<TARGET_FILE:wallpaperx-dbus-service-test>)
         set_tests_properties(dbus_service_classic_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_TIER=classic"
-            LABELS "lavapipe"
-            RESOURCE_LOCK wallpaperx_bus_tests)
+            LABELS "lavapipe")
     endif()
 
-    # One lock across every bus-driven test, not one per tier. Two reasons, and the
-    # second is the reason it is shared rather than merely present: they render from
-    # generated PNGs under the same WALLPAPERX_TEST_IMAGE_DIR, so ctest -jN must not run
-    # one while another is mid-write -- and daemon_system's responsiveness phase takes a
-    # ratio of contended to uncontended call times, whose per-call floors a neighbour
-    # saturating the same rasteriser moves. Every entry here also holds bounded waits that
-    # a busy host can expire. Serialising them costs well under a second in total.
-    set_tests_properties(dbus_service PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests)
-    set_tests_properties(dbus_service_classic PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests)
-    if(WALLPAPERX_LAVAPIPE_ICD)
-        set_tests_properties(dbus_service_lavapipe PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests)
-    endif()
+    # No lock on the bus-driven entries by default. Each has its own bus, network namespace and
+    # TMPDIR, and writes its generated fixtures under that TMPDIR (tests/test_image_dir.h), so no
+    # entry reads a file another is writing. An entry takes a lock only for a resource it still
+    # shares, named below where it is registered.
 
     # 77 means a goal could not be asked on this host: S6.12's unreadable-file clause under
     # root, or S6.24's content half on an export whose bytes are not CPU-addressable (this
@@ -1493,7 +1526,6 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
     # non-zero and read as a failure of the HTTP server.
     set_tests_properties(http_config PROPERTIES
         ENVIRONMENT "WALLPAPERX_FORCE_TIER="
-        RESOURCE_LOCK wallpaperx_bus_tests
         SKIP_RETURN_CODE 77)
 
     # The lavapipe twin exists for the sanitizer tier, not for ICD coverage: the HTTP
@@ -1507,7 +1539,6 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
         set_tests_properties(http_config_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_TIER="
             LABELS "lavapipe"
-            RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
     endif()
 
@@ -1522,7 +1553,7 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
     # bus to destroy under a running daemon -- S6.35). Without it that run exits non-zero
     # and reads as a daemon failure; with it ctest says Skipped, which is neither a pass
     # nor an accusation. A run with real failures still returns 1 and is still red.
-    set_tests_properties(daemon_system PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests
+    set_tests_properties(daemon_system PROPERTIES
                          SKIP_RETURN_CODE 77)
 
     # The twin reads the cross-process frame the other way: a LINEAR dma_buf, mapped, where
@@ -1533,15 +1564,14 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
         set_tests_properties(daemon_system_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
             LABELS "lavapipe"
-            RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
     endif()
 
-    # Device loss, exit 75, and the restart that brings the wallpapers back. Private bus
-    # and the shared lock for daemon_system's reasons; the binary also refuses any other bus.
+    # Device loss, exit 75, and the restart that brings the wallpapers back. Private bus, which the
+    # binary insists on: it refuses any other.
     wallpaperx_add_test(NAME device_loss_restart
              COMMAND $<TARGET_FILE:wallpaperx-device-loss-restart-test>)
-    set_tests_properties(device_loss_restart PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests
+    set_tests_properties(device_loss_restart PROPERTIES
                          SKIP_RETURN_CODE 77)
     if(WALLPAPERX_LAVAPIPE_ICD)
         wallpaperx_add_test(NAME device_loss_restart_lavapipe
@@ -1549,83 +1579,141 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
         set_tests_properties(device_loss_restart_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
             LABELS "lavapipe"
-            RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
     endif()
     # The same binary's crash phases on their own: a crash's last lines through the log writer.
     wallpaperx_add_test(NAME crash_log_flush
              COMMAND $<TARGET_FILE:wallpaperx-device-loss-restart-test> crash-flush)
-    set_tests_properties(crash_log_flush PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests SKIP_RETURN_CODE 77)
+    set_tests_properties(crash_log_flush PROPERTIES SKIP_RETURN_CODE 77)
     if(WALLPAPERX_LAVAPIPE_ICD)
         wallpaperx_add_test(NAME crash_log_flush_lavapipe
                  COMMAND $<TARGET_FILE:wallpaperx-device-loss-restart-test> crash-flush)
         set_tests_properties(crash_log_flush_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
             LABELS "lavapipe"
-            RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
     endif()
 
-    # Private bus and the shared lock for daemon_system's reasons: it starts the installed daemon.
-    # The lock also keeps the two entries apart, since every install rewrites this tree's
-    # install_manifest_daemon.txt and the test reads it back. The Lavapipe entry is what puts the
+    # Private bus: it starts the installed daemon. A lock of their own keeps the two entries apart,
+    # since every install rewrites this tree's install_manifest_daemon.txt and the test reads it
+    # back. The Lavapipe entry is what puts the
     # install and unit checks, which need no GPU, in continuous integration.
     wallpaperx_add_test(NAME daemon_install
              COMMAND $<TARGET_FILE:wallpaperx-daemon-install-test>)
-    set_tests_properties(daemon_install PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests SKIP_RETURN_CODE 77)
+    set_tests_properties(daemon_install PROPERTIES RESOURCE_LOCK wallpaperx_install_manifest SKIP_RETURN_CODE 77)
     if(WALLPAPERX_LAVAPIPE_ICD)
         wallpaperx_add_test(NAME daemon_install_lavapipe
                  COMMAND $<TARGET_FILE:wallpaperx-daemon-install-test>)
         set_tests_properties(daemon_install_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
             LABELS "lavapipe"
-            RESOURCE_LOCK wallpaperx_bus_tests
+            RESOURCE_LOCK wallpaperx_install_manifest
             SKIP_RETURN_CODE 77)
     endif()
 
-    # Step 13 Stage E1: a `video` wallpaper drawn end to end. Private bus and the shared
-    # RESOURCE_LOCK for the same reasons the entries above carry them -- it renders, and it
-    # requests the same well-known name. SKIP_RETURN_CODE because two things it needs can be
-    # absent: the ffmpeg command line that generates its fixture, and a host whose Vulkan
-    # stack comes up at all; neither may read as a pass.
-    wallpaperx_add_test(NAME video_wallpaper
-             COMMAND $<TARGET_FILE:wallpaperx-video-wallpaper-test>)
-    set_tests_properties(video_wallpaper PROPERTIES
+    # One entry per phase of a test binary, <BASE>.<phase>, each run with WALLPAPERX_TEST_PHASE='^<phase>$'
+    # (prerequisites a phase names through phaseSelectedFor() are pulled in by the binary itself), so
+    # a full ctest -j8 waits on its slowest phase rather than on a whole binary. The names are read
+    # from the source at configure time: phaseSelected("x"), phaseSelectedFor("x", ...), phase("x", ...)
+    # and a {"x", &run...} / {"x", [] ...} table row. <BASE> itself is phase_entry.sh, which fails
+    # when the binary's offered phases and these entries differ, and runs the whole binary when the
+    # caller sets WALLPAPERX_TEST_PHASE (control_run.sh --phase, test_phases.sh). SERIAL names the
+    # phases that get RUN_SERIAL; each must be a phase.
+    function(wallpaperx_add_phase_tests)
+        cmake_parse_arguments(PARSE_ARGV 0 ARG "" "BASE;TARGET;SOURCE;TIMEOUT" "ENVIRONMENT;LABELS;SERIAL")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${ARG_SOURCE}")
+        file(READ "${ARG_SOURCE}" text)
+        string(REGEX MATCHALL "phaseSelected(For)?\\(\"[A-Za-z0-9_]+\"|[^A-Za-z0-9_]phase\\(\"[A-Za-z0-9_]+\"" hits "${text}")
+        # Table rows only inside `phases[] = { ... };`: other tables in a test have the same shape.
+        # The lambda form is matched as `[]`, balanced, since a lone `[` would fuse the list's items.
+        string(FIND "${text}" "phases[] = {" table_at)
+        if(table_at GREATER_EQUAL 0)
+            string(SUBSTRING "${text}" ${table_at} -1 table)
+            string(FIND "${table}" "};" table_end)
+            string(SUBSTRING "${table}" 0 ${table_end} table)
+            string(REGEX MATCHALL "\\{\"[A-Za-z0-9_]+\", *(&|\\[\\])" rows "${table}")
+            list(APPEND hits ${rows})
+        endif()
+        set(phases "")
+        foreach(hit IN LISTS hits)
+            string(REGEX REPLACE "^[^\"]*\"([A-Za-z0-9_]+)\".*$" "\\1" name "${hit}")
+            list(APPEND phases "${name}")
+        endforeach()
+        list(REMOVE_DUPLICATES phases)
+        if(NOT phases)
+            message(FATAL_ERROR "wallpaperx_add_phase_tests: no phase names found in ${ARG_SOURCE}")
+        endif()
+        foreach(name IN LISTS ARG_SERIAL)
+            if(NOT name IN_LIST phases)
+                message(FATAL_ERROR "wallpaperx_add_phase_tests: SERIAL names ${name}, which ${ARG_SOURCE} does not offer")
+            endif()
+        endforeach()
+        list(JOIN phases "\n" listing)
+        set(list_file "${CMAKE_CURRENT_BINARY_DIR}/phases/${ARG_BASE}.txt")
+        file(WRITE "${list_file}" "${listing}\n")
+
+        set(props SKIP_RETURN_CODE 77)
+        if(ARG_LABELS)
+            list(APPEND props LABELS "${ARG_LABELS}")
+        endif()
+        if(ARG_TIMEOUT)
+            list(APPEND props TIMEOUT ${ARG_TIMEOUT})
+        endif()
+        wallpaperx_add_test(NAME ${ARG_BASE}
+                 COMMAND /bin/sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/phase_entry.sh "${list_file}"
+                         $<TARGET_FILE:${ARG_TARGET}>)
+        set_tests_properties(${ARG_BASE} PROPERTIES ENVIRONMENT "${ARG_ENVIRONMENT}" ${props})
+        foreach(name IN LISTS phases)
+            wallpaperx_add_test(NAME ${ARG_BASE}.${name} COMMAND $<TARGET_FILE:${ARG_TARGET}>)
+            set(env ${ARG_ENVIRONMENT} "WALLPAPERX_TEST_PHASE=^${name}$")
+            set_tests_properties(${ARG_BASE}.${name} PROPERTIES ENVIRONMENT "${env}" ${props})
+            if(name IN_LIST ARG_SERIAL)
+                set_tests_properties(${ARG_BASE}.${name} PROPERTIES RUN_SERIAL TRUE)
+            endif()
+        endforeach()
+    endfunction()
+
+    # Step 13 Stage E1: a `video` wallpaper drawn end to end. SKIP_RETURN_CODE because two things
+    # it needs can be absent: the ffmpeg command line that generates its fixture, and a host whose
+    # Vulkan stack comes up at all; neither may read as a pass.
+    # RUN_SERIAL, not a lock, for the phases that count pictures a second against a 120 a second
+    # cap: any neighbour's load moves that (measured at -j8: 104.7-119.0 a second, alone 119.99),
+    # and a lock would only keep out entries holding the same lock.
+    set(_wx_video_serial capBudget highRate)
+    wallpaperx_add_phase_tests(BASE video_wallpaper TARGET wallpaperx-video-wallpaper-test
+        SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/tests/video_wallpaper_test.cpp
         ENVIRONMENT "WALLPAPERX_FORCE_TIER="
-        RESOURCE_LOCK wallpaperx_bus_tests
-        SKIP_RETURN_CODE 77)
+        SERIAL ${_wx_video_serial})
 
     # The lavapipe twin grades the other export path: a LINEAR dma_buf, whose pixels are mapped,
     # where this GPU's OPAQUE_FD export is read through the plugin's GL importer. It is also a
     # software decode, which is the other half of the decoder this daemon may be handed.
     if(WALLPAPERX_LAVAPIPE_ICD)
-        wallpaperx_add_test(NAME video_wallpaper_lavapipe
-                 COMMAND $<TARGET_FILE:wallpaperx-video-wallpaper-test>)
-        set_tests_properties(video_wallpaper_lavapipe PROPERTIES
-            ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_TIER="
+        wallpaperx_add_phase_tests(BASE video_wallpaper_lavapipe TARGET wallpaperx-video-wallpaper-test
+            SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/tests/video_wallpaper_test.cpp
+            ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}" "WALLPAPERX_FORCE_TIER="
             LABELS "lavapipe"
-            RESOURCE_LOCK wallpaperx_bus_tests
-            SKIP_RETURN_CODE 77)
+            SERIAL ${_wx_video_serial})
     endif()
 
-    # A video's sound. The shared lock because its checks time sound against pictures to a few
-    # milliseconds; SKIP_RETURN_CODE for a host with no ffmpeg command line, no pipewire binary or no
-    # Vulkan stack. The lavapipe twin is the one CI and the controls run: the sound logic does not
-    # depend on the driver, and a software decode keeps the GPU free.
-    wallpaperx_add_test(NAME audio_playback COMMAND $<TARGET_FILE:wallpaperx-audio-playback-test>)
-    set_tests_properties(audio_playback PROPERTIES
+    # A video's sound. SKIP_RETURN_CODE for a host with no ffmpeg command line, no pipewire binary
+    # or no Vulkan stack. The lavapipe twin is the one CI and the controls run: the sound logic does
+    # not depend on the driver, and a software decode keeps the GPU free.
+    # rateCap RUN_SERIAL on the graphics card: at -j8 it once heard a capped file's sound moved
+    # mid-pass (1 of 3 seeks), and passed four times alone. cleanCredit likewise: its slowed run
+    # needs 1500 ms of drawing, and drew 1221 ms at -j24 against 2665 ms alone.
+    set(_wx_audio_serial rateCap cleanCredit)
+    wallpaperx_add_phase_tests(BASE audio_playback TARGET wallpaperx-audio-playback-test
+        SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/tests/audio_playback_test.cpp
         ENVIRONMENT "WALLPAPERX_FORCE_TIER="
-        RESOURCE_LOCK wallpaperx_bus_tests
         TIMEOUT 600
-        SKIP_RETURN_CODE 77)
+        SERIAL ${_wx_audio_serial})
     if(WALLPAPERX_LAVAPIPE_ICD)
-        wallpaperx_add_test(NAME audio_playback_lavapipe COMMAND $<TARGET_FILE:wallpaperx-audio-playback-test>)
-        set_tests_properties(audio_playback_lavapipe PROPERTIES
-            ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_TIER="
+        wallpaperx_add_phase_tests(BASE audio_playback_lavapipe TARGET wallpaperx-audio-playback-test
+            SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/tests/audio_playback_test.cpp
+            ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}" "WALLPAPERX_FORCE_TIER="
             LABELS "lavapipe"
-            RESOURCE_LOCK wallpaperx_bus_tests
-            TIMEOUT 600
-            SKIP_RETURN_CODE 77)
+            TIMEOUT 600)
     endif()
     # The same binary run as a caller whose environment names PipeWire servers: decoy sockets the test
     # listens on, which the wrapper must keep from it. No GPU and no sound server needed. No PulseAudio
@@ -1666,7 +1754,6 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
         set_tests_properties(item_import_failure PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
             LABELS "novulkan"
-            RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
 
         # The same item again, driven by a stub that only ever REFUSES. It lives in a window --
@@ -1685,7 +1772,6 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
         set_tests_properties(item_refusal_retry PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
             LABELS "novulkan"
-            RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
         # The same binary on a bus of its own inside the entry's private one, whose policy refuses
         # GetNameOwner: what the item does when it cannot learn who owns the daemon's name. The nested
@@ -1706,7 +1792,6 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
         set_tests_properties(item_refusal_retry_lookup PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
             LABELS "novulkan"
-            RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
         # The same binary's scripted runs, each a process of its own: the plugin's daemon watch, its
         # one-line latch and its timeline record are process-wide.
@@ -1717,7 +1802,6 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
             set_tests_properties(item_refusal_retry_${refusal_run} PROPERTIES
                 ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
                 LABELS "novulkan"
-                RESOURCE_LOCK wallpaperx_bus_tests
                 SKIP_RETURN_CODE 77)
         endforeach()
 
@@ -1740,7 +1824,6 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
         set_tests_properties(item_modifier_report PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
             LABELS "novulkan"
-            RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
 
         # The same item again, driven by a stub that announces ImportModifiersChanged. Its own
@@ -1760,7 +1843,6 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
         set_tests_properties(item_modifier_retry PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
             LABELS "novulkan"
-            RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
 
         # The same item, driven by a stub that records SetOutputSize. The binary configures the
@@ -1778,7 +1860,6 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
         set_tests_properties(item_size_report PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
             LABELS "novulkan"
-            RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
 
         # Stand-ins for Plasma's task manager and KWindowSystem QML modules, for the tests below that
@@ -1824,11 +1905,10 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
         set_tests_properties(item_window_report item_window_report_no_bus PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
             LABELS "novulkan"
-            RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
 
         # The packaged QML around the renderer, run for real against a stub daemon on both channels.
-        # Binds 127.0.0.1:18462, main.qml's port, hence the shared lock.
+        # They bind 127.0.0.1:18462, main.qml's port, each in its entry's own network namespace.
         add_executable(wallpaperx-plasma-surface-test tests/plasma_surface_test.cpp)
         target_link_libraries(wallpaperx-plasma-surface-test PRIVATE
             Qt6::Core Qt6::DBus Qt6::Gui Qt6::Qml Qt6::Quick Threads::Threads)
@@ -1851,7 +1931,6 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
         set_tests_properties(plasma_surface plasma_surface_named plasma_surface_retry plasma_surface_retry_no_bus PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
             LABELS "novulkan"
-            RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
 
         # ScreenWindows.qml against Plasma's real task manager model, on the nested KWin the display
@@ -1869,7 +1948,6 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
         set_tests_properties(screen_windows_kwin PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=wayland;KWIN_WAYLAND_NO_PERMISSION_CHECKS=1;WALLPAPERX_TEST_KWIN_OUTPUTS=2;QT_NO_XDG_DESKTOP_PORTAL=1"
             LABELS "novulkan"
-            RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
 
         # The import entries skip when their GL is not on the exporting GPU; this one fails, so a
@@ -1926,23 +2004,18 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
                 PkgConfig::EGL OpenGL::GL)
             target_include_directories(wallpaperx-item-import-release-test PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
-            # The shader directory and an asset directory of their own: both binaries now RENDER
-            # into the target their stub exports, because an acquire descriptor is a hand-over of a
-            # published frame and exportFrameAcquireFd refuses a target that published nothing.
-            # They share this directory and write differently-named fixtures into it; both entries
-            # hold the wallpaperx_bus_tests lock, so neither can be mid-write while the other reads.
-            set(WALLPAPERX_ITEM_ASSET_DIR ${CMAKE_CURRENT_BINARY_DIR}/item_scene_assets)
-            file(MAKE_DIRECTORY ${WALLPAPERX_ITEM_ASSET_DIR})
+            # The shader directory: these binaries RENDER into the target their stub exports, because
+            # an acquire descriptor is a hand-over of a published frame and exportFrameAcquireFd
+            # refuses a target that published nothing. Their fixtures go to tests/test_image_dir.h's
+            # folder, private to each ctest entry.
             target_compile_definitions(wallpaperx-item-import-release-test PRIVATE
                 WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml"
-                WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
-                WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_ITEM_ASSET_DIR}")
+                WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}")
             add_dependencies(wallpaperx-item-import-release-test wallpaperxplugin wallpaperx-shaders)
             wallpaperx_add_display_test(NAME item_import_release
                      COMMAND $<TARGET_FILE:wallpaperx-item-import-release-test>)
             set_tests_properties(item_import_release PROPERTIES
                 ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
-                RESOURCE_LOCK wallpaperx_bus_tests
                 SKIP_RETURN_CODE 77)
 
             # The same scene again, for what the item TELLS the desktop rather than for what it
@@ -1960,14 +2033,12 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
                 ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
             target_compile_definitions(wallpaperx-item-frame-shown-test PRIVATE
                 WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml"
-                WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
-                WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_ITEM_ASSET_DIR}")
+                WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}")
             add_dependencies(wallpaperx-item-frame-shown-test wallpaperxplugin wallpaperx-shaders)
             wallpaperx_add_display_test(NAME item_frame_shown
                      COMMAND $<TARGET_FILE:wallpaperx-item-frame-shown-test>)
             set_tests_properties(item_frame_shown PROPERTIES
                 ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
-                RESOURCE_LOCK wallpaperx_bus_tests
                 SKIP_RETURN_CODE 77)
 
             # The same scene once more, for what the item TELLS THE DAEMON when it lets an image
@@ -1984,8 +2055,7 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
                 ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
             target_compile_definitions(wallpaperx-item-release-ledger-test PRIVATE
                 WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml"
-                WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
-                WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_ITEM_ASSET_DIR}")
+                WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}")
             add_dependencies(wallpaperx-item-release-ledger-test wallpaperxplugin wallpaperx-shaders)
             # late-reply-alive and late-reply-replaced wait out the plugin's 25 s fetch patience, so each
             # takes about 30 s.
@@ -1995,7 +2065,6 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
                          COMMAND $<TARGET_FILE:wallpaperx-item-release-ledger-test> ${release_phase})
                 set_tests_properties(item_release_${release_phase} PROPERTIES
                     ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
-                    RESOURCE_LOCK wallpaperx_bus_tests
                     SKIP_RETURN_CODE 77)
             endforeach()
 
@@ -2013,8 +2082,7 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
                 ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
             target_compile_definitions(wallpaperx-item-offscreen-test PRIVATE
                 WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml"
-                WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
-                WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_ITEM_ASSET_DIR}")
+                WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}")
             add_dependencies(wallpaperx-item-offscreen-test wallpaperxplugin wallpaperx-shaders)
             # Step 13 Stage F: what the item keeps imported, and that keeping it changes nothing it
             # draws or tells the daemon. One entry per phase, for item_release_ledger's reason. The
@@ -2028,8 +2096,7 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
                 ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
             target_compile_definitions(wallpaperx-item-import-cache-test PRIVATE
                 WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml"
-                WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
-                WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_ITEM_ASSET_DIR}")
+                WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}")
             add_dependencies(wallpaperx-item-import-cache-test wallpaperxplugin wallpaperx-shaders)
             # tests/gl_semaphore_fault.h defines eglGetProcAddress in the executable to fail a GL
             # semaphore wait on demand; exported, or the plugin -- loaded at runtime -- binds libEGL's.
@@ -2059,7 +2126,6 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
                 endif()
                 set_tests_properties(item_cache_${cache_phase} PROPERTIES
                     ENVIRONMENT "${cache_environment}"
-                    RESOURCE_LOCK wallpaperx_bus_tests
                     SKIP_RETURN_CODE 77)
             endforeach()
 
@@ -2076,8 +2142,7 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
                 ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
             target_compile_definitions(wallpaperx-item-timeline-test PRIVATE
                 WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml"
-                WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
-                WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_ITEM_ASSET_DIR}")
+                WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}")
             target_link_options(wallpaperx-item-timeline-test PRIVATE
                 "LINKER:--export-dynamic-symbol=eglGetProcAddress"
                 "LINKER:--export-dynamic-symbol=glGetStringi")
@@ -2091,7 +2156,6 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
                          COMMAND $<TARGET_FILE:wallpaperx-item-timeline-test> ${timeline_phase})
                 set_tests_properties(item_timeline_${timeline_phase} PROPERTIES
                     ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
-                    RESOURCE_LOCK wallpaperx_bus_tests
                     SKIP_RETURN_CODE 77)
             endforeach()
             # The steady phase again on the dma_buf export, the other handle type the plugin waits on.
@@ -2099,7 +2163,6 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
                      COMMAND $<TARGET_FILE:wallpaperx-item-timeline-test> steady)
             set_tests_properties(item_timeline_steady-dmabuf PROPERTIES
                 ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1;WALLPAPERX_FORCE_HANDLE_TYPE=dmabuf"
-                RESOURCE_LOCK wallpaperx_bus_tests
                 SKIP_RETURN_CODE 77)
 
             foreach(offscreen_phase hidden painted)
@@ -2107,7 +2170,6 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
                          COMMAND $<TARGET_FILE:wallpaperx-item-offscreen-test> ${offscreen_phase})
                 set_tests_properties(item_offscreen_${offscreen_phase} PROPERTIES
                     ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
-                    RESOURCE_LOCK wallpaperx_bus_tests
                     SKIP_RETURN_CODE 77)
             endforeach()
         else()
@@ -2167,12 +2229,7 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
             wallpaperx-daemon-lib wallpaperx-frame-import)
         target_include_directories(wallpaperx-cross-process-import-test PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
-        # Its own asset directory. The fixture is written by this test and read by the daemon it
-        # spawns, and a directory shared with another entry is one another entry can be mid-write in.
-        set(WALLPAPERX_XPROC_ASSET_DIR ${CMAKE_CURRENT_BINARY_DIR}/cross_process_assets)
-        file(MAKE_DIRECTORY ${WALLPAPERX_XPROC_ASSET_DIR})
         target_compile_definitions(wallpaperx-cross-process-import-test PRIVATE
-            WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_XPROC_ASSET_DIR}"
             WALLPAPERX_DAEMON_BINARY="$<TARGET_FILE:wallpaperx-daemon>")
         # Baking the path in is not enough: without this the test can be built and run against a
         # stale daemon binary, and would report an old daemon's behaviour as the current one's.
@@ -2186,7 +2243,6 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
         # SKIP_RETURN_CODE because a host whose GL and Vulkan resolve to different drivers, or whose
         # daemon exports a dma_buf, has not exercised this and must not report that it has.
         set_tests_properties(cross_process_import PROPERTIES
-            RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
     else()
         # Registered as a permanent skip rather than left absent, for the reason above: a missing

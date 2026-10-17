@@ -89,12 +89,20 @@ public:
         // started part way in, or the first after a loop. Its presentation time says nothing about
         // its distance from the picture before it.
         bool startsPass = false;
+        // As DecodedFrame::skip().
+        PictureSkip skip = PictureSkip::Nothing;
+        // For the first picture after a loop, where the pass before it ended, as
+        // VideoDecoder::readThrough(): past its last picture shown when that one's successors were skipped.
+        std::optional<std::chrono::nanoseconds> passEnded;
+        // As DecodedFrame::keptThrough() and readSince().
+        PictureSkip keptThrough = PictureSkip::Nothing;
+        uint32_t readSince = 1;
     };
     // Throws std::logic_error before the first picture.
     PictureTiming timing() const;
 
-    // As VideoDecoder::averageFrameInterval().
-    std::optional<std::chrono::nanoseconds> averageFrameInterval() const { return m_decoder.averageFrameInterval(); }
+    // As VideoDecoder::deepestSkip().
+    PictureSkip deepestSkip() const { return m_decoder.deepestSkip(); }
 
     // Where the picture draw() last showed lies in the file, for a pipeline opened on it later to
     // start there. Empty before the first draw and when the decoder could not find it again.

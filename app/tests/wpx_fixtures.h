@@ -56,8 +56,8 @@ namespace wallpaperx::apptest {
 
 using OrderedJson = nlohmann::ordered_json;
 
-// PLAN.md's wallpaper.json example with its colour in upper case, and speed's max at 2, the most
-// the daemon plays a video at (PLAN's example says 3, which the app refuses). The property keys
+// PLAN.md's wallpaper.json example with its colour in upper case, and speed's range 0.1 to 2, which
+// offers all three playback speeds (0.5, 1 and 2). The property keys
 // are listed speed, mute, tint -- not alphabetical -- so an implementation that sorts them is caught.
 inline constexpr const char* kPlanManifest = R"({
   "schema_version": "1",

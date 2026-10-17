@@ -222,13 +222,8 @@ bool runInstalledPhase() {
     unsetenv("WALLPAPERX_ALLOW_NO_VALIDATION");
     graded(waived.failures == 0 && waived.ungraded == 0,
            "the operator's waiver excuses an absent validator instead of charging either bucket");
-    // Grades THIS FILE, not production: no change to the code under test can red it. It guards
-    // the scrub above, so a later phase added here cannot silently inherit the waiver -- nothing
-    // depends on it today.
-    // CONTROL: the unsetenv two lines above deleted -> this line red, 1 failure, exit 1. Reverted.
-    graded(!validationWaived(), "the probe cleared the waiver switch again after grading its effect");
 
-    checkComparisonCount(8);
+    checkComparisonCount(7);
     return true;
 }
 

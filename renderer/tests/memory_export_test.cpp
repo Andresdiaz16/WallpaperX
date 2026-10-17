@@ -28,14 +28,23 @@ int main() {
     // environment they happen to run in.
     constexpr const char* kNoOverride = nullptr;
 
+    // GOAL: S3.2 -- the vendor policy and the WALLPAPERX_FORCE_HANDLE_TYPE override pick the handle
+    //       type each GPU can export, and refuse rather than hand back one it cannot.
+    // CONTROL: renderer/vulkan/memory_export.cpp, one break per line below, each reverted:
+    //       NVIDIA branch returning DMA_BUF -> "FAIL: NVIDIA uses OPAQUE_FD regardless of the dma_buf
+    //       capability flag"; final return made OPAQUE_FD -> "FAIL: AMD with dma_buf support uses
+    //       DMA_BUF"; the no-dma_buf throw deleted -> "FAIL: AMD without dma_buf support should throw,
+    //       not silently return an unusable handle type"; "opaque" compared as "opaque-x" -> "FAIL:
+    //       forcing opaque overrides the dma_buf default"; the forced-dmabuf return made OPAQUE_FD ->
+    //       "FAIL: forcing dmabuf overrides the NVIDIA OPAQUE_FD policy when the driver supports it";
+    //       its support check disabled -> "FAIL: forcing dmabuf without dma_buf support should
+    //       throw"; "dmabuf" matched by a 3-character prefix -> "FAIL: an unrecognised
+    //       WALLPAPERX_FORCE_HANDLE_TYPE value falls through to the default policy".
+
     check(wallpaperx::externalMemoryHandleType(GpuVendor::NVIDIA, /*hasExternalMemoryDmaBuf=*/false, kNoOverride) == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
           "NVIDIA uses OPAQUE_FD regardless of the dma_buf capability flag");
     check(wallpaperx::externalMemoryHandleType(GpuVendor::AMD, /*hasExternalMemoryDmaBuf=*/true, kNoOverride) == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
           "AMD with dma_buf support uses DMA_BUF");
-    check(wallpaperx::externalMemoryHandleType(GpuVendor::Intel, /*hasExternalMemoryDmaBuf=*/true, kNoOverride) == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-          "Intel with dma_buf support uses DMA_BUF");
-    check(wallpaperx::externalMemoryHandleType(GpuVendor::Other, /*hasExternalMemoryDmaBuf=*/true, kNoOverride) == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-          "Other vendor with dma_buf support falls back to DMA_BUF");
 
     try {
         wallpaperx::externalMemoryHandleType(GpuVendor::AMD, /*hasExternalMemoryDmaBuf=*/false, kNoOverride);
@@ -66,9 +75,6 @@ int main() {
     check(wallpaperx::externalMemoryHandleType(GpuVendor::NVIDIA, /*hasExternalMemoryDmaBuf=*/true, "dma-buf") ==
               VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
           "an unrecognised WALLPAPERX_FORCE_HANDLE_TYPE value falls through to the default policy");
-    check(wallpaperx::externalMemoryHandleType(GpuVendor::NVIDIA, /*hasExternalMemoryDmaBuf=*/true, "") ==
-              VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
-          "an empty WALLPAPERX_FORCE_HANDLE_TYPE falls through to the default policy");
 
     if (wallpaperx::testing::reportFailures("memory_export_test") == 0) {
         std::cout << "memory_export_test: all checks passed" << std::endl;

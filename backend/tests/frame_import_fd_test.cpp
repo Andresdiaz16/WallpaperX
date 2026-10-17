@@ -11,6 +11,7 @@
 // The refused semaphore import runs last: on NVIDIA no semaphore import succeeds in a context after
 // one is refused.
 
+#include "test_image_dir.h"
 #include "frame_import.h"
 
 #include "support/test_image.h"
@@ -130,7 +131,7 @@ bool runChecks() {
         }
         wallpaperx::OffscreenTargetManager targets(device);
         const std::string imagePath = wallpaperx::testing::writeGradientPng(
-            std::string(WALLPAPERX_TEST_IMAGE_DIR) + "/frame_import_fd_gradient.png", 16, 16);
+            wallpaperx::testing::testImageDir() + "/frame_import_fd_gradient.png", 16, 16);
         wallpaperx::StaticRenderer renderer(device, targets.renderPass(), imagePath, WALLPAPERX_SHADER_DIR);
         const wallpaperx::OffscreenTarget& target = targets.create(0, kWidth, kHeight);
         targets.render(renderer, target);

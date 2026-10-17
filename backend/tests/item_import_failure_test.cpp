@@ -416,8 +416,9 @@ int main(int argc, char** argv) {
             //       string from the fetch and render facts; setUnavailableReason, which the
             //       earlier annotation named, no longer exists. Reverted.
             auto* renderer = qobject_cast<QQuickItem*>(root->property("rendererItem").value<QObject*>());
-            check(renderer != nullptr, "the QML scene exposes the renderer item");
-            if (renderer != nullptr) {
+            if (renderer == nullptr) {
+                wallpaperx::testing::harnessFailure("the QML scene does not expose the renderer item");
+            } else {
                 check(renderer->property("unavailableReason").toString() == published,
                       "the QML binding holds the same string the property returns");
             }

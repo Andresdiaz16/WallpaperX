@@ -475,6 +475,9 @@ void createdDuringScan(const QString& root) {
     const bool written = copy->rest();
     copy->finish();
     const bool listed = readyWith(*m, QStringLiteral("Good,Open"));
+    // CONTROL: app/library/folder_watcher.cpp:32, IN_CLOSE_WRITE dropped from kInsideEvents, control_batch
+    //       2026-10-15, app_library_changes '^createdDuringScan$' -> "FAIL: S15.56: open was not listed once
+    //       closed; [Good]"; restored, green.
     expect(written && listed, QStringLiteral("S15.56: open was not listed once closed; [%1]").arg(titles(m->wallpapers())));
 }
 
@@ -523,6 +526,9 @@ void closedDuringScan(const QString& root) {
     expect(withAssetSizes(handled, QStringLiteral("Quick")) == u"Good",
            QStringLiteral("S15.56: a folder copied in and closed during a scan was published as [%1]").arg(withAssetSizes(handled, QStringLiteral("Quick"))));
     const bool listed = waitUntil([&] { const Wallpaper* q = rowTitled(m->wallpapers(), QStringLiteral("Quick")); return q && q->assetStamp.size == 2000; }, kWaitMs);
+    // CONTROL: app/library/folder_watcher.cpp:438, readWatchEvents' `if (changed) m_settle.start();` removed,
+    //       control_batch 2026-10-15, app_library_changes '^closedDuringScan$' -> "FAIL: S15.56: quick was not
+    //       listed whole by the scan its copy scheduled; [Good]"; restored, green.
     expect(listed, QStringLiteral("S15.56: quick was not listed whole by the scan its copy scheduled; [%1]").arg(titles(m->wallpapers())));
 }
 
@@ -907,14 +913,14 @@ void modelRows() {
                .arg(inserts).arg(removals).arg(moves).arg(changes));
 }
 
-// The user's state on a listed wallpaper: it is selected and its speed edited to 1.8, which is not
-// its default and within the range every manifest here declares.
+// The user's state on a listed wallpaper: it is selected and its speed edited to 0.5, which is not
+// its default and is a choice every manifest here offers.
 bool selectEdited(LibraryManager& m, const QString& path) {
-    return m.select(path) && m.setPropertyValue(QStringLiteral("speed"), 1.8);
+    return m.select(path) && m.setPropertyValue(QStringLiteral("speed"), 0.5);
 }
 
 bool keptEdited(const LibraryManager& m, const QString& path) {
-    return m.selectedPath() == path && m.propertyValues().value(QStringLiteral("speed")) == QVariant(1.8);
+    return m.selectedPath() == path && m.propertyValues().value(QStringLiteral("speed")) == QVariant(0.5);
 }
 
 QString selectionOf(const LibraryManager& m) {
@@ -955,11 +961,12 @@ void rewrittenInPlace(const QString& root) {
         //       tell a held row from a scan that never ran; c moved in half-way forces one. For
         //       wallpaper.json the half is proven to read broken, so that scan provably saw it; for
         //       the asset the kept row is recognised by its old asset size. Every publish is recorded.
-        // CONTROL: app/library/folder_watcher.cpp, handle()'s `hold(*tree, path);` (its IN_MODIFY
-        //       branch) deleted -> red, "S15.60: while a was rewritten a scan published
-        //       [B,C,a(broken)], selected "" with speed " and "S15.60 (the asset): ... [A v1@1500,B,C]";
-        //       app/library/library_manager.cpp holdBack()'s `scan.append(shown);` deleted -> red,
-        //       "... published [B,C], selected "" ..."; restored.
+        // CONTROL: control_batch, re-run 2026-10-15: app/library/folder_watcher.cpp, handle()'s
+        //       `hold(*tree, path);` (its IN_MODIFY branch) deleted -> red, "S15.60: while a was rewritten a
+        //       scan published [B,C,a(broken)], selected "" with speed " and "S15.60 (the asset): while a was
+        //       rewritten a scan published [A v1@1500,B,C], selected "a" with speed 0.5";
+        //       app/library/library_manager.cpp holdBack()'s `scan.append(shown);` deleted -> red, both
+        //       "... published [B,C], selected "" with speed "; restored.
         QFile file(written);
         const qsizetype half = v2.size() / 2;
         if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate) || !writeSlowly(file, v2.left(half), 2, kWriteGapMs)) {
@@ -1036,9 +1043,10 @@ void rewrittenWhilePolled(const QString& root) {
     //       changed since the scan began, and closed, so no writer check can be what keeps the row.
     //       No event loop runs meanwhile, so no poll interleaves. sentinel is removed in the same
     //       window: a publish without it proves the result was handled.
-    // CONTROL: app/library/folder_watcher.cpp, scanFinished()'s `if (auto* polled = std::get_if<PollWatch>(&m_watch)) {...}`
-    //       block deleted -> red, "S15.60 (polling): the scan that read a half-written published
-    //       [a(broken)], selected "" with speed "; restored.
+    // CONTROL: app/library/folder_watcher.cpp, control_batch 2026-10-15: scanFinished()'s
+    //       `if (auto* polled = std::get_if<PollWatch>(&m_watch)) {...}` made never to run (`; false`) -> red,
+    //       "S15.60 (polling): the scan that read a half-written published [a(broken)], selected "" with
+    //       speed "; restored.
     QString unproven;
     {
         PoolHold hold(kWaitMs);

@@ -266,33 +266,37 @@ void detail(QQmlEngine& engine, QQuickWindow& window, LibraryManager& library, A
     collect<WallpaperProperty>(view.get(), rows);
     std::ranges::sort(rows, {}, [](const QQuickItem* row) { return row->mapToScene(QPointF(0, 0)).y(); });
     QStringList order;
-    QQuickItem* slider = nullptr;
+    QQuickItem* speedSlider = nullptr;
     QQuickItem* toggle = nullptr;
     QQuickItem* speedRow = nullptr;
     QQuickItem* muteRow = nullptr;
     QQuickItem* volumeRow = nullptr;
+    QQuickItem* zoomRow = nullptr;
     for (QQuickItem* row : rows) {
         const QString key = row->property("modelData").value<WallpaperProperty>().key;
         order.append(key);
         if (key == u"speed") {
-            slider = firstInheriting(row, "QQuickSlider");
+            speedSlider = firstInheriting(row, "QQuickSlider");
             speedRow = row;
         } else if (key == u"mute") {
             toggle = firstInheriting(row, "QQuickSwitch");
             muteRow = row;
         } else if (key == u"volume") {
             volumeRow = row;
+        } else if (key == u"zoom") {
+            zoomRow = row;
         }
     }
     // GOAL: S15.46 -- the detail view lists the settings top to bottom in wallpaper.json's order, the
     //       volume the library adds for a video with sound after them.
     // CONTROL: app/qml/WallpaperDetail.qml, the Repeater's `model: root.chosen.properties` made
     //       `root.chosen.properties.slice().sort((a, b) => a.key.localeCompare(b.key))` (control_batch,
-    //       re-run 2026-10-11) -> red, "S15.46: the settings are shown as mute,speed,tint,volume"; restored.
-    expect(order.join(u',') == u"speed,mute,tint,volume",
-           QStringLiteral("S15.46: the settings are shown as %1, not speed,mute,tint,volume").arg(order.join(u',')));
-    if (!slider || !toggle || !volumeRow) {
-        expect(false, QStringLiteral("S15.46: no slider for speed, no switch for mute or no row for volume"));
+    //       re-run 2026-10-15) -> red, "S15.46: the settings are shown as mute,speed,tint,volume,zoom, not
+    //       speed,mute,tint,zoom,volume"; restored.
+    expect(order.join(u',') == u"speed,mute,tint,zoom,volume",
+           QStringLiteral("S15.46: the settings are shown as %1, not speed,mute,tint,zoom,volume").arg(order.join(u',')));
+    if (!speedRow || !toggle || !volumeRow || !zoomRow) {
+        expect(false, QStringLiteral("S15.46: no row for speed, no switch for mute, or no row for volume or zoom"));
         return;
     }
     // The shown texts of a row's labels, left to right.
@@ -313,60 +317,109 @@ void detail(QQmlEngine& engine, QQuickWindow& window, LibraryManager& library, A
 
     // GOAL: S15.482 -- a video's own sound settings are labelled "Sound" and "Volume" whatever
     //       wallpaper.json calls them, and the volume shows as a whole percentage: 100 % at 1, 25 % at
-    //       0.25, while another float keeps two decimals.
+    //       0.25; the speed row shows its label and its three choices, and no number; any other float
+    //       (zoom) shows two decimals: 1.25 at its default, 0.50 at 0.5.
     // CONTROL: via control_batch.sh, 2026-10-11, each alone, reverted, in app/qml/WallpaperDetail.qml: the
     //       volume's percentage made `Number(row.current).toFixed(2)` -> "FAIL: S15.482: ... the volume row
     //       [Volume, 1.00] at 1 and [Volume, 0.25] at 0.25 ..."; the label made `row.modelData.label` ->
-    //       "... the mute row reads [Mute], the volume row [volume, 100 %] ...".
+    //       "... the mute row reads [Mute], the volume row [volume, 100 %] ...". The speed row,
+    //       control_batch 2026-10-15: the choice button's `text: qsTr("%1×").arg(modelData)` made
+    //       `qsTr("%1").arg(modelData)` -> red, "... the speed row [Speed, 0.5, 1, 2] (edits taken 1)".
     {
         const QStringList muteTexts = textsOf(muteRow);
         const QStringList speedTexts = textsOf(speedRow);
         const QStringList atOne = textsOf(volumeRow);
-        library.setPropertyValue(QStringLiteral("volume"), 0.25);
+        const QStringList zoomDefault = textsOf(zoomRow);
+        const bool edited = library.setPropertyValue(QStringLiteral("volume"), 0.25) && library.setPropertyValue(QStringLiteral("zoom"), 0.5);
         settleEvents(window);
         const QStringList atQuarter = textsOf(volumeRow);
+        const QStringList zoomHalf = textsOf(zoomRow);
         library.resetPropertyValues();
         settleEvents(window);
-        expect(muteTexts.value(0) == u"Sound" && atOne == QStringList{QStringLiteral("Volume"), QStringLiteral("100 %")} &&
+        expect(edited && muteTexts.value(0) == u"Sound" && atOne == QStringList{QStringLiteral("Volume"), QStringLiteral("100 %")} &&
                    atQuarter == QStringList{QStringLiteral("Volume"), QStringLiteral("25 %")} &&
-                   speedTexts == QStringList{QStringLiteral("Speed"), QStringLiteral("1.00")},
-               QStringLiteral("S15.482: the mute row reads [%1], the volume row [%2] at 1 and [%3] at 0.25, the speed row [%4]")
-                   .arg(muteTexts.join(u", "), atOne.join(u", "), atQuarter.join(u", "), speedTexts.join(u", ")));
+                   speedTexts == QStringList{QStringLiteral("Speed"), QStringLiteral("0.5×"), QStringLiteral("1×"), QStringLiteral("2×")},
+               QStringLiteral("S15.482: the mute row reads [%1], the volume row [%2] at 1 and [%3] at 0.25, the speed row [%4] (edits taken %5)")
+                   .arg(muteTexts.join(u", "), atOne.join(u", "), atQuarter.join(u", "), speedTexts.join(u", ")).arg(edited));
+        // CONTROL: app/qml/WallpaperDetail.qml, control_batch 2026-10-15: the value label's
+        //       `Number(row.current).toFixed(2)` made `toFixed(1)` -> red, "S15.482: the zoom row reads
+        //       [Zoom, 1.3] at 1.25 and [Zoom, 0.5] at 0.5"; restored.
+        expect(zoomDefault == QStringList{QStringLiteral("Zoom"), QStringLiteral("1.25")} &&
+                   zoomHalf == QStringList{QStringLiteral("Zoom"), QStringLiteral("0.50")},
+               QStringLiteral("S15.482: the zoom row reads [%1] at 1.25 and [%2] at 0.5").arg(zoomDefault.join(u", "), zoomHalf.join(u", ")));
     }
-    const auto sliderValue = [&] { return slider->property("value").toDouble(); };
     const auto speed = [&] { return library.propertyValues().value(QStringLiteral("speed")).toDouble(); };
+    QList<QQuickItem*> choices;
+    for (QQuickItem* button : allInheriting(speedRow, "QQuickAbstractButton")) {
+        if (button->isVisible()) {
+            choices.append(button);
+        }
+    }
+    std::ranges::sort(choices, {}, [](const QQuickItem* item) { return item->mapToScene(QPointF(0, 0)).x(); });
+    // The texts of the checked choice buttons, left to right: exactly one when the control is right.
+    const auto checkedChoices = [&] {
+        QStringList on;
+        for (const QQuickItem* button : choices) {
+            if (button->property("checked").toBool()) {
+                on.append(button->property("text").toString());
+            }
+        }
+        return on.join(u',');
+    };
+    // GOAL: S15.46 -- speed is chosen with one checkable button per playback speed, 0.5×, 1× and 2×,
+    //       and no slider; the default's button (1×) starts checked, alone.
+    // CONTROL: app/qml/WallpaperDetail.qml, control_batch 2026-10-14: `isChoice` made `false` (the
+    //       slider back) -> red, "S15.46: the speed row shows a slider 1 and buttons [] with [] checked".
+    const bool sliderShown = speedSlider && speedSlider->isVisible();
+    QStringList choiceTexts;
+    for (const QQuickItem* button : choices) {
+        choiceTexts.append(button->property("text").toString() + (button->property("checkable").toBool() ? QString() : QStringLiteral("(not checkable)")));
+    }
+    expect(!sliderShown && choiceTexts == QStringList{QStringLiteral("0.5×"), QStringLiteral("1×"), QStringLiteral("2×")} && checkedChoices() == u"1×",
+           QStringLiteral("S15.46: the speed row shows a slider %1 and buttons [%2] with [%3] checked")
+               .arg(sliderShown).arg(choiceTexts.join(u", "), checkedChoices()));
+    if (choices.size() != 3) {
+        return;
+    }
 
-    // GOAL: S15.46 -- the speed slider shows the library's value: an edit made in C++ moves it.
-    // CONTROL: app/qml/WallpaperDetail.qml, the Slider's `value: row.modelData.type === "float" ? row.current : 0`
-    //       made `? row.modelData.defaultValue : 0` -> red, "S15.46: after speed was set to 2 in the library the slider shows 1"; restored.
+    // GOAL: S15.46 -- the speed buttons show the library's value: an edit made in C++ checks its button.
+    // CONTROL: app/qml/WallpaperDetail.qml, control_batch 2026-10-15: the button's `checked:` binding
+    //       made `modelData === row.modelData.defaultValue` -> red, "S15.46: after speed was set to 2 in
+    //       the library the checked speed is [1×]".
     library.setPropertyValue(QStringLiteral("speed"), 2.0);
     settleEvents(window);
-    expect(sliderValue() == 2.0, QStringLiteral("S15.46: after speed was set to 2 in the library the slider shows %1").arg(sliderValue()));
+    expect(checkedChoices() == u"2×", QStringLiteral("S15.46: after speed was set to 2 in the library the checked speed is [%1]").arg(checkedChoices()));
 
-    // GOAL: S15.46 -- dragging the slider writes the library's value, and "Reset to defaults"
-    //       afterwards moves the dragged slider back to the default: user input does not cut the
-    //       slider loose from the library.
-    // WHY-THIS-SHAPE: a real press-move-release on the track, since only user input can break the
-    //       binding; resetting without a drag first would pass a slider whose binding breaks on drag.
-    // CONTROL: app/qml/WallpaperDetail.qml, the Slider's `onMoved: root.library.setPropertyValue(row.modelData.key, value)`
-    //       made `onMoved: { root.library.setPropertyValue(row.modelData.key, value); value = value; }`
-    //       -> red, "S15.46: after a drag and a reset the slider shows 1.85878, not 1" (control_batch,
-    //       2026-10-02); restored.
-    const QPointF left = slider->mapToScene(QPointF(slider->width() * 0.5, slider->height() / 2));
-    const QPointF right = slider->mapToScene(QPointF(slider->width() * 0.9, slider->height() / 2));
-    QTest::mousePress(&window, Qt::LeftButton, {}, left.toPoint());
-    for (int step = 1; step <= 5; ++step) {
-        QTest::mouseMove(&window, (left + (right - left) * step / 5.0).toPoint());
-    }
-    QTest::mouseRelease(&window, Qt::LeftButton, {}, right.toPoint());
+    // GOAL: S15.46 -- a click on a speed button writes the library and checks that button alone; a
+    //       second click on it leaves it checked; "Reset to defaults" afterwards checks the default's
+    //       button again, and a C++ edit after that still moves it: user input does not cut the buttons
+    //       loose from the library.
+    // WHY-THIS-SHAPE: real clicks, since only user input can break a `checked` binding; resetting
+    //       without a click first would pass buttons whose binding breaks on click. The second click is
+    //       the one a plain checkable button would turn off.
+    // CONTROL: app/qml/WallpaperDetail.qml, control_batch 2026-10-14: onClicked deleted -> red, "S15.46:
+    //       after a click on 0.5× the library holds speed 2 and [0.5×] is checked"; 2026-10-15:
+    //       `autoExclusive: true` made `false` -> red, "S15.46: after a second click on 0.5× the library
+    //       holds speed 0.5 and [] is checked". Not red: onClicked given `checked = checked;` after the write (the clicked
+    //       button's binding cut) stays green, since at the reset the 1× button's binding checks it and
+    //       autoExclusive unchecks the rest; the reset line went red under the `checked:` break above
+    //       ("S15.46: after a reset [0.5×] is checked, not 1×", 2026-10-15).
+    QTest::mouseClick(&window, Qt::LeftButton, {}, centreOf(choices[0]));
     settleEvents(window);
-    // Dragged to 90% of a 0.1-2 track, from 2 (its end): strictly between proves the drag wrote it.
-    const double dragged = speed();
-    expect(dragged > 1.5 && dragged < 2.0 && std::abs(dragged - sliderValue()) < 1e-9,
-           QStringLiteral("S15.46: after dragging the slider right the library holds speed %1 and the slider shows %2").arg(dragged).arg(sliderValue()));
+    expect(speed() == 0.5 && checkedChoices() == u"0.5×",
+           QStringLiteral("S15.46: after a click on 0.5× the library holds speed %1 and [%2] is checked").arg(speed()).arg(checkedChoices()));
+    QTest::mouseClick(&window, Qt::LeftButton, {}, centreOf(choices[0]));
+    settleEvents(window);
+    expect(speed() == 0.5 && checkedChoices() == u"0.5×",
+           QStringLiteral("S15.46: after a second click on 0.5× the library holds speed %1 and [%2] is checked").arg(speed()).arg(checkedChoices()));
     library.resetPropertyValues();
     settleEvents(window);
-    expect(sliderValue() == 1.0, QStringLiteral("S15.46: after a drag and a reset the slider shows %1, not 1").arg(sliderValue()));
+    expect(checkedChoices() == u"1×", QStringLiteral("S15.46: after a reset [%1] is checked, not 1×").arg(checkedChoices()));
+    library.setPropertyValue(QStringLiteral("speed"), 2.0);
+    settleEvents(window);
+    expect(checkedChoices() == u"2×", QStringLiteral("S15.46: after a click, a reset and a C++ edit to 2, [%1] is checked").arg(checkedChoices()));
+    library.resetPropertyValues();
+    settleEvents(window);
 
     // GOAL: S15.46 and S15.481 -- the mute setting shows as a "Sound" switch that is on when the
     //       wallpaper is not muted: muted by default, it starts off; a click turns it on and the library's
@@ -681,8 +734,11 @@ int main(int argc, char* argv[]) {
 
     const QString dir = scratch.path() + QStringLiteral("/lib #?% é");
     const QString ocean = dir + QStringLiteral("/ocean");
-    // A video with sound, so the detail view offers its sound controls (S15.473).
-    if (!writeFolder(ocean, planEntriesWith(QByteArray(kPlanManifest), soundVideo())).isEmpty() ||
+    // A video with sound, so the detail view offers its sound controls (S15.473), and a float other
+    // than speed and volume, shown as a number (S15.482).
+    OrderedJson oceanManifest = planManifest();
+    oceanManifest["properties"]["zoom"] = OrderedJson::parse(R"({"type": "float", "default": 1.25, "min": 0.0, "max": 4.0, "label": "Zoom"})");
+    if (!writeFolder(ocean, planEntriesWith(jsonBytes(oceanManifest), soundVideo())).isEmpty() ||
         !writeFolder(dir + QStringLiteral("/broken"), {{QStringLiteral("wallpaper.json"), "hello"}}).isEmpty()) {
         harnessFailure("the library folder could not be built");
         static_cast<void>(wallpaperx::testing::reportHarnessFaults("in this test file's fixtures, not in the app"));

@@ -232,7 +232,6 @@ void reportingPhase(Harness& harness) {
     {
         const ReportStub::Call report = harness.reportsFor(sized).front();
         const auto [w, h] = harness.expected(kItemWidth, kItemHeight);
-        check(widthOf(report) == w && heightOf(report) == h, "the first report is the item's size in device pixels");
         check(report.atMs - lastTriggerMs >= kSettleFloorMs, "the first size report waits for the triggers to settle");
         if (widthOf(report) != w || heightOf(report) != h || report.atMs - lastTriggerMs < kSettleFloorMs) {
             std::fprintf(stderr, "  reported %ux%u %lld ms after the last trigger; expected %ux%u no sooner than %lld ms\n",

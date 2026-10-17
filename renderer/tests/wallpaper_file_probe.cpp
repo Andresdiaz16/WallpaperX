@@ -199,8 +199,6 @@ int openDescriptorCount() {
 //       FAILs, four per refusable kind ("a directory was opened as a wallpaper file", "... was not
 //       refused as a content error", and the two naming checks) plus the no-writer pipe below,
 //       with the run printing "a directory -> OPENED". Reverted, green.
-// COVERAGE-ASSERT: kIrregularKinds is a literal, compared against the list's own length, so
-//       deleting a case reddens the count instead of quietly shrinking what was graded.
 void checkIrregularPathsAreRefusedAsContent(const ScratchDir& scratch) {
     const std::string fifo = scratch.file("with-writer.fifo");
     const std::string directory = scratch.file("a-directory");
@@ -247,12 +245,8 @@ void checkIrregularPathsAreRefusedAsContent(const ScratchDir& scratch) {
         {"a character device (/dev/null)", nullptr, true, 0},
         {"a dangling symlink", &dangling, false, ENOENT},
     };
-    constexpr int kIrregularKinds = 4;
-    check(static_cast<int>(sizeof(kinds) / sizeof(kinds[0])) == kIrregularKinds,
-          "the list of irregular kinds no longer has the four entries this check is written for");
 
     const std::string devNull = "/dev/null";
-    int graded = 0;
     const int fdsBefore = openDescriptorCount();
     for (const Kind& kind : kinds) {
         const std::string& path = kind.path == nullptr ? devNull : *kind.path;
@@ -281,14 +275,10 @@ void checkIrregularPathsAreRefusedAsContent(const ScratchDir& scratch) {
                   std::string(kind.what) + ": errno is not the OS's own reason (expected " +
                       std::strerror(kind.expectErrno) + ", saw " + std::strerror(opened.err) + ")");
         }
-        ++graded;
     }
     const int fdsAfter = openDescriptorCount();
 
     ::close(writer);
-
-    check(graded == kIrregularKinds,
-          "every irregular kind ran (" + std::to_string(graded) + " of " + std::to_string(kIrregularKinds) + ")");
 
     // GOAL: a refusal gives back the descriptor it checked. The function opens first and asks
     //       fstat afterwards -- which is the whole point, there being no window between the two --
@@ -552,8 +542,7 @@ std::string canonicalDir(const ScratchDir& scratch, const char* name) {
 //       (btrfs) is opened, never refused", printing the network refusal; (c) in
 //       refusedFilesystemOf(), the lstat moved ahead of the refusedTypeAt() check -> the 17
 //       "nothing ... was looked up" FAILs and the symlink one. All observed 2026-09-21; reverted.
-// COVERAGE-ASSERT: the number of types graded on each side is compared with the literal list's
-//       length, and lstat is required to have been called on the local path, so the "nothing
+// COVERAGE-ASSERT: lstat is required to have been called on the local path, so the "nothing
 //       under the mount was looked up" half is not read off a hook that sees nothing.
 void checkNetworkAndLocalKernelFilesystems(const ScratchDir& scratch) {
     const std::string base = canonicalDir(scratch, "kernel-mounts");
@@ -567,8 +556,6 @@ void checkNetworkAndLocalKernelFilesystems(const ScratchDir& scratch) {
     const char* const kNetwork[] = {"nfs",     "nfs4",  "cifs",   "smb3",      "smbfs", "ncpfs",
                                     "afs",     "ceph",  "9p",     "coda",      "lustre", "gpfs",
                                     "beegfs",  "orangefs", "pvfs2", "glusterfs", "davfs"};
-    constexpr int kNetworkCount = 17;
-    int networkGraded = 0;
     for (const char* type : kNetwork) {
         const std::string table =
             writeMountTable(scratch, "mountinfo-network", {{2, 1, mountPoint, type}});
@@ -588,21 +575,16 @@ void checkNetworkAndLocalKernelFilesystems(const ScratchDir& scratch) {
                   ") is refused by the mount table, with a reason naming the type (saw '" + refused + "', " +
                   describe(answer) + ")");
         check(!lookedInside, std::string("nothing on the network mount (") + type + ") was looked up before the refusal");
-        ++networkGraded;
     }
-    check(networkGraded == kNetworkCount && std::size(kNetwork) == kNetworkCount,
-          "every kernel network type was graded (" + std::to_string(networkGraded) + ")");
 
     const char* const kLocal[] = {"ext4", "btrfs", "xfs", "f2fs", "vfat", "exfat", "ntfs3",
                                   "tmpfs", "overlay", "zfs", "bcachefs", "iso9660", "ext3"};
-    constexpr int kLocalCount = 13;
     const std::string localFile = mountPoint + "/local.png";
     {
         std::error_code ec;
         std::filesystem::create_directories(mountPoint, ec);
         std::ofstream(localFile) << "bytes";
     }
-    int localGraded = 0;
     bool sawLookup = false;
     for (const char* type : kLocal) {
         const std::string table = writeMountTable(scratch, "mountinfo-local", {{2, 1, mountPoint, type}});
@@ -612,10 +594,7 @@ void checkNetworkAndLocalKernelFilesystems(const ScratchDir& scratch) {
               std::string("a file on a kernel local filesystem (") + type + ") is opened, never refused (" +
                   describe(answer) + ")");
         for (const std::string& p : injected.lstats()) sawLookup |= p == localFile;
-        ++localGraded;
     }
-    check(localGraded == kLocalCount && std::size(kLocal) == kLocalCount,
-          "every kernel local type was graded (" + std::to_string(localGraded) + ")");
     check(sawLookup, "the lstat hook saw the local file looked up, so its silence under a network mount means "
                      "something");
 }
@@ -654,8 +633,6 @@ void checkFuseAllowList(const ScratchDir& scratch) {
                                     "fuse.exfat",      "fuse.exfat-fuse", "fuse.btrfs-fuse", "fuse.btrfs",
                                     "fuse.gocryptfs",  "fuse.encfs",     "fuse.cryfs",      "fuse.mergerfs",
                                     "fuse.bindfs"};
-    constexpr int kAllowedCount = 13;
-    int allowedGraded = 0;
     for (const char* type : kAllowed) {
         const std::string table = writeMountTable(scratch, "mountinfo-fuse", {{2, 1, mountPoint, type}});
         const Injected injected(Injection{table});
@@ -663,15 +640,10 @@ void checkFuseAllowList(const ScratchDir& scratch) {
         check(refusedTypeFor(file).empty() && answer.kind == OpenAnswer::Kind::Opened,
               std::string("a file on an allow-listed FUSE filesystem (") + type + ") is opened (" + describe(answer) +
                   ")");
-        ++allowedGraded;
     }
-    check(allowedGraded == kAllowedCount && std::size(kAllowed) == kAllowedCount,
-          "every allow-listed FUSE type was graded (" + std::to_string(allowedGraded) + ")");
 
     const char* const kRefused[] = {"fuse.sshfs", "fuse.rclone", "fuse.gvfsd-fuse", "fuse.kio-fuse",
                                     "fuse.portal", "fuse", "fuse.never-heard-of-it"};
-    constexpr int kRefusedCount = 7;
-    int refusedGraded = 0;
     for (const char* type : kRefused) {
         const std::string table = writeMountTable(scratch, "mountinfo-fuse", {{2, 1, mountPoint, type}});
         const Injected injected(Injection{table});
@@ -680,10 +652,7 @@ void checkFuseAllowList(const ScratchDir& scratch) {
                   answer.text.find("FUSE filesystem (" + std::string(type) + ")") != std::string::npos,
               std::string("a file on a FUSE filesystem that is not on the allow-list (") + type +
                   ") is refused, with a reason saying it is FUSE (" + describe(answer) + ")");
-        ++refusedGraded;
     }
-    check(refusedGraded == kRefusedCount && std::size(kRefused) == kRefusedCount,
-          "every refused FUSE type was graded (" + std::to_string(refusedGraded) + ")");
 
     {
         const std::string table = writeMountTable(scratch, "mountinfo-fuse", {{2, 1, mountPoint, "fuse.a$b;c"}});

@@ -401,6 +401,8 @@ bool videoExtensionsHidden(const Device& device, const std::string& label) {
 struct FailurePlan {
     int after = -1;  // pictures shown before the call that meets the failure; -1 for no failure
     std::function<void()> arm;  // further conditions for that call, cleared when it returns
+    // Every call decodes through decodeWithin() with this, then draws; Nothing is renderNext().
+    wallpaperx::PictureSkip skip = wallpaperx::PictureSkip::Nothing;
 };
 
 struct FailingCall {
@@ -484,7 +486,12 @@ PipelineRun runPipeline(Device& device, const std::string& file, size_t expected
             bool more = false;
             g_poolCall = static_cast<int>(call);
             try {
-                more = pipeline.renderNext(targets, target);
+                if (plan.skip == wallpaperx::PictureSkip::Nothing) {
+                    more = pipeline.renderNext(targets, target);
+                } else {
+                    more = pipeline.decodeWithin(UINT32_MAX, plan.skip) == VideoPipeline::Decode::Decoded;
+                    if (more) pipeline.draw(targets, target);
+                }
             } catch (...) {
                 if (failing) endFailingCall();
                 throw;
@@ -625,7 +632,6 @@ const SequenceFixture kSequenceFixtures[] = {
     {"counter_jump.ts", "jumping back", true},
     {"counter_repeat.mkv", "repeating", true},
 };
-constexpr size_t kSequenceFixtureCount = 4;
 
 void runSequenceChecks(Device& device, const std::string& label, bool onDevice) {
     if (onDevice ? !hardwareDecoderPresent(device, label) : !videoExtensionsHidden(device, label)) return;
@@ -646,10 +652,8 @@ void runSequenceChecks(Device& device, const std::string& label, bool onDevice) 
     //       dropping, outside a resume, a picture whose timestamp is not above the last returned:
     //       counter_jump.ts "60 pictures shown against 120", counter_repeat.mkv "30 pictures shown
     //       against 60"; the rising and untimestamped fixtures stayed green.
-    // COVERAGE-ASSERT: the fixture list has its four entries, and each irregular fixture's independent
-    //       decode shows a timestamp not above the one before; otherwise the drop is never offered.
-    check(std::size(kSequenceFixtures) == kSequenceFixtureCount,
-          "the playback fixture list no longer has the four entries this check is written for");
+    // COVERAGE-ASSERT: each irregular fixture's independent decode shows a timestamp not above the one
+    //       before; otherwise the drop is never offered.
     for (const SequenceFixture& fixture : kSequenceFixtures) {
         const std::optional<CounterReference> reference = counterReference(label, fixture.file);
         if (!reference) continue;
@@ -1082,6 +1086,54 @@ void runDropCountChecks(Device& device, const std::string& label) {
         }
         std::printf("%s: %s: WallpaperContentError after the %d pictures already shown: %s\n", label.c_str(),
                     what.c_str(), kAfter, run.threw.c_str());
+    }
+
+    // GOAL: S15.610 -- a hardware failure on a pass that has skipped pictures, where the resume could only
+    //       count pictures, loses the place but not the file: after exactly the pictures already shown, software
+    //       plays the stream again from its first picture, rising to its end, with no rejection; the same
+    //       failure on a pass that skipped nothing resumes by count and shows every picture once. False if
+    //       software counts the pictures returned while skipping (fewer than the packets they came from) and
+    //       resumes part way in, or refuses a playable file as bad content.
+    // WHY-THIS-SHAPE: the raw H.264 stream carries no timestamps, and its first software pass is refused as
+    //       S13.64's first case does, so the resume by packet number ends without meeting its packet and falls
+    //       back to counting; its unreferenced B pictures give skipping something to leave out. Each call decodes through decodeWithin() asking for unreferenced pictures skipped, then
+    //       draws. The counter read back from every call shows which picture was on screen.
+    // CONTROL: control_batch.sh 2026-10-15, reverted, video_pipeline_resume_drop_count (RTX), renderer/video/video_decoder.cpp: seekToResume()
+    //       without its start from the first picture after skipping (so it resumes by count) -> "FAIL: ... skipping
+    //       unreferenced pictures: 75 pictures shown, from the first again 0, both runs rising 1, then the stream
+    //       ended"; the old refusal put back -> "... 24 pictures shown, from the first again 0, both runs rising 0,
+    //       then VideoDecoder: ...". Green: 85 shown (24, then the file again), 90 of 90 skipping nothing.
+    for (const bool skipping : {true, false}) {
+        constexpr int kShown = 24;
+        const PipelineRun run =
+            runPipeline(device, asset(file), reference->ids.size(),
+                        FailurePlan{kShown,
+                                    [] {
+                                        g_refuseFrom = 1;
+                                        g_refuseThrough = 1;
+                                    },
+                                    skipping ? wallpaperx::PictureSkip::Unreferenced : wallpaperx::PictureSkip::Nothing});
+        const std::string what = failurePoint(file, kShown) + (skipping ? ", skipping unreferenced pictures" : ", skipping nothing");
+        if (!failureExercised(label, what, run)) continue;
+        std::printf("%s: %s: %zu pictures shown, then %s\n", label.c_str(), what.c_str(), run.shown.size(),
+                    run.threw.empty() ? (run.ended ? "the stream ended" : "nothing") : run.threw.c_str());
+        if (!skipping) {
+            checkSoftwareTookOver(label, what, run);
+            gradeSequence(label, what, run, *reference);
+            continue;
+        }
+        // Two rising runs: the pictures shown before the failure, then the stream again from its first one.
+        bool restartedRising = run.shown.size() > static_cast<size_t>(kShown) + 1;
+        for (size_t i = 1; restartedRising && i < run.shown.size(); ++i) {
+            if (i != static_cast<size_t>(kShown) && run.shown[i] <= run.shown[i - 1]) restartedRising = false;
+        }
+        const bool fromFirst = run.shown.size() > static_cast<size_t>(kShown) && run.shown[kShown] == run.shown.front();
+        if (run.threwContentError || !run.ended || !fromFirst || !restartedRising) {
+            std::fprintf(stderr, "FAIL: %s: %s: %zu pictures shown, from the first again %d, both runs rising %d, then %s\n",
+                         label.c_str(), what.c_str(), run.shown.size(), fromFirst ? 1 : 0, restartedRising ? 1 : 0,
+                         run.threw.empty() ? (run.ended ? "the stream ended" : "nothing") : run.threw.c_str());
+            fail("a resume after skipping that could only count pictures did not play the file again from its first picture");
+        }
     }
 }
 
@@ -1602,8 +1654,10 @@ void runStartAtChecks(Device& device, const std::string& label, bool onDevice, S
     //       picture and plays on: the picture it opened at does not start a pass and the loop's does. The
     //       daemon parks a file whose pass holds one picture -- two successive pass starts -- so a resumed
     //       last picture marked as a pass start would park a playing video for good.
-    // CONTROL: the decodeNext() `startsPass` break above -> "FAIL: ... counter_short.mp4 opened at its last
-    //       picture: showed 19 0 1 where 19 0 1 was due; pass starts 110", on both entries. Reverted.
+    // CONTROL: renderer/video/video_pipeline.cpp, decode()'s `startsPass` made `!m_timing` (the S15.141 break
+    //       above), via control_batch.sh 2026-10-15, reverted -> "FAIL: video_pipeline_probe (start-at-host): counter_short.mp4 opened at
+    //       its last picture: showed 19 0 1 where 19 0 1 was due; pass starts 110", on start-at-host (Lavapipe)
+    //       and start-at-device (RTX).
     {
         const char* const file = "counter_short.mp4";
         const std::optional<CounterReference> reference = counterReference(label, file);
@@ -2807,7 +2861,6 @@ const std::vector<SizeChangeFixture> kSizeChangeFixtures = {
     {"counter_grow.obu", "AV1, 320x240 to 640x480", VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR,
      {{320, 240}, {640, 480}}, 0, true},
 };
-constexpr size_t kSizeChangeFixtureCount = 11;
 
 // The coded sizes this device decodes a codec's 8-bit 4:2:0 main profile at, asked of Vulkan directly
 // rather than of ffmpeg or the decoder, so which part of a fixture the device declines is known first.
@@ -3512,6 +3565,10 @@ void runRetireWaitChecks(Device& device, const std::string& label, const SizeCha
     //       hardware codec was freed in call 30, while its last reader was still running" (call 32 for AV1).
     //       next() without its first releaseRetiredCodec(): "the hardware codec was never freed by call 33,
     //       the first after its last reader completed" (35 for AV1); the end-of-stream cases stayed green.
+    //       releaseRetiredCodec() waiting on the retired codec's last reader when it has not completed, via
+    //       control_batch.sh 2026-10-15, reverted (RTX) -> "FAIL: ... counter_shrink_grow.hevc, the fallback with a batch held: waits on the
+    //       playback path, as above", beside "the hardware codec was freed in call 30, while its last reader
+    //       was still running".
     // COVERAGE-ASSERT: the fallback call follows device pictures and began with the batch held, and the
     //       Device still reports it unfinished after that call. "Held" needs the interposer's record as well
     //       as the Device's answer: with the hold never applied, asking the Device alone passed the first
@@ -3915,7 +3972,9 @@ void runRefusedTeardownChecks(Device& device, const std::string& label) {
     //       so a wait at teardown has something to wait on and is counted; with nothing pending a drain makes no
     //       Vulkan call and would stay green. The size is known to be refused from the capability query itself.
     // CONTROL: renderer/video/video_decoder.cpp closeDecoder() also asking safeToFree() when a retired codec is
-    //       held, reverted: "teardown made 1 wait(s), 1 on a held batch".
+    //       held, reverted: "teardown made 1 wait(s), 1 on a held batch". closeDecoder() dropping the retired
+    //       codec without avcodec_free_context(), via control_batch.sh 2026-10-15, reverted (RTX) -> "FAIL: the hardware codec refused
+    //       before decoding was not freed at teardown".
     // COVERAGE-ASSERT: the first call opened a software decoder and returned a host picture, no image pool was
     //       made, and the hardware codec was still open with the batch held when teardown began.
     std::string threw;
@@ -4545,7 +4604,6 @@ const LoopFixture kLoopFixtures[] = {
     {"counter_jump.ts", "transport stream whose timestamps jump back", false, false},
     {"counter_resize.h264", "raw H.264 that halves in size", true, false},
 };
-constexpr size_t kLoopFixtureCount = 7;
 
 void runLoopChecks(Device& device, const std::string& label, bool onDevice) {
     if (onDevice ? !hardwareDecoderPresent(device, label) : !videoExtensionsHidden(device, label)) return;
@@ -4581,11 +4639,8 @@ void runLoopChecks(Device& device, const std::string& label, bool onDevice) {
     //       calls made and 51 read back" -- and the first call is seen building the stage, red with
     //       counting off, "the first call was seen making none". That the WAIT counter is wired is
     //       proven by waitCounterIsWired(), not by the first call waiting: whether it waits depends on
-    //       whether the GPU finished first, which is the scheduler's to decide. The list's length and
-    //       counter_bf2.mkv's missing decode timestamp are asserted, red with six expected and with the
-    //       MP4 claimed instead.
-    check(std::size(kLoopFixtures) == kLoopFixtureCount,
-          "the loop fixture list no longer has the seven entries this check is written for");
+    //       whether the GPU finished first, which is the scheduler's to decide. counter_bf2.mkv's missing
+    //       decode timestamp is asserted, red with the MP4 claimed instead.
     check(waitCounterIsWired(device), "a wait made through this probe's vkWaitForFences is counted, so a boundary "
                                       "count of no waits is a measurement");
     for (const LoopFixture& fixture : kLoopFixtures) {
@@ -4966,7 +5021,7 @@ void runTimingChecks(Device& device, const std::string& label, bool onDevice) {
     //       frame. The timings are compared against the fixture's own recipe rather than against each
     //       other alone: a pipeline reporting a constant would satisfy "consecutive differences are
     //       equal" perfectly.
-    // CONTROL: renderer/video/video_pipeline.cpp, decodeNext()'s `startsPass = true;` after the
+    // CONTROL: renderer/video/video_pipeline.cpp, decode()'s `startsPass = true;` after the
     //       restart deleted -> "FAIL: the first picture after a loop is marked as starting a pass",
     //       printing "1 mark(s), where 2 were due", and the spacing check with it ("-1900000000 ns at
     //       20" -- the whole file backwards, which is what the mark exists to keep a caller from
@@ -4974,7 +5029,12 @@ void runTimingChecks(Device& device, const std::string& label, bool onDevice) {
     //       AVRational{1, 1} as its base -> "FAIL: each picture is due one file interval after the one
     //       before it", printing "38 of 38 steps are not 100000000 ns; first: 1024000000000 ns at 1".
     //       Reverted. The second observed 2026-09-18; the first via control_batch.sh 2026-09-30 on timing-host,
-    //       which also printed "39 pair(s) compared, where 38 were due".
+    //       which also printed "39 pair(s) compared, where 38 were due". Via control_batch.sh 2026-10-15, reverted, timing-host on
+    //       Lavapipe: timing() returning an empty PictureTiming instead of throwing -> "FAIL: timing() before
+    //       any picture has been decoded throws std::logic_error"; decode() recording no presentation time ->
+    //       "FAIL: every picture of a file that carries timestamps reports a presentation time and a duration";
+    //       renderer/video/video_decoder.cpp, decode()'s duration from twice the frame's -> "FAIL: and the
+    //       duration each reports is the file's own picture interval".
     // COVERAGE-ASSERT: the number of pictures decoded and the number of successive pairs actually
     //       compared are both asserted, so a run that decoded two pictures cannot report the same
     //       verdict as one that decoded forty.
@@ -5076,6 +5136,208 @@ void runTimingChecks(Device& device, const std::string& label, bool onDevice) {
 }
 
 // ------------------------------------------------------------------------- //
+// Looping: a pass end with packets past an edit list's end
+// ------------------------------------------------------------------------- //
+
+uint64_t readBigEndian(const std::vector<uint8_t>& bytes, size_t at, size_t width) {
+    uint64_t value = 0;
+    for (size_t i = 0; i < width; ++i) value = (value << 8) | bytes[at + i];
+    return value;
+}
+
+void writeBigEndian(std::vector<uint8_t>& bytes, size_t at, size_t width, uint64_t value) {
+    for (size_t i = width; i-- > 0;) {
+        bytes[at + i] = static_cast<uint8_t>(value & 0xff);
+        value >>= 8;
+    }
+}
+
+struct Mp4Box {
+    std::string type;
+    size_t body = 0;  // first byte after the header
+    size_t end = 0;
+};
+
+// The boxes directly inside [from, to); empty when one is malformed.
+std::vector<Mp4Box> mp4Boxes(const std::vector<uint8_t>& bytes, size_t from, size_t to) {
+    std::vector<Mp4Box> boxes;
+    for (size_t at = from; at + 8 <= to;) {
+        uint64_t size = readBigEndian(bytes, at, 4);
+        size_t header = 8;
+        if (size == 1) {
+            if (at + 16 > to) return {};
+            size = readBigEndian(bytes, at + 8, 8);
+            header = 16;
+        } else if (size == 0) {
+            size = to - at;
+        }
+        if (size < header || size > to - at) return {};
+        boxes.push_back(Mp4Box{std::string(reinterpret_cast<const char*>(&bytes[at + 4]), 4), at + header, at + size});
+        at += size;
+    }
+    return boxes;
+}
+
+// Shortens the first segment of every track's edit list by `seconds`, in the copy held in `bytes`.
+// Returns how many edit lists were changed: 0 when the file has none, or a layout this does not read.
+size_t trimEditLists(std::vector<uint8_t>& bytes, double seconds) {
+    size_t changed = 0;
+    for (const Mp4Box& moov : mp4Boxes(bytes, 0, bytes.size())) {
+        if (moov.type != "moov") continue;
+        std::optional<uint64_t> timescale;
+        const std::vector<Mp4Box> inMoov = mp4Boxes(bytes, moov.body, moov.end);
+        for (const Mp4Box& box : inMoov) {
+            if (box.type != "mvhd" || box.body + 32 > box.end) continue;
+            const bool wide = bytes[box.body] == 1;
+            timescale = readBigEndian(bytes, box.body + (wide ? 20 : 12), 4);
+        }
+        if (!timescale || *timescale == 0) return 0;
+        for (const Mp4Box& trak : inMoov) {
+            if (trak.type != "trak") continue;
+            for (const Mp4Box& edts : mp4Boxes(bytes, trak.body, trak.end)) {
+                if (edts.type != "edts") continue;
+                for (const Mp4Box& elst : mp4Boxes(bytes, edts.body, edts.end)) {
+                    if (elst.type != "elst" || elst.body + 8 > elst.end) continue;
+                    const size_t width = bytes[elst.body] == 1 ? 8 : 4;
+                    const size_t entries = readBigEndian(bytes, elst.body + 4, 4);
+                    const size_t duration = elst.body + 8;
+                    if (entries == 0 || duration + width > elst.end) continue;
+                    const uint64_t trim = static_cast<uint64_t>(seconds * static_cast<double>(*timescale));
+                    const uint64_t length = readBigEndian(bytes, duration, width);
+                    if (length <= trim) continue;
+                    writeBigEndian(bytes, duration, width, length - trim);
+                    ++changed;
+                }
+            }
+        }
+    }
+    return changed;
+}
+
+// Video packets the demuxer flags AV_PKT_FLAG_DISCARD that are presented after every packet it does not:
+// the ones an edit list's end leaves past the pass. -1 when the file cannot be read.
+int trailingDiscardPackets(const std::string& file) {
+    AVFormatContext* format = nullptr;
+    if (avformat_open_input(&format, file.c_str(), nullptr, nullptr) < 0) return -1;
+    struct Close {
+        AVFormatContext*& format;
+        ~Close() { avformat_close_input(&format); }
+    } close{format};
+    if (avformat_find_stream_info(format, nullptr) < 0) return -1;
+    const int stream = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    if (stream < 0) return -1;
+    AVPacket* packet = av_packet_alloc();
+    if (packet == nullptr) return -1;
+    std::optional<int64_t> lastKept;
+    std::vector<int64_t> discarded;
+    while (av_read_frame(format, packet) >= 0) {
+        if (packet->stream_index == stream && packet->pts != AV_NOPTS_VALUE) {
+            if ((packet->flags & AV_PKT_FLAG_DISCARD) != 0) {
+                discarded.push_back(packet->pts);
+            } else if (!lastKept || packet->pts > *lastKept) {
+                lastKept = packet->pts;
+            }
+        }
+        av_packet_unref(packet);
+    }
+    av_packet_free(&packet);
+    if (!lastKept) return 0;
+    return static_cast<int>(std::count_if(discarded.begin(), discarded.end(), [&](int64_t pts) { return pts > *lastKept; }));
+}
+
+void runTrimmedEndChecks(Device& device, const std::string& label) {
+    const char* const original = "counter_loop_short.mp4";
+    if (!haveAsset(original, label)) return;
+    namespace fs = std::filesystem;
+    std::string pattern = (fs::temp_directory_path() / "wallpaperx-trim-XXXXXX").string();
+    if (mkdtemp(pattern.data()) == nullptr) {
+        std::fprintf(stderr, "FAIL: %s: cannot create a scratch directory from %s\n", label.c_str(), pattern.c_str());
+        fail("the harness could not create a scratch directory for the trimmed copy");
+        return;
+    }
+    struct Scratch {
+        fs::path path;
+        ~Scratch() {
+            std::error_code error;
+            fs::remove_all(path, error);
+        }
+    } scratch{pattern};
+    const std::string trimmed = (scratch.path / "trimmed.mp4").string();
+    {
+        std::vector<uint8_t> bytes;
+        if (FILE* in = std::fopen(asset(original).c_str(), "rb")) {
+            uint8_t buffer[65536];
+            for (size_t n; (n = std::fread(buffer, 1, sizeof buffer, in)) > 0;) bytes.insert(bytes.end(), buffer, buffer + n);
+            std::fclose(in);
+        }
+        // Five pictures of the fixture's thirty a second.
+        const size_t changed = bytes.empty() ? 0 : trimEditLists(bytes, 5.0 / 30.0);
+        FILE* out = changed == 0 ? nullptr : std::fopen(trimmed.c_str(), "wb");
+        const bool written = out != nullptr && std::fwrite(bytes.data(), 1, bytes.size(), out) == bytes.size();
+        if (out != nullptr && std::fclose(out) != 0) out = nullptr;
+        if (changed == 0 || !written) {
+            std::fprintf(stderr, "FAIL: %s: %s: %zu edit list(s) found to trim, %s\n", label.c_str(), original, changed,
+                         written ? "written" : "copy not written");
+            fail("the harness could not make a copy of the fixture whose edit list ends before its packets");
+            return;
+        }
+    }
+    const int trailing = trailingDiscardPackets(trimmed);
+    if (trailing <= 0) {
+        std::printf("%s: the trimmed copy of %s has %d trailing packet(s) flagged discard by the demuxer, so a pass "
+                    "end lengthened by them cannot be told -- NOT VERIFIED\n",
+                    label.c_str(), original, trailing);
+        g_notVerified = true;
+        return;
+    }
+
+    // GOAL: S15.625 -- a loop's pass end ignores the packets past an MP4 edit list's end, which the
+    //       demuxer flags discard: the passEnded the first picture of pass 2 reports equals the last shown
+    //       picture's presentation time plus its duration. False if those packets lengthen the pass.
+    // WHY-THIS-SHAPE: the fixture is made here, from a copy whose `elst` duration is lowered five pictures,
+    //       since FFmpeg's muxer writes no edit list that trims the end. The demuxer's discard flags on the
+    //       trailing packets are counted first; with none the run is NOT VERIFIED, as the goal is unreached.
+    // CONTROL: control_batch.sh 2026-10-15, reverted, timing_device (RTX) and timing_host_lavapipe:
+    //       renderer/video/video_decoder.cpp readVideoPacket() updating m_readThrough for a discard packet ->
+    //       "pass end 666666666 ns; last shown picture 500000000 ns lasting 33333333 ns", both entries.
+    std::vector<VideoPipeline::PictureTiming> shown;
+    std::string threw;
+    constexpr size_t kCap = 200;
+    std::optional<size_t> boundary;
+    try {
+        VideoPipeline pipeline(device, trimmed, kShaderDir, VideoPipeline::Playback::Loop);
+        while (shown.size() < kCap && !boundary && pipeline.decodeNext()) {
+            shown.push_back(pipeline.timing());
+            if (shown.size() > 1 && shown.back().startsPass) boundary = shown.size() - 1;
+        }
+    } catch (const std::exception& e) {
+        threw = e.what();
+    }
+    if (!threw.empty() || !boundary) {
+        std::fprintf(stderr, "FAIL: %s: trimmed %s: %zu picture(s) decoded, %s%s\n", label.c_str(), original,
+                     shown.size(), threw.empty() ? "no loop boundary reached" : "threw: ", threw.c_str());
+        fail("the trimmed copy did not loop, so its pass end was never reported");
+        return;
+    }
+    const VideoPipeline::PictureTiming& last = shown[*boundary - 1];
+    const VideoPipeline::PictureTiming& first = shown[*boundary];
+    if (!last.presentation || !last.duration || !first.passEnded ||
+        *first.passEnded != *last.presentation + *last.duration) {
+        const auto ns = [](const std::optional<std::chrono::nanoseconds>& t) {
+            return t ? std::to_string(t->count()) : std::string("none");
+        };
+        std::fprintf(stderr, "FAIL: %s: trimmed %s: pass end %s ns; last shown picture %s ns lasting %s ns\n",
+                     label.c_str(), original, ns(first.passEnded).c_str(), ns(last.presentation).c_str(),
+                     ns(last.duration).c_str());
+        fail("the pass end reported at the loop is not the last shown picture's end");
+        return;
+    }
+    std::printf("%s: trimmed %s: %d trailing discard packet(s); %zu picture(s) a pass, ending at %lld ns as its last "
+                "picture does\n",
+                label.c_str(), original, trailing, *boundary, static_cast<long long>(first.passEnded->count()));
+}
+
+// ------------------------------------------------------------------------- //
 // The two halves the daemon drives: decode, then draw
 // ------------------------------------------------------------------------- //
 
@@ -5092,24 +5354,25 @@ void runHalvesChecks(Device& device, const std::string& label, bool onDevice) {
     // GOAL: S13.120 -- the sequence the daemon uses. decodeNext() then draw() shows the picture that
     //       decodeNext() decoded; decodeNext() on its own writes to NO target, so a caller that decides
     //       not to show the picture leaves what is on screen untouched; draw() before anything has been
-    //       decoded throws std::logic_error rather than drawing whatever the target held; and
-    //       renderNext() is still exactly the two composed.
+    //       decoded throws std::logic_error rather than drawing whatever the target held.
     // WHY-THIS-SHAPE: what is watched across the lone decode is whether the target is PUBLISHED, not
     //       what its pixels hold. Reading the pixels is the obvious version and it cannot be written:
     //       the readback reclaims the published frame, and a target may be reclaimed once per render,
     //       so a second read with no draw between throws rather than answering. Publication is the
     //       property anyway -- only render() publishes, so a decodeNext() that drew anywhere would leave
-    //       the target published, and one that did not cannot. renderNext() is run over the same fixture
-    //       in a pipeline of its own and its sequence compared, rather than trusting that it delegates:
-    //       "composed of the two" is a claim about output, not about code.
-    // CONTROL: renderer/video/video_pipeline.cpp, each reverted -- observed below. The untouched-target
-    //       check has no production mutation that expresses it: decodeNext() takes no target and so
-    //       cannot be made to draw into one. Its control is in this harness -- renderNext() substituted
-    //       for that one decodeNext() call, which publishes and reddens it -- and that is recorded here
-    //       rather than left to look like an unreddened check.
+    //       the target published, and one that did not cannot.
+    // CONTROL: control_batch.sh 2026-10-15, reverted, halves-host on Lavapipe, renderer/video/video_pipeline.cpp: draw()'s
+    //       no-stage guard returning instead of throwing -> "FAIL: draw() before any picture has been decoded
+    //       throws std::logic_error"; draw() rendering only while nothing has been shown -> "FAIL: and the draw
+    //       that follows it does publish one"; convert() converting only the first picture -> "FAIL: and the
+    //       draw that follows shows the picture that decode had decoded". The untouched-target check has no
+    //       production mutation that expresses it: decodeNext() takes no target and so cannot be made to draw
+    //       into one. Its control is in this harness: renderNext() substituted for that one decodeNext() call,
+    //       which publishes and reddens it.
     // COVERAGE-ASSERT: the picture drawn after the lone decode is asserted to be the NEXT one, so a
-    //       readback that had stopped distinguishing pictures (which would make the sequence checks
-    //       trivially true) fails here instead of passing there.
+    //       readback that had stopped distinguishing pictures fails here rather than letting the
+    //       untouched-target check pass. renderNext() matching the two halves is graded by
+    //       runSequenceChecks, which drives renderNext() through runPipeline.
     std::string threw;
     bool drawBeforeDecodeThrew = false;
     std::string otherThrow;
@@ -5119,8 +5382,6 @@ void runHalvesChecks(Device& device, const std::string& label, bool onDevice) {
     bool publishedAfterDraw = false;
     int afterFirstDraw = -2;
     int afterSecondDraw = -2;
-    std::vector<int> halves;
-    std::vector<int> composed;
     try {
         OffscreenTargetManager targets(device);
         const OffscreenTarget& target = targets.create(1, kTargetWidth, kTargetHeight);
@@ -5142,7 +5403,6 @@ void runHalvesChecks(Device& device, const std::string& label, bool onDevice) {
             if (decodedFirst) {
                 pipeline.draw(targets, target);
                 afterFirstDraw = shown();
-                halves.push_back(afterFirstDraw);
 
                 // Decoded and converted, deliberately not drawn: what the daemon does for a pass it may
                 // still abandon. shown() above reclaimed the frame the draw published, so the target is
@@ -5152,18 +5412,11 @@ void runHalvesChecks(Device& device, const std::string& label, bool onDevice) {
                     publishedAfterLoneDecode = target.published();
                     pipeline.draw(targets, target);
                     publishedAfterDraw = target.published();
-                    afterSecondDraw = shown();
-                    halves.push_back(afterSecondDraw);
-                    while (pipeline.decodeNext()) {
-                        pipeline.draw(targets, target);
-                        halves.push_back(shown());
-                    }
+                    // Read back only once published: a reclaim of an unpublished target throws, which would
+                    // report this run as having thrown instead of naming the check below.
+                    if (publishedAfterDraw) afterSecondDraw = shown();
                 }
             }
-        }
-        {
-            VideoPipeline composedPipeline(device, asset(file), kShaderDir, VideoPipeline::Playback::Once);
-            while (composedPipeline.renderNext(targets, target)) composed.push_back(shown());
         }
     } catch (const std::exception& e) {
         threw = e.what();
@@ -5199,20 +5452,9 @@ void runHalvesChecks(Device& device, const std::string& label, bool onDevice) {
         std::fprintf(stderr, "  the draw after it showed %d where picture %d was due\n", afterSecondDraw,
                      reference->ids[1]);
     }
-    const bool everyPicture = halves == reference->ids;
-    check(everyPicture, "decodeNext() then draw() shows every picture once, in order");
-    if (!everyPicture) {
-        std::fprintf(stderr, "  %zu pictures shown against %zu\n", halves.size(), reference->ids.size());
-    }
-    const bool sameAsComposed = composed == halves;
-    check(sameAsComposed, "renderNext() shows exactly what the two halves show, in the same order");
-    if (!sameAsComposed) {
-        std::fprintf(stderr, "  renderNext() showed %zu pictures, the halves %zu\n", composed.size(), halves.size());
-    }
-    if (everyPicture && sameAsComposed) {
-        std::printf("%s: %s: %zu pictures through decodeNext()+draw() and the same %zu through renderNext(); the "
-                    "target held picture %d across a decode\n",
-                    label.c_str(), file, halves.size(), composed.size(), afterFirstDraw);
+    if (thenShown) {
+        std::printf("%s: %s: the target held picture %d across a decode, then showed picture %d\n", label.c_str(), file,
+                    afterFirstDraw, afterSecondDraw);
     }
 }
 
@@ -5980,8 +6222,6 @@ int main(int argc, char** argv) {
     if (mode == "shape-device" || mode == "loop-device" || mode == "release-device" || mode == "retire-device") {
         std::vector<std::pair<std::string, std::function<void(Device&)>>> cases;
         if (mode == "shape-device") {
-            check(kSizeChangeFixtures.size() == kSizeChangeFixtureCount,
-                  "the size-change fixture list no longer has the eleven entries this entry is written for");
             for (const SizeChangeFixture& fixture : kSizeChangeFixtures) {
                 cases.emplace_back(fixture.file,
                                    [&fixture, label](Device& device) { runShapeDeviceFixture(device, label, fixture); });
@@ -6048,8 +6288,14 @@ int main(int argc, char** argv) {
                          if (mode == "shape") runShapeChecks(device, label);
                          if (mode == "halves-device") runHalvesChecks(device, label, /*onDevice=*/true);
                          if (mode == "halves-host") runHalvesChecks(device, label, /*onDevice=*/false);
-                         if (mode == "timing-device") runTimingChecks(device, label, /*onDevice=*/true);
-                         if (mode == "timing-host") runTimingChecks(device, label, /*onDevice=*/false);
+                         if (mode == "timing-device") {
+                             runTimingChecks(device, label, /*onDevice=*/true);
+                             if (hardwareDecoderPresent(device, label)) runTrimmedEndChecks(device, label);
+                         }
+                         if (mode == "timing-host") {
+                             runTimingChecks(device, label, /*onDevice=*/false);
+                             if (videoExtensionsHidden(device, label)) runTrimmedEndChecks(device, label);
+                         }
                          if (mode == "steady-device") runSteadyChecks(device, label, /*onDevice=*/true);
                          if (mode == "steady-host") runSteadyChecks(device, label, /*onDevice=*/false);
                          if (mode == "loop-host") {

@@ -203,6 +203,22 @@ private:
 // the decode reports it, and neither is retried -- the packet is gone, so a retry would spin.
 bool isDamagedPacket(int err) { return err == AVERROR_INVALIDDATA; }
 
+AVDiscard discardFor(PictureSkip skip) {
+    switch (skip) {
+        case PictureSkip::Nothing: return AVDISCARD_DEFAULT;
+        case PictureSkip::Unreferenced: return AVDISCARD_NONREF;
+        case PictureSkip::NonIntra: return AVDISCARD_NONINTRA;
+        case PictureSkip::NonKey: return AVDISCARD_NONKEY;
+    }
+    return AVDISCARD_DEFAULT;
+}
+
+// Whether going from `from` to `to` starts decoding pictures that can reference ones `from` left out.
+// Nothing references an unreferenced picture, and an intra one references nothing.
+bool lowersOntoSkipped(PictureSkip from, PictureSkip to) {
+    return from > PictureSkip::Unreferenced && to <= PictureSkip::Unreferenced;
+}
+
 // `value` in `base` units -- pkt_timebase, which is the stream's -- or nothing for an unset one.
 std::optional<std::chrono::nanoseconds> inNanoseconds(int64_t value, AVRational base) {
     if (value == AV_NOPTS_VALUE || base.num <= 0 || base.den <= 0) return std::nullopt;
@@ -217,11 +233,25 @@ std::optional<std::chrono::nanoseconds> nominalInterval(const AVStream& stream) 
     return std::nullopt;
 }
 
-// What VideoDecoder::readVideoPacket() numbered the packet a frame was decoded from; ffmpeg
-// carries it in `opaque`, where 0 is no number.
+// A packet's `opaque`, which ffmpeg copies to the frames decoded from it: the number
+// VideoDecoder::readVideoPacket() gave it above kLevelBits, 0 for none, and below them the
+// PictureSkip it was sent at.
+constexpr unsigned kLevelBits = 3;
+constexpr uintptr_t kLevelMask = (uintptr_t{1} << kLevelBits) - 1;
+static_assert(static_cast<uintptr_t>(PictureSkip::NonKey) <= kLevelMask);
+
 std::optional<uint64_t> packetNumber(const AVFrame& frame) {
-    const auto number = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(frame.opaque));
+    const auto number = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(frame.opaque) >> kLevelBits);
     return number == 0 ? std::nullopt : std::optional<uint64_t>(number);
+}
+
+PictureSkip sentSkipping(const AVFrame& frame) {
+    return static_cast<PictureSkip>(reinterpret_cast<uintptr_t>(frame.opaque) & kLevelMask);
+}
+
+void tagSkipping(AVPacket& packet, PictureSkip skip) {
+    const uintptr_t number = reinterpret_cast<uintptr_t>(packet.opaque) & ~kLevelMask;
+    packet.opaque = reinterpret_cast<void*>(number | static_cast<uintptr_t>(skip));
 }
 
 }  // namespace
@@ -263,7 +293,9 @@ DecodedFrame::DecodedFrame(DecodedFrame&& other) noexcept
       m_colour(other.m_colour),
       m_presentation(other.m_presentation),
       m_duration(other.m_duration),
-      m_position(other.m_position) {}
+      m_position(other.m_position),
+      m_skip(other.m_skip),
+      m_readSince(other.m_readSince) {}
 
 DecodedFrame& DecodedFrame::operator=(DecodedFrame&& other) noexcept {
     if (this != &other) {
@@ -274,6 +306,8 @@ DecodedFrame& DecodedFrame::operator=(DecodedFrame&& other) noexcept {
         m_presentation = other.m_presentation;
         m_duration = other.m_duration;
         m_position = other.m_position;
+        m_skip = other.m_skip;
+        m_readSince = other.m_readSince;
     }
     return *this;
 }
@@ -293,6 +327,14 @@ void DecodedFrame::release() noexcept {
 const AVFrame& DecodedFrame::frame() const {
     if (m_frame == nullptr) throw std::logic_error("DecodedFrame: used after being moved from");
     return *m_frame;
+}
+
+PictureSkip DecodedFrame::keptThrough() const {
+    const AVFrame& f = frame();
+    if ((f.flags & AV_FRAME_FLAG_KEY) != 0) return PictureSkip::NonKey;
+    if (f.pict_type == AV_PICTURE_TYPE_I) return PictureSkip::NonIntra;
+    if (f.pict_type != AV_PICTURE_TYPE_B) return PictureSkip::Unreferenced;
+    return PictureSkip::Nothing;
 }
 
 DecodedFrame::Storage DecodedFrame::storage() const {
@@ -544,6 +586,7 @@ void VideoDecoder::openDecoder() {
 void VideoDecoder::reopenInSoftware() {
     m_pending = Pending::Nothing;
     m_flushed = false;
+    m_skipping = PictureSkip::Nothing;
     m_awaitingHardwareSetup = false;
     m_parkedFailure = nullptr;
     retireDecoder();
@@ -558,6 +601,7 @@ void VideoDecoder::seekAgain() {
     m_pending = Pending::Nothing;
     avcodec_flush_buffers(m_codec);
     m_flushed = false;
+    m_skipping = PictureSkip::Nothing;
     av_packet_unref(m_packet);
     seekToResume();
 }
@@ -587,12 +631,6 @@ bool VideoDecoder::withinCatchUp(int64_t distance) const {
     const std::optional<std::chrono::nanoseconds> interval = nominalInterval(stream);
     const std::optional<std::chrono::nanoseconds> span = inNanoseconds(distance, stream.time_base);
     return interval && span && *span <= kCatchUpPictures * *interval;
-}
-
-std::optional<std::chrono::nanoseconds> VideoDecoder::averageFrameInterval() const {
-    const AVRational rate = m_format->streams[m_stream]->avg_frame_rate;
-    if (rate.num <= 0 || rate.den <= 0) return std::nullopt;
-    return inNanoseconds(1, av_inv_q(rate));
 }
 
 int64_t VideoDecoder::nextSeekBack(int64_t back) const {
@@ -708,7 +746,21 @@ bool VideoDecoder::skipToPacket(const PacketMark& mark) {
 
 bool VideoDecoder::decodesOnDevice() const { return m_codec != nullptr && m_codec->hw_device_ctx != nullptr; }
 
+PictureSkip VideoDecoder::deepestSkip() const {
+    switch (m_codec != nullptr ? m_codec->codec_id : AV_CODEC_ID_NONE) {
+        case AV_CODEC_ID_H264:
+        case AV_CODEC_ID_HEVC: return decodesOnDevice() ? PictureSkip::Unreferenced : PictureSkip::NonKey;
+        case AV_CODEC_ID_MPEG1VIDEO:
+        case AV_CODEC_ID_MPEG2VIDEO:
+        case AV_CODEC_ID_MPEG4: return PictureSkip::Unreferenced;
+        default: return PictureSkip::Nothing;
+    }
+}
+
 void VideoDecoder::seekToResume() {
+    // Packets read before a seek lie nowhere near the picture the resume returns. Not in restart(): the
+    // packets read past a pass's last picture are part of its distance to the next pass's first.
+    m_readSinceReturned = 0;
     // Ending without meeting that packet's picture means software did not decode the same pictures.
     const bool byPacket = m_returned.lastPacket && !std::holds_alternative<DropThroughPacket>(m_resume);
     if (!m_returned.lastTimestamp && !byPacket && m_startedAfter) {
@@ -720,6 +772,11 @@ void VideoDecoder::seekToResume() {
         m_resume = std::monostate{};
     }
     if (!m_returned.lastTimestamp) {
+        // Nothing left says which picture was returned last, which loses the place, not the file.
+        if (m_returned.count != 0 && !byPacket && m_returned.skipped) {
+            startAtFirstPicture();
+            return;
+        }
         rewind();
         if (m_returned.count == 0) {
             m_resume = std::monostate{};
@@ -810,6 +867,7 @@ void VideoDecoder::restart() {
     m_device.assertGpuThread("VideoDecoder::restart");
     avcodec_flush_buffers(m_codec);
     m_flushed = false;
+    m_skipping = PictureSkip::Nothing;
     m_returned = {};
     m_resume = std::monostate{};
     m_startedAfter.reset();
@@ -1141,6 +1199,15 @@ int VideoDecoder::readVideoPacket() {
         if (err < 0) return err;
         if (m_packet->stream_index == m_stream) {
             if (m_packetsRead) numberPacket();
+            // One the container marks as decoded only for reference, as outside an edit list, is
+            // never shown, so it neither ends a pass nor puts distance between two pictures.
+            if ((m_packet->flags & AV_PKT_FLAG_DISCARD) != 0) return 0;
+            ++m_readSinceReturned;
+            const AVStream& stream = *m_format->streams[m_stream];
+            const auto start = inNanoseconds(m_packet->pts, stream.time_base);
+            const auto length = m_packet->duration > 0 ? inNanoseconds(m_packet->duration, stream.time_base)
+                                                       : nominalInterval(stream);
+            if (start && length && (!m_readThrough || *start + *length > *m_readThrough)) m_readThrough = *start + *length;
             return 0;
         }
         av_packet_unref(m_packet);
@@ -1148,7 +1215,7 @@ int VideoDecoder::readVideoPacket() {
 }
 
 void VideoDecoder::numberPacket() {
-    m_packet->opaque = reinterpret_cast<void*>(static_cast<uintptr_t>(++*m_packetsRead));
+    m_packet->opaque = reinterpret_cast<void*>(static_cast<uintptr_t>(++*m_packetsRead) << kLevelBits);
     if (*m_packetsRead == 1) m_firstPacket = PacketMark::of(*m_packet);
 }
 
@@ -1207,6 +1274,8 @@ std::variant<std::optional<DecodedFrame>, VideoDecoder::Dropping> VideoDecoder::
             const int64_t timestamp = m_frame->best_effort_timestamp;
             const std::optional<uint64_t> packet = packetNumber(*m_frame);
             if (!admit(timestamp, packet)) {
+                // The next picture returned is counted on from here, where the last one returned was.
+                m_readSinceReturned = 0;
                 av_frame_unref(m_frame);
                 if (dropLimit && ++dropped >= *dropLimit) return Dropping{};
                 continue;
@@ -1219,6 +1288,8 @@ std::variant<std::optional<DecodedFrame>, VideoDecoder::Dropping> VideoDecoder::
             frame.m_presentation = inNanoseconds(timestamp, stream.time_base);
             frame.m_duration = out->duration > 0 ? inNanoseconds(out->duration, stream.time_base)
                                                  : nominalInterval(stream);
+            frame.m_skip = sentSkipping(*out);
+            frame.m_readSince = std::max(std::exchange(m_readSinceReturned, 0), 1U);
             recordReturned(timestamp, packet);
             if (m_returned.lastTimestamp) frame.m_position = StreamPosition(*m_returned.lastTimestamp);
             return frame;
@@ -1272,9 +1343,18 @@ std::variant<std::optional<DecodedFrame>, VideoDecoder::Dropping> VideoDecoder::
                 recordLanding();
             }
         }
-        // Read by ffmpeg per packet.
-        const bool skipping = skip == PictureSkip::Unreferenced && std::holds_alternative<std::monostate>(m_resume);
-        m_codec->skip_frame = skipping ? AVDISCARD_NONREF : AVDISCARD_DEFAULT;
+        // Read by ffmpeg per packet. A level goes up at once, and down onto pictures that can reference
+        // skipped ones only at a packet that resets the decoder. A container's key flag is not enough: it
+        // also marks open-GOP pictures, whose leading pictures reference ones before them.
+        const PictureSkip wanted =
+            std::holds_alternative<std::monostate>(m_resume) ? std::min(skip, deepestSkip()) : PictureSkip::Nothing;
+        if (!lowersOntoSkipped(m_skipping, wanted) ||
+            (!m_flushed && resetsDecoder(*m_format->streams[m_stream]->codecpar, *m_packet))) {
+            m_skipping = wanted;
+        }
+        m_codec->skip_frame = discardFor(m_skipping);
+        if (m_skipping != PictureSkip::Nothing) m_returned.skipped = true;
+        if (!m_flushed) tagSkipping(*m_packet, m_skipping);
         err = avcodec_send_packet(m_codec, m_flushed ? nullptr : m_packet);
         // EAGAIN is "read the output first, then send this one again", and ffmpeg promises the
         // receive that follows will not ask for input; a second EAGAIN for the same packet is

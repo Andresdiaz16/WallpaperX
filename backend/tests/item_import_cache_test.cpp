@@ -57,6 +57,7 @@
 // context with the Vulkan device that produced the export: an opaque fd is importable only by the
 // driver that made it.
 
+#include "test_image_dir.h"
 #include "daemon/ring_depth.h"
 #include "kde/frame_import.h"
 #include "support/validation_grade.h"
@@ -882,7 +883,7 @@ bool runPhase(const PhaseName& which) {
                 const quint64 reusedBefore = scene.reused();
                 // Built now: building it uploads a texture and waits, which the gate would hold for good.
                 const std::string bluePath = wallpaperx::testing::writeSolidPng(
-                    std::string(WALLPAPERX_TEST_IMAGE_DIR) + "/item_import_cache_late.png", 16, 16, palette[2]);
+                    wallpaperx::testing::testImageDir() + "/item_import_cache_late.png", 16, 16, palette[2]);
                 wallpaperx::StaticRenderer blue(device, targets.renderPass(), bluePath, WALLPAPERX_SHADER_DIR);
                 const std::string acquireError0 = stub.acquireError();
                 stub.lateBinaryNext([&] { targets.render(blue, *ring.front()); });
@@ -1051,19 +1052,6 @@ bool runPhase(const PhaseName& which) {
                                           "shown: " +
                                               std::string(claimsFrameShown(scene.item) ? "yes" : "no") + ", reason [" +
                                               scene.reason().toStdString() + "])");
-                    // GOAL: S13.201 while the picture stays, after a reset: no release names the newest
-                    //       hand-over delivered (every ask but the held one) while the picture is on screen.
-                    // CONTROL: the HandOver phase's control (a failed wait's own claim released while the
-                    //       node is kept) -> "FAIL: and none of the failures gives back the claim on the picture
-                    //       still shown (1 release(s) naming 15 or later)".
-                    quint64 liveNewest = 0;
-                    for (size_t i = 0; i + 1 < stub.asks().size(); ++i) {
-                        liveNewest = std::max(liveNewest, stub.asks()[i].handover);
-                    }
-                    check(liveNewest != 0 && endingReleases(liveNewest) == 0,
-                          "and none of the failures gives back the claim on the picture still shown (" +
-                              std::to_string(endingReleases(liveNewest)) + " release(s) naming " +
-                              std::to_string(liveNewest) + " or later)");
                     faults.failWaits.store(0);
                     stub.refuseFurtherWith(QStringLiteral("io.wallpaperx.Error.NoFrame"));
                     stub.sendHeldReply();

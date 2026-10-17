@@ -1694,7 +1694,7 @@ int main(int argc, char** argv) {
 
         const auto publishedReason = [&root] { return root->property("publishedReason").toString(); };
 
-        // GOAL: an item with nothing on screen that is refused SAYS SO. False for a plugin that
+        // GOAL: S15.621 -- an item with nothing on screen that is refused SAYS SO. False for a plugin that
         //       reports nothing, which is the right answer only while a wallpaper is up: with the
         //       backdrop showing, silence is a blank desktop that explains nothing.
         // WHY-THIS-SHAPE: the reason is required to be non-empty and the item is required to have
@@ -1705,7 +1705,7 @@ int main(int argc, char** argv) {
         // CONTROL: the `else` arm of `if (m_frameShown)` in WallpaperXItem::takeFrameReply
         //       (backend/kde/wallpaperx_item.cpp) changed to `setFetchReason(QString());` ->
         //       "FAIL: an item with nothing on screen publishes a reason when it is refused",
-        //       printing "the item asked 3 time(s) and published []". Reverted.
+        //       printing "the item asked 2 time(s) and published []"; control_batch.sh 2026-10-15, reverted.
         const bool refusedAndReported =
             pumpUntil([&] { return stub.requests() > 0 && !publishedReason().isEmpty(); }, 5000);
         check(refusedAndReported, "an item with nothing on screen publishes a reason when it is refused");
@@ -1718,23 +1718,10 @@ int main(int argc, char** argv) {
         check(!root->property("rendererDrawing").toBool(),
               "and it is not claiming a frame is on screen, which is the case the retry is for");
 
-        // GOAL: and it asks again on its own. Nothing else will make it: the daemon's
-        //       announcement of a freed image is sent when a consumer RELEASES one, and the
-        //       consumer holding the ring is by definition one that has stopped releasing.
-        //       Without this the screen stays on the backdrop until the user sets a wallpaper.
-        // WHY-THIS-SHAPE: no FrameReady is ever sent on this bus, and the window the item lives in
-        //       never runs a scene-graph pass, so nothing but the item's own timer can produce a
-        //       second request. The obvious shape -- send a FrameReady and check it re-fetches --
-        //       grades the announcement path, which already has coverage, and would pass for a
-        //       plugin with no timer at all.
-        // COVERAGE-ASSERT: the count at the moment the refusal was published is asserted to be
-        //       exactly one, so a harness that made the item ask repeatedly on its own -- by
-        //       rendering the scene, or by joining and leaving the window -- fails here rather
-        //       than crediting those asks to the timer.
-        // CONTROL: `retryWhileNothingIsShown();` deleted from the NoFreeImage branch of
-        //       WallpaperXItem::takeFrameReply (backend/kde/wallpaperx_item.cpp) -> "FAIL: and it
-        //       asks again on its own, with nothing having told it to", printing that it stayed
-        //       at 1 request. Reverted.
+        // The retries in a fixed window, measured for the NoFrame phase below; that the item asks
+        // again at all is S15.362's, graded in the refusal-runs run. The count at the refusal must
+        // be exactly one, so asks the harness caused (a scene pass, a window rejoin) are not
+        // credited to the timer.
         const int askedWhenReported = stub.requests();
         check(askedWhenReported == 1, "joining the window cost exactly one fetch, so a second is the timer's");
         if (askedWhenReported != 1) {
@@ -1742,17 +1729,7 @@ int main(int argc, char** argv) {
                                  "than the timer is driving it and this phase cannot attribute the next ask\n",
                          askedWhenReported);
         }
-        const bool askedAgain = pumpUntil([&] { return stub.requests() > askedWhenReported; }, kRetryWindowMs);
-        check(askedAgain, "and it asks again on its own, with nothing having told it to");
-        if (!askedAgain) {
-            std::fprintf(stderr, "  it stayed at %d request(s) for %d ms after being refused, with no announcement "
-                                 "coming\n",
-                         stub.requests(), kRetryWindowMs);
-        }
-
-        // COVERAGE-ASSERT: how many retries actually landed in the window, carried into the
-        // second phase. That phase's claim is that a DIFFERENT answer produces none over the same
-        // span, and it is worth nothing unless this one produced some.
+        (void)pumpUntil([&] { return stub.requests() > askedWhenReported; }, kRetryWindowMs);
         refusedRetries = stub.requests() - askedWhenReported;
     }
 
@@ -1773,6 +1750,10 @@ int main(int argc, char** argv) {
         }
         const auto publishedReason = [&root] { return root->property("publishedReason").toString(); };
 
+        // GOAL: S15.622 -- an item told NoFrame publishes a reason. False for a blank, silent desktop.
+        // CONTROL: WallpaperXItem::takeFrameReply's last error arm (backend/kde/wallpaperx_item.cpp) made
+        //       `setFetchReason(QString());` -> "FAIL: an item told there is no frame yet publishes a reason too",
+        //       printing "asked 1 time(s) ... and published []"; control_batch.sh 2026-10-15, reverted.
         const bool reported = pumpUntil(
             [&] { return stub.requests() > askedBefore && !publishedReason().isEmpty(); }, 5000);
         check(reported, "an item told there is no frame yet publishes a reason too");
@@ -1783,7 +1764,7 @@ int main(int argc, char** argv) {
             return wallpaperx::testing::reportNotVerifiedOrPassed();
         }
 
-        // GOAL: and it does NOT ask again. "No frame yet" is answered by the user setting a
+        // GOAL: S15.622 -- and it does NOT ask again. "No frame yet" is answered by the user setting a
         //       wallpaper, which arrives as a FrameReady; a plugin that treated it like a
         //       refusal would ask the daemon every couple of seconds for the life of a fresh
         //       install, on every screen.
@@ -1796,9 +1777,13 @@ int main(int argc, char** argv) {
         //       the general error path of WallpaperXItem::takeFrameReply (backend/kde/
         //       wallpaperx_item.cpp), just before its `return` -> "FAIL: and it does not ask
         //       again -- a frame that has never existed is not something to poll for", printing
-        //       the extra requests. Reverted.
+        //       "it asked 2 more time(s) in 6000 ms, where a refusal produced 1"; control_batch.sh
+        //       2026-10-15, reverted.
         // COVERAGE-ASSERT: the retry count from the first phase is asserted non-zero here, so a
         //       run in which nothing ever retried cannot report this silence as established.
+        // CONTROL: `retryWhileNothingIsShown();` deleted from WallpaperXItem::takeFrameReply's
+        //       NoFreeImage branch (backend/kde/wallpaperx_item.cpp) -> "FAIL: the same span produced
+        //       at least one retry when the answer was a refusal", alone; control_batch.sh 2026-10-14.
         check(refusedRetries > 0, "the same span produced at least one retry when the answer was a refusal");
         if (refusedRetries <= 0) {
             std::fprintf(stderr, "  the refusal phase saw no retry, so %d ms of silence here says nothing\n",

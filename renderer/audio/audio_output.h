@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -33,8 +34,9 @@ public:
     AudioTrack(const AudioTrack&) = delete;
     AudioTrack& operator=(const AudioTrack&) = delete;
 
-    // The file's time `from` is heard at `at`, and the rest follows on from it. With `loop`, the
-    // sound from `from` to its end then plays again and again, with nothing more asked of the owner.
+    // The file's time `from` is heard at `at`, and the rest follows on from it at the track's rate. With
+    // `loop`, the sound from `from` to its end then plays again and again, with nothing more asked of
+    // the owner.
     struct Anchor {
         std::chrono::nanoseconds from{};
         std::chrono::steady_clock::time_point at;
@@ -42,10 +44,10 @@ public:
         bool operator==(const Anchor&) const = default;
     };
 
-    // Plays from `anchor`, replacing what this track plays at `at`. An `at` already past starts that
-    // far into the file at once; one still to come keeps the sound before it until then, however far
-    // off, which is how a loop's last picture keeps its sound to its end. A repeat of the last anchor
-    // does nothing.
+    // Plays from `anchor`, replacing what this track plays at `at`. An `at` already past starts as far
+    // into the file as the sound would have played by now; one still to come keeps the sound before it
+    // until then, however far off, which is how a loop's last picture keeps its sound to its end. A
+    // repeat of the last anchor does nothing.
     void play(const Anchor& anchor) noexcept;
 
     // Fades out at once; the stream then stops and nothing is decoded until the next play().
@@ -53,6 +55,14 @@ public:
 
     // 0 to 1, a gain on the samples, reached over a few milliseconds rather than in a step.
     void setVolume(float gain) noexcept;
+
+    // The file's time played each second, 0.5 to 2, pitch kept; 1 at first. What is decoded ahead and
+    // not yet handed to the sound server, but for its next two cycles, is decoded again at the new rate,
+    // joined on without a gap, so the change is heard within a few of the server's cycles and a rate
+    // replaced before then never is; the clock follows it there. A play() begins at the rate set when it
+    // is taken up.
+    void setRate(double rate) noexcept;
+    double rate() const noexcept;
 
     // What the last play() asked for; nothing before the first and after stop().
     const std::optional<Anchor>& anchor() const { return m_anchor; }
@@ -62,8 +72,10 @@ public:
     struct Clock {
         std::chrono::nanoseconds file{};
         std::chrono::steady_clock::time_point at;
+        // The file's time a second heard from there, until the rate next changes.
+        double rate = 1.0;
         std::chrono::steady_clock::time_point heardAt(std::chrono::nanoseconds fileTime) const {
-            return at + (fileTime - file);
+            return at + std::chrono::nanoseconds(std::llround(static_cast<double>((fileTime - file).count()) / rate));
         }
     };
     // Nothing unless that sound is being played out as of `now`: not before it starts or after its
@@ -139,6 +151,16 @@ private:
     void begin(AudioTrackState& track, uint64_t serial, const AudioTrack::Anchor& anchor);
     void end(AudioTrackState& track, uint64_t serial);
     void fill(AudioTrackState& track);
+    // Hands the decoder the rate the owner asks for, once the segment has room to record it. True when what was
+    // queued was cut and the decoder sought back to the cut, so the segment must be filled again from there.
+    bool followRate(AudioTrackState& track);
+    // Stops `track`'s writing back at the first frame its stream's next cycles leave to be replaced, and returns
+    // where: the segment's start if the stream has not switched into it yet. Nothing before the stream's first
+    // cycle, or when too little is queued past the stream's next cycles.
+    std::optional<uint64_t> cutQueued(AudioTrackState& track);
+    // Records that the frames read to ring position `at` on lie in the file from `file` on at `rate`,
+    // when that is not where the segment's last mark puts them.
+    void markRate(AudioTrackState& track, uint64_t at, std::chrono::nanoseconds file, double rate);
     // Starts a segment past the last frame written, and returns where.
     uint64_t newSegment(AudioTrackState& track);
     // When `track` next needs a pass that no wake will ask for, if ever.
