@@ -2513,6 +2513,109 @@ std::string describeTreeChange(const std::map<std::string, std::string>& before,
     return out.empty() ? " nothing" : out;
 }
 
+std::string readTextFile(const std::filesystem::path& file);
+bool writeTextFile(const std::filesystem::path& file, const std::string& text);
+
+// A copy of `source` with every third byte from 60% of its mdat payload onward changed: the first
+// picture stays whole, the rest of each pass is damaged. Empty when the file has no mdat.
+std::string damagedVideoBytes(const std::string& source) {
+    std::string bytes = readTextFile(source);
+    const size_t box = bytes.find("mdat");
+    if (box == std::string::npos || box < 4) return {};
+    size_t size = 0;
+    for (size_t i = box - 4; i < box; ++i) size = (size << 8) | static_cast<unsigned char>(bytes[i]);
+    const size_t start = box + 4, end = box - 4 + size;
+    if (size < 8 || end > bytes.size()) return {};
+    for (size_t at = start + (end - start) * 6 / 10; at < end; at += 3) bytes[at] ^= 0x5a;
+    return bytes;
+}
+
+// GOAL: S15.669 -- the daemon binary routes FFmpeg's messages through its limiter: a looping video whose
+//       packets make FFmpeg complain on every pass shows at most 10 "wallpaperx-daemon: ffmpeg" lines in
+//       three seconds, and no line in FFmpeg's own "[h264 @ 0x...]" form. False if main() never installs it.
+// WHY-THIS-SHAPE: the real binary, because the install is in main(); in-process tests call install()
+//       themselves and so cannot see it missing. At least one limiter line is required, so a decode path
+//       that says nothing about the damage is NOT VERIFIED rather than green.
+// CONTROL: control_batch.sh 2026-10-17, phase ffmpegLogInstalled, reverted: backend/daemon/main.cpp's
+//       `wallpaperx::ffmpeg_log::install();` deleted -> "FAIL: the daemon prints FFmpeg's messages only
+//       through its limiter, never in FFmpeg's own form" and "FAIL: ... at least one limiter line" (0 limiter
+//       lines, 81 in FFmpeg's own form; green: 10 and 0).
+void checkFfmpegLogInstalled(const std::string& validationEnv, const std::string& clip, const Check& check) {
+    constexpr const char* kGoal = "S15.669 (the daemon limits FFmpeg's log)";
+    ScratchDir home("ffmpeglog");
+    if (!home.ok()) throw ScratchDirectoryLost("a scratch HOME could not be created");
+    const std::string damaged = damagedVideoBytes(clip);
+    const std::string file = (home.path() / "damaged.mp4").string();
+    if (damaged.empty() || !writeTextFile(file, damaged)) {
+        notVerified(kGoal, "the damaged copy of " + clip + " could not be made");
+        return;
+    }
+    std::error_code ec;
+    for (const char* sub : {"config", "state", "cache"}) std::filesystem::create_directories(home.path() / sub, ec);
+    NestedBus bus;
+    if (!bus.ok()) {
+        if (const char* fault = bus.preambleFault()) {
+            phaseSetupFault(kGoal, fault);
+            return;
+        }
+        notVerified(kGoal, bus.reason());
+        return;
+    }
+    SpawnedDaemon daemon({validationEnv, std::string("DBUS_SESSION_BUS_ADDRESS=") + bus.address(),
+                          "HOME=" + home.path().string(), "XDG_CONFIG_HOME=" + (home.path() / "config").string(),
+                          "XDG_STATE_HOME=" + (home.path() / "state").string(),
+                          "XDG_CACHE_HOME=" + (home.path() / "cache").string()});
+    if (!daemon.waitForOutput(std::string("serving ") + DbusService::kBusName, std::chrono::seconds(30))) {
+        if (reportedStartupFault(daemon, kGoal)) return;
+        notVerified(kGoal, "the daemon for this phase never reached the bus");
+        return;
+    }
+    bool drew = false;
+    {
+        auto connection = sdbus::createSessionBusConnectionWithAddress(bus.address());
+        connection->enterEventLoopAsync();
+        auto proxy = sdbus::createProxy(*connection, sdbus::ServiceName{DbusService::kBusName},
+                                        sdbus::ObjectPath{DbusService::kObjectPath});
+        try {
+            setWallpaper(*proxy, "video", file, 0, std::chrono::seconds(10));
+            const auto deadline = Clock::now() + std::chrono::seconds(20);
+            while (!drew && Clock::now() < deadline) {
+                const StatusReply status = getStatus(*proxy, std::chrono::seconds(10));
+                const nlohmann::json* entry = wallpaperStatus(status, "0");
+                drew = entry != nullptr && entry->value("has_frame", false);
+                if (!drew) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            if (drew) std::this_thread::sleep_for(std::chrono::seconds(3));
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "  the damaged video could not be set: %s\n", e.what());
+        }
+    }
+    daemon.shutdown(SIGTERM);
+    if (!drew) {
+        notVerified(kGoal, "the daemon drew no picture of the damaged video, so nothing played on");
+        return;
+    }
+    int limited = 0, raw = 0;
+    std::istringstream lines(daemon.output());
+    for (std::string line; std::getline(lines, line);) {
+        if (line.find("wallpaperx-daemon: ffmpeg") != std::string::npos) {
+            ++limited;
+        } else if (line.find(" @ 0x") != std::string::npos) {
+            ++raw;
+            if (raw <= 3) std::fprintf(stderr, "  raw: %s\n", line.c_str());
+        }
+    }
+    std::printf("daemon_system_test: damaged video: %d limiter line(s), %d in FFmpeg's own form\n", limited, raw);
+    if (limited == 0 && raw == 0) {
+        notVerified(kGoal, "FFmpeg said nothing about the damaged video on this decode path");
+        return;
+    }
+    check(raw == 0, "the daemon prints FFmpeg's messages only through its limiter, never in FFmpeg's own form");
+    check(limited >= 1 && limited <= 10,
+          "the daemon's FFmpeg messages for a damaged looping video are at most the limiter's 10, and at least one limiter line");
+    if (limited > 10) std::fprintf(stderr, "  %d limiter lines\n", limited);
+}
+
 // GOAL: S13.191 -- a stop that cannot finish ends the process at the three-second deadline, and
 //       that path writes NOTHING: config and state directory byte for byte as when the stop began
 //       (a record left behind reads as a death at the next start).
@@ -4106,6 +4209,53 @@ std::string healthCheckStatusOf(const nlohmann::json& body, const char* name) {
     return (*checks)[name].value("status", std::string());
 }
 
+void checkPropertiesSavedOnStop(NameWatcher& names, const std::string& validationEnv, const std::string& bluePath,
+                                const Check& check) {
+    constexpr int32_t kMonitor = 5;
+    constexpr const char* kGoals = "S15.651 (a property change just before SIGTERM is saved)";
+    ScratchDir configHome("propstop");
+    if (!configHome.ok()) {
+        throw ScratchDirectoryLost("a scratch XDG_CONFIG_HOME could not be created under the temp directory");
+    }
+    SpawnedDaemon daemon({validationEnv, configHome.env()});
+    if (!names.waitFor(true)) {
+        if (!reportedStartupFault(daemon, kGoals)) notVerified(kGoals, "the daemon never acquired the bus name");
+        return;
+    }
+    {
+        auto proxy = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
+        setWallpaper(*proxy, "static", bluePath, kMonitor);
+        wallpaperx::testing::setWallpaperProperties(*proxy, kMonitor,
+                                                    wallpaperx::testing::WireProperties{{"glow", sdbus::Variant(true)}});
+    }
+
+    // GOAL: S15.651 -- a SetWallpaperProperties answered just before SIGTERM is in the config file
+    //       after the stop, though its save waits out a coalescing delay the stop cuts short.
+    // WHY-THIS-SHAPE: SIGTERM follows the reply at once, well inside the 250 ms delay, so the value
+    //       is on disk only if the stop path writes what is still waiting.
+    // CONTROL: backend/daemon/main.cpp `manager.flushConfig();` and ~ConfigWriter()'s `waitForQueued();`
+    //       (backend/daemon/config_writer.cpp) both deleted, with kCoalesce made 10 s (control_batch) ->
+    //       red, "FAIL: a property change made just before SIGTERM is in the config file after the stop".
+    //       At 250 ms the same deletions stay green -- the stop's teardown outlasts the delay, so the
+    //       worker writes anyway -- and either flush alone also stays green: neither is graded alone.
+    const int exitCode = daemon.shutdown(SIGTERM);
+    awaitNameRelease(names, "the next phase");
+    const nlohmann::json root = nlohmann::json::parse(readTextFile(configHome.configFile()), nullptr, false);
+    bool saved = false;
+    if (root.is_object() && root.contains("monitors") && root["monitors"].is_array()) {
+        for (const nlohmann::json& row : root["monitors"]) {
+            if (row.is_object() && row.value("monitor_id", -1) == kMonitor && row.contains("properties") &&
+                row["properties"].is_object() && row["properties"].value("glow", false)) {
+                saved = true;
+            }
+        }
+    }
+    check(saved, "a property change made just before SIGTERM is in the config file after the stop");
+    if (!saved) {
+        std::fprintf(stderr, "  exit %d, config: %s\n", exitCode, readTextFile(configHome.configFile()).substr(0, 400).c_str());
+    }
+}
+
 void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, const Check& check) {
     constexpr int32_t kMonitorRestore = 18;
     constexpr const char* kGoals = "S8.1/S8.3/S8.11 (a wallpaper survives a restart, byte for byte)";
@@ -4840,6 +4990,16 @@ void checkStartsOnAnyConfig(NameWatcher& names, const std::string& validationEnv
         {"a file that is not JSON at all", "wallpapers = all of them"},
         {"a JSON array where an object belongs", "[{\"monitor_id\":0}]"},
         {"50 000 levels of nesting", deep},
+        // S15.649: fields load() carries as text, which it would dump() recursively if not bounded.
+        // 400 000, not 50 000: the daemon's stack takes dump() at 50 000 levels without the guard.
+        // CONTROL: backend/daemon/config_store.cpp carriedText()'s nestsWithin test made `false &&`
+        //       (control_batch) -> red, both cases' "the daemon starts and serves DBus", "exits through
+        //       main() rather than aborting" and "exits 0 on SIGTERM"; at 50 000 levels it stayed green.
+        {"a row's properties nested 400 000 deep",
+         "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/a.png\",\"properties\":" +
+             std::string(400000, '[') + std::string(400000, ']') + "}]}"},
+        {"a top-level sound nested 400 000 deep",
+         "{\"version\":1,\"sound\":" + std::string(400000, '[') + std::string(400000, ']') + ",\"monitors\":[]}"},
     };
     // Appended rather than braced in: an initializer_list's backing array is const, so the
     // vector copies each element and the 100 MB case would exist twice at once.
@@ -6188,7 +6348,9 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
     //       (backend/daemon/config_writer.cpp), via control_batch.sh, --phase
     //       '^stalledConfigWrite$', 2026-09-30 -> "FAIL: a second SetWallpaper during the stall does
     //       not wait for the deadline all over again", printing "the second call took 2000 ms against
-    //       a 2000 ms deadline", and nothing else red. Reverted.
+    //       a 2000 ms deadline". Also red: "a daemon with a config write it can never finish still exits
+    //       0 on SIGTERM" and "it leaves through main() rather than through the teardown watchdog", since
+    //       the stop's own wait for the stuck write is then paid again too. Reverted.
     const auto secondStart = Clock::now();
     std::string secondError;
     try {
@@ -6426,6 +6588,9 @@ int main(int argc, char** argv) {
         // missed between the fork and the subscription.
         NameWatcher names;
 
+        // sdbus-c++ builds every Variant on a connection of its own, opened on first use and kept for
+        // the process: opened here, so the baseline holds it and a phase sending a{sv} is not a leak.
+        { const sdbus::Variant prime(true); }
         const size_t fdsBefore = openFdCount();
 
         const std::string validationEnv = std::string("WALLPAPERX_VALIDATION=") + (wantValidation ? "1" : "0");
@@ -6758,6 +6923,7 @@ int main(int argc, char** argv) {
             checkConfigServerLostPort(names, bluePath, validationEnv, signals.total() > 0, check);
         });
         phase("configRestart", [&] { checkConfigRestart(names, validationEnv, check); });
+        phase("propertiesSavedOnStop", [&] { checkPropertiesSavedOnStop(names, validationEnv, bluePath, check); });
         phase("crashRefusal", [&] { checkCrashRefusal(names, validationEnv, bluePath, check); });
         phase("outputRestart", [&] { checkOutputRestart(names, validationEnv, check); });
         phase("startsOnAnyConfig", [&] { checkStartsOnAnyConfig(names, validationEnv, check); });
@@ -6776,6 +6942,7 @@ int main(int argc, char** argv) {
               [&] { checkWatchdogEndsAStuckStopWritingNothing(validationEnv, check); });
         phase("alarmDeliversQueuedLines", [&] { checkAlarmDeliversQueuedLines(validationEnv, wedgeClip, check); });
         phase("lossDuringFailedStart", [&] { checkLossDuringFailedStart(validationEnv, bluePath, check); });
+        phase("ffmpegLogInstalled", [&] { checkFfmpegLogInstalled(validationEnv, wedgeClip, check); });
         phase("restoredVideoIsPostedAfterTheRecordOpens", [&] {
             checkTheRestoredVideoIsPostedAfterTheRecordOpens(validationEnv, wedgeClip, check);
         });

@@ -17,9 +17,15 @@ namespace {
 // enough that a stalled mount does not visibly stall a login.
 constexpr std::chrono::seconds kWriteDeadline{2};
 
+// How long a snapshot waits for a newer one to replace it. Bounds both the writes a burst of
+// changes makes and what a SIGKILL inside the window loses.
+constexpr std::chrono::milliseconds kCoalesce{250};
+
 }
 
 ConfigWriter::ConfigWriter(ConfigStore store) : m_store(std::move(store)) {}
+
+ConfigWriter::~ConfigWriter() { waitForQueued(); }
 
 void ConfigWriter::refuse(std::string why) {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -44,12 +50,12 @@ bool ConfigWriter::refusing() const {
 void ConfigWriter::startLocked() {
     if (m_worker) return;
 
-    // The store is copied in and nothing else is captured: this thread outlives its owner
-    // whenever a write is stuck, and a write on a dead mount cannot be interrupted.
+    // Nothing of this object is captured: this thread outlives its owner whenever a write is
+    // stuck, and a write on a dead mount cannot be interrupted.
     std::shared_ptr<PersistWorker> worker;
     try {
         worker = std::make_shared<PersistWorker>();
-        std::thread([worker, store = m_store] {
+        std::thread([worker, store = m_store, notice = m_notice] {
             for (;;) {
                 PersistedConfig contents;
                 {
@@ -58,6 +64,8 @@ void ConfigWriter::startLocked() {
                     // write on a dead mount cannot be interrupted. The thread ends with the
                     // process, and holds nothing the process needs to release.
                     worker->wake.wait(lock, [&worker] { return worker->pending.has_value(); });
+                    worker->wake.wait_for(lock, kCoalesce, [&worker] { return worker->flush; });
+                    worker->flush = false;
                     contents = std::move(*worker->pending);
                     worker->pending.reset();
                     worker->writingSince = std::chrono::steady_clock::now();
@@ -86,6 +94,11 @@ void ConfigWriter::startLocked() {
                     worker->stalled = false;
                 }
                 worker->settled.notify_all();
+
+                // After the worker's lock is released: a bus handler waiting for this write holds
+                // the bus's lock, which the callback needs.
+                std::lock_guard<std::mutex> lock(notice->mutex);
+                if (notice->written) notice->written();
             }
         }).detach();
     } catch (const std::exception& e) {
@@ -151,6 +164,10 @@ void ConfigWriter::waitForQueued() noexcept {
     // than the daemon, and the choice is then NOT known to be saved.
     if (worker) {
         std::unique_lock<std::mutex> workerLock(worker->mutex);
+        if (worker->pending) {
+            worker->flush = true;
+            worker->wake.notify_one();
+        }
         const auto quiesced = [&worker] { return !worker->pending && !worker->writingSince; };
         // Not waited on again until something completes: a second stalled call would add
         // another deadline's delay to a thread that has already learned the answer.
@@ -173,6 +190,11 @@ bool ConfigWriter::awaitQueued(std::string& whyNot) {
     const Outcome result = outcome();
     if (!result.onDisk()) whyNot = result.why;
     return result.onDisk();
+}
+
+void ConfigWriter::onWritten(std::function<void()> written) {
+    std::lock_guard<std::mutex> lock(m_notice->mutex);
+    m_notice->written = std::move(written);
 }
 
 ConfigWriter::Outcome ConfigWriter::outcome() const {

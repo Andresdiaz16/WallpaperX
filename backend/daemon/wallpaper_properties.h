@@ -51,7 +51,7 @@ constexpr std::size_t kMaxPropertyKeyBytes = 64;
 std::string propertiesError(const WallpaperProperties& properties);
 
 // `properties` without the entries propertiesError() would refuse, and without those past
-// kMaxProperties, adding how many were left out to `dropped`. For a config file, where one bad
+// kMaxProperties -- "speed", "mute" and "volume" counted first -- adding how many were left out to `dropped`. For a config file, where one bad
 // value must not cost the wallpaper it rides on. Two are moved instead, each counted: a numeric
 // "volume" outside 0 to 1 to the nearer end, in `clampedVolumes`, since a build before "volume" was
 // reserved stored whatever range the wallpaper declared; and a positive "speed" that is not one of

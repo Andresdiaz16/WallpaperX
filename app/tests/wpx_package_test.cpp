@@ -273,6 +273,240 @@ void malformedManifests() {
     expect(checked == 39, QStringLiteral("S15.32: %1 malformed manifests were checked, not 39").arg(checked));
 }
 
+// What parseManifest made of `json`, run in a forked child so a stack overflow is this case's verdict
+// rather than the end of the binary.
+struct ForkedParse {
+    bool ran = false;
+    int signal = 0;
+    bool accepted = false;
+    QString sentence;
+};
+
+ForkedParse parseForked(const QByteArray& json) {
+    ForkedParse out;
+    int pipeFds[2];
+    if (::pipe(pipeFds) != 0) {
+        return out;
+    }
+    const pid_t child = ::fork();
+    if (child < 0) {
+        ::close(pipeFds[0]);
+        ::close(pipeFds[1]);
+        return out;
+    }
+    if (child == 0) {
+        ::close(pipeFds[0]);
+        const auto parsed = parseManifest(json);
+        const QByteArray said = parsed ? QByteArray("\x01") : parsed.error().toUtf8();
+        qsizetype at = 0;
+        while (at < said.size()) {
+            const ssize_t n = ::write(pipeFds[1], said.constData() + at, size_t(said.size() - at));
+            if (n <= 0) {
+                break;
+            }
+            at += n;
+        }
+        ::_exit(0);
+    }
+    ::close(pipeFds[1]);
+    QByteArray said;
+    char buffer[65536];
+    for (;;) {
+        const ssize_t n = ::read(pipeFds[0], buffer, sizeof buffer);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            break;
+        }
+        said.append(buffer, n);
+    }
+    ::close(pipeFds[0]);
+    int status = 0;
+    while (::waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) {
+            return out;
+        }
+    }
+    out.ran = true;
+    out.signal = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+    out.accepted = said == "\x01";
+    out.sentence = QString::fromUtf8(said);
+    return out;
+}
+
+struct UnquotableCase {
+    const char* what;
+    QByteArray json;
+};
+
+// Each case refused with a short sentence that does not carry the value. Returns how many were graded.
+int gradeUnquotable(const char* goal, const UnquotableCase* cases, std::size_t count) {
+    constexpr qsizetype kMaxSentence = 200;
+    int graded = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        const UnquotableCase& c = cases[i];
+        const QString what = QLatin1String(c.what);
+        if (c.json == kPlanManifest) {
+            harnessFailure(std::string(goal) + ": the manifest for " + c.what + " could not be made");
+            continue;
+        }
+        const ForkedParse r = parseForked(c.json);
+        if (!r.ran) {
+            harnessFailure(std::string(goal) + ": the parse of " + c.what + " could not be forked");
+            continue;
+        }
+        ++graded;
+        if (r.signal != 0) {
+            expect(false, QStringLiteral("%1: %2 crashed (signal %3)").arg(QLatin1String(goal), what).arg(r.signal));
+            continue;
+        }
+        expect(!r.accepted, QStringLiteral("%1: %2 was accepted").arg(QLatin1String(goal), what));
+        expect(r.sentence.size() <= kMaxSentence,
+               QStringLiteral("%1: %2 was refused with a %3-character sentence").arg(QLatin1String(goal), what).arg(r.sentence.size()));
+        expect(!r.sentence.contains(QChar(0x202e)) && !r.sentence.contains(u"xxxxxxxx"),
+               QStringLiteral("%1: %2 was refused with a sentence that quotes it: \"%3\"")
+                   .arg(QLatin1String(goal), what, r.sentence.left(kMaxSentence)));
+    }
+    return graded;
+}
+
+QByteArray deepValue() {
+    return QByteArray(100000, '[') + QByteArray(100000, ']');
+}
+
+QByteArray longValue() {
+    return '"' + QByteArray(1000000, 'x') + '"';
+}
+
+// S15.645
+void unquotableValues() {
+    // The value sits on the last key at every level: schema_version moved to the end of the
+    // document, and type to the end of tint, the last property.
+    const auto lastVersion = [](const QByteArray& value) {
+        QByteArray json(kPlanManifest);
+        json.replace("\"schema_version\": \"1\",", "");
+        json.replace("\n  }\n}", "\n  },\n  \"schema_version\": " + value + "\n}");
+        return json;
+    };
+    const auto lastType = [](const QByteArray& value) {
+        QByteArray json(kPlanManifest);
+        json.replace(R"("tint":  { "type": "color", "default": "#FFFFFF",         "label": "Tint"  })",
+                     R"("tint": { "default": "#FFFFFF", "label": "Tint", "type": )" + value + " }");
+        return json;
+    };
+    const UnquotableCase cases[] = {
+        {"a schema_version nested 100000 deep", lastVersion(deepValue())},
+        {"a 1,000,000-character schema_version", lastVersion(longValue())},
+        {"a property type nested 100000 deep", lastType(deepValue())},
+        {"a 1,000,000-character property type", lastType(longValue())},
+        {"a property type holding U+202E", lastType("\"in\xe2\x80\xaet\"")},
+        {"a schema_version holding 100000 numbers", lastVersion('[' + QByteArray(100000, '7').replace("7", "7,").chopped(1) + ']')},
+    };
+    // GOAL: S15.645 -- a schema_version or property type of any shape is refused with a short sentence:
+    //       never a crash, and never a sentence carrying the value when it is deep, long or not plain ASCII.
+    // WHY-THIS-SHAPE: parsed in a forked child, so a stack overflow is this case's FAIL, not a binary
+    //       killed with no line. The deep cases are now refused by the depth limit before quotable() runs;
+    //       the shallow 100000-number array is what still reaches quotable()'s refusal of a non-number.
+    // CONTROL: app/library/wpx_package.cpp quotable(), control_batch: `else if (!value.is_number())`
+    //       refusal deleted (2026-10-17) -> red, "S15.645: a schema_version holding 100000 numbers was refused
+    //       with a 200076-character sentence"; `text.size() > kMaxQuotedBytes ||` deleted -> red, "S15.645: a 1,000,000-character schema_version
+    //       was refused with a 1000077-character sentence" and the type's; the printable-ASCII test deleted
+    //       -> red, "S15.645: a property type holding U+202E was refused with a sentence that quotes it".
+    // COVERAGE-ASSERT: every case must be graded, so a manifest that failed to build cannot thin this.
+    const int graded = gradeUnquotable("S15.645", cases, std::size(cases));
+    expect(graded == int(std::size(cases)), QStringLiteral("S15.645: %1 manifests were graded, not %2").arg(graded).arg(std::size(cases)));
+}
+
+// S15.659
+void deepBeforeSiblings() {
+    const auto firstVersion = [](const QByteArray& value) {
+        QByteArray json(kPlanManifest);
+        json.replace("\"schema_version\": \"1\"", "\"schema_version\": " + value);
+        return json;
+    };
+    const auto firstType = [](const QByteArray& value) {
+        QByteArray json(kPlanManifest);
+        json.replace("\"type\": \"bool\"", "\"type\": " + value);
+        return json;
+    };
+    const UnquotableCase cases[] = {
+        {"a schema_version nested 100000 deep, with keys after it", firstVersion(deepValue())},
+        {"a property type nested 100000 deep, with keys after it", firstType(deepValue())},
+    };
+    // GOAL: S15.659 -- a deeply nested value anywhere in wallpaper.json is refused without a crash,
+    //       wherever it sits among its siblings.
+    // WHY-THIS-SHAPE: the deep value is followed by more keys at each level, so growing the
+    //       ordered_json object (a vector of pairs with a const key, copied rather than moved when it
+    //       reallocates) copies the deep value recursively inside Json::parse.
+    // CONTROL: control_batch 2026-10-17, reverted: app/library/wpx_package.cpp parseManifest's
+    //       `if (!nestsWithin(json, kMaxManifestDepth))` made `if (false)` -> red, "S15.659: a schema_version
+    //       nested 100000 deep, with keys after it crashed (signal 11)" and the property type's.
+    const int graded = gradeUnquotable("S15.659", cases, std::size(cases));
+    expect(graded == int(std::size(cases)), QStringLiteral("S15.659: %1 manifests were graded, not %2").arg(graded).arg(std::size(cases)));
+}
+
+// `levels` arrays and objects inside one another, alternating, around a 0.
+QByteArray nested(int levels) {
+    QByteArray open, close;
+    for (int i = 0; i < levels; ++i) {
+        open += (i % 2 == 0) ? "[" : "{\"k\":";
+        close.prepend((i % 2 == 0) ? "]" : "}");
+    }
+    return open + '0' + close;
+}
+
+// PLAN's manifest with `before` as a key's value ahead of an "extra" key holding `value`; the document
+// itself is one level, so `value` nested n deep makes n + 1.
+QByteArray withExtra(const QByteArray& before, const QByteArray& value) {
+    QByteArray json(kPlanManifest);
+    json.replace("\n}", ",\n  \"note\": " + before + ",\n  \"extra\": " + value + "\n}");
+    return json;
+}
+
+// S15.675
+void manifestDepthLimit() {
+    const QString kRefusal = QStringLiteral("wallpaper.json is nested more than 64 levels deep.");
+    const QByteArray brackets(100, '[');
+    struct Case {
+        const char* what;
+        QByteArray json;
+        bool accepted;
+    };
+    const Case cases[] = {
+        {"a document nested 64 deep", withExtra("\"\"", nested(63)), true},
+        {"a document nested 65 deep", withExtra("\"\"", nested(64)), false},
+        {"100 brackets inside a string", withExtra('"' + brackets + '"', "0"), true},
+        {"100 brackets after an escaped quote inside a string", withExtra("\"\\\"" + brackets + '"', "0"), true},
+        {"a string ending in an escaped backslash, then 65 deep", withExtra(R"("a\\")", nested(64)), false},
+    };
+    // GOAL: S15.675 -- wallpaper.json is accepted up to 64 levels of arrays and objects and refused at 65
+    //       with exactly "wallpaper.json is nested more than 64 levels deep."; brackets inside strings,
+    //       after an escaped quote too, are not levels, and an escaped backslash does not leave a string open.
+    // WHY-THIS-SHAPE: the levels alternate arrays and objects, so a scan counting only one kind passes 65 as
+    //       ~33; the escaped-backslash case is refused only if the string is seen to close before the deep value.
+    // CONTROL: control_batch 2026-10-17, each alone, reverted, app/library/wpx_package.cpp nestsWithin: kMaxManifestDepth
+    //       65 -> "FAIL: S15.675: a document nested 65 deep was accepted"; `++depth > limit` made `>=` -> "... nested 64
+    //       deep was refused: wallpaper.json is nested more than 64 levels deep."; `|| c == '{'` dropped -> "65 deep was
+    //       accepted"; the `c == '"'` that opens a string made `false` -> "100 brackets inside a string was refused";
+    //       `escaped = true` made `false` -> "100 brackets after an escaped quote inside a string was refused";
+    //       `escaped = false` dropped -> "a string ending in an escaped backslash, then 65 deep was accepted".
+    for (const Case& c : cases) {
+        if (!c.json.contains("\"extra\"")) {
+            harnessFailure(std::string("S15.675: the manifest for ") + c.what + " could not be made");
+            continue;
+        }
+        const auto parsed = parseManifest(c.json);
+        if (c.accepted) {
+            expect(parsed.has_value(), QStringLiteral("S15.675: %1 was refused: %2")
+                                           .arg(QLatin1String(c.what), parsed ? QString() : parsed.error()));
+        } else {
+            expect(!parsed && parsed.error() == kRefusal,
+                   QStringLiteral("S15.675: %1 was %2").arg(QLatin1String(c.what), parsed ? QStringLiteral("accepted") : QStringLiteral("refused with: ") + parsed.error()));
+        }
+    }
+}
+
 // What the daemon makes of a wallpaper.json's properties as declared: its own propertiesError() on
 // every default, and on a "volume"'s min and max, the two ends its slider can reach. Empty: accepted.
 std::string daemonVerdict(const OrderedJson& properties) {
@@ -1933,6 +2167,9 @@ int main(int argc, char* argv[]) {
     const QString root = scratch.path();
     runPhase("manifestOrderAndFields", manifestOrderAndFields);
     runPhase("malformedManifests", malformedManifests);
+    runPhase("unquotableValues", unquotableValues);
+    runPhase("deepBeforeSiblings", deepBeforeSiblings);
+    runPhase("manifestDepthLimit", manifestDepthLimit);
     runPhase("daemonPropertyRules", daemonPropertyRules);
     runPhase("speedChoices", speedChoices);
     runPhase("acceptValues", acceptValues);

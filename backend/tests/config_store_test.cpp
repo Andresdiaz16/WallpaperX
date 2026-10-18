@@ -8349,7 +8349,7 @@ void runSaveVisibleOnReturnChecks() {
 
     // The bytes the parked write was carrying, so "the caller waited" is about THIS request's
     // write and not about some other one that happened to be in flight.
-    // CONTROL: `worker->pending = std::move(rows);` in ConfigWriter::queue()
+    // CONTROL: `worker->pending = std::move(config);` in ConfigWriter::queue()
     //       (backend/daemon/config_writer.cpp) replaced with an empty vector, i.e. a save that
     //       queues the wrong state, via control_run.sh, --phase 'the wait a save is given',
     //       2026-09-29 -> "FAIL: the write this phase released is the one the request queued",
@@ -8451,7 +8451,7 @@ void runLatestSnapshotWinsChecks() {
     //       that never reach the disk -- the write lands in the pipe and its rename moves the
     //       fifo, not a file. It is also the only way to see a superseded snapshot's content
     //       at all.
-    // CONTROL: `worker->pending = std::move(rows);` in ConfigWriter::queue()
+    // CONTROL: `worker->pending = std::move(config);` in ConfigWriter::queue()
     //       (backend/daemon/config_writer.cpp) replaced with an empty vector, via control_run.sh,
     //       --phase 'the snapshot that wins a stall', 2026-09-29 -> "FAIL: the write that stalled is
     //       the snapshot that was current when it started", printing "the fifo carried 37 bytes",
@@ -8485,8 +8485,8 @@ void runLatestSnapshotWinsChecks() {
     //       renames the FIFO onto config.json, and an unguarded read of that path would block
     //       this thread for good.
     // CONTROL: two, both in backend/daemon/config_writer.cpp, via control_run.sh over the whole
-    //       binary, 2026-09-29, both reverted. (a) `worker->pending = std::move(rows);` in
-    //       ConfigWriter::queue() made `if (!worker->pending) worker->pending = std::move(rows);`,
+    //       binary, 2026-09-29, both reverted. (a) `worker->pending = std::move(config);` in
+    //       ConfigWriter::queue() made `if (!worker->pending) worker->pending = std::move(config);`,
     //       i.e. first-wins -> "FAIL: the snapshot that lands after a stalled write is the newest
     //       one", printing "monitor 2 is missing from the file", and nothing else red. (b)
     //       `pending` turned into a std::deque<std::vector<PersistedWallpaper>> the worker pops the
@@ -8657,8 +8657,8 @@ void runOutputSizeFieldChecks() {
     check(written, "a size is written beside its connector name, and nowhere else");
     if (!written) std::fprintf(stderr, "  file: %s\n", describeSizes(rows).c_str());
 
-    // CONTROL: `if (element.contains(kKeyOutputSize)) entry.outputSizeJson = element.at(kKeyOutputSize).dump();`
-    //       deleted from ConfigStore::load() (backend/daemon/config_store.cpp) via control_run.sh,
+    // CONTROL: `{kKeyOutputSize, &entry.outputSizeJson}` taken out of the carried-field table in
+    //       ConfigStore::load() (backend/daemon/config_store.cpp) via control_run.sh,
     //       2026-09-29 -> "FAIL: a written size is read back, and a row without one reads as having
     //       none", and red in the phases below that restore a size. Reverted.
     const LoadResult loaded = store.load();
@@ -10009,6 +10009,335 @@ void runWriterFailureKeptChecks() {
 #endif
 }
 
+std::string nested(int depth) { return std::string(static_cast<std::size_t>(depth), '[') + std::string(static_cast<std::size_t>(depth), ']'); }
+
+void runDeepCarriedFieldChecks() {
+    constexpr const char* kGoal = "S15.649 (a carried field nested too deep costs its row only)";
+    const ScratchDir scratch("deepfield");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoal, 1);
+    if (!paths.has_value()) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    const std::filesystem::path file = paths->config;
+    const ConfigStore store(file);
+    const std::string good = "{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/a.png\"}";
+    const auto withRow = [&good](const std::string& field, const std::string& value) {
+        return "{\"version\":1,\"monitors\":[" + good + ",{\"monitor_id\":1,\"type\":\"static\",\"path\":\"/b.png\",\"" +
+               field + "\":" + value + "}]}";
+    };
+    struct Case {
+        std::string what;
+        std::string content;
+        int entries;
+        int malformed;
+    };
+    std::vector<Case> cases;
+    for (const char* field : {"properties", "pause", "sound", "output_size"}) {
+        cases.push_back({std::string("a row's ") + field + " nested 65 deep", withRow(field, nested(65)), 1, 1});
+        cases.push_back({std::string("a row's ") + field + " nested 64 deep", withRow(field, nested(64)), 2, 0});
+    }
+    cases.push_back({"the top-level sound nested 65 deep",
+                     "{\"version\":1,\"sound\":" + nested(65) + ",\"monitors\":[" + good + "]}", 1, 1});
+    cases.push_back({"the top-level sound nested 64 deep",
+                     "{\"version\":1,\"sound\":" + nested(64) + ",\"monitors\":[" + good + "]}", 1, 0});
+
+    // GOAL: S15.649 -- a row field load() carries as text (properties, pause, sound, output_size) or
+    //       the top-level sound, nested past 64 levels, is counted malformed and costs that row only;
+    //       64 levels is still carried.
+    // WHY-THIS-SHAPE: 65 and 64, not the 100000 a crash needs: with the guard gone 100000 kills this
+    //       process with no FAIL line (dump() recursing), which daemon_system's start corpus reports
+    //       instead; 65 lets the same break go red here as a count.
+    // CONTROL: backend/daemon/config_store.cpp, control_batch: carriedText()'s nestsWithin test made
+    //       `false &&` -> red, "FAIL: a row's properties nested 65 deep" and the other four 65 cases;
+    //       kMaxDepth made 63 -> red, the five 64 cases; the row loop's `++result.malformedEntries;
+    //       continue;` emptied -> red, the four row 65 cases; the top-level sound's
+    //       `++result.malformedEntries` deleted -> red, "FAIL: the top-level sound nested 65 deep" alone.
+    // COVERAGE-ASSERT: all ten cases must be loaded.
+    int loaded = 0;
+    for (const Case& c : cases) {
+        if (!writeFile(file, c.content)) {
+            notVerified(kGoal, "a case file could not be written");
+            continue;
+        }
+        const LoadResult result = store.load();
+        ++loaded;
+        const bool shaped = result.error.empty() && static_cast<int>(result.entries.size()) == c.entries &&
+                            result.malformedEntries == c.malformed;
+        check(shaped, c.what.c_str());
+        if (!shaped) {
+            std::fprintf(stderr, "  %s: %zu entries (expected %d), %d malformed (expected %d), error '%s'\n",
+                         c.what.c_str(), result.entries.size(), c.entries, result.malformedEntries, c.malformed,
+                         result.error.c_str());
+        }
+    }
+    check(loaded == static_cast<int>(cases.size()), "every nesting case was loaded");
+
+    // GOAL: S15.649 at a start -- a row whose properties nest 100000 deep leaves the daemon running with
+    //       the other row restored, the file copied aside, and the health saying so.
+    // CONTROL: backend/daemon/config_store.cpp, control_batch: the row loop's `++result.malformedEntries;
+    //       continue;` emptied -> red, "FAIL: a start over a row nested too deep copies the file aside and
+    //       says so", with the other row still restored.
+    const std::string content =
+        "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"" +
+        paths->wallpapers.front().string() + "\"},{\"monitor_id\":1,\"type\":\"static\",\"path\":\"/b.png\",\"properties\":" +
+        nested(100000) + "}]}";
+    if (!writeFile(file, content)) {
+        notVerified(kGoal, "the start's config file could not be written");
+        return;
+    }
+    WallpaperManager::Config managerConfig;
+    managerConfig.configFile = file;
+    WallpaperManager manager(managerConfig);
+    manager.restoreSaved();
+    manager.preserveUnreadableConfig();
+    const WallpaperManager::Snapshot snap = manager.snapshot();
+    check(snap.monitors.count(0) == 1, "a start over a row nested too deep restores the other row");
+    const std::filesystem::path kept = preservedCopyDir(scratch) / "config.json.bad";
+    const std::string detail = snap.health.persistence.detail;
+    const bool noted = readFile(kept) == content && detail.find("1 malformed") != std::string::npos;
+    check(noted, "a start over a row nested too deep copies the file aside and says so");
+    if (!noted) std::fprintf(stderr, "  copy %s, persistence detail: %s\n", std::filesystem::exists(kept) ? "made" : "absent", detail.c_str());
+}
+
+void runOverflowingNumberChecks() {
+    constexpr const char* kGoal = "S15.652 (a number no double holds costs only its field)";
+    const ScratchDir scratch("overflow");
+    if (!scratch.ok()) {
+        notVerified(kGoal, "a scratch directory could not be created");
+        return;
+    }
+    const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
+    const ConfigStore store(file);
+    const std::string content =
+        "{\"version\":1,\"monitors\":["
+        "{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/a/1e999\",\"properties\":{\"volume\":1e300}},"
+        "{\"monitor_id\":1,\"type\":\"static\",\"path\":\"/b.png\",\"properties\":{\"speed\":1e999,\"mute\":true},"
+        "\"pause\":-1E+999},"
+        "{\"monitor_id\":1e999,\"type\":\"static\",\"path\":\"/c.png\"}]}";
+    if (!writeFile(file, content)) {
+        notVerified(kGoal, "the config file could not be written");
+        return;
+    }
+    // GOAL: S15.652 -- a number too large for a double (1e999, -1E+999) is read as null, costing its
+    //       field (or its row, where the field is required) and never the file; the same characters inside
+    //       a string, and a large number a double holds, are untouched.
+    // WHY-THIS-SHAPE: the path ends in "1e999", which a rewrite that does not skip strings turns into
+    //       "/a/null" -- a different file restored, not an error. A suffix such as ".png" would hide it:
+    //       the scanned token "1e999." is not a number.
+    // CONTROL: backend/daemon/config_store.cpp, control_batch: load()'s `nullOverflowingNumbers(text);`
+    //       deleted -> red, "FAIL: a config holding 1e999 still loads ..." (error "... out_of_range ...");
+    //       nullOverflowingNumbers' string-skipping branch made `if (false)` -> red, "FAIL: 1e999 inside a
+    //       string is left as written".
+    const LoadResult result = store.load();
+    std::map<int, PersistedWallpaper> byId;
+    for (const PersistedWallpaper& entry : result.entries) byId[entry.monitorId] = entry;
+    const bool kept = result.error.empty() && byId.size() == 2 && result.malformedEntries == 1;
+    check(kept, "a config holding 1e999 still loads, losing only the row whose monitor id it was");
+    if (!kept) std::fprintf(stderr, "  %zu entries, %d malformed, error '%s'\n", result.entries.size(), result.malformedEntries, result.error.c_str());
+    if (byId.count(0) == 1 && byId.count(1) == 1) {
+        check(byId[0].path == "/a/1e999", "1e999 inside a string is left as written");
+        check(byId[0].propertiesJson.find("1e+300") != std::string::npos || byId[0].propertiesJson.find("1e300") != std::string::npos,
+              "a large number a double holds is kept");
+        const bool nulled = byId[1].propertiesJson.find("\"speed\":null") != std::string::npos &&
+                            byId[1].propertiesJson.find("\"mute\":true") != std::string::npos && byId[1].pauseJson == "null";
+        check(nulled, "1e999 and -1E+999 are read as null beside the row's other values");
+        if (!nulled) std::fprintf(stderr, "  properties %s, pause %s\n", byId[1].propertiesJson.c_str(), byId[1].pauseJson.c_str());
+    }
+}
+
+PersistedConfig propertyRows(int rows) {
+    std::string properties = "{";
+    for (int k = 0; k < 40; ++k) properties += (k == 0 ? "" : ",") + std::string("\"k") + std::to_string(100 + k) + "\":true";
+    properties += "}";
+    PersistedConfig config;
+    for (int i = 0; i < rows; ++i) {
+        PersistedWallpaper row{i, "static", "/p/" + std::to_string(i) + ".png"};
+        row.propertiesJson = properties;
+        config.monitors.push_back(std::move(row));
+    }
+    return config;
+}
+
+void runCompactSaveChecks() {
+    constexpr const char* kGoal = "S15.650 (a save is compact, and never over the size a start reads)";
+    const ScratchDir scratch("compactsave");
+    if (!scratch.ok()) {
+        notVerified(kGoal, "a scratch directory could not be created");
+        return;
+    }
+    const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
+    const ConfigStore store(file);
+    // GOAL: S15.650 -- a config under the size limit when written compactly is saved and read back
+    //       whole, though indented it would be over the limit a start refuses.
+    // WHY-THIS-SHAPE: the indented size is asserted over the limit, so this cannot pass on a config
+    //       small enough that the writer's layout never mattered.
+    // CONTROL: backend/daemon/config_store.cpp, control_batch, re-run 2026-10-17: serialise()'s `root.dump()`
+    //       made `root.dump(2)` -> red, "FAIL: a config of 1800 rows is saved and read back whole".
+    const PersistedConfig fits = propertyRows(1800);
+    const SaveResult saved = store.save(fits);
+    const LoadResult loaded = store.load();
+    const std::string text = readFile(file);
+    const bool whole = saved.error.empty() && loaded.error.empty() && loaded.entries.size() == fits.monitors.size() &&
+                       !loaded.entries.empty() && loaded.entries.back().propertiesJson == fits.monitors.back().propertiesJson;
+    check(whole, "a config of 1800 rows is saved and read back whole");
+    if (!whole) std::fprintf(stderr, "  save '%s', load '%s', %zu bytes, %zu rows\n", saved.error.c_str(), loaded.error.c_str(), text.size(), loaded.entries.size());
+    const nlohmann::json parsed = nlohmann::json::parse(text, nullptr, false);
+    check(!parsed.is_discarded() && parsed.dump(2).size() > ConfigStore::kMaxBytes && text.size() <= ConfigStore::kMaxBytes,
+          "the 1800-row config is under the limit only because it is written compactly");
+
+    // GOAL: S15.650 -- a save whose compact text is still over the limit is refused with a reason,
+    //       and the file on disk is left as it was.
+    // CONTROL: backend/daemon/config_store.cpp, control_batch, re-run 2026-10-17: save()'s `if (text.size() >
+    //       kMaxBytes)` made `if (false)` -> red, "FAIL: a save over the limit is refused and the file kept".
+    const SaveResult over = store.save(propertyRows(2400));
+    const bool refused = !over.error.empty() && readFile(file) == text;
+    check(refused, "a save over the limit is refused and the file kept");
+    if (!refused) std::fprintf(stderr, "  save error '%s', file now %zu bytes\n", over.error.c_str(), readFile(file).size());
+
+    // A file of `rows` rows, each carrying 60 numbers written as "1e9", which a save writes back as
+    // "1000000000.0": four bytes on disk, thirteen saved.
+    const auto shortNumbers = [](int rows) {
+        std::string numbers;
+        for (int k = 0; k < 60; ++k) numbers += (k == 0 ? "1e9" : ",1e9");
+        std::string text = R"({"version":1,"monitors":[)";
+        for (int i = 0; i < rows; ++i) {
+            text += (i == 0 ? "" : ",") + std::string(R"({"monitor_id":)") + std::to_string(i) +
+                    R"(,"type":"static","path":"/p.png","properties":{"n":[)" + numbers + "]}}";
+        }
+        return text + "]}\n";
+    };
+
+    // GOAL: S15.686 -- a file under the size limit on disk whose saved form is over it is refused at
+    //       load, with a reason and marked safe to copy aside, so no run starts from a file it cannot save.
+    // WHY-THIS-SHAPE: both sizes are asserted first -- on disk under, saved over -- so the refusal cannot
+    //       be the on-disk gate's; a file that grows but stays under is then loaded and saved, so the
+    //       refusal is about growth past the limit and not about short number forms.
+    // CONTROL: backend/daemon/config_store.cpp, control_batch 2026-10-17: load()'s `if (saved > kMaxBytes)`
+    //       made `if (false)` -> red, "FAIL: a file whose saved form is over the limit is refused at load
+    //       and marked safe to copy aside". The second check is red under serialise()'s `root.dump(2)`
+    //       (S15.650's control below). Reverted.
+    {
+        const std::string grows = shortNumbers(2600);
+        const nlohmann::json parsed = nlohmann::json::parse(grows, nullptr, false);
+        const bool staged = !parsed.is_discarded() && grows.size() <= ConfigStore::kMaxBytes &&
+                            parsed.dump().size() > ConfigStore::kMaxBytes && writeFile(file, grows);
+        if (!staged) {
+            notVerified("S15.686", "a file under the limit on disk and over it saved could not be staged");
+        } else {
+            const LoadResult tooBig = store.load();
+            const bool rejected = tooBig.entries.empty() && tooBig.preservable &&
+                                  tooBig.error.find("when saved") != std::string::npos;
+            check(rejected, "a file whose saved form is over the limit is refused at load and marked safe to copy aside");
+            if (!rejected) {
+                std::fprintf(stderr, "  %zu bytes on disk, %zu saved: %zu entries, preservable %d, error '%s'\n",
+                             grows.size(), parsed.dump().size(), tooBig.entries.size(), tooBig.preservable ? 1 : 0,
+                             tooBig.error.c_str());
+            }
+        }
+        const std::string fitsGrown = shortNumbers(1000);
+        if (!writeFile(file, fitsGrown)) {
+            notVerified("S15.686", "a file that grows but stays under the limit could not be written");
+        } else {
+            const LoadResult loaded = store.load();
+            const SaveResult resaved = loaded.error.empty() ? store.save(PersistedConfig{loaded.entries, loaded.soundJson})
+                                                            : SaveResult{};
+            const bool kept = loaded.error.empty() && loaded.entries.size() == 1000 && resaved.error.empty() &&
+                              readFile(file).size() > fitsGrown.size();
+            check(kept, "a file that grows when saved but stays under the limit loads and saves");
+            if (!kept) std::fprintf(stderr, "  load '%s' (%zu entries), save '%s'\n", loaded.error.c_str(), loaded.entries.size(), resaved.error.c_str());
+        }
+    }
+}
+
+PersistedConfig onePath(const std::string& path) { return PersistedConfig{{PersistedWallpaper{0, "static", path}}}; }
+
+void runCoalescedSaveChecks() {
+    constexpr const char* kGoal = "S15.651 (a burst of saves is coalesced, and a stop still writes the last)";
+    const ScratchDir scratch("coalesce");
+    if (!scratch.ok()) {
+        notVerified(kGoal, "a scratch directory could not be created");
+        return;
+    }
+    const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
+    const ConfigStore store(file);
+    {
+        // GOAL: S15.651 -- 200 saves queued 5 ms apart make at most one write per 250 ms of the burst
+        //       (plus two for its ends), and the file ends holding the last.
+        // WHY-THIS-SHAPE: the bound is computed from the burst's measured length, so a slow machine
+        //       stretches it rather than failing; a count of exactly N writes would assert the scheduler.
+        // CONTROL: backend/daemon/config_writer.cpp, control_batch, re-run 2026-10-17: the worker's `wake.wait_for(lock,
+        //       kCoalesce, ...)` deleted -> red, "FAIL: a burst of 200 saves is coalesced" (about 200 writes).
+        // COVERAGE-ASSERT: at least one write must be counted, so a counter that sees nothing fails.
+        wallpaperx::ConfigWriter writer(store);
+        countRenamesOnto(file);
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < 200; ++i) {
+            writer.queue(onePath("/p/" + std::to_string(i) + ".png"));
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        const auto burst = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+        const bool landed = writer.awaitQueued();
+        const unsigned writes = renamesCounted();
+        countRenamesOnto({});
+        const unsigned bound = static_cast<unsigned>(burst.count() / 250) + 2;
+        const LoadResult last = store.load();
+        check(landed && writes >= 1 && writes <= bound, "a burst of 200 saves is coalesced");
+        std::fprintf(writes <= bound ? stdout : stderr, "  %u writes over a %lld ms burst (bound %u)\n", writes,
+                     static_cast<long long>(burst.count()), bound);
+        check(last.entries.size() == 1 && last.entries.front().path == "/p/199.png", "the coalesced burst leaves the last save on disk");
+
+        // GOAL: S15.651 -- a save waited for (awaitQueued) is written at once, not after the delay.
+        // WHY-THIS-SHAPE: the fastest of three waits against the 250 ms delay: without the flush every
+        //       wait takes at least that long, while one slow fsync cannot fail the check alone.
+        // CONTROL: backend/daemon/config_writer.cpp, control_batch, re-run 2026-10-17: waitForQueued()'s `worker->flush =
+        //       true;` deleted -> red, "FAIL: a save waited for is written without the coalescing delay".
+        long long fastest = std::numeric_limits<long long>::max();
+        bool allLanded = true;
+        for (int round = 0; round < 3; ++round) {
+            writer.queue(onePath("/q/" + std::to_string(round) + ".png"));
+            const auto t0 = std::chrono::steady_clock::now();
+            allLanded = writer.awaitQueued() && allLanded;
+            fastest = std::min<long long>(fastest, std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
+        }
+        check(allLanded && fastest < 250, "a save waited for is written without the coalescing delay");
+        std::fprintf(fastest < 250 ? stdout : stderr, "  fastest waited save took %lld ms\n", fastest);
+    }
+
+    // GOAL: S15.651 -- a writer destroyed right after a queue() (the daemon stopping) writes it first.
+    // CONTROL: backend/daemon/config_writer.cpp, control_batch: ~ConfigWriter()'s `waitForQueued();`
+    //       deleted -> red, "FAIL: a save queued just before the writer is destroyed is on disk".
+    {
+        wallpaperx::ConfigWriter writer(store);
+        writer.queue(onePath("/stop.png"));
+    }
+    const LoadResult stopped = store.load();
+    check(stopped.entries.size() == 1 && stopped.entries.front().path == "/stop.png",
+          "a save queued just before the writer is destroyed is on disk");
+}
+
+void runAppliedKeysFirstChecks() {
+    // GOAL: S15.653 -- under the 64-property cap, speed, mute and volume are kept whatever the other
+    //       keys are called, and the cap drops other keys instead.
+    // WHY-THIS-SHAPE: the hundred other keys all sort before "mute", so a cap applied in key order
+    //       fills up before reaching any of the three.
+    // CONTROL: backend/daemon/wallpaper_properties.cpp, control_batch: usableProperties()' first loop
+    //       over kAppliedKeys deleted and the second's `if` made unconditional -> red, "FAIL: under the
+    //       property cap, speed, mute and volume are kept".
+    wallpaperx::WallpaperProperties properties;
+    for (int i = 0; i < 100; ++i) properties["a" + std::to_string(100 + i)] = true;
+    properties["speed"] = 2.0;
+    properties["mute"] = true;
+    properties["volume"] = 0.5;
+    int dropped = 0;
+    int clamped = 0;
+    int snapped = 0;
+    const wallpaperx::WallpaperProperties usable = wallpaperx::usableProperties(properties, dropped, clamped, snapped);
+    const bool kept = usable.size() == wallpaperx::kMaxProperties && usable.count("speed") == 1 && usable.count("mute") == 1 &&
+                      usable.count("volume") == 1 && dropped == 103 - static_cast<int>(wallpaperx::kMaxProperties);
+    check(kept, "under the property cap, speed, mute and volume are kept");
+    if (!kept) std::fprintf(stderr, "  %zu kept, %d dropped, speed %zu mute %zu volume %zu\n", usable.size(), dropped,
+                            usable.count("speed"), usable.count("mute"), usable.count("volume"));
+}
+
 void runPlaybackSpeedChecks() {
     // GOAL: S15.100 -- "speed" takes exactly 0.5, 1 and 2: propertiesError() accepts those three and refuses
     //       0.25, 0.75, 1.5, 3, 0 and a bool with "property speed must be 0.5, 1 or 2"; playbackSpeed() is 1
@@ -10278,10 +10607,10 @@ void runPropertiesOlderConfigChecks() {
         // WHY-THIS-SHAPE: the repair clauses are what decide a rewrite, so their absence is what says
         //       the file is left as it was; a byte comparison here would race the queued repair write.
         // CONTROL: ConfigStore::load() (backend/daemon/config_store.cpp) made to read a row with no
-        //       `properties` key as one holding null -- `entry.propertiesJson =
-        //       element.value(kKeyProperties, nlohmann::json()).dump();` unguarded -- via control_run.sh,
-        //       2026-09-29 -> "FAIL: a config written before properties existed restores with nothing
-        //       dropped or repaired". Reverted.
+        //       `properties` key as one holding null -- the carried-field check made
+        //       `carriedText(element.value(field.first, nlohmann::json()), *field.second)`, unguarded, which
+        //       does the same to pause, sound and output_size -- via control_batch.sh -> "FAIL: a config
+        //       written before properties existed restores with nothing dropped or repaired". Reverted.
         WallpaperManager::Config managerConfig;
         managerConfig.configFile = paths->config;
         WallpaperManager manager(managerConfig);
@@ -11858,6 +12187,11 @@ int main() {
         {"a SetWallpaper whose save is not on disk", runRequestAfterCommitChecks},
         {"the config writer's wait without a reason", runNoReasonWaitChecks},
         {"a failed call leaves an earlier unsaved save reported unsaved", runWriterFailureKeptChecks},
+        {"a carried field nested too deep", runDeepCarriedFieldChecks},
+        {"a number no double can hold", runOverflowingNumberChecks},
+        {"a save near and over the size limit", runCompactSaveChecks},
+        {"a burst of saves", runCoalescedSaveChecks},
+        {"the property cap keeps the applied keys", runAppliedKeysFirstChecks},
         {"the speed a video is played at", runPlaybackSpeedChecks},
         {"when a wallpaper's properties are written", runPropertiesWriteChecks},
         {"a wallpaper's properties across a restart", runPropertiesRestartChecks},

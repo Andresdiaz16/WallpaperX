@@ -187,6 +187,11 @@ public:
     QJsonValue sound = true;
     QMap<int, QJsonValue> screenSound;
 
+    // The daemon's PersistenceChanged, from the connection owning the stand-in's name.
+    bool announcePersistenceChanged() {
+        return m_bus.send(QDBusMessage::createSignal(m_path, QStringLiteral("io.wallpaperx.Daemon"), QStringLiteral("PersistenceChanged")));
+    }
+
     QString status() const {
         QJsonObject names;
         QJsonObject shown;

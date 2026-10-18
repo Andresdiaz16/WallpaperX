@@ -21,6 +21,7 @@
 #include <climits>
 #include <cmath>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 
@@ -47,6 +48,56 @@ QString systemError(int error)
 QString fromJson(const Json& value)
 {
     return QString::fromStdString(value.get<std::string>());
+}
+
+// `value` as JSON fit to quote in a sentence: a number, or a short string of printable ASCII. Never
+// anything else: dump() recurses once per level of nesting, and a string may be any length.
+std::optional<QString> quotable(const Json& value)
+{
+    constexpr std::size_t kMaxQuotedBytes = 32;
+    if (value.is_string()) {
+        const auto& text = value.get_ref<const std::string&>();
+        if (text.size() > kMaxQuotedBytes || !std::ranges::all_of(text, [](char c) { return c >= 0x20 && c < 0x7f; })) {
+            return std::nullopt;
+        }
+    } else if (!value.is_number()) {
+        return std::nullopt;
+    }
+    return QString::fromStdString(value.dump());
+}
+
+// Json::parse does not recurse, but an ordered_json object copies its members when it grows, and
+// copying a value recurses once per level. A real manifest nests a handful deep.
+constexpr int kMaxManifestDepth = 64;
+
+// Whether `json` opens at most `limit` arrays and objects inside one another, without recursing.
+// Brackets inside strings are skipped, so up to the first byte the parser refuses, this is the
+// depth it would build.
+bool nestsWithin(const QByteArray& json, int limit)
+{
+    int depth = 0;
+    bool inString = false;
+    bool escaped = false;
+    for (const char c : json) {
+        if (inString) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                inString = false;
+            }
+        } else if (c == '"') {
+            inString = true;
+        } else if (c == '[' || c == '{') {
+            if (++depth > limit) {
+                return false;
+            }
+        } else if ((c == ']' || c == '}') && depth > 0) {
+            --depth;
+        }
+    }
+    return true;
 }
 
 const QRegularExpression& colorPattern()
@@ -110,9 +161,10 @@ std::expected<WallpaperProperty, QString> parseProperty(const QString& key, cons
         property.type = WallpaperProperty::Type::Bool;
     } else if (typeName == "color") {
         property.type = WallpaperProperty::Type::Color;
+    } else if (const auto quoted = quotable(*type)) {
+        return refuse(QStringLiteral("has type %1, which is not float, bool or color.").arg(*quoted));
     } else {
-        return refuse(QStringLiteral("has type \"%1\", which is not float, bool or color.")
-                          .arg(QString::fromStdString(typeName)));
+        return refuse(QStringLiteral("has a type that is not float, bool or color."));
     }
 
     const auto fallback = spec.find("default");
@@ -638,6 +690,10 @@ QUrl Wallpaper::previewSource() const
 
 std::expected<Wallpaper, QString> parseManifest(const QByteArray& json)
 {
+    if (!nestsWithin(json, kMaxManifestDepth)) {
+        return std::unexpected(
+            QStringLiteral("wallpaper.json is nested more than %1 levels deep.").arg(kMaxManifestDepth));
+    }
     Json doc;
     try {
         doc = Json::parse(json.cbegin(), json.cend());
@@ -660,9 +716,12 @@ std::expected<Wallpaper, QString> parseManifest(const QByteArray& json)
     const bool versionOne = (version->is_string() && version->get<std::string>() == "1")
                             || (version->is_number_integer() && version->get<long long>() == 1);
     if (!versionOne) {
-        return std::unexpected(QStringLiteral("wallpaper.json is for schema version %1, which this WallpaperX does "
-                                              "not read.")
-                                   .arg(QString::fromStdString(version->dump())));
+        const auto quoted = quotable(*version);
+        return std::unexpected(quoted ? QStringLiteral("wallpaper.json is for schema version %1, which this "
+                                                       "WallpaperX does not read.")
+                                            .arg(*quoted)
+                                      : QStringLiteral("wallpaper.json is for a schema version this WallpaperX "
+                                                       "does not read."));
     }
 
     // Each is required, a string, and non-empty.

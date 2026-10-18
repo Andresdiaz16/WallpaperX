@@ -903,17 +903,18 @@ void liveEdits() {
            QStringLiteral("S15.241: an accepted edit left \"%1\" shown").arg(rig.applier->liveError()));
 
     // GOAL: S15.242 -- once a stream of edits settles, the daemon's persistence health is read
-    //       again, so a save that failed behind the accepted edit just made is shown.
+    //       again, so a save the daemon could not queue behind the accepted edit just made (refused,
+    //       or no writer) is shown: no write follows it, so no PersistenceChanged (S15.689) will.
     // WHY-THIS-SHAPE: S15.241's accepted edit left a re-read of its own in flight, and the stand-in
     //       builds each reply when it sends it, so that read would carry the failure set here with
     //       no help from the speed edit below. It is drained first: the marker follows it on the same
     //       connection, so it was answered "ok" before the failure is set. The status must then be
     //       read again after the flip. The wait's deadline fails the check.
-    // CONTROL: app/daemon/apply_controller.cpp, control_batch, re-run 2026-10-15: sendLive()'s
+    // CONTROL: app/daemon/apply_controller.cpp, control_batch, re-run 2026-10-17: sendLive()'s
     //       `m_daemon.refresh();` in the idle branch deleted -> red, "S15.242: after an accepted edit
     //       the persistence problem reads "" (settled 1, 0 status read(s) since the failure)"; the
     //       refresh moved inside `if (m_liveError != error)` (re-read only when the shown error
-    //       changes) -> red, the same line. With the drain and the read-after-the-failure condition
+    //       changes) -> red, the same line (2026-10-15, not re-run). With the drain and the read-after-the-failure condition
     //       both taken out (the shape the review found), that second break left the phase green.
     const bool settled = rig.daemonDrained();
     rig.daemonFake->calls.clear();
@@ -1135,6 +1136,154 @@ void daemonPresence() {
     } else {
         expect(back, QStringLiteral("S15.246: after the daemon came back the client is state %1").arg(int(rig.client->state())));
     }
+}
+
+void daemonReturn() {
+    constexpr const char* goals = "S15.647, S15.648";
+    Rig rig;
+    if (!build(rig, goals, QStringLiteral("return"))) {
+        return;
+    }
+    // The re-send names the wallpaper (SetWallpaperWithProperties, properties third); a later edit
+    // on the same daemon addresses the monitor alone (SetWallpaperProperties).
+    const auto resends = [&] { return rig.sent("SetWallpaperWithProperties"); };
+    const auto edits = [&] { return rig.sent("SetWallpaperProperties"); };
+    const QString asset = rig.ocean + QStringLiteral("/assets/video.mp4");
+    const auto speedResent = [&] {
+        const auto r = resends();
+        if (r.isEmpty() || r.back().args.value(0).toString() != u"video" || r.back().args.value(1).toString() != asset ||
+            r.back().args.value(2).toInt() != 0) {
+            return QVariant();
+        }
+        return r.back().args.value(3).toMap().value(QStringLiteral("speed"));
+    };
+    const auto describeResends = [&] {
+        QStringList out;
+        for (const FakeCall& c : resends()) {
+            out.append(c.args.value(1).toString() + u' ' + c.args.value(2).toString() + u' ' + describeMap(c.args.value(3).toMap()));
+        }
+        return u'[' + joined(out) + u']';
+    };
+    const bool applied = rig.apply();
+    const bool live = applied && rig.applier->liveOutput() == u"DP-1";
+    if (!live) {
+        harnessFailure(std::string(goals) + ": the Apply this phase starts from did not leave DP-1 live");
+        return;
+    }
+
+    // GOAL: S15.647 -- a speed changed while the daemon is gone reaches the daemon that returns, before
+    //       the user touches anything again, as SetWallpaperWithProperties naming the open wallpaper and
+    //       its monitor, and the "not running" sentence that change left is cleared.
+    // WHY-THIS-SHAPE: graded on the call the stand-in daemon received after its name came back, not on
+    //       the app's state: an app that only cleared its sentence would pass a check of the app alone
+    //       while the daemon plays the old speed. The wallpaper is named because a restarted daemon may
+    //       hold another one on that monitor. The wait's deadline fails the check.
+    // CONTROL: control_batch, 2026-10-17, each reverted: app/daemon/daemon_client.cpp, `emit
+    //       serviceStarted();` deleted -> red, "S15.647: after the daemon returned it received [] naming the
+    //       wallpaper and 0 SetWallpaperProperties, the app shows "... is not running.""; app/daemon/
+    //       apply_controller.cpp sendLive()'s `if (m_live->sent)` made `if (true)` (re-sent by monitor alone)
+    //       -> red, "... received [] naming the wallpaper and 1 SetWallpaperProperties ...".
+    rig.daemonFake->stop();
+    const bool gone = waitUntil([&] { return rig.client->state() == DaemonClient::State::Unavailable; }, kWaitMs);
+    rig.library->setPropertyValue(QStringLiteral("speed"), 2.0);
+    const bool failedShown = waitUntil([&] { return !rig.applier->liveError().isEmpty(); }, kWaitMs);
+    if (!gone || !failedShown) {
+        harnessFailure(std::string(goals) + ": the edit made with the daemon gone was not refused, so there is nothing to re-send");
+        return;
+    }
+    rig.daemonFake->calls.clear();
+    const QString restarted = rig.daemonFake->start();
+    if (!restarted.isEmpty()) {
+        harnessFailure(std::string(goals) + ": the daemon stand-in could not take its name back: " + restarted.toStdString());
+        return;
+    }
+    const bool resent = waitUntil([&] { return speedResent() == QVariant(2.0); }, kWaitMs);
+    const bool cleared = waitUntil([&] { return rig.applier->liveError().isEmpty(); }, kWaitMs);
+    expect(resent && cleared && edits().isEmpty(),
+           QStringLiteral("S15.647: after the daemon returned it received %1 naming the wallpaper and %2 SetWallpaperProperties, the app shows \"%3\"")
+               .arg(describeResends()).arg(edits().size()).arg(rig.applier->liveError()));
+
+    // GOAL: S15.688 -- once the re-send naming the wallpaper is accepted, the next edit addresses the
+    //       monitor alone (SetWallpaperProperties) and does not set the wallpaper again.
+    // WHY-THIS-SHAPE: read once the re-send's reply is handled and the edit has reached the stand-in, so
+    //       an edit sent before the reply landed, which may rightly be a second full call, is not graded.
+    // CONTROL: app/daemon/apply_controller.cpp sendLive()'s `if (m_live->sent)` made `if (false)` (control_batch,
+    //       2026-10-17, reverted) -> red, "S15.688: after the accepted re-send an edit sent 0
+    //       SetWallpaperProperties (speed "") and [.../ocean/assets/video.mp4 0 {... speed=0.5 ...}]".
+    const bool resendSettled = rig.repliesHandled() && rig.daemonDrained() && rig.repliesHandled();
+    rig.daemonFake->calls.clear();
+    rig.library->setPropertyValue(QStringLiteral("speed"), 0.5);
+    const bool edited = waitUntil([&] { return !edits().isEmpty(); }, kWaitMs) && rig.daemonDrained();
+    const QVariant editSpeed = edits().isEmpty() ? QVariant() : edits().back().args.value(1).toMap().value(QStringLiteral("speed"));
+    expect(resendSettled && edited && editSpeed == QVariant(0.5) && resends().isEmpty(),
+           QStringLiteral("S15.688: after the accepted re-send an edit sent %1 SetWallpaperProperties (speed \"%2\") and %3")
+               .arg(edits().size()).arg(editSpeed.toString()).arg(describeResends()));
+
+    // GOAL: S15.648 -- the open wallpaper's values are re-sent on every daemon start, even when the
+    //       app's last change was accepted: a restarted daemon holds only what it saved.
+    // WHY-THIS-SHAPE: the second restart follows an accepted change, which is the case an app keeping
+    //       "what the daemon accepted" across the restart would skip as already sent.
+    // CONTROL: app/daemon/apply_controller.cpp, `m_live->sent.reset();` in the serviceStarted handler
+    //       deleted (control_batch, re-run 2026-10-17) -> red, "S15.648: after a restart following an accepted
+    //       change the daemon received [] naming the wallpaper and 0 SetWallpaperProperties", beside S15.647's.
+    const bool drained = rig.repliesHandled() && rig.daemonDrained();
+    rig.daemonFake->stop();
+    const bool goneAgain = waitUntil([&] { return rig.client->state() == DaemonClient::State::Unavailable; }, kWaitMs);
+    rig.daemonFake->calls.clear();
+    const QString again = rig.daemonFake->start();
+    if (!drained || !goneAgain || !again.isEmpty()) {
+        harnessFailure(std::string(goals) + ": the second restart could not be staged: " + again.toStdString());
+        return;
+    }
+    const bool resentAgain = waitUntil([&] { return speedResent() == QVariant(0.5); }, kWaitMs);
+    expect(resentAgain, QStringLiteral("S15.648: after a restart following an accepted change the daemon received %1 naming the wallpaper and %2 SetWallpaperProperties")
+                            .arg(describeResends()).arg(edits().size()));
+}
+
+void persistenceSignal() {
+    constexpr const char* goals = "S15.689";
+    Rig rig;
+    if (!build(rig, goals, QStringLiteral("persisted"))) {
+        return;
+    }
+    const QString failing =
+        QStringLiteral("The WallpaperX service could not save its settings, so they may be lost when it restarts: the disk is full");
+    const bool applied = rig.apply();
+    rig.library->setPropertyValue(QStringLiteral("speed"), 2.0);
+    // The edit's reply, the status read it starts, and that read's reply: nothing of the app's own is
+    // left in flight when the failure is set.
+    const bool settled = applied && waitUntil([&] { return !rig.sent("SetWallpaperProperties").isEmpty(); }, kWaitMs) &&
+                         rig.repliesHandled() && rig.daemonDrained() && rig.repliesHandled();
+    if (!settled || !rig.client->persistenceProblem().isEmpty()) {
+        harnessFailure(std::string(goals) + ": the accepted edit this phase starts from did not settle with no problem shown");
+        return;
+    }
+
+    // GOAL: S15.689 -- a save that fails after the daemon has answered (its write runs 250 ms later) is
+    //       shown once the daemon announces PersistenceChanged, and a failure cleared later stops showing
+    //       on the next announcement.
+    // WHY-THIS-SHAPE: the app is idle when the stand-in's status flips -- every reply handled -- so the
+    //       signal is the only thing that can make it read GetStatus again; the read is asserted to have
+    //       happened. The wait's deadline fails the check.
+    // CONTROL: control_batch, 2026-10-17, each reverted: app/daemon/daemon_client.cpp, the constructor's
+    //       PersistenceChanged connection deleted -> red, "S15.689: after PersistenceChanged announcing a
+    //       failed write the app shows "" (0 status read(s))"; DaemonClient::refresh() returning at once while
+    //       persistence reads "fail" -> red, "S15.689: after PersistenceChanged announcing a cleared failure
+    //       the app shows "The WallpaperX service could not save its settings, ...: the disk is full"".
+    rig.daemonFake->calls.clear();
+    rig.daemonFake->persistence = QStringLiteral("fail");
+    const bool sentFail = rig.daemonFake->announcePersistenceChanged();
+    const bool shown = waitUntil([&] { return !rig.client->persistenceProblem().isEmpty(); }, kWaitMs);
+    expect(sentFail && shown && rig.client->persistenceProblem() == failing && !rig.sent("GetStatus").isEmpty(),
+           QStringLiteral("S15.689: after PersistenceChanged announcing a failed write the app shows \"%1\" (%2 status read(s))")
+               .arg(rig.client->persistenceProblem()).arg(rig.sent("GetStatus").size()));
+
+    const bool idle = rig.daemonDrained() && rig.repliesHandled();
+    rig.daemonFake->persistence = QStringLiteral("ok");
+    const bool sentOk = rig.daemonFake->announcePersistenceChanged();
+    const bool gone = waitUntil([&] { return rig.client->persistenceProblem().isEmpty(); }, kWaitMs);
+    expect(idle && sentOk && gone,
+           QStringLiteral("S15.689: after PersistenceChanged announcing a cleared failure the app shows \"%1\"").arg(rig.client->persistenceProblem()));
 }
 
 void lateReplies() {
@@ -1834,6 +1983,8 @@ int main(int argc, char* argv[]) {
     runPhase("failureSentences", failureSentences);
     runPhase("pauseModes", pauseModes);
     runPhase("daemonPresence", daemonPresence);
+    runPhase("daemonReturn", daemonReturn);
+    runPhase("persistenceSignal", persistenceSignal);
     runPhase("lateReplies", lateReplies);
     runPhase("pauseScope", pauseScope);
     runPhase("applyScope", applyScope);

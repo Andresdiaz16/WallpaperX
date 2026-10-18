@@ -1154,6 +1154,79 @@ void autoImport(const QString& root) {
     }
 }
 
+// S15.646
+void longNames(const QString& root) {
+    const QString dir = root + QStringLiteral("/longnames");
+    const QString wallpapers = dir + QStringLiteral("/wallpapers");
+    const QString drop = dir + QStringLiteral("/drop");
+    const auto at = [&dir](const char* name) { return dir + QLatin1Char('/') + QLatin1String(name); };
+    const QByteArray plan(kPlanManifest);
+    // 128 two-byte characters: 256 bytes, though only 128 characters.
+    const QString wide = QString(128, QChar(0xe9));
+    QString why;
+    const auto build = [&why](const QString& w) {
+        if (why.isEmpty() && !w.isEmpty()) {
+            why = w;
+        }
+    };
+    build(QDir().mkpath(wallpapers) && QDir().mkpath(drop) ? QString() : QStringLiteral("the folders could not be made"));
+    build(writeZip(at("file256.wpx"), planEntries(plan) + Entries{{QStringLiteral("assets/") + QString(256, u'x'), "x"}}));
+    build(writeZip(at("folder256.wpx"), planEntries(plan) + Entries{{QString(256, u'd') + QStringLiteral("/a.txt"), "x"}}));
+    build(writeZip(at("wide256.wpx"), planEntries(plan) + Entries{{QStringLiteral("assets/") + wide, "x"}}));
+    build(writeZip(at("file255.wpx"), planEntries(plan) + Entries{{QStringLiteral("assets/") + QString(255, u'x'), "x"}}));
+    const auto dropped = zipBytes(root + QStringLiteral("/long.scratch"), planEntries(plan) + Entries{{QStringLiteral("assets/") + QString(256, u'x'), "x"}});
+    build(dropped ? QString() : QStringLiteral("the dropped package could not be made"));
+    if (!why.isEmpty() || wide.toUtf8().size() != 256) {
+        fault("S15.646", why.isEmpty() ? QStringLiteral("the two-byte name is not 256 bytes") : why);
+        return;
+    }
+    const QString reason = QStringLiteral("It holds a file or folder whose name is longer than the 255 bytes a Linux disk can store.");
+
+    // GOAL: S15.646 -- an entry with any path part over 255 bytes is Refused (a permanent verdict,
+    //       recorded so the drop folder never retries it), not Failed, and nothing is left behind; the
+    //       limit is in bytes, and 255 bytes is still imported.
+    // WHY-THIS-SHAPE: the two-byte name is 128 characters, so a check counting characters lets it
+    //       through to the disk, which refuses it with ENAMETOOLONG -- a Failed, retried every scan.
+    // CONTROL: app/library/importer.cpp planEntries, control_batch: the name-length refusal made
+    //       `if (false)` -> red, "S15.646: file256.wpx gave Failed ..." for each 256 case, "S15.646: the
+    //       long name dropped in was reported as [...] and recorded 0" and "S15.646: after a restart the long
+    //       name ran 1 import(s)"; `part.toUtf8().size()` made
+    //       `part.size()` -> red, "S15.646: wide256.wpx gave Failed ..." only; `> NAME_MAX` made
+    //       `>= NAME_MAX` -> red, "S15.646: a 255-byte name gave Refused ...".
+    for (const char* file : {"file256.wpx", "folder256.wpx", "wide256.wpx"}) {
+        const ImportResult r = unpackPackage(at(file), wallpapers, kNotCancelled);
+        const QStringList left = entriesOf(wallpapers);
+        expect(r.outcome == ImportResult::Outcome::Refused && r.problem == reason && left.isEmpty(),
+               QStringLiteral("S15.646: %1 gave %2, left [%3]; wanted Refused \"%4\"").arg(QLatin1String(file), describe(r), left.join(u", "), reason));
+        QDir(wallpapers).removeRecursively();
+        QDir().mkpath(wallpapers);
+    }
+    const ImportResult fits = unpackPackage(at("file255.wpx"), wallpapers, kNotCancelled);
+    expect(fits.outcome == ImportResult::Outcome::Imported, QStringLiteral("S15.646: a 255-byte name gave %1").arg(describe(fits)));
+
+    {
+        Session s(drop, wallpapers);
+        s.importer().rescan();
+        if (!s.quiesce() || !dropIn(drop, QStringLiteral("long.wpx"), *dropped)) {
+            fault("S15.646", QStringLiteral("long.wpx could not be dropped in"));
+            return;
+        }
+        const bool reported = waitUntil([&] { return !s.importer().problems().isEmpty(); }, kWaitMs) && s.quiesce();
+        const bool recorded = recordOf(drop).contains(keyOf(drop + QStringLiteral("/long.wpx")));
+        expect(reported && recorded && s.importer().problems() == QStringList{QStringLiteral("long.wpx could not be imported. ") + reason},
+               QStringLiteral("S15.646: the long name dropped in was reported as [%1] and recorded %2")
+                   .arg(s.importer().problems().join(QStringLiteral(" | "))).arg(recorded));
+    }
+    {
+        Session s(drop, wallpapers);
+        s.importer().rescan();
+        const bool quiet = s.quiesce();
+        const int runs = s.takeRuns();
+        expect(quiet && runs == 0 && s.importer().problems().isEmpty(),
+               QStringLiteral("S15.646: after a restart the long name ran %1 import(s), reporting [%2]").arg(runs).arg(s.importer().problems().join(QStringLiteral(" | "))));
+    }
+}
+
 // S15.79, S15.80
 void failuresAndMarking(const QString& root) {
     if (::geteuid() == 0) {
@@ -3936,6 +4009,7 @@ int main(int argc, char* argv[]) {
     const QString root = scratch.path();
     runPhase("imports", [&] { imports(root); });
     runPhase("refusals", [&] { refusals(root); });
+    runPhase("longNames", [&] { longNames(root); });
     runPhase("staleImports", [&] { staleImports(root); });
     runPhase("cancelledImport", [&] { cancelledImport(root); });
     runPhase("freeSpace", [&] { freeSpace(root); });

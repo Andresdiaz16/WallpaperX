@@ -18,6 +18,7 @@
 #include "audio/audio_output.h"
 #include "daemon/crash_record.h"
 #include "daemon/dbus_service.h"
+#include "daemon/ffmpeg_log.h"
 #include "daemon/render_worker.h"
 #include "daemon/wallpaper_manager.h"
 
@@ -43,6 +44,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/error.h>
+#include <libavutil/log.h>
 #include <libavutil/mathematics.h>
 #include <libswresample/swresample.h>
 }
@@ -98,6 +100,7 @@ struct BufferRecord {
     uint64_t first = 0;   // its first frame's index in g_left
     uint32_t frames = 0;
     float peak = 0.0f;
+    int stream = 0;  // which pw_stream_new made its stream, from 1; 0 if unknown
 };
 
 constexpr size_t kMaxRecords = size_t{1} << 15;
@@ -112,6 +115,9 @@ bool g_overflow = false;
 std::atomic<int64_t> g_lastLoudQueuedAt{0};
 
 std::atomic<int> g_streamsMade{0};
+// Each stream's number, by pointer, newest last: a freed stream's address can be handed to a new one.
+std::mutex g_serialMutex;
+std::vector<std::pair<const pw_stream*, int>> g_streamSerials;
 std::atomic<bool> g_faultInConnect{false};
 // pw_stream_connect calls still to fail, as a server refusing a stream does.
 std::atomic<int> g_refuseConnects{0};
@@ -317,7 +323,17 @@ void record(pw_stream* stream, pw_buffer* buffer) {
         peak = std::max({peak, std::fabs(samples[2 * i]), std::fabs(samples[2 * i + 1])});
     }
     const int64_t queued = nowNs();
-    g_records[g_recordCount++] = {queued, heard, g_frameCount, frames, peak};
+    int serial = 0;
+    {
+        std::lock_guard<std::mutex> serialLock(g_serialMutex);
+        for (auto it = g_streamSerials.rbegin(); it != g_streamSerials.rend(); ++it) {
+            if (it->first == stream) {
+                serial = it->second;
+                break;
+            }
+        }
+    }
+    g_records[g_recordCount++] = {queued, heard, g_frameCount, frames, peak, serial};
     g_frameCount += frames;
     if (peak > 0.2f) g_lastLoudQueuedAt.store(queued);
 }
@@ -376,14 +392,19 @@ extern "C" void vkCmdBlitImage(VkCommandBuffer cmd, VkImage source, VkImageLayou
 extern "C" pw_stream* pw_stream_new(pw_core* core, const char* name, pw_properties* props) {
     using Fn = pw_stream* (*)(pw_core*, const char*, pw_properties*);
     static const Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "pw_stream_new"));
-    probe::g_streamsMade.fetch_add(1);
+    const int serial = probe::g_streamsMade.fetch_add(1) + 1;
     probe::g_lastStreamMadeAt.store(probe::nowNs());
     {
         const char* media = props != nullptr ? pw_properties_get(props, PW_KEY_MEDIA_NAME) : nullptr;
         std::lock_guard<std::mutex> lock(probe::g_pwMutex);
         probe::g_mediaNames.push_back(media != nullptr ? media : "(none)");
     }
-    return real(core, name, props);
+    pw_stream* made = real(core, name, props);
+    if (made != nullptr) {
+        std::lock_guard<std::mutex> lock(probe::g_serialMutex);
+        probe::g_streamSerials.emplace_back(made, serial);
+    }
+    return made;
 }
 
 extern "C" int pw_stream_connect(pw_stream* stream, enum spa_direction direction, uint32_t target_id,
@@ -1249,7 +1270,9 @@ private:
 
     static void onGlobalRemove(void* data, uint32_t id) {
         auto& self = *static_cast<StandInLinker*>(data);
+        // PipeWire hands a removed port's id to a later port, which must be linked afresh.
         self.m_ports.erase(id);
+        self.m_linkedPorts.erase(id);
         if (const auto it = self.m_nodes.find(id); it != self.m_nodes.end()) {
             if (it->second.proxy != nullptr) pw_proxy_destroy(it->second.proxy);
             self.m_nodes.erase(it);
@@ -1628,6 +1651,258 @@ void runHeardChecks() {
     };
     const std::vector<StepResult> results = runSteps(steps);
     gradeSteps("heard rule", steps, results, takeCapture());
+}
+
+// The stream numbers that queued a buffer in [from, to), with at least `minPeak` when it is above 0.
+std::set<int> streamsIn(const Capture& c, int64_t from, int64_t to, float minPeak = 0.0f) {
+    std::set<int> out;
+    for (const probe::BufferRecord& b : c.buffers) {
+        if (b.queuedAt >= from && b.queuedAt < to && b.peak >= minPeak) out.insert(b.stream);
+    }
+    return out;
+}
+
+// GOAL: S15.660/S15.661 -- one screen is heard at a time, the one whose focus report came last: with DP-1
+//       heard, DP-2 playing the same tone and then reporting its desktop focused leaves exactly one stream
+//       scheduled, DP-2's, not both.
+// WHY-THIS-SHAPE: buffers are attributed to the pw_stream_new call that made their stream, not to a
+//       pointer a new stream may reuse; a peak or buffer-rate check cannot tell one stream from two of the
+//       same tone. Graded 600 ms after DP-2's first loud buffer, past DP-1's fade.
+// CONTROL: control_batch.sh 2026-10-16, phase oneHeard, setOutputFocus's take-the-focus loop deleted
+//       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: one-heard rule: only the screen reported last is
+//       heard" (streams {1,2}). Reverted.
+// COVERAGE-ASSERT: the window holds at least 30 buffers, so "one stream" is not an empty window.
+void runOneHeardChecks() {
+    const char* kGoals = "S15.660-S15.661 (one screen heard, the one reported last)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    Daemon d(smallConfig());
+    if (!startHeard(d, asset("wallpaper_tone.mp4"), kGoals)) return;
+    const int64_t before = probe::nowNs();
+    std::this_thread::sleep_for(500ms);
+    const std::set<int> first = streamsIn(takeCapture(), before, probe::nowNs(), 0.25f);
+    if (first.size() != 1) {
+        check(false, "one-heard rule: DP-1 alone is heard before DP-2 reports (the premise)",
+              fmt("%.0f loud streams", static_cast<double>(first.size())));
+        return;
+    }
+    d.playOther(asset("wallpaper_tone.mp4"));
+    std::this_thread::sleep_for(1s);
+    const int64_t reported = probe::nowNs();
+    d.manager.setOutputFocus(":1.5", "DP-2", ScreenFocus::Desktop, false);
+    d.worker.wake();
+    const bool other = waitFor(kSoundArrivalDeadline, [&] {
+        const std::set<int> s = streamsIn(takeCapture(), reported, INT64_MAX, 0.25f);
+        return std::any_of(s.begin(), s.end(), [&](int n) { return first.count(n) == 0; });
+    });
+    if (!other) {
+        check(false, "one-heard rule: DP-2's sound starts once it reports its desktop focused");
+        return;
+    }
+    std::this_thread::sleep_for(600ms);
+    const int64_t from = probe::nowNs();
+    std::this_thread::sleep_for(1500ms);
+    const Capture cap = takeCapture();
+    const std::set<int> heard = streamsIn(cap, from, probe::nowNs());
+    const Window w = windowOf(cap, from, probe::nowNs());
+    std::string list;
+    for (int n : heard) list += std::to_string(n) + " ";
+    check(w.buffers >= 30, "one-heard rule: buffers were queued in the graded window",
+          fmt("%.0f buffers", static_cast<double>(w.buffers)));
+    check(heard.size() == 1 && first.count(*heard.begin()) == 0, "one-heard rule: only the screen reported last is heard",
+          "streams { " + list + "}, DP-1's was " + std::to_string(*first.begin()));
+}
+
+// GOAL: S15.670 -- the stand-in session manager links every stream a heard screen makes in turn, the third
+//       included, though PipeWire gives the third stream's ports ids of the first's removed ports.
+// WHY-THIS-SHAPE: three wallpapers applied in turn on one heard screen, each graded by a loud buffer from
+//       a stream made after its change, so a stream left playing from before cannot pass it.
+// CONTROL: by hand 2026-10-16, StandInLinker::onGlobalRemove's `self.m_linkedPorts.erase(id);` deleted
+//       (this file) -> "FAIL: three-streams rule: the wallpaper applied third is heard". Restored.
+void runThreeStreamChecks() {
+    const char* kGoals = "S15.670 (a third stream in turn is linked)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    Daemon d(smallConfig());
+    if (!startHeard(d, asset("wallpaper_tone.mp4"), kGoals)) return;
+    const char* order[] = {"wallpaper_beeps_long.mp4", "wallpaper_tone.mp4"};
+    const char* names[] = {"second", "third"};
+    for (int i = 0; i < 2; ++i) {
+        const int made = probe::g_streamsMade.load();
+        const int64_t changed = probe::nowNs();
+        d.manager.requestWallpaper("video", asset(order[i]), 0);
+        d.worker.post(0);
+        const bool heard = waitFor(kSoundArrivalDeadline, [&] {
+            const std::set<int> s = streamsIn(takeCapture(), changed, INT64_MAX, 0.25f);
+            return std::any_of(s.begin(), s.end(), [&](int n) { return n > made; });
+        });
+        check(heard, std::string("three-streams rule: the wallpaper applied ") + names[i] + " is heard",
+              fmt("%.0f streams made before it, %.0f now", made, probe::g_streamsMade.load()));
+        if (!heard) return;
+    }
+}
+
+// GOAL: S15.671-S15.674 -- FFmpeg's log, once installed: info and debug never printed; warnings and errors
+//       printed whole and escaped, a message sent in pieces as one line; the first 10 only, the rest held
+//       back; one a minute after, carrying the count held back.
+// WHY-THIS-SHAPE: av_log is called directly, alone in this process, so the counts are exact; a damaged
+//       file would make FFmpeg's own count of messages the measure. The refill is waited for (61 s): the
+//       limiter reads steady_clock and offers no other way in.
+// CONTROL: control_batch.sh 2026-10-16, phase ffmpegLog, in backend/daemon/ffmpeg_log.cpp, each alone,
+//       reverted: kLevel made AV_LOG_INFO -> "FAIL: ffmpeg log: info messages are not printed" (and the
+//       first-10 and count lines, the info lines taking tokens); takeToken always true -> "FAIL: ffmpeg log:
+//       only the first 10 warnings and errors are printed" (30 lines); the refill's `s.tokens + earned` made
+//       `s.tokens` -> "FAIL: ffmpeg log: a minute later one more line is printed"; the count line's
+//       `s.held != 0` made `false` -> "FAIL: ffmpeg log: the line after the minute carries the count held
+//       back", alone; writeLine's sanitizeForLog dropped -> "FAIL: ffmpeg log: a control byte ... is
+//       escaped", alone.
+void runFfmpegLogChecks() {
+    wallpaperx::ffmpeg_log::install();
+    std::string first, later;
+    {
+        wallpaperx::testing::StreamCapture cap(STDERR_FILENO);
+        if (!cap.ok()) {
+            notVerified("S15.671-S15.673", "stderr could not be captured");
+            return;
+        }
+        for (int i = 0; i < 3; ++i) av_log(nullptr, AV_LOG_INFO, "an info message %d\n", i);
+        av_log(nullptr, AV_LOG_DEBUG, "a debug message\n");
+        av_log(nullptr, AV_LOG_WARNING, "a message in ");
+        av_log(nullptr, AV_LOG_WARNING, "two pieces\n");
+        av_log(nullptr, AV_LOG_ERROR, "title \x1b[2Jcleared\n");
+        for (int i = 0; i < 28; ++i) av_log(nullptr, AV_LOG_ERROR, "bad packet %d\n", i);
+        first = cap.text();
+        std::this_thread::sleep_for(61s);
+        av_log(nullptr, AV_LOG_ERROR, "after the minute\n");
+        later = cap.text().substr(first.size());
+    }
+    const auto lines = [](const std::string& t, const std::string& needle) {
+        int n = 0;
+        for (size_t at = t.find(needle); at != std::string::npos; at = t.find(needle, at + 1)) ++n;
+        return n;
+    };
+    check(lines(first, "info message") == 0 && lines(first, "debug message") == 0, "ffmpeg log: info messages are not printed");
+    check(lines(first, "wallpaperx-daemon: ffmpeg: a message in two pieces\n") == 1,
+          "ffmpeg log: a warning sent in pieces is printed as one line");
+    check(lines(first, "cleared") == 1 && first.find('\x1b') == std::string::npos,
+          "ffmpeg log: a control byte in a message is escaped, not written raw");
+    check(lines(first, "wallpaperx-daemon: ffmpeg") == 10 && lines(first, "bad packet 7\n") == 1 &&
+              lines(first, "bad packet 8\n") == 0,
+          "ffmpeg log: only the first 10 warnings and errors are printed",
+          fmt("%.0f lines", lines(first, "wallpaperx-daemon: ffmpeg")));
+    check(lines(later, "after the minute") == 1, "ffmpeg log: a minute later one more line is printed");
+    check(lines(later, "wallpaperx-daemon: ffmpeg (20 more not logged): after the minute") == 1,
+          "ffmpeg log: the line after the minute carries the count held back", later);
+}
+
+// Copies `source`'s streams into a Matroska file at `target`, every second byte of each sound packet
+// changed, so its sound decoder complains about most packets. Returns why it failed, empty on success.
+std::string remuxDamagedSound(const std::string& source, const std::string& target) {
+    using Context = std::unique_ptr<AVFormatContext, void (*)(AVFormatContext*)>;
+    AVFormatContext* rawIn = nullptr;
+    if (avformat_open_input(&rawIn, source.c_str(), nullptr, nullptr) < 0) return "cannot open " + source;
+    Context in(rawIn, [](AVFormatContext* c) { avformat_close_input(&c); });
+    if (avformat_find_stream_info(in.get(), nullptr) < 0) return "no stream information in " + source;
+    AVFormatContext* rawOut = nullptr;
+    if (avformat_alloc_output_context2(&rawOut, nullptr, "matroska", target.c_str()) < 0 || rawOut == nullptr) {
+        return "no Matroska muxer";
+    }
+    Context out(rawOut, [](AVFormatContext* c) {
+        if (c->pb != nullptr) avio_closep(&c->pb);
+        avformat_free_context(c);
+    });
+    for (unsigned i = 0; i < in->nb_streams; ++i) {
+        AVStream* os = avformat_new_stream(out.get(), nullptr);
+        if (os == nullptr || avcodec_parameters_copy(os->codecpar, in->streams[i]->codecpar) < 0) return "cannot copy a stream";
+        os->codecpar->codec_tag = 0;
+        os->time_base = in->streams[i]->time_base;
+    }
+    if (avio_open(&out->pb, target.c_str(), AVIO_FLAG_WRITE) < 0) return "cannot write " + target;
+    if (avformat_write_header(out.get(), nullptr) < 0) return "cannot write the header";
+    std::unique_ptr<AVPacket, void (*)(AVPacket*)> pkt(av_packet_alloc(), [](AVPacket* p) { av_packet_free(&p); });
+    int damaged = 0;
+    uint32_t noise = 12345;
+    while (av_read_frame(in.get(), pkt.get()) >= 0) {
+        const AVStream* is = in->streams[pkt->stream_index];
+        if (is->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && av_packet_make_writable(pkt.get()) >= 0) {
+            for (int b = 0; b < pkt->size; b += 2) {
+                noise = noise * 1103515245u + 12345u;
+                pkt->data[b] = static_cast<uint8_t>(noise >> 16);
+            }
+            ++damaged;
+        }
+        av_packet_rescale_ts(pkt.get(), is->time_base, out->streams[pkt->stream_index]->time_base);
+        pkt->pos = -1;
+        if (av_interleaved_write_frame(out.get(), pkt.get()) < 0) return "cannot write a packet";
+        av_packet_unref(pkt.get());
+    }
+    if (av_write_trailer(out.get()) < 0) return "cannot write the trailer";
+    return damaged > 0 ? std::string() : "no sound packet to damage";
+}
+
+// GOAL: S15.668 -- a heard video whose sound packets are damaged, looping for six seconds (three passes),
+//       puts at most the limiter's 10 FFmpeg lines in the log, and none in FFmpeg's own "[aac @ 0x...]" form.
+//       False if the real sound decode path's complaints get past the limiter.
+// WHY-THIS-SHAPE: the damage is made at run time from the beeps fixture, packet by packet and only in the
+//       sound, so the pictures still play and the file still loops. install() is called here as main() does
+//       (the daemon_system phase ffmpegLogInstalled grades that main() does). The once-a-minute line is
+//       graded by ffmpegLog, so this phase does not wait for it.
+// CONTROL: control_batch.sh 2026-10-17, phase damagedSoundLog, reverted: backend/daemon/ffmpeg_log.cpp
+//       takeToken's `if (s.tokens == 0) return false;` deleted -> "FAIL: damaged sound rule: at most 10 FFmpeg
+//       lines for a damaged heard file" (474 lines; green: 10).
+// COVERAGE-ASSERT: at least one limiter line naming the sound decoder, or NOT VERIFIED: the decoder must
+//       have complained for the cap to mean anything.
+void runDamagedSoundLogChecks() {
+    const char* kGoals = "S15.668 (damaged sound does not flood the log)";
+    SoundServer sound(kGoals);
+    if (!sound.ready) return;
+    wallpaperx::testing::ScratchDir scratch("damagedsound");
+    if (!scratch.ok()) {
+        notVerified(kGoals, "no scratch folder for the fixture");
+        return;
+    }
+    const std::string file = (scratch.path() / "wallpaper_damaged_sound.mkv").string();
+    if (const std::string why = remuxDamagedSound(asset("wallpaper_beeps.mp4"), file); !why.empty()) {
+        notVerified(kGoals, "the fixture could not be made: " + why);
+        return;
+    }
+    wallpaperx::ffmpeg_log::install();
+    Daemon d(smallConfig());
+    std::string text;
+    bool drew = false;
+    {
+        wallpaperx::testing::StreamCapture log(STDERR_FILENO);
+        if (!log.ok()) {
+            notVerified(kGoals, "stderr could not be captured");
+            return;
+        }
+        d.play(file, ScreenFocus::Desktop);
+        drew = d.waitForCommits(3, 15s);
+        if (drew) std::this_thread::sleep_for(6s);
+        text = log.text();
+    }
+    if (!drew) {
+        notVerified(kGoals, "the video drew no pictures within 15 s");
+        return;
+    }
+    int limited = 0, named = 0, raw = 0;
+    std::istringstream lines(text);
+    for (std::string line; std::getline(lines, line);) {
+        if (line.find("wallpaperx-daemon: ffmpeg") != std::string::npos) {
+            ++limited;
+            if (line.find("[aac @") != std::string::npos) ++named;
+        } else if (line.find("[aac @") != std::string::npos) {
+            ++raw;
+        }
+    }
+    std::printf("audio_playback_test: damaged sound rule: %d limiter lines (%d from the sound decoder), %d raw\n", limited,
+                named, raw);
+    if (named == 0) {
+        notVerified(kGoals, "the sound decoder said nothing about the damaged packets");
+        return;
+    }
+    check(limited <= 10, "damaged sound rule: at most 10 FFmpeg lines for a damaged heard file", fmt("%.0f lines", limited));
+    check(raw == 0, "damaged sound rule: no FFmpeg line in its own form", fmt("%.0f lines", raw));
 }
 
 // GOAL: S15.494 -- pausing the screen (always_paused) or hiding it stops its sound within a round: silent,
@@ -11195,6 +11470,10 @@ int main(int argc, char** argv) {
         {"engineOneContext", &runOneContextChecks},
         {"streamNames", &runStreamNameChecks},
         {"heard", &runHeardChecks},
+        {"oneHeard", &runOneHeardChecks},
+        {"threeStreams", &runThreeStreamChecks},
+        {"ffmpegLog", &runFfmpegLogChecks},
+        {"damagedSoundLog", &runDamagedSoundLogChecks},
         {"stop", &runStopChecks},
         {"speed", &runSpeedChecks},
         {"volume", &runVolumeChecks},

@@ -674,6 +674,11 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
         //       (backend/daemon/dbus_service.cpp) -> "FAIL: io.wallpaperx.Daemon exports exactly the
         //       signals this table names".
         {"signal", "ConfigChanged", ArgList{}},
+        // GOAL: S15.685 -- PersistenceChanged is exported, with no arguments: a consumer reads GetStatus again.
+        // CONTROL: control_batch.sh 2026-10-17, phase host, `sdbus::registerSignal("PersistenceChanged")` in
+        //       DbusService::registerVTable (backend/daemon/dbus_service.cpp) renamed "PersistenceNotice" ->
+        //       "FAIL: io.wallpaperx.Daemon exports exactly the signals this table names". Reverted.
+        {"signal", "PersistenceChanged", ArgList{}},
     };
 
     for (const auto& [element, name, expectedArgs] : expected) {
@@ -1649,6 +1654,70 @@ void runPropertiesWireChecksOn(wallpaperx::WallpaperManager& manager, const std:
         }
     }
 
+    // GOAL: S15.663 -- a dictionary naming one key twice is refused InvalidArgs by both methods, and
+    //       nothing of it is applied: the monitor keeps its wallpaper and its set.
+    // WHY-THIS-SHAPE: sent as a vector of entries, since the map the other calls use cannot carry a key
+    //       twice; each rides beside "mute": false, which would change the held set if the rest applied.
+    // CONTROL: control_batch.sh, re-run 2026-10-17, phase propertiesWire, fromWire's single repeat test made
+    //       `if (false)` (backend/daemon/dbus_service.cpp) -> "FAIL: a property key given twice is refused
+    //       InvalidArgs by both methods and nothing is applied", beside S15.687's line. Reverted.
+    {
+        using Entries = std::vector<sdbus::DictEntry<std::string, Variant>>;
+        const std::vector<Entries> twice{
+            {{"mute", Variant(false)}, {"speed", Variant(2.0)}, {"speed", Variant(true)}},
+            {{"mute", Variant(false)}, {"speed", Variant(1.0)}, {"speed", Variant(1.0)}},
+        };
+        const nlohmann::json before = entryOf(kMonitorPropsHeld);
+        bool refused = before.is_object();
+        for (const Entries& entries : twice) {
+            const std::string viaReplace = errorNameFrom([&] {
+                proxy.callMethod("SetWallpaperProperties").onInterface(DbusService::kInterface).withArguments(kMonitorPropsHeld, entries);
+            });
+            const std::string viaSet = errorNameFrom([&] {
+                proxy.callMethod("SetWallpaperWithProperties").onInterface(DbusService::kInterface)
+                    .withArguments(std::string("static"), imagePath, kMonitorPropsHeld, entries);
+            });
+            if (viaReplace != kInvalidArgs || viaSet != kInvalidArgs) {
+                refused = false;
+                std::fprintf(stderr, "  answered '%s' and '%s'\n", viaReplace.c_str(), viaSet.c_str());
+            }
+        }
+        const nlohmann::json after = entryOf(kMonitorPropsHeld);
+        check(refused && after == before, "a property key given twice is refused InvalidArgs by both methods and nothing is applied");
+        if (after != before) std::fprintf(stderr, "  entry %s -> %s\n", before.dump().c_str(), after.dump().c_str());
+
+        // GOAL: S15.687 -- a key repeated with a malformed second value (a wrong D-Bus type, a string that
+        //       is not a colour) is refused as a repeat, by both methods, not as a bad value.
+        // WHY-THIS-SHAPE: the message is read, not only the error name: both refusals are InvalidArgs, so
+        //       the name cannot tell which check fired.
+        // CONTROL: control_batch.sh 2026-10-17, phase propertiesWire, in fromWire (backend/daemon/dbus_service.cpp):
+        //       the repeat test narrowed to `properties.contains(key) && value.containsValueOfType<double>()` ->
+        //       "FAIL: a repeated key whose second value is malformed is refused as a repeat by both methods"
+        //       ("refused with 'property "speed" has D-Bus type "i"; ...'"), beside S15.663's line. Reverted.
+        const std::vector<Entries> badSecond{
+            {{"speed", Variant(1.0)}, {"speed", Variant(int32_t{3})}},
+            {{"tint", Variant(std::string("#ff0000"))}, {"tint", Variant(std::string("#12345g"))}},
+        };
+        int asRepeat = 0;
+        for (const Entries& entries : badSecond) {
+            const std::string viaReplace = errorMessageFrom([&] {
+                proxy.callMethod("SetWallpaperProperties").onInterface(DbusService::kInterface).withArguments(kMonitorPropsHeld, entries);
+            });
+            const std::string viaSet = errorMessageFrom([&] {
+                proxy.callMethod("SetWallpaperWithProperties").onInterface(DbusService::kInterface)
+                    .withArguments(std::string("static"), imagePath, kMonitorPropsHeld, entries);
+            });
+            for (const std::string& message : {viaReplace, viaSet}) {
+                if (message.find("given more than once") != std::string::npos) {
+                    ++asRepeat;
+                } else {
+                    std::fprintf(stderr, "  refused with '%s'\n", message.c_str());
+                }
+            }
+        }
+        check(asRepeat == 4, "a repeated key whose second value is malformed is refused as a repeat by both methods");
+    }
+
     // GOAL: S15.97's limits -- 64 entries whose keys are 64 characters are accepted and kept whole,
     //       so every refusal below is of its bad entry.
     // CONTROL: `key.size() > kMaxPropertyKeyBytes` in propertyError (backend/daemon/
@@ -1677,8 +1746,9 @@ void runPropertiesWireChecksOn(wallpaperx::WallpaperManager& manager, const std:
     //       2; or mute false), so dropping the bad entry and applying the rest shows;
     //       the file is compared byte for byte across the table once the writer is idle.
     // CONTROL: each red on its own cases' lines (both methods), beside "no refused call wrote the
-    //       config file" and the held-set line. In fromWire (backend/daemon/dbus_service.cpp): the
-    //       unexpected-type throw made `continue` (types i and as); the non-colour throw likewise. In
+    //       config file" and the held-set line. In fromWire (backend/daemon/dbus_service.cpp), re-run
+    //       2026-10-17 via control_batch.sh: the unexpected-type throw made `continue` (types i and as); the
+    //       non-colour throw likewise. In
     //       propertyError (backend/daemon/wallpaper_properties.cpp): keyCharacter() accepting ' ', or any
     //       byte past 0x7f; the isfinite() test, the speed rule,
     //       the mute rule, `key.empty() ||`, or the 65-character test deleted. The count bound deleted
@@ -3010,6 +3080,122 @@ void runConfigChangedWireChecks(const wallpaperx::WallpaperManager::Config& base
     }
 }
 
+// PersistenceChanged: a config write returned, so GetStatus's persistence may have changed. One per
+// finished write, failed or not; none for a save that was never queued.
+void runPersistenceChangedWireChecks(const wallpaperx::WallpaperManager::Config& base, const std::string& unrenderablePath,
+                                     const Check& check) {
+    using sdbus::Variant;
+    using wallpaperx::HealthStatus;
+    using wallpaperx::testing::setWallpaperProperties;
+
+    // `layout` names where the config file goes under a fresh scratch directory; `stage` prepares it.
+    // `writes` is how many writes the three calls below finish; `status` what persistence must end at.
+    struct Case {
+        const char* label;
+        const char* goal;
+        std::filesystem::path layout;
+        std::function<bool(const std::filesystem::path&)> stage;
+        int writes;
+        HealthStatus status;
+    };
+    // Read-only, so the file is absent at load (no refusal) and every write fails. False under root or
+    // a filesystem ignoring mode bits, where no write can be made to fail (X.3).
+    const auto readOnlyDirectory = [](const std::filesystem::path& root) {
+        std::error_code ec;
+        std::filesystem::create_directories(root / "ro", ec);
+        std::filesystem::permissions(root / "ro", std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec,
+                                     std::filesystem::perm_options::replace, ec);
+        { std::ofstream probe(root / "ro" / "probe"); }
+        return !ec && !std::filesystem::exists(root / "ro" / "probe");
+    };
+    const auto unreadable = [](const std::filesystem::path& root) {
+        std::filesystem::create_directories(root / "wallpaperx");
+        return static_cast<bool>(std::ofstream(root / "wallpaperx" / "config.json") << "{ not json");
+    };
+    const Case cases[] = {
+        {"a successful write", "S15.685 (success)", "wallpaperx/config.json", nullptr, 3, HealthStatus::Ok},
+        {"a failed write", "S15.685 (failure)", "ro/config.json", readOnlyDirectory, 3, HealthStatus::Fail},
+        {"a refused save", "S15.685 (refused)", "wallpaperx/config.json", unreadable, 0, HealthStatus::Fail},
+    };
+
+    // GOAL: S15.685 -- each finished config write sends exactly one PersistenceChanged, whether it
+    //       succeeded or failed, and a save that is refused (the file could not be read) sends none.
+    // WHY-THIS-SHAPE: each call is awaited until its own signal has arrived before the next, so the
+    //       250 ms coalescing cannot merge two writes and the expected count is the number of calls; the
+    //       exact count is read once persistence is no longer pending and announcementsSettled() has
+    //       ordered a reply behind every signal sent, never on the at-least wait alone.
+    // CONTROL: control_batch.sh 2026-10-17, phase persistenceChangedWire, each alone and reverted. In the
+    //       writer loop (backend/daemon/config_writer.cpp): `notice->written()` not called -> "FAIL: a
+    //       successful write sends PersistenceChanged within 5 s" and the failed write's; called only when
+    //       `saved.error.empty()` -> the failed write's alone; called twice -> "FAIL: a successful write sends
+    //       exactly one PersistenceChanged per finished write" ("4 signal(s), 3 expected") and the failed
+    //       write's. ConfigWriter::queue()'s refusal branch calling it -> "FAIL: a refused save sends exactly
+    //       one ..." ("3 signal(s), 0 expected"). DbusService's constructor not installing the hook
+    //       (backend/daemon/dbus_service.cpp) -> the two "within 5 s" lines.
+    // COVERAGE-ASSERT: the three calls must be accepted and persistence must end Ok or Fail as staged,
+    //       or the case is not verified rather than graded.
+    for (const Case& c : cases) {
+        const wallpaperx::testing::ScratchDir scratch("dbuspersist");
+        if (!scratch.ok() || (c.stage && !c.stage(scratch.path()))) {
+            wallpaperx::testing::notVerified(c.goal, "the scratch config for this case could not be staged");
+            continue;
+        }
+        wallpaperx::WallpaperManager::Config config = base;
+        config.configFile = scratch.path() / c.layout;
+        withNoDeviceManager(config, "the PersistenceChanged wire phase", check, [&](wallpaperx::WallpaperManager& manager) {
+            auto serviceConn = sdbus::createSessionBusConnection();
+            DbusService service(*serviceConn, manager);
+            serviceConn->enterEventLoopAsync();
+            const sdbus::ServiceName daemonName{serviceConn->getUniqueName()};
+            const sdbus::ObjectPath objectPath{DbusService::kObjectPath};
+            AnnouncementLog announced;
+            auto listener = sdbus::createProxy(daemonName, objectPath);
+            listener->uponSignal("PersistenceChanged").onInterface(DbusService::kInterface).call([&announced] { announced.record(); });
+            auto proxyOwner = sdbus::createProxy(daemonName, objectPath);
+            sdbus::IProxy& proxy = *proxyOwner;
+
+            const std::function<void()> calls[] = {
+                [&] { setWallpaper(proxy, "shader", unrenderablePath, kMonitorNoticeFirst); },
+                [&] { setWallpaperProperties(proxy, kMonitorNoticeFirst, {{"speed", Variant(0.5)}}); },
+                [&] { setWallpaperProperties(proxy, kMonitorNoticeFirst, {{"speed", Variant(2.0)}}); },
+            };
+            int expected = 0;
+            for (const auto& call : calls) {
+                const std::string refused = errorNameFrom(call);
+                if (!refused.empty()) {
+                    wallpaperx::testing::notVerified(c.goal, std::string("a call was refused with ") + refused);
+                    return;
+                }
+                if (c.writes > 0) {
+                    ++expected;
+                    if (!announced.waitFor(expected)) {
+                        check(false, (std::string(c.label) + " sends PersistenceChanged within 5 s").c_str());
+                        std::fprintf(stderr, "  %d signal(s) after call %d\n", announced.count(), expected);
+                        return;
+                    }
+                }
+            }
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (manager.snapshot().health.persistence.status == HealthStatus::Pending &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            const wallpaperx::HealthCheck persistence = manager.snapshot().health.persistence;
+            if (persistence.status != c.status) {
+                wallpaperx::testing::notVerified(c.goal, std::string("persistence ended ") + wallpaperx::toString(persistence.status) +
+                                                             " (" + persistence.detail + "), not as staged");
+                return;
+            }
+            const bool settled = announcementsSettled(*listener);
+            check(settled && announced.count() == c.writes,
+                  (std::string(c.label) + " sends exactly one PersistenceChanged per finished write").c_str());
+            if (announced.count() != c.writes) {
+                std::fprintf(stderr, "  %d signal(s), %d expected\n", announced.count(), c.writes);
+            }
+        });
+    }
+}
+
 // Every task the worker is handed is answered exactly once: a dropped export task (queue full,
 // worker stopping) would leave its caller waiting out sd-bus's ~25 s timeout. Driven at the worker,
 // since no bus sequence stages either state; on the coalescing phase's manager (no renders here, so
@@ -3416,23 +3602,32 @@ void runPauseWireChecks(const wallpaperx::WallpaperManager::Config& base, const 
     // GOAL: S15.124 -- each window mode pauses on its own field of the report and ignores the other:
     //       paused_while_focused on window_focused, paused_while_maximized on window_maximized; and
     //       S15.131's window half -- GetStatus's two window fields are the screen's last report.
-    // WHY-THIS-SHAPE: both screens are sent the same report twice, once with only the focused bit and
-    //       once with only the maximized bit, so each mode is seen paused by its own field and playing
-    //       under the other's. One report of both bits would pass a mode that read either field.
-    // CONTROL: via control_batch.sh, --phase '^pauseWire$', re-run 2026-10-11, the two report terms
+    //       S15.662 -- a screen whose focus another screen's report took resumes paused_while_focused.
+    // WHY-THIS-SHAPE: focus is reported on one screen at a time, since a focus report now takes the
+    //       focus from every other screen; then both are sent only the maximized bit, which takes nothing.
+    //       So each mode is seen paused by its own field and playing under the other's. One report of
+    //       both bits would pass a mode that read either field.
+    // CONTROL: control_batch.sh 2026-10-16, setOutputFocus's take-the-focus loop deleted
+    //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a screen whose focus another screen's report took
+    //       resumes paused_while_focused", alone. Reverted.
+    //       Via control_batch.sh, --phase '^pauseWire$', re-run 2026-10-16, the two report terms
     //       (`report->focus == ScreenFocus::Window`, `report->windowMaximized`) swapped in pausedLocked()
     //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a focused window pauses paused_while_focused and
     //       not paused_while_maximized" and "FAIL: a maximized window pauses paused_while_maximized and not
-    //       paused_while_focused", with the later checks that rely on a focused report pausing. Reverted. For
+    //       paused_while_focused", with the resume line and the later checks that rely on a focused report
+    //       pausing. Reverted. For
     //       the window fields: snapshot()'s `status.focus = report->focus;` made `= ScreenFocus::None;` ->
     //       "FAIL: GetStatus shows what each screen last reported about its windows", alone. Reverted.
     {
-        const std::string first = errorNameFrom([&] {
-            setOutputFocus(proxy, "DP-PF", true, false);
-            setOutputFocus(proxy, "DP-PM", true, false);
-        });
+        const std::string first = errorNameFrom([&] { setOutputFocus(proxy, "DP-PF", true, false); });
         const bool byFocus = first.empty() && pausedIs(kMonitorPauseFocused, true) && pausedIs(kMonitorPauseMaximized, false);
         const nlohmann::json focusedReport = pauseOf(kMonitorPauseFocused);
+        const std::string taker = errorNameFrom([&] { setOutputFocus(proxy, "DP-PM", true, false); });
+        const nlohmann::json takenReport = pauseOf(kMonitorPauseFocused);
+        const bool resumed = byFocus && taker.empty() && takenReport.is_object() && takenReport.value("paused", true) == false &&
+                             takenReport.value("focus", std::string()) == "none" && pausedIs(kMonitorPauseMaximized, false);
+        check(resumed, "a screen whose focus another screen's report took resumes paused_while_focused");
+        if (!resumed) std::fprintf(stderr, "  answered '%s'; after DP-PM's report: %s\n", taker.c_str(), takenReport.dump().c_str());
         const std::string second = errorNameFrom([&] {
             setOutputFocus(proxy, "DP-PF", false, true);
             setOutputFocus(proxy, "DP-PM", false, true);
@@ -4067,12 +4262,12 @@ void runFocusStateWireChecks(const wallpaperx::WallpaperManager::Config& base, c
     // WHY-THIS-SHAPE: every combination of the three focus names and the maximized flag, one report each
     //       on one screen, so each wrong rule (desktop not counted, maximized ignored, a desktop report
     //       dropped as if empty, window_focused read off any focus) flips a different row.
-    // CONTROL: via control_batch.sh, --phase '^focusStateWire$', 2026-10-11, each alone, reverted, in
-    //       backend/daemon/wallpaper_manager.cpp unless named: soundHeardLocked's `focus != ScreenFocus::None`
-    //       made `== ScreenFocus::Window` -> the heard line and S15.455's premise; its `&&
-    //       !report->windowMaximized` dropped -> the heard line alone; setOutputFocus's erase condition made
-    //       `focus != ScreenFocus::Window` (a desktop report dropped) -> both lines, S15.455's premise and
-    //       S15.456's desktop line. In getStatus (backend/daemon/dbus_service.cpp): `"focus"` hard-wired
+    // CONTROL: via control_batch.sh, --phase '^focusStateWire$', each alone, reverted, in
+    //       backend/daemon/wallpaper_manager.cpp unless named, re-run 2026-10-16: soundHeardLocked's `focus !=
+    //       ScreenFocus::None` made `== ScreenFocus::Window` -> the heard line, S15.455's premise and the
+    //       one-heard line; its `&& !report->windowMaximized` dropped -> the heard line alone; setOutputFocus's
+    //       erase condition made `focus != ScreenFocus::Window` (a desktop report dropped) -> both lines,
+    //       S15.455's premise, S15.456's desktop line and both S15.660/S15.667 lines. 2026-10-11: in getStatus (backend/daemon/dbus_service.cpp): `"focus"` hard-wired
     //       "none" -> the echo line (and S15.456, S15.458, which read it); window_focused made `focus !=
     //       ScreenFocus::None` -> the echo line alone.
     // COVERAGE-ASSERT: all seven rows must have been compared. Controlled with ScreenFocus::Desktop dropped
@@ -4138,7 +4333,7 @@ void runFocusStateWireChecks(const wallpaperx::WallpaperManager::Config& base, c
     // WHY-THIS-SHAPE: the screen reports the desktop itself as focused (SetOutputFocusState "desktop")
     //       throughout, the state in which sound is meant to play; one level is switched off at a time and
     //       back, so a rule ignoring any one of them shows on its own line.
-    // CONTROL: via control_batch.sh, --phase '^focusStateWire$', 2026-10-11, each alone, reverted, one term
+    // CONTROL: via control_batch.sh, --phase '^focusStateWire$', re-run 2026-10-16, each alone, reverted, one term
     //       of soundHeardLocked (backend/daemon/wallpaper_manager.cpp) dropped: the `soundOn(m_sound)` test ->
     //       "FAIL: switching off sound on every screen alone silences the screen"; the screen setting's ->
     //       "... the screen's sound ..."; `wallpaperMuted(...)` -> "... its wallpaper's mute ...". Each alone.
@@ -4251,6 +4446,90 @@ void runFocusStateWireChecks(const wallpaperx::WallpaperManager::Config& base, c
             }
         }
         check(mapped, "SetOutputFocus maps a focused window to \"window\" and no focus to \"none\"");
+    }
+
+    // GOAL: S15.664-S15.666 -- SetMonitorPause, SetSound and SetMonitorSound log a line only for a call that
+    //       changes the setting: three identical calls and two real changes give one, two and two lines.
+    // WHY-THIS-SHAPE: stdout, where those lines go, is captured over the calls alone; the first pause call is
+    //       itself a change (from paused_while_focused), the sound ones start where the setting already is.
+    // CONTROL: control_batch.sh 2026-10-16, phase focusStateWire, in backend/daemon/dbus_service.cpp, each
+    //       alone: setMonitorPause's `if (m_manager.setMonitorPause(...))` made unconditional -> "FAIL:
+    //       SetMonitorPause logs only a change" (3 lines); setSound's `if (changed)` made `if (true)` -> "FAIL:
+    //       SetSound logs only a change" (5); setMonitorSound's likewise -> "FAIL: SetMonitorSound ...". Reverted.
+    {
+        int pauseLines = -1, soundLines = -1, monitorLines = -1;
+        std::string answer;
+        {
+            wallpaperx::testing::StreamCapture out(STDOUT_FILENO);
+            if (out.ok()) {
+                answer = errorNameFrom([&] {
+                    for (int i = 0; i < 3; ++i) setMonitorPause(proxy, kMonitorHeardPaused, "play");
+                    for (int i = 0; i < 3; ++i) setSound(proxy, true);
+                    setSound(proxy, false);
+                    setSound(proxy, true);
+                    for (int i = 0; i < 3; ++i) setMonitorSound(proxy, kMonitorHeard, true);
+                    setMonitorSound(proxy, kMonitorHeard, false);
+                    setMonitorSound(proxy, kMonitorHeard, true);
+                });
+                pauseLines = out.count("SetMonitorPause(monitor=" + std::to_string(kMonitorHeardPaused) + ",");
+                soundLines = out.count("SetSound(on=");
+                monitorLines = out.count("SetMonitorSound(monitor=" + std::to_string(kMonitorHeard) + ",");
+            }
+        }
+        if (pauseLines < 0) {
+            wallpaperx::testing::notVerified("S15.664-S15.666", "stdout could not be captured");
+        } else {
+            check(answer.empty() && pauseLines == 1, "SetMonitorPause logs only a change");
+            check(answer.empty() && soundLines == 2, "SetSound logs only a change");
+            check(answer.empty() && monitorLines == 2, "SetMonitorSound logs only a change");
+            if (!answer.empty() || pauseLines != 1 || soundLines != 2 || monitorLines != 2) {
+                std::fprintf(stderr, "  answered '%s'; %d, %d, %d lines\n", answer.c_str(), pauseLines, soundLines, monitorLines);
+            }
+        }
+    }
+
+    // GOAL: S15.660/S15.661 -- one screen is heard at a time, the one whose focus report came last, and
+    //       S15.667 -- a screen whose focus is taken keeps a maximized window it reported.
+    // WHY-THIS-SHAPE: two playing screens report focus in turn and GetStatus is read for both after each, so
+    //       a rule letting both be heard, or the first keep it, shows; DP-HEARDP's first report carries a
+    //       maximized window, which must survive DP-HEARD's report taking its focus.
+    // CONTROL: control_batch.sh 2026-10-16, phase focusStateWire, in setOutputFocus
+    //       (backend/daemon/wallpaper_manager.cpp), each alone: the take-the-focus loop deleted -> "FAIL: only
+    //       the screen whose focus was reported last is heard" and the maximized line (DP-HEARDP kept "window");
+    //       its keep-the-maximized branch removed, every other focused report erased -> "FAIL: a screen whose
+    //       focus is taken keeps its maximized window", alone. Reverted.
+    {
+        const std::string answer = errorNameFrom([&] {
+            setMonitorPause(proxy, kMonitorHeardPaused, "play");
+            setOutputFocusState(proxy, "DP-HEARDP", "window", true);
+            setOutputFocusState(proxy, "DP-HEARD", "desktop", false);
+        });
+        const nlohmann::json kept = pauseOf(kMonitorHeardPaused);
+        const bool keepsMaximized = answer.empty() && kept.is_object() && kept.value("focus", std::string()) == "none" &&
+                                    kept.value("window_maximized", false);
+        check(keepsMaximized, "a screen whose focus is taken keeps its maximized window");
+        if (!keepsMaximized) std::fprintf(stderr, "  answered '%s'; DP-HEARDP: %s\n", answer.c_str(), kept.dump().c_str());
+        struct Turn {
+            const char* output;
+            const char* focus;
+            bool heard;
+            bool heardP;
+        };
+        const Turn turns[] = {{"DP-HEARDP", "desktop", false, true}, {"DP-HEARD", "window", true, false},
+                              {"DP-HEARDP", "window", false, true}};
+        bool one = true;
+        int compared = 0;
+        for (const Turn& t : turns) {
+            const std::string reply = errorNameFrom([&] { setOutputFocusState(proxy, t.output, t.focus, false); });
+            const std::optional<bool> a = heardOf(kMonitorHeard), b = heardOf(kMonitorHeardPaused);
+            if (reply.empty() && a && b) ++compared;
+            if (!reply.empty() || !a || !b || *a != t.heard || *b != t.heardP) {
+                one = false;
+                std::fprintf(stderr, "  after %s %s: answered '%s', heard %d and %d\n", t.output, t.focus, reply.c_str(),
+                             a ? int(*a) : -1, b ? int(*b) : -1);
+            }
+        }
+        check(one && compared == 3, "only the screen whose focus was reported last is heard");
     }
     });
 }
@@ -8753,6 +9032,7 @@ int main() {
         phase("importModifierAnnouncement",
               [&] { runImportModifierAnnouncementChecks(config, imagePath, unrenderablePath, check); });
         phase("configChangedWire", [&] { runConfigChangedWireChecks(config, unrenderablePath, check); });
+        phase("persistenceChangedWire", [&] { runPersistenceChangedWireChecks(config, unrenderablePath, check); });
 
         // These two drive renderPending() on this thread, so there is no worker for their Device to be
         // pinned to.

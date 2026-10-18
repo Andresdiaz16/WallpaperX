@@ -16,6 +16,7 @@ namespace {
 constexpr const char* kSpeed = "speed";
 constexpr const char* kMute = "mute";
 constexpr const char* kVolume = "volume";
+constexpr std::string_view kAppliedKeys[] = {kSpeed, kMute, kVolume};
 
 std::optional<std::uint8_t> hexByte(char high, char low) {
     const auto digit = [](char c) -> int {
@@ -88,7 +89,7 @@ std::string propertiesError(const WallpaperProperties& properties) {
 WallpaperProperties usableProperties(const WallpaperProperties& properties, int& dropped, int& clampedVolumes,
                                      int& snappedSpeeds) {
     WallpaperProperties usable;
-    for (const auto& [key, read] : properties) {
+    const auto consider = [&](const std::string& key, const PropertyValue& read) {
         PropertyValue value = read;
         double* volume = key == kVolume ? std::get_if<double>(&value) : nullptr;
         const bool clamped = volume != nullptr && std::isfinite(*volume) && (*volume < 0 || *volume > 1);
@@ -104,6 +105,15 @@ WallpaperProperties usableProperties(const WallpaperProperties& properties, int&
         } else {
             ++dropped;
         }
+    };
+    // The keys the daemon applies first, so the cap only ever drops keys it passes through.
+    for (const std::string_view applied : kAppliedKeys) {
+        if (const auto it = properties.find(std::string(applied)); it != properties.end()) {
+            consider(it->first, it->second);
+        }
+    }
+    for (const auto& [key, read] : properties) {
+        if (!std::ranges::contains(kAppliedKeys, std::string_view(key))) consider(key, read);
     }
     return usable;
 }

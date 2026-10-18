@@ -74,9 +74,10 @@ std::string requestRefusal(const std::string& client) {
 }
 
 // Each value by its D-Bus type -- d, b, or s holding "#rrggbb" -- and nothing converted: an i for
-// a float property is a client that does not know what it is sending. Which keys and values are
+// a float property is a client that does not know what it is sending. A key given twice is
+// refused, since keeping either would accept a value never checked. Which keys and values are
 // acceptable is the manager's rule.
-WallpaperProperties fromWire(const std::map<std::string, sdbus::Variant>& wire) {
+WallpaperProperties fromWire(const std::vector<sdbus::DictEntry<std::string, sdbus::Variant>>& wire) {
     // Before the copy, which is what the bound is for.
     if (wire.size() > kMaxProperties) {
         throw InvalidRequest("at most " + std::to_string(kMaxProperties) + " properties, got " +
@@ -84,6 +85,9 @@ WallpaperProperties fromWire(const std::map<std::string, sdbus::Variant>& wire) 
     }
     WallpaperProperties properties;
     for (const auto& [key, value] : wire) {
+        if (properties.contains(key)) {
+            throw InvalidRequest("property " + sanitizeForLog(key, 128) + " is given more than once");
+        }
         if (value.containsValueOfType<double>()) {
             properties.emplace(key, value.get<double>());
         } else if (value.containsValueOfType<bool>()) {
@@ -125,6 +129,8 @@ DbusService::DbusService(sdbus::IConnection& connection, WallpaperManager& manag
     // no handler can be dispatched until the vtable below is registered.
     registerVTable();
     watchClientExits();
+    // Last, so a constructor that throws leaves the writer no pointer to this object.
+    m_manager.onConfigWritten([this] { announcePersistenceChanged(); });
 }
 
 void DbusService::watchClientExits() {
@@ -221,8 +227,9 @@ DbusService::~DbusService() {
     // destroying either first leaves the other dangling. stop() joins the render thread, then
     // leaves post() a no-op for any handler still in flight.
     //
-    // The bus watch goes first: its callback reaches into the manager, and it must stop firing
-    // before anything else is torn down.
+    // The bus watch and the writer's notice go first: both reach into this object, and must stop
+    // firing before anything else is torn down.
+    m_manager.onConfigWritten({});
     m_busWatch.reset();
     m_worker.stop();
 }
@@ -353,7 +360,11 @@ void DbusService::registerVTable() {
             // No parameters, for the same reason: a consumer reads /config again, and that answer
             // is the whole of what changed. Sent for a wallpaper set, a screen named and a sound
             // setting changed.
-            sdbus::registerSignal("ConfigChanged"))
+            sdbus::registerSignal("ConfigChanged"),
+            // No parameters: GetStatus's `persistence` may have changed, because a config write
+            // returned. Apart from ConfigChanged, which has every consumer read /config again and
+            // would do so for each step of a slider; a write changes nothing /config answers.
+            sdbus::registerSignal("PersistenceChanged"))
         .forInterface(std::string(kInterface));
 }
 
@@ -385,6 +396,16 @@ void DbusService::announceConfigChanged() {
         // Not the call's failure: what it changed is recorded. A consumer shows the old answer
         // until the next change or daemon restart.
         std::fprintf(stderr, "wallpaperx-daemon: failed to emit ConfigChanged: %s\n", e.what());
+    }
+}
+
+void DbusService::announcePersistenceChanged() noexcept {
+    try {
+        m_object->emitSignal("PersistenceChanged").onInterface(kInterface);
+    } catch (const std::exception& e) {
+        // A consumer shows the old persistence health until the next write returns.
+        std::fprintf(stderr, "wallpaperx-daemon: failed to emit PersistenceChanged: %s\n", e.what());
+    } catch (...) {
     }
 }
 
@@ -554,11 +575,13 @@ void DbusService::setOutputVisible(const std::string& outputName, bool visible) 
 }
 
 void DbusService::setMonitorPause(int32_t monitorId, const std::string& mode) {
-    std::printf("wallpaperx-daemon: SetMonitorPause(monitor=%d, mode=%s)\n", monitorId, sanitizeForLog(mode).c_str());
-    std::fflush(stdout);
-
+    // Changes only, as the two sound settings below: a client may re-send its state on every call.
     try {
-        m_manager.setMonitorPause(monitorId, mode);
+        if (m_manager.setMonitorPause(monitorId, mode)) {
+            std::printf("wallpaperx-daemon: SetMonitorPause(monitor=%d, mode=%s)\n", monitorId,
+                        sanitizeForLog(mode).c_str());
+            std::fflush(stdout);
+        }
     } catch (const InvalidRequest& e) {
         std::fprintf(stderr, "wallpaperx-daemon: SetMonitorPause rejected (monitor=%d): %s\n", monitorId, e.what());
         throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
@@ -572,9 +595,6 @@ void DbusService::setMonitorPause(int32_t monitorId, const std::string& mode) {
 }
 
 void DbusService::setSound(bool on) {
-    std::printf("wallpaperx-daemon: SetSound(on=%s)\n", on ? "true" : "false");
-    std::fflush(stdout);
-
     bool changed = false;
     try {
         changed = m_manager.setSound(on);
@@ -583,6 +603,8 @@ void DbusService::setSound(bool on) {
         throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
     }
     if (changed) {
+        std::printf("wallpaperx-daemon: SetSound(on=%s)\n", on ? "true" : "false");
+        std::fflush(stdout);
         announceConfigChanged();
         // The round this runs starts or stops the heard screen's sound.
         m_worker.wake();
@@ -590,9 +612,6 @@ void DbusService::setSound(bool on) {
 }
 
 void DbusService::setMonitorSound(int32_t monitorId, bool on) {
-    std::printf("wallpaperx-daemon: SetMonitorSound(monitor=%d, on=%s)\n", monitorId, on ? "true" : "false");
-    std::fflush(stdout);
-
     bool changed = false;
     try {
         changed = m_manager.setMonitorSound(monitorId, on);
@@ -604,6 +623,8 @@ void DbusService::setMonitorSound(int32_t monitorId, bool on) {
         throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
     }
     if (changed) {
+        std::printf("wallpaperx-daemon: SetMonitorSound(monitor=%d, on=%s)\n", monitorId, on ? "true" : "false");
+        std::fflush(stdout);
         announceConfigChanged();
         m_worker.wake();
     }

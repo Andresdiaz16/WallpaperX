@@ -1410,7 +1410,7 @@ bool WallpaperManager::setOutputVisible(const std::string& outputName, bool visi
     return changed;
 }
 
-void WallpaperManager::setMonitorPause(int monitorId, const std::string& mode) {
+bool WallpaperManager::setMonitorPause(int monitorId, const std::string& mode) {
     requireValidMonitorId(monitorId);
     const std::optional<PauseMode> parsed = pauseModeFromName(mode);
     if (!parsed) {
@@ -1425,15 +1425,18 @@ void WallpaperManager::setMonitorPause(int monitorId, const std::string& mode) {
     std::optional<std::string> next;
     if (*parsed != PauseMode::Play) next = toJsonText(*parsed);
 
+    SettingCommit commit = SettingCommit::Skipped;
     {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
-        if (commitSettingLocked(m_pauseSettings, monitorId, std::move(next)) == SettingCommit::Skipped) return;
+        commit = commitSettingLocked(m_pauseSettings, monitorId, std::move(next));
+        if (commit == SettingCommit::Skipped) return false;
         endPlayIfPausedLocked(monitorId);
     }
 
     // As requestWallpaper() waits: the setting is committed, so a failed write is persistence
     // health's to report, not this call's.
     awaitPersisted();
+    return commit == SettingCommit::Changed;
 }
 
 bool WallpaperManager::setSound(bool on) {
@@ -1516,6 +1519,19 @@ void WallpaperManager::setOutputFocus(const std::string& client, const std::stri
         return;
     }
     m_outputFocus.insert_or_assign(outputName, FocusReport{client, focus, windowMaximized});
+    // One screen holds the focus, so this report takes it from any other: that screen's own
+    // withdrawal may come later, from another client, or never. After the insert, which is all
+    // that can throw.
+    if (focus != ScreenFocus::None) {
+        for (auto it = m_outputFocus.begin(); it != m_outputFocus.end();) {
+            if (it->first != outputName && it->second.focus != ScreenFocus::None && !it->second.windowMaximized) {
+                it = m_outputFocus.erase(it);
+                continue;
+            }
+            if (it->first != outputName) it->second.focus = ScreenFocus::None;
+            ++it;
+        }
+    }
     endPlayIfPausedLocked(bound->second);
 }
 
@@ -1616,6 +1632,8 @@ bool WallpaperManager::awaitPersisted(std::string& whyNot) {
 void WallpaperManager::awaitPersisted() noexcept {
     (void)m_writer.awaitQueued();
 }
+
+void WallpaperManager::flushConfig() noexcept { awaitPersisted(); }
 
 void WallpaperManager::applyPersistOutcomeLocked(DaemonHealth& health) const {
     using State = ConfigWriter::Outcome::State;

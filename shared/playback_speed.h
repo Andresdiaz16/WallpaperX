@@ -18,8 +18,9 @@ namespace wallpaperx {
 // The speeds a video plays at, and the only values "speed" takes.
 inline constexpr std::array<double, 3> kPlaybackSpeeds{0.5, 1.0, 2.0};
 
-// The one of `among` nearest `speed` by ratio, so 0.7 plays at 1 and 1.5 at 2. A speed that is not a
-// positive finite number is taken as 1, the speed of a video without one. `among` must not be empty.
+// The one of `among` nearest `speed` by ratio, so 0.7 plays at 0.5, 0.75 at 1 and 1.5 at 2. A speed
+// that is not a positive finite number is taken as 1, the speed of a video without one. `among` must
+// not be empty.
 inline double nearestPlaybackSpeed(double speed, std::span<const double> among = kPlaybackSpeeds)
 {
     const double from = std::isfinite(speed) && speed > 0 ? speed : 1.0;

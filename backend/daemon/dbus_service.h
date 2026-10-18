@@ -52,6 +52,9 @@ private:
     // arrival is that notice.
     void announceConfigChanged();
 
+    // Emits PersistenceChanged. On the config writer's thread; emitting is thread-safe in sdbus-c++.
+    void announcePersistenceChanged() noexcept;
+
     // DBus method handlers. PLAN.md's DBus Interface section is the wire contract.
     //
     // Returns once the request is recorded and queued: a successful reply means "accepted",
@@ -60,7 +63,9 @@ private:
     //
     // SetWallpaper and SetWallpaperWithProperties both land here, `method` naming which in the log;
     // SetWallpaper is the second with no properties.
-    using WireProperties = std::map<std::string, sdbus::Variant>;
+    // Every entry as sent, not a map: deserializing into one keeps the first of a repeated key and
+    // drops the rest unread.
+    using WireProperties = std::vector<sdbus::DictEntry<std::string, sdbus::Variant>>;
     void setWallpaper(const char* method, const std::string& type, const std::string& path, int32_t monitorId,
                       const WireProperties& properties);
 

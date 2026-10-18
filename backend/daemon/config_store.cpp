@@ -6,15 +6,22 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string_view>
 #include <system_error>
+#include <utility>
+#include <vector>
 
 #include <fcntl.h>
+#include <locale.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -27,6 +34,10 @@ constexpr const char* kFileName = "config.json";
 // A 32-monitor config is about 4 kB. The cap is not about legitimate files: it bounds how
 // long startup can spend, and how much it can allocate, on a file someone else wrote.
 constexpr std::uintmax_t kMaxBytes = ConfigStore::kMaxBytes;
+
+// How deep a field load() carries as text may nest. Values this build writes nest at most one
+// level; the bound is for dump(), which overflows the stack at tens of thousands.
+constexpr int kMaxDepth = 64;
 
 // Every field name in one place: a typo in the reader that matches a typo in the writer is
 // invisible until someone else's build reads the file.
@@ -118,6 +129,166 @@ OutputSize readOutputSize(const nlohmann::json& field) {
         return {};
     }
     return OutputSize{static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height)};
+}
+
+// RFC 8259's number grammar, so only a token nlohmann would read as a number is ever rewritten.
+bool jsonNumber(std::string_view token) {
+    std::size_t i = 0;
+    const auto digits = [&] {
+        const std::size_t start = i;
+        while (i < token.size() && token[i] >= '0' && token[i] <= '9') ++i;
+        return i > start;
+    };
+    if (i < token.size() && token[i] == '-') ++i;
+    if (i < token.size() && token[i] == '0') {
+        ++i;
+    } else if (!digits()) {
+        return false;
+    }
+    if (i < token.size() && token[i] == '.') {
+        ++i;
+        if (!digits()) return false;
+    }
+    if (i < token.size() && (token[i] == 'e' || token[i] == 'E')) {
+        ++i;
+        if (i < token.size() && (token[i] == '+' || token[i] == '-')) ++i;
+        if (!digits()) return false;
+    }
+    return i == token.size();
+}
+
+// Whether a number token reads as an infinity, the parser's one reason to refuse a whole document
+// over a single value. strtod_l in the C locale: nlohmann reads with strtod, but adapts the
+// decimal point to the locale first.
+bool overflowsDouble(const std::string& token) {
+    static const locale_t c = ::newlocale(LC_ALL_MASK, "C", locale_t{});
+    if (c == locale_t{}) return false;
+    return std::isinf(::strtod_l(token.c_str(), nullptr, c));
+}
+
+bool numberCharacter(char c) {
+    return (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.' || c == 'e' || c == 'E';
+}
+
+// Writes each number no double can hold as null -- what nlohmann's own writer makes of an
+// infinity -- so it costs its field, judged like any other unusable value, rather than the file.
+void nullOverflowingNumbers(std::string& text) {
+    std::string rewritten;
+    std::size_t copied = 0;
+    for (std::size_t i = 0; i < text.size();) {
+        const char c = text[i];
+        if (c == '"') {
+            for (++i; i < text.size() && text[i] != '"'; ++i) {
+                if (text[i] == '\\') ++i;
+            }
+            ++i;
+        } else if (c == '-' || (c >= '0' && c <= '9')) {
+            const std::size_t start = i;
+            while (i < text.size() && numberCharacter(text[i])) ++i;
+            const std::string token = text.substr(start, i - start);
+            if (jsonNumber(token) && overflowsDouble(token)) {
+                rewritten.append(text, copied, start - copied);
+                rewritten += "null";
+                copied = i;
+            }
+        } else {
+            ++i;
+        }
+    }
+    if (copied != 0) {
+        rewritten.append(text, copied);
+        text.swap(rewritten);
+    }
+}
+
+// Iterative, since recursion is what it guards: a scalar is depth 0, `[]` depth 1.
+bool nestsWithin(const nlohmann::json& field, int limit) {
+    std::vector<std::pair<const nlohmann::json*, int>> pending{{&field, 1}};
+    while (!pending.empty()) {
+        const auto [value, depth] = pending.back();
+        pending.pop_back();
+        if (!value->is_structured()) continue;
+        if (depth > limit) return false;
+        for (const nlohmann::json& child : *value) pending.emplace_back(&child, depth + 1);
+    }
+    return true;
+}
+
+// A field carried as text, or false when it nests too deep to be: dump() recurses once per level.
+bool carriedText(const nlohmann::json& field, std::string& out) {
+    if (!nestsWithin(field, kMaxDepth)) return false;
+    out = field.dump();
+    return true;
+}
+
+// The file save() writes for `config`, counting into `result` what it had to drop. Throws only
+// what allocation and dump() throw.
+std::string serialise(const PersistedConfig& config, SaveResult& result) {
+    nlohmann::json monitors = nlohmann::json::array();
+    for (const PersistedWallpaper& entry : config.monitors) {
+        // dump() throws on invalid UTF-8 and Linux paths are arbitrary bytes, so a
+        // single unusual filename would otherwise cost every monitor its wallpaper.
+        // Dropping just this entry keeps the rest, and the count tells the caller a
+        // monitor will not come back.
+        //
+        // Half by half: the two are independently valid, and one gate over both cost a
+        // screen its name because the picture on it had an unusual filename -- leaving
+        // that screen anonymous after a restart, which no renaming of the image undoes.
+        const bool wallpaperOk = isValidUtf8(entry.path) && isValidUtf8(entry.type);
+        const bool nameOk = isValidUtf8(entry.output);
+        if (!wallpaperOk && (!entry.type.empty() || !entry.path.empty())) {
+            ++result.skippedNonUtf8;
+        }
+        // Counted wherever the name is lost, not only on rows that survive: a name this
+        // file cannot carry leaves the screen anonymous either way.
+        if (!nameOk && !entry.output.empty()) ++result.skippedNames;
+        // Nothing left worth a row.
+        if (!wallpaperOk && (!nameOk || entry.output.empty()) && !entry.holdsMonitorSettings()) continue;
+
+        // Both keys stay present whatever survives: load() reads a row missing either one
+        // as malformed, which would turn a degraded write into a lost row at the next start.
+        nlohmann::json row{{kKeyMonitorId, entry.monitorId},
+                           {kKeyType, wallpaperOk ? entry.type : ""},
+                           {kKeyPath, wallpaperOk ? entry.path : ""}};
+        // Only beside a wallpaper they belong to, and only when there are some, for the reason
+        // `output` below gives.
+        if (wallpaperOk && (!entry.type.empty() || !entry.path.empty()) && !entry.propertiesJson.empty()) {
+            // Every caller passes text dump() produced. Anything else costs this field, not the
+            // whole write.
+            nlohmann::json properties = nlohmann::json::parse(entry.propertiesJson, nullptr, false);
+            if (!properties.is_discarded()) row[kKeyProperties] = std::move(properties);
+        }
+        // Only when there is one: a config for an install that never named a screen
+        // stays byte-identical to what a build without this field writes.
+        if (nameOk && !entry.output.empty()) {
+            row[kKeyOutput] = entry.output;
+            if (!entry.outputSizeJson.empty()) {
+                // Same contract as properties above.
+                nlohmann::json size = nlohmann::json::parse(entry.outputSizeJson, nullptr, false);
+                if (!size.is_discarded()) row[kKeyOutputSize] = std::move(size);
+            }
+        }
+        // Beside anything or nothing: it belongs to the monitor id. Absent means play, so a config
+        // that never set one is byte-identical to what a build without this field writes.
+        if (!entry.pauseJson.empty()) {
+            nlohmann::json pause = nlohmann::json::parse(entry.pauseJson, nullptr, false);
+            if (!pause.is_discarded()) row[kKeyPause] = std::move(pause);
+        }
+        // The same: absent means on.
+        if (!entry.soundJson.empty()) {
+            nlohmann::json sound = nlohmann::json::parse(entry.soundJson, nullptr, false);
+            if (!sound.is_discarded()) row[kKeySound] = std::move(sound);
+        }
+        monitors.push_back(std::move(row));
+    }
+    nlohmann::json root{{kKeyVersion, ConfigStore::kSchemaVersion}, {kKeyMonitors, std::move(monitors)}};
+    if (!config.soundJson.empty()) {
+        nlohmann::json sound = nlohmann::json::parse(config.soundJson, nullptr, false);
+        if (!sound.is_discarded()) root[kKeySound] = std::move(sound);
+    }
+    // Compact: indenting makes a file about half as large again, and one load() refuses
+    // must never be written.
+    return root.dump() + "\n";
 }
 
 }  // namespace
@@ -234,6 +405,7 @@ LoadResult ConfigStore::load() const {
             result.error = describe(m_file, "contains a NUL byte");
             return result;
         }
+        nullOverflowingNumbers(text);
 
         // allow_exceptions=false: a parse failure is a value here, not a throw.
         const nlohmann::json root = nlohmann::json::parse(text, nullptr, false);
@@ -256,8 +428,11 @@ LoadResult ConfigStore::load() const {
             result.error = describe(m_file, "has no monitors array");
             return result;
         }
-        // Not judged here, like pause below: see PersistedWallpaper::propertiesJson.
-        if (root.contains(kKeySound)) result.soundJson = root.at(kKeySound).dump();
+        // Not judged here, like pause below: see PersistedWallpaper::propertiesJson. Counted with the
+        // malformed rows when too deep to carry, which is what has the file copied aside.
+        if (root.contains(kKeySound) && !carriedText(root.at(kKeySound), result.soundJson)) {
+            ++result.malformedEntries;
+        }
 
         for (const nlohmann::json& element : root.at(kKeyMonitors)) {
             PersistedWallpaper entry;
@@ -273,13 +448,34 @@ LoadResult ConfigStore::load() const {
                 ++result.malformedEntries;
                 continue;
             }
-            // Optional, and like properties below, not judged here: see PersistedWallpaper::propertiesJson.
-            if (element.contains(kKeyOutputSize)) entry.outputSizeJson = element.at(kKeyOutputSize).dump();
-            // A config written before properties existed has none.
-            if (element.contains(kKeyProperties)) entry.propertiesJson = element.at(kKeyProperties).dump();
-            if (element.contains(kKeyPause)) entry.pauseJson = element.at(kKeyPause).dump();
-            if (element.contains(kKeySound)) entry.soundJson = element.at(kKeySound).dump();
+            // Optional, and not judged here: see PersistedWallpaper::propertiesJson. A config written
+            // before any of them existed has none. One nested too deep to carry costs the row.
+            const std::pair<const char*, std::string*> carried[] = {{kKeyOutputSize, &entry.outputSizeJson},
+                                                                    {kKeyProperties, &entry.propertiesJson},
+                                                                    {kKeyPause, &entry.pauseJson},
+                                                                    {kKeySound, &entry.soundJson}};
+            if (!std::ranges::all_of(carried, [&element](const auto& field) {
+                    return !element.contains(field.first) || carriedText(element.at(field.first), *field.second);
+                })) {
+                ++result.malformedEntries;
+                continue;
+            }
             result.entries.push_back(std::move(entry));
+        }
+
+        // Judged again in the form save() writes, which can be longer than the file: 1e9 is written
+        // back as 1000000000.0. A file accepted here is then one this run can save.
+        PersistedConfig loaded{std::move(result.entries), std::move(result.soundJson)};
+        SaveResult dropped;
+        const std::size_t saved = serialise(loaded, dropped).size();
+        result.entries = std::move(loaded.monitors);
+        result.soundJson = std::move(loaded.soundJson);
+        if (saved > kMaxBytes) {
+            result.entries.clear();
+            result.soundJson.clear();
+            result.error = describe(m_file, "would be " + std::to_string(saved) + " bytes when saved, over the " +
+                                                std::to_string(kMaxBytes) + " byte limit");
+            return result;
         }
     } catch (const std::exception& e) {
         result.entries.clear();
@@ -299,69 +495,13 @@ SaveResult ConfigStore::save(const PersistedConfig& config) const {
 
     const std::filesystem::path temp = m_file.string() + ".tmp";
     try {
-        nlohmann::json monitors = nlohmann::json::array();
-        for (const PersistedWallpaper& entry : config.monitors) {
-            // dump() throws on invalid UTF-8 and Linux paths are arbitrary bytes, so a
-            // single unusual filename would otherwise cost every monitor its wallpaper.
-            // Dropping just this entry keeps the rest, and the count tells the caller a
-            // monitor will not come back.
-            //
-            // Half by half: the two are independently valid, and one gate over both cost a
-            // screen its name because the picture on it had an unusual filename -- leaving
-            // that screen anonymous after a restart, which no renaming of the image undoes.
-            const bool wallpaperOk = isValidUtf8(entry.path) && isValidUtf8(entry.type);
-            const bool nameOk = isValidUtf8(entry.output);
-            if (!wallpaperOk && (!entry.type.empty() || !entry.path.empty())) {
-                ++result.skippedNonUtf8;
-            }
-            // Counted wherever the name is lost, not only on rows that survive: a name this
-            // file cannot carry leaves the screen anonymous either way.
-            if (!nameOk && !entry.output.empty()) ++result.skippedNames;
-            // Nothing left worth a row.
-            if (!wallpaperOk && (!nameOk || entry.output.empty()) && !entry.holdsMonitorSettings()) continue;
-
-            // Both keys stay present whatever survives: load() reads a row missing either one
-            // as malformed, which would turn a degraded write into a lost row at the next start.
-            nlohmann::json row{{kKeyMonitorId, entry.monitorId},
-                               {kKeyType, wallpaperOk ? entry.type : ""},
-                               {kKeyPath, wallpaperOk ? entry.path : ""}};
-            // Only beside a wallpaper they belong to, and only when there are some, for the reason
-            // `output` below gives.
-            if (wallpaperOk && (!entry.type.empty() || !entry.path.empty()) && !entry.propertiesJson.empty()) {
-                // Every caller passes text dump() produced. Anything else costs this field, not the
-                // whole write.
-                nlohmann::json properties = nlohmann::json::parse(entry.propertiesJson, nullptr, false);
-                if (!properties.is_discarded()) row[kKeyProperties] = std::move(properties);
-            }
-            // Only when there is one: a config for an install that never named a screen
-            // stays byte-identical to what a build without this field writes.
-            if (nameOk && !entry.output.empty()) {
-                row[kKeyOutput] = entry.output;
-                if (!entry.outputSizeJson.empty()) {
-                    // Same contract as properties above.
-                    nlohmann::json size = nlohmann::json::parse(entry.outputSizeJson, nullptr, false);
-                    if (!size.is_discarded()) row[kKeyOutputSize] = std::move(size);
-                }
-            }
-            // Beside anything or nothing: it belongs to the monitor id. Absent means play, so a config
-            // that never set one is byte-identical to what a build without this field writes.
-            if (!entry.pauseJson.empty()) {
-                nlohmann::json pause = nlohmann::json::parse(entry.pauseJson, nullptr, false);
-                if (!pause.is_discarded()) row[kKeyPause] = std::move(pause);
-            }
-            // The same: absent means on.
-            if (!entry.soundJson.empty()) {
-                nlohmann::json sound = nlohmann::json::parse(entry.soundJson, nullptr, false);
-                if (!sound.is_discarded()) row[kKeySound] = std::move(sound);
-            }
-            monitors.push_back(std::move(row));
+        const std::string text = serialise(config, result);
+        if (text.size() > kMaxBytes) {
+            result.error = describe(m_file, "not saved, it would be " + std::to_string(text.size()) +
+                                                " bytes, over the " + std::to_string(kMaxBytes) +
+                                                " byte limit a start reads");
+            return result;
         }
-        nlohmann::json root{{kKeyVersion, kSchemaVersion}, {kKeyMonitors, std::move(monitors)}};
-        if (!config.soundJson.empty()) {
-            nlohmann::json sound = nlohmann::json::parse(config.soundJson, nullptr, false);
-            if (!sound.is_discarded()) root[kKeySound] = std::move(sound);
-        }
-        const std::string text = root.dump(2) + "\n";
 
         constexpr int kFlags = O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW;
         int fd = ::open(temp.c_str(), kFlags, 0644);

@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -224,6 +225,12 @@ std::expected<Plan, QString> planEntries(zip_t* zip)
         }
         if (!isPlainRelativePath(entry.name)) {
             return std::unexpected(QStringLiteral("It holds \"%1\", which would land outside its folder.").arg(entry.name));
+        }
+        const auto tooLong = [](const QString& part) { return part.toUtf8().size() > NAME_MAX; };
+        if (std::ranges::any_of(entry.name.split(u'/'), tooLong)) {
+            return std::unexpected(QStringLiteral("It holds a file or folder whose name is longer than the %1 bytes a "
+                                                  "Linux disk can store.")
+                                       .arg(NAME_MAX));
         }
         if (entry.name == QLatin1StringView(kImportRecordName)) {
             return std::unexpected(QStringLiteral("It holds %1, a name WallpaperX keeps for itself.").arg(entry.name));

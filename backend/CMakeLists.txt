@@ -125,6 +125,7 @@ add_library(wallpaperx-daemon-lib STATIC
     daemon/config_writer.cpp
     daemon/crash_record.cpp
     daemon/dbus_service.cpp
+    daemon/ffmpeg_log.cpp
     daemon/kept_rows.cpp
     daemon/http_server.cpp
     daemon/log_pump.cpp

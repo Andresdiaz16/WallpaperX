@@ -605,14 +605,16 @@ public:
     // InvalidRequest for a bad id or an unknown name. Survives every wallpaper change. All or
     // nothing up to the queued save, which is then waited on without an answer, as requestWallpaper()
     // does: a failed write is reported in persistence health. The caller wakes the render worker.
-    // Idempotent.
-    void setMonitorPause(int monitorId, const std::string& mode);
+    // Idempotent. Returns whether the setting changed.
+    bool setMonitorPause(int monitorId, const std::string& mode);
 
     // Records what the screen named `outputName` reports about its windows: what holds the focus
     // there, and whether a window there is maximized or fullscreen. Not persisted. A screen that has
     // never reported, or whose reporter `client` has since left the bus, is taken to have neither,
-    // so the focus modes play until a report says otherwise. Throws as setOutputVisible() does. The
-    // caller wakes the render worker. Idempotent.
+    // so the focus modes play until a report says otherwise. At most one screen holds the focus: a
+    // report of some focus here ends any other screen's, as a report of none from it would, and
+    // leaves its maximized window recorded. Throws as setOutputVisible() does. The caller wakes the
+    // render worker. Idempotent.
     void setOutputFocus(const std::string& client, const std::string& outputName, ScreenFocus focus,
                         bool windowMaximized);
 
@@ -678,6 +680,15 @@ public:
     // starts, not at the end of teardown, which the stop deadline may cut short. Idempotent;
     // destruction does it too.
     void endPlayingRecord();
+
+    // Writes a save still waiting for later changes to join it, bounded by the write deadline.
+    // Call as the stop starts, for endPlayingRecord()'s reason; destruction does it too.
+    void flushConfig() noexcept;
+
+    // Called on the config writer's thread whenever a write returns, which is when the persistence
+    // health snapshot() reports can change without any call; empty stops it. See
+    // ConfigWriter::onWritten for the lock rule.
+    void onConfigWritten(std::function<void()> written) { m_writer.onWritten(std::move(written)); }
 
     // Renders the monitor's current request, on the render worker's thread and never the DBus
     // one. rendered=true only when the frame is still the one that was asked for: a request
@@ -1751,8 +1762,9 @@ private:
 
     // What each screen reported about its windows, by name for m_outputsNotDrawn's reason, and who
     // reported it, so the report dies with its reporter. Only a report of some focus or a maximized
-    // window is held: absent means neither. Every key is a bound name -- bindOutputLocked() drops a
-    // name's report with its binding. Guarded by m_stateMutex.
+    // window is held: absent means neither. At most one holds a focus (setOutputFocus()). Every key
+    // is a bound name -- bindOutputLocked() drops a name's report with its binding. Guarded by
+    // m_stateMutex.
     struct FocusReport {
         std::string reporter;
         ScreenFocus focus = ScreenFocus::None;

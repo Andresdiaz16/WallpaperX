@@ -7,6 +7,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -34,6 +35,10 @@ struct PersistWorker {
     // One slot, not a queue: the newest snapshot already describes everything the older ones
     // would have written.
     std::optional<PersistedConfig> pending;
+
+    // Someone is waiting for `pending` to land, so it is written without waiting out the delay
+    // that lets later snapshots replace it.
+    bool flush = false;
 
     // Set when a snapshot is handed over, cleared when the write returns. A value that stays
     // put is what tells the health report the filesystem has stopped answering.
@@ -75,6 +80,9 @@ public:
 
     explicit ConfigWriter(ConfigStore store);
 
+    // Writes a snapshot still waiting out its delay, with awaitQueued()'s bounded wait.
+    ~ConfigWriter();
+
     ConfigWriter(const ConfigWriter&) = delete;
     ConfigWriter& operator=(const ConfigWriter&) = delete;
 
@@ -87,13 +95,15 @@ public:
     void allow();
     bool refusing() const;
 
-    // Hands the file's contents over without waiting. False when nothing was queued -- disabled, refused, or
-    // no thread -- and outcome() then carries which. Taken by value so the copy, if any, is made
+    // Hands the file's contents over without waiting. The write starts after a short delay, in
+    // which a later queue() replaces it -- so a slider writes a few times a second, not once a
+    // step -- or at once when awaitQueued() asks for it. False when nothing was queued --
+    // disabled, refused, or no thread -- and outcome() then carries which. Taken by value so the copy, if any, is made
     // before anything here changes: a throw leaves this object as it was.
     bool queue(PersistedConfig config);
 
-    // A bounded wait for the last queue() to land: a wait that runs out leaves the write in
-    // flight and the rows not known to be on disk. Returns whether they reached the file, true
+    // A bounded wait for the last queue() to land, which is then written without its delay: a
+    // wait that runs out leaves the write in flight and the rows not known to be on disk. Returns whether they reached the file, true
     // when persistence is disabled since durability was never promised. Builds no reason, so
     // it cannot throw: a caller that has already committed a change relies on that.
     bool awaitQueued() noexcept;
@@ -104,7 +114,19 @@ public:
     // needs is in it, so nothing else here answers part of the same question.
     Outcome outcome() const;
 
+    // Called on the writer's thread each time a write returns, failed or not, holding none of this
+    // object's locks; empty stops it, waiting for a call in progress to return. Must not throw.
+    // Whoever clears it must not hold a lock `written` takes, or the two wait on each other.
+    void onWritten(std::function<void()> written);
+
 private:
+    // Shared with the writer's thread, which outlives this object: the callback, not this object,
+    // is what it may reach.
+    struct WrittenNotice {
+        std::mutex mutex;
+        std::function<void()> written;
+    };
+
     // Spawns the thread on first use and leaves the worker null when it could not be created,
     // recording why. Caller holds m_mutex.
     void startLocked();
@@ -117,6 +139,7 @@ private:
     Outcome::State stateLocked() const noexcept;
 
     const ConfigStore m_store;
+    const std::shared_ptr<WrittenNotice> m_notice = std::make_shared<WrittenNotice>();
 
     mutable std::mutex m_mutex;
 

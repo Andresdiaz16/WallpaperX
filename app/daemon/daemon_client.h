@@ -108,9 +108,12 @@ public:
     QVariantMap screenSound() const;
     QString persistenceProblem() const;
 
-    // Reads GetStatus again; a reply to an earlier read is then discarded.
-    Q_INVOKABLE void refresh();
+public slots:
+    // Reads GetStatus again; a reply to an earlier read is then discarded. Also run on the daemon's
+    // PersistenceChanged.
+    void refresh();
 
+public:
     // The monitor id the daemon knows `connector` by, naming a free one for it first when it has
     // none. One at a time across every caller: two screens bound at once would both be given the
     // same free id, and the second would take it from the first.
@@ -125,6 +128,8 @@ public:
 
 signals:
     void statusChanged();
+    // The daemon's name has a new owner: a daemon started, holding only what it had saved.
+    void serviceStarted();
 
 private:
     struct Bind {

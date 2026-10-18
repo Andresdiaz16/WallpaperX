@@ -2,6 +2,7 @@
 
 #include "crash_record.h"
 #include "dbus_service.h"
+#include "ffmpeg_log.h"
 #include "http_server.h"
 #include "log_pump.h"
 #include "wallpaper_manager.h"
@@ -432,6 +433,7 @@ int serve(int argc, char** argv) {
         // Before any teardown the deadline could cut short: this stop is orderly whatever follows.
         // A lost device included -- the loss is the GPU's, not any video's.
         manager.endPlayingRecord();
+        manager.flushConfig();
 
         // Destroyed in reverse declaration order: HTTP, then the service (stopping the
         // render worker), then the manager (GPU teardown + leak report), the shutdown
@@ -484,6 +486,7 @@ int main(int argc, char** argv) {
 
     // First after those, so every line from here on -- this file's, the libraries' -- goes through it.
     if (!wallpaperx::logpump::install()) return fatal("wallpaperx-daemon: fatal: could not start the log writer\n");
+    wallpaperx::ffmpeg_log::install();
     const int status = serve(argc, argv);
     // What runs after main -- static destructors, the Vulkan loader, a sanitizer's end-of-run
     // report -- then writes to the destinations directly.

@@ -125,16 +125,21 @@ private:
     // What an Apply put where; the open wallpaper's values follow it there while it stays open.
     struct Live {
         quint64 id = 0;
+        // The library's path for it, and the type and file the daemon is given.
         QString wallpaperPath;
+        QString type;
+        QString assetPath;
         QString connector;
         int monitorId = -1;
-        // What the daemon last accepted for it.
-        QVariantMap sent;
+        // What the daemon last accepted for it. Nothing once a restarted daemon may hold another
+        // wallpaper there, and the next send then sets the wallpaper itself with the values.
+        std::optional<QVariantMap> sent;
     };
     enum class Sending { No, Yes, YesThenAgain };
 
     void settleApply(Progress state, QString message);
-    void startLive(const QString& wallpaperPath, const QString& connector, int monitorId, QVariantMap sent);
+    // Gives `live` a new id.
+    void startLive(Live live);
     void endLiveUnlessOpen();
     void sendLive();
 

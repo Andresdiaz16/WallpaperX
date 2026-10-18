@@ -47,6 +47,14 @@ ApplyController::ApplyController(KScreenClient& kscreen, LibraryManager& library
         emit applyChanged();
     });
     connect(&m_library, &LibraryManager::propertyValuesChanged, this, &ApplyController::sendLive);
+    connect(&m_daemon, &DaemonClient::serviceStarted, this, [this] {
+        if (m_live) {
+            // A new id, so a reply from the daemon that went away records nothing.
+            m_live->id = ++m_lastLiveId;
+            m_live->sent.reset();
+            sendLive();
+        }
+    });
     connect(&m_kscreen, &KScreenClient::selectionChanged, this, [this] {
         emit blockedReasonChanged();
         emit applyChanged();
@@ -114,7 +122,7 @@ void ApplyController::apply()
                 return;
             }
             // Live from here: the daemon holds the wallpaper whatever Plasma answers.
-            startLive(wallpaper.filePath, connector, id, values);
+            startLive(Live{0, wallpaper.filePath, wallpaper.type, wallpaper.assetPath, connector, id, values});
             m_plasma.activate(this, connector, [=, this](std::expected<int, QString> switched) {
                 if (!switched) {
                     settleApply(Progress::Failed,
@@ -217,9 +225,10 @@ void ApplyController::settle(Change& change, ChangeSignal changed, Progress stat
     emit (this->*changed)();
 }
 
-void ApplyController::startLive(const QString& wallpaperPath, const QString& connector, int monitorId, QVariantMap sent)
+void ApplyController::startLive(Live live)
 {
-    m_live = Live{++m_lastLiveId, wallpaperPath, connector, monitorId, std::move(sent)};
+    live.id = ++m_lastLiveId;
+    m_live = std::move(live);
     m_liveError.clear();
     emit liveChanged();
     // Closed while the daemon was answering, or edited meanwhile.
@@ -252,7 +261,7 @@ void ApplyController::sendLive()
     }
     m_sending = Sending::Yes;
     const quint64 id = m_live->id;
-    m_daemon.setProperties(this, m_live->monitorId, values, [this, id, values](std::expected<void, QString> set) {
+    auto done = [this, id, values](std::expected<void, QString> set) {
         if (m_live && m_live->id == id) {
             const QString error = set ? QString()
                                       : tr("A change was not applied to %1. %2").arg(m_live->connector, set.error());
@@ -267,10 +276,17 @@ void ApplyController::sendLive()
         if (std::exchange(m_sending, Sending::No) == Sending::YesThenAgain) {
             sendLive();
         } else {
-            // The save behind an accepted change is reported only in the daemon's persistence health.
+            // A save the daemon could not queue is in its persistence health now; one it queued is
+            // announced by PersistenceChanged once written.
             m_daemon.refresh();
         }
-    });
+    };
+    if (m_live->sent) {
+        m_daemon.setProperties(this, m_live->monitorId, values, std::move(done));
+    } else {
+        // Addressed by wallpaper: a monitor addressed alone may hold another one now.
+        m_daemon.setWallpaper(this, m_live->type, m_live->assetPath, m_live->monitorId, values, std::move(done));
+    }
 }
 
 } // namespace wallpaperx

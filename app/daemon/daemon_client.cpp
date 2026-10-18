@@ -189,8 +189,12 @@ DaemonClient::DaemonClient(QDBusConnection bus, QString service, DaemonTimeouts 
                     settle(State::Unavailable, notRunning(), {});
                 } else {
                     refresh();
+                    emit serviceStarted();
                 }
             });
+    // How a save the daemon did not wait for is heard of: its reply comes before the write.
+    m_bus.connect(m_service, QString::fromLatin1(kObjectPath), QString::fromLatin1(kInterface),
+                  QStringLiteral("PersistenceChanged"), this, SLOT(refresh()));
 }
 
 QVariantMap DaemonClient::pauseModes() const
