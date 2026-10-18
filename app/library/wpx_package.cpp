@@ -119,6 +119,27 @@ QString propertyProblem(const QString& key, const QString& what)
     return QStringLiteral("Property \"%1\" in wallpaper.json %2").arg(key, what);
 }
 
+// `value` as a double when it holds a number of any width; QML hands an integer literal over as an int.
+std::optional<double> numberOf(const QVariant& value)
+{
+    switch (value.typeId()) {
+    case QMetaType::Double:
+    case QMetaType::Float:
+    case QMetaType::Int:
+    case QMetaType::UInt:
+    case QMetaType::LongLong:
+    case QMetaType::ULongLong:
+        return value.toDouble();
+    default:
+        return std::nullopt;
+    }
+}
+
+bool isPositionKey(QStringView key)
+{
+    return std::ranges::any_of(kPositionKeys, [key](std::string_view k) { return key == QLatin1StringView(k); });
+}
+
 std::expected<WallpaperProperty, QString> parseProperty(const QString& key, const Json& spec)
 {
     const auto refuse = [&key](const QString& what) { return std::unexpected(propertyProblem(key, what)); };
@@ -130,6 +151,10 @@ std::expected<WallpaperProperty, QString> parseProperty(const QString& key, cons
     }
     if (!spec.is_object()) {
         return refuse(QStringLiteral("is not an object."));
+    }
+    // The daemon reads these as the wallpaper's position, which the app sets itself.
+    if (const QString reserved = QString::fromLatin1(kPositionKey); key == reserved || key.startsWith(reserved + u'.')) {
+        return refuse(QStringLiteral("is reserved: WallpaperX sets a wallpaper's position itself."));
     }
 
     WallpaperProperty property;
@@ -515,10 +540,9 @@ std::optional<QString> settleSoundProperties(Wallpaper& wallpaper)
     if (wallpaper.audio == AudioStreams::Unknown) {
         return std::nullopt;
     }
-    // Taken as declared once the daemon's property cap is reached: one more would cost the
-    // wallpaper its Apply.
+    // Taken as declared once the cap is reached: one more would cost the wallpaper its Apply.
     const auto declared = [&wallpaper](const char* key) {
-        return wallpaper.properties.size() >= kMaxProperties ||
+        return wallpaper.properties.size() >= kMaxWallpaperProperties ||
                std::ranges::contains(wallpaper.properties, QLatin1StringView(key), &WallpaperProperty::key);
     };
     if (!declared(kMuteKey)) {
@@ -636,18 +660,11 @@ std::optional<QVariant> WallpaperProperty::accept(const QVariant& value) const
 {
     switch (type) {
     case Type::Float: {
-        switch (value.typeId()) {
-        case QMetaType::Double:
-        case QMetaType::Float:
-        case QMetaType::Int:
-        case QMetaType::UInt:
-        case QMetaType::LongLong:
-        case QMetaType::ULongLong:
-            break;
-        default:
+        const std::optional<double> given = numberOf(value);
+        if (!given) {
             return std::nullopt;
         }
-        const double number = value.toDouble();
+        const double number = *given;
         if (!std::isfinite(number) || number < minimum || number > maximum) {
             return std::nullopt;
         }
@@ -686,6 +703,56 @@ QUrl Wallpaper::previewSource() const
     }
     return QUrl(QStringLiteral("image://%1/%2")
                     .arg(QString::fromLatin1(kPreviewProviderId), previewImageId(filePath, previewName, previewStamp)));
+}
+
+QStringList Wallpaper::positionModes() const
+{
+    QStringList names;
+    const std::string kind = type.toStdString();
+    for (const PositionMode mode : kPositionModes) {
+        if (positionModeAllowed(kind, mode)) {
+            names.append(QString::fromLatin1(toString(mode)));
+        }
+    }
+    return names;
+}
+
+QVariantMap Wallpaper::defaultValues() const
+{
+    QVariantMap values;
+    if (!usable()) {
+        return values;
+    }
+    for (const WallpaperProperty& property : properties) {
+        values.insert(property.key, property.defaultValue);
+    }
+    const Placement standard;
+    values.insert(QString::fromLatin1(kPositionKey), QString::fromLatin1(toString(standard.mode)));
+    values.insert(QString::fromLatin1(kPositionZoomKey), standard.zoom);
+    values.insert(QString::fromLatin1(kPositionXKey), standard.x);
+    values.insert(QString::fromLatin1(kPositionYKey), standard.y);
+    return values;
+}
+
+std::optional<QVariant> Wallpaper::accept(const QString& key, const QVariant& value) const
+{
+    if (!usable()) {
+        return std::nullopt;
+    }
+    if (!isPositionKey(key)) {
+        const auto it = std::ranges::find(properties, key, &WallpaperProperty::key);
+        return it == properties.end() ? std::nullopt : it->accept(value);
+    }
+    if (key == QLatin1StringView(kPositionKey)) {
+        if (value.typeId() != QMetaType::QString || !positionModes().contains(value.toString())) {
+            return std::nullopt;
+        }
+        return value;
+    }
+    const std::optional<double> number = numberOf(value);
+    const bool allowed = number && (key == QLatin1StringView(kPositionZoomKey) ? positionZoomAllowed(*number)
+                                                                               : positionOffsetAllowed(*number));
+    return allowed ? std::optional<QVariant>(*number) : std::nullopt;
 }
 
 std::expected<Wallpaper, QString> parseManifest(const QByteArray& json)
@@ -780,10 +847,10 @@ std::expected<Wallpaper, QString> parseManifest(const QByteArray& json)
         if (!properties.is_object()) {
             return std::unexpected(QStringLiteral("wallpaper.json's properties are not an object."));
         }
-        if (qsizetype(properties.size()) > kMaxProperties) {
+        if (qsizetype(properties.size()) > kMaxWallpaperProperties) {
             return std::unexpected(QStringLiteral("wallpaper.json has %1 properties; WallpaperX takes at most %2.")
                                        .arg(properties.size())
-                                       .arg(kMaxProperties));
+                                       .arg(kMaxWallpaperProperties));
         }
         for (const auto& [key, spec] : properties.items()) {
             auto property = parseProperty(QString::fromStdString(key), spec);

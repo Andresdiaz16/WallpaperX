@@ -18,6 +18,7 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <array>
@@ -26,6 +27,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -38,24 +40,30 @@ struct Vertex {
 };
 
 // Mirrors the push_constant blocks: the texture region in fullscreen.vert, then the heap index
-// fullscreen_heap.frag reads. The other tiers' fragment shader ignores the index.
+// fullscreen_heap.frag reads, then whether both fragment shaders repeat the texture. The other
+// tiers' fragment shader ignores the index.
 struct Push {
     float uvOrigin[2];
     float uvExtent[2];
     uint32_t textureIndex;
+    uint32_t tile;
 };
 static_assert(offsetof(Push, uvOrigin) == 0 && offsetof(Push, uvExtent) == 8 && offsetof(Push, textureIndex) == 16 &&
-              sizeof(Push) <= kPushDataBytes);
+              offsetof(Push, tile) == 20 && sizeof(Push) <= kPushDataBytes);
 }
 
 StaticRenderer::StaticRenderer(Device& device, VkRenderPass renderPass, const std::string& imagePath, const std::string& shaderDir)
-    : m_device(device), m_renderPass(renderPass) {
+    : StaticRenderer(device, renderPass, StillImage::load(device, imagePath), shaderDir) {}
+
+StaticRenderer::StaticRenderer(Device& device, VkRenderPass renderPass, std::shared_ptr<const StillImage> image,
+                               const std::string& shaderDir)
+    : m_device(device), m_image(std::move(image)), m_renderPass(renderPass) {
+    if (!m_image) throw std::invalid_argument("StaticRenderer: no image to draw");
     m_heapAllocator = dynamic_cast<DescriptorHeapAllocator*>(&m_device.descriptorAllocator());
 
     try {
-        loadAndUploadTexture(imagePath);
         createSampler();
-        m_descriptorHandle = m_device.descriptorAllocator().allocate(m_textureView, m_sampler);
+        m_descriptorHandle = m_device.descriptorAllocator().allocate(m_image->view(), m_sampler);
         createQuad();
         createPipeline(renderPass, shaderDir);
     } catch (...) {
@@ -77,9 +85,7 @@ void StaticRenderer::cleanup() {
     // within the bound gets them left behind instead, and the next submit is refused, which is
     // how a wedge reaches the daemon's health report from here. No batch to name: nothing
     // records which render last drew with this pipeline, so any pending one may still be.
-    const bool idle = m_device.safeToFree(
-        "a wallpaper's texture, that texture's view and sampler, its pipeline, and its vertex "
-        "buffer");
+    const bool idle = m_device.safeToFree("a wallpaper's sampler, its pipeline, and its vertex buffer");
     if (idle) {
         if (m_pipeline) vkDestroyPipeline(device, m_pipeline, nullptr);
         m_pipeline = VK_NULL_HANDLE;
@@ -104,18 +110,34 @@ void StaticRenderer::cleanup() {
         std::fprintf(stderr, "StaticRenderer::cleanup: descriptorAllocator().free() failed: %s\n", e.what());
     }
 
-    if (m_heapAllocator) {
-        m_heapAllocator->unregisterImageView(m_textureView);
-        m_heapAllocator->unregisterSampler(m_sampler);
-    }
+    if (m_heapAllocator) m_heapAllocator->unregisterSampler(m_sampler);
 
     if (!idle) return;
 
     if (m_sampler) vkDestroySampler(device, m_sampler, nullptr);
-    if (m_textureView) vkDestroyImageView(device, m_textureView, nullptr);
     m_sampler = VK_NULL_HANDLE;
-    m_textureView = VK_NULL_HANDLE;
+}
+
+StillImage::~StillImage() {
+    cleanup();
+}
+
+void StillImage::cleanup() {
+    // Host bookkeeping, so it runs even when the view itself is left behind.
+    if (m_heapAllocator) m_heapAllocator->unregisterImageView(m_view);
+
+    // Any pending render may have drawn from it: the image outlives the renderers that recorded those.
+    if (!m_device.safeToFree("a wallpaper's texture and that texture's view")) return;
+
+    if (m_view) vkDestroyImageView(m_device.device(), m_view, nullptr);
+    m_view = VK_NULL_HANDLE;
     m_device.memory().destroyImage(m_texture);
+}
+
+bool StillImage::FileIdentity::operator==(const FileIdentity& other) const {
+    const auto same = [](const timespec& a, const timespec& b) { return a.tv_sec == b.tv_sec && a.tv_nsec == b.tv_nsec; };
+    return device == other.device && inode == other.inode && size == other.size && same(modified, other.modified) &&
+           same(changed, other.changed);
 }
 
 // Peak host memory allowed for one decode -- the PEAK, not the finished buffer. Several
@@ -184,10 +206,11 @@ struct BufferGuard {
 
 }  // namespace
 
-void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
-    // Probes and decode share one open: reopening by path lets a swapped file be charged
-    // the wrong peak factor. Safe without a rewind because both _from_file probes
-    // ftell/fseek around their work (stb_image.h:7701, :7722).
+std::shared_ptr<const StillImage> StillImage::load(Device& device, const std::string& imagePath,
+                                                   std::shared_ptr<const StillImage> kept) {
+    // Probes, decode and the identity check share one open: reopening by path lets a swapped file
+    // be charged the wrong peak factor, or be taken for the one already decoded. Safe without a
+    // rewind because both _from_file probes ftell/fseek around their work (stb_image.h:7701, :7722).
     //
     // Through openWallpaperFile() rather than fopen: a render happens whenever a screen reports a
     // new size, long after the path was checked, and opening what is a named pipe by then parks
@@ -199,17 +222,46 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
             describeRejection(kComponent, std::string("cannot open image (") + std::strerror(why) + ")", imagePath));
     }
     // fdopen fails only for want of memory to build the stream, which is not the image's doing.
-    FilePtr probe(::fdopen(fd, "rb"));
-    if (!probe) {
+    FilePtr file(::fdopen(fd, "rb"));
+    if (!file) {
         ::close(fd);
         throw ResourceExhausted(describeRejection(kComponent, "out of memory opening the image", imagePath));
     }
 
+    // openWallpaperFile() has already asked this descriptor once, so only a shortage fails here.
+    struct stat st{};
+    if (::fstat(fd, &st) != 0) {
+        const int why = errno;
+        const std::string reason = std::string("cannot read the image's attributes (") + std::strerror(why) + ")";
+        if (why == ENOMEM) throw ResourceExhausted(describeRejection(kComponent, reason, imagePath));
+        throw WallpaperContentError(describeRejection(kComponent, reason, imagePath));
+    }
+    // Read before the decode, so a write landing during it is a change the next load sees.
+    const FileIdentity identity{st.st_dev, st.st_ino, st.st_size, st.st_mtim, st.st_ctim};
+    if (kept && kept->m_file == identity) return kept;
+    kept.reset();
+
+    return std::shared_ptr<const StillImage>(new StillImage(device, file.get(), imagePath, identity));
+}
+
+StillImage::StillImage(Device& device, FILE* file, const std::string& imagePath, const FileIdentity& identity)
+    : m_device(device),
+      m_heapAllocator(dynamic_cast<DescriptorHeapAllocator*>(&device.descriptorAllocator())),
+      m_file(identity) {
+    try {
+        upload(file, imagePath);
+    } catch (...) {
+        cleanup();
+        throw;
+    }
+}
+
+void StillImage::upload(FILE* probe, const std::string& imagePath) {
     int probeWidth = 0;
     int probeHeight = 0;
     int probeChannels = 0;
-    const bool headerRead = stbi_info_from_file(probe.get(), &probeWidth, &probeHeight, &probeChannels) != 0;
-    const bool sixteenBit = headerRead && stbi_is_16_bit_from_file(probe.get()) != 0;
+    const bool headerRead = stbi_info_from_file(probe, &probeWidth, &probeHeight, &probeChannels) != 0;
+    const bool sixteenBit = headerRead && stbi_is_16_bit_from_file(probe) != 0;
 
     if (!headerRead) {
         throw WallpaperContentError(
@@ -243,7 +295,7 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     int imageWidth = 0;
     int imageHeight = 0;
     int channels = 0;
-    PixelsPtr pixels(stbi_load_from_file(probe.get(), &imageWidth, &imageHeight, &channels, STBI_rgb_alpha));
+    PixelsPtr pixels(stbi_load_from_file(probe, &imageWidth, &imageHeight, &channels, STBI_rgb_alpha));
     if (!pixels) {
         throw WallpaperContentError(
             describeRejection(kComponent, "failed to load image (" + stbFailureReason() + ")", imagePath));
@@ -284,7 +336,7 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     m_texture = m_device.memory().createImage(imageInfo, "static-renderer-texture");
-    m_textureExtent = {imageInfo.extent.width, imageInfo.extent.height};
+    m_extent = {imageInfo.extent.width, imageInfo.extent.height};
 
     m_device.immediateSubmit([&](VkCommandBuffer cmd) {
         const VkImageMemoryBarrier toTransferDst =
@@ -313,12 +365,12 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
     viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
-    if (const VkResult r = vkCreateImageView(m_device.device(), &viewInfo, nullptr, &m_textureView); r != VK_SUCCESS) {
+    if (const VkResult r = vkCreateImageView(m_device.device(), &viewInfo, nullptr, &m_view); r != VK_SUCCESS) {
         throwVkFailure("StaticRenderer: vkCreateImageView", r);
     }
 
     if (m_heapAllocator) {
-        m_heapAllocator->registerImageView(m_textureView, viewInfo);
+        m_heapAllocator->registerImageView(m_view, viewInfo);
     }
 }
 
@@ -458,6 +510,13 @@ void StaticRenderer::createPipeline(VkRenderPass renderPass, const std::string& 
     }
 }
 
+void StaticRenderer::place(const Placement& placement) {
+    if (!placementAllowed(placement)) {
+        throw std::invalid_argument("StaticRenderer: a zoom or offset outside what Free mode allows");
+    }
+    m_placement = placement;
+}
+
 VkImageLayout StaticRenderer::record(VkCommandBuffer cmd, const OffscreenTarget& target) {
     const VkFramebuffer framebuffer = target.framebuffer;
     const uint32_t width = target.width;
@@ -475,29 +534,47 @@ VkImageLayout StaticRenderer::record(VkCommandBuffer cmd, const OffscreenTarget&
 
     vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
+    // Per record, not per renderer: one renderer may draw monitors of different shapes. The clear
+    // above is the black wherever the image does not reach.
+    const std::optional<Region> region =
+        placedRegion(m_placement, m_image->extent().width, m_image->extent().height, width, height);
+    if (region) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
 
-    VkViewport viewport{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f};
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    VkRect2D scissor{{0, 0}, {width, height}};
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
+        const bool tile = m_placement.mode == PositionMode::Tile;
+        // A tiled draw covers the target and repeats the texture from where the centred copy starts.
+        const Crop drawn = tile ? Crop{0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height)} : region->target;
+        // Sampled from the exact edges, not the whole-texel crop, so a cut edge moves smoothly.
+        const Area& exact = region->exact;
+        const Area shown = tile ? Area{exact.x0 - region->target.x0, exact.y0 - region->target.y0,
+                                       exact.x0 - region->target.x0 + width, exact.y0 - region->target.y0 + height}
+                                : exact;
 
-    m_device.descriptorAllocator().bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+        const VkViewport viewport{static_cast<float>(drawn.x0), static_cast<float>(drawn.y0),
+                                  static_cast<float>(drawn.x1 - drawn.x0), static_cast<float>(drawn.y1 - drawn.y0),
+                                  0.0f, 1.0f};
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        const VkRect2D scissor{{drawn.x0, drawn.y0},
+                               {static_cast<uint32_t>(drawn.x1 - drawn.x0), static_cast<uint32_t>(drawn.y1 - drawn.y0)}};
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-    // Per record, not per renderer: one renderer may draw monitors of different shapes.
-    const Crop crop = coverCrop(m_textureExtent.width, m_textureExtent.height, width, height);
-    const auto textureWidth = static_cast<float>(m_textureExtent.width);
-    const auto textureHeight = static_cast<float>(m_textureExtent.height);
-    const Push push{
-        {static_cast<float>(crop.x0) / textureWidth, static_cast<float>(crop.y0) / textureHeight},
-        {static_cast<float>(crop.x1 - crop.x0) / textureWidth, static_cast<float>(crop.y1 - crop.y0) / textureHeight},
-        m_descriptorHandle.index,
-    };
-    m_device.descriptorAllocator().pushData(cmd, 0, &push, sizeof(push));
+        m_device.descriptorAllocator().bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
 
-    VkDeviceSize offset = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffer.buffer, &offset);
-    vkCmdDraw(cmd, 6, 1, 0, 0);
+        const double textureWidth = m_image->extent().width;
+        const double textureHeight = m_image->extent().height;
+        const Push push{
+            {static_cast<float>(shown.x0 / textureWidth), static_cast<float>(shown.y0 / textureHeight)},
+            {static_cast<float>((shown.x1 - shown.x0) / textureWidth),
+             static_cast<float>((shown.y1 - shown.y0) / textureHeight)},
+            m_descriptorHandle.index,
+            tile ? 1u : 0u,
+        };
+        m_device.descriptorAllocator().pushData(cmd, 0, &push, sizeof(push));
+
+        VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffer.buffer, &offset);
+        vkCmdDraw(cmd, 6, 1, 0, 0);
+    }
 
     vkCmdEndRenderPass(cmd);
 

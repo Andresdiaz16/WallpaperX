@@ -83,8 +83,8 @@ public:
     // Empty, or a usable wallpaper in `wallpapers`.
     QString selectedPath() const { return m_selection; }
     Wallpaper selectedWallpaper() const;
-    // Every property of the selected wallpaper by key: the user's value, or its default. Empty
-    // when nothing is selected.
+    // Every value the selected wallpaper takes by key (Wallpaper::defaultValues), the position keys
+    // included: the user's value, or its default. Empty when nothing is selected.
     QVariantMap propertyValues() const;
 
     // Reads the folder again. The current list stays until the new one replaces it. A scan
@@ -99,9 +99,11 @@ public:
     // list already does. A scan that holds the folder back does not count. Given up when the scan
     // that counts does not list it usable, and by select() or clearSelection().
     Q_INVOKABLE void reveal(const QString& filePath);
-    // False, changing nothing, unless the selected wallpaper has property `key` and it can hold
-    // `value` (WallpaperProperty::accept).
+    // False, changing nothing, unless the selected wallpaper takes `key` and it can hold `value`
+    // (Wallpaper::accept).
     Q_INVOKABLE bool setPropertyValue(const QString& key, const QVariant& value);
+    // Every value at once, one change: false, changing nothing, if any is refused.
+    Q_INVOKABLE bool setPropertyValues(const QVariantMap& values);
     Q_INVOKABLE void resetPropertyValues();
 
 signals:

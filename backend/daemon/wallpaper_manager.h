@@ -43,6 +43,7 @@ class AudioTrack;
 class Device;
 class OffscreenTargetManager;
 struct OffscreenTarget;
+class StillImage;
 class VideoPipeline;
 
 // A request that was malformed rather than one that failed to render. Its own type so the
@@ -341,8 +342,8 @@ struct FrameAvailable {
 // What one round of the video clock did: the pictures it committed, each to be announced like a
 // render's frame, the monitors owed a render again -- playback failed, or the session their
 // pictures need was freed while nobody was looking -- and when it next has work. `nextDue` covers
-// a session waiting to be freed as well as a picture waiting to be shown; no `nextDue` means
-// neither is pending, and only a render or a wake can start one.
+// a session or a kept still image waiting to be freed as well as a picture waiting to be shown; no
+// `nextDue` means none is pending, and only a render or a wake can start one.
 struct ClockRound {
     struct Shown {
         int monitorId = 0;
@@ -500,6 +501,13 @@ public:
     // pictures delivered, not time since it was set, so a video nobody watched earns nothing.
     static constexpr std::chrono::minutes kCleanPlayAfter{10};
 
+    // How long a still's decoded image is kept after the last pass that drew it, so a redraw at a new
+    // layout or size -- a position control being dragged, a screen reporting its size after a start --
+    // draws from it instead of decoding the file again. It trades the image's video memory, four bytes
+    // a pixel per screen, against decoding the file again. Thirty seconds spans the pauses of someone
+    // adjusting a layout; past it the memory goes back.
+    static constexpr std::chrono::seconds kStillKeptFor{30};
+
     // The longest a Config may set any of the waits above to.
     static constexpr std::chrono::hours kMaxTiming{24};
 
@@ -540,6 +548,7 @@ public:
         std::chrono::steady_clock::duration pausedSessionRelease = kPausedSessionRelease;
         std::chrono::steady_clock::duration refusalLogInterval = kRefusalLogInterval;
         std::chrono::steady_clock::duration cleanPlayAfter = kCleanPlayAfter;
+        std::chrono::steady_clock::duration stillKeptFor = kStillKeptFor;
 
         // Handed to the Device: runs the moment a GPU call first answers VK_ERROR_DEVICE_LOST, on
         // whichever thread made it, usually with the GPU lock held: the stop starts while the job
@@ -563,10 +572,14 @@ public:
 
     // Replaces the properties of the wallpaper this monitor holds, keeping the wallpaper: a video
     // plays on from the picture it is at. Throws InvalidRequest for a bad id, a set
-    // propertiesError() refuses, or a monitor holding no wallpaper. Needs no render; the caller
-    // wakes the render worker, whose next round times the waiting picture at the new speed. The
-    // write is queued, not waited on, since a slider sends a stream of these. Idempotent.
-    void setWallpaperProperties(int monitorId, const WallpaperProperties& properties);
+    // propertiesError() or positionError() refuses, or a monitor holding no wallpaper. The caller
+    // wakes the render worker, whose next round times the waiting picture at the new speed and lays
+    // it out anew. The write is queued, not waited on, since a slider sends a stream of these.
+    // Idempotent.
+    //
+    // Returns whether the monitor is now owed a render, which the caller posts: a changed layout on
+    // anything but a playing video, whose next picture shows it.
+    bool setWallpaperProperties(int monitorId, const WallpaperProperties& properties);
 
     // Records the connector name a monitor is known by -- "DP-3". Throws InvalidRequest for a
     // bad id or a name outputNameError() rejects, and std::runtime_error when the name did not
@@ -701,7 +714,7 @@ public:
     // A video plays only while its monitor is settled -- showing a frame of this wallpaper with no
     // render owed -- so a request or a resize stops it until that render has run. Never touches
     // requestSeq: a picture is not a render anyone asked for. Failures land in lastError, as a
-    // render's do, and stop that video.
+    // render's do, and stop that video. Also frees the kept still images whose time has run out.
     ClockRound advanceVideo(std::chrono::steady_clock::time_point now);
 
     // What asks the render worker for a clock round when something only a round acts on changes off
@@ -953,8 +966,17 @@ private:
         // wallpaper, leaving a decoder open on bytes that are gone.
         uint64_t wallpaperSeq = 0;
 
+        // The latest unbroken run of requestSeq bumps made by a layout change alone: those in
+        // (from, to]. It stands only while `to` is still requestSeq, so any other bump ends it.
+        struct RelaidRun {
+            uint64_t from = 0;
+            uint64_t to = 0;
+        } relaid;
+
         uint64_t generation = 0;
         bool hasFrame = false;
+        // The layout the committed frame was drawn with. Meaningless unless hasFrame.
+        Placement shownPlacement;
         std::string lastError;
         Fault lastErrorFault = Fault::File;  // meaningless while lastError is empty
 
@@ -1118,9 +1140,11 @@ private:
 
     struct VideoSession;
 
-    // Publishes the frame just drawn into `target`, returning its generation, or records why a
-    // render or a picture produced none. Caller must hold m_stateMutex.
-    uint64_t commitFrameLocked(MonitorState& state, const OffscreenTarget& target);
+    // Publishes the frame just drawn into `target` laid out as `drawnWith`, returning its generation,
+    // or records why a render or a picture produced none. Caller must hold m_stateMutex.
+    uint64_t commitFrameLocked(MonitorState& state, const OffscreenTarget& target, const Placement& drawnWith);
+    // Whether every request since `seq` was a layout change alone. Caller must hold m_stateMutex.
+    static bool relaidOnlySince(const MonitorState& state, uint64_t seq);
     static void recordFailureLocked(MonitorState& state, const std::string& error, Fault fault);
 
     // What a failed render or picture was: the message, and who answers for it. Built by
@@ -1168,7 +1192,7 @@ private:
 
     // Whether `failure`, met by a CatchingUp session on its way to its saved position, gives that
     // position up so the file plays from its first picture: a content error, since the position may be
-    // what failed, or a shortage, since only an open runs under retryAfterEvictionLocked(). Logs when
+    // what failed, or a shortage, since only an open runs under retryOnShortageLocked(). Logs when
     // it does. The caller has closed the session; the open that follows starts at the first picture,
     // the position having been spent by the one before.
     static bool givesUpPosition(int monitorId, const RenderFailure& failure);
@@ -1252,12 +1276,24 @@ private:
     // resolve. Caller must hold m_gpuMutex and not m_stateMutex.
     bool evictIdleVideoSessionLocked();
 
-    // Runs `attempt`, and when it fails for want of something a closed session gives back -- memory,
-    // a decoder, the file descriptor its video holds -- closes an idle one and runs it once more.
-    // What the second attempt throws, or the first when nothing could be closed, propagates. Caller
-    // must hold m_gpuMutex and not m_stateMutex.
+    // What a shortage may be relieved with. Kept stills give back only video memory; an idle video
+    // session also gives back a decoder and the file descriptor its video holds. An attempt holding a
+    // session pointer must not close one, since the session it closes may be that one.
+    enum class Relief { KeptStills, KeptStillsThenIdleVideo };
+
+    // Runs `attempt`, and each time it fails for want of a resource, frees the next of what `relief`
+    // allows -- every kept still, then an idle session -- and runs it again. What the last attempt
+    // throws propagates. Caller must hold m_gpuMutex and not m_stateMutex.
     template <typename Attempt>
-    void retryAfterEvictionLocked(Attempt&& attempt);
+    void retryOnShortageLocked(Relief relief, Attempt&& attempt);
+
+    // The three ends of a kept still image, all with m_gpuMutex held: every one, for memory, answering
+    // whether there was any; one for anything but this still wallpaper, called beside
+    // dropStaleVideoSessionLocked() for its reason; and those past their time, folding the earliest
+    // left into `round.nextDue`.
+    bool dropKeptStillsLocked();
+    void dropStaleKeptStillLocked(int monitorId, std::optional<Drawable> kind, uint64_t wallpaperSeq);
+    void releaseExpiredStillsLocked(std::chrono::steady_clock::time_point now, ClockRound& round);
 
     // The session to draw this monitor's video with, opened and decoded into when it has none for
     // this wallpaper -- so a re-post costs the blit of the picture already held. One opened where a
@@ -1668,6 +1704,17 @@ private:
     // Before the sessions, whose tracks it must outlive.
     std::unique_ptr<AudioOutput> m_audio;
     std::map<int, VideoSession> m_videoSessions;
+
+    // A still's decoded image, kept past the pass that drew it for Config::stillKeptFor, and only for
+    // the wallpaper it was decoded for. A pass for any other, or one that fails, lets it go; one for
+    // the same wallpaper still opens the file and decodes it again if it has changed. Guarded by
+    // m_gpuMutex, and after the Device for VideoSession's reason.
+    struct KeptStill {
+        uint64_t wallpaperSeq = 0;
+        std::shared_ptr<const StillImage> image;
+        std::chrono::steady_clock::time_point until;
+    };
+    std::map<int, KeptStill> m_keptStills;
 
     // What a session's monitor lets it do, the reasons its pictures stand still told apart where its
     // sound treats them differently: a render owed redraws the same video and leaves the sound be,

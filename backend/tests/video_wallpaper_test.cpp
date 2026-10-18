@@ -168,6 +168,7 @@ CallGate g_decodeGate;           // a packet handed to the decoder: the span the
 CallGate g_freeCodecGate;        // the decoder's codec context being freed: a session's teardown
 CallGate g_submitFailGate;       // a queue submission, failed
 CallGate g_closeFileGate;        // a wallpaper file's descriptor being closed, by path: a session's end
+CallGate g_imageGate;            // an image created at the armed extent ("40x30"): a still's decode, by its size
 
 // Queue submissions to be failed as VK_ERROR_DEVICE_LOST -- which the daemon sorts as the GPU's
 // own fault, where the shortage g_submitFailGate injects is sorted as a resource running out. The
@@ -179,6 +180,11 @@ std::atomic<int> g_submitDeviceLost{0};
 // interpose, so an armed count is spent on the picture converter's image inside the decode that
 // opens a session -- which is the shortage the retry-once path exists for.
 std::atomic<int> g_failImageCreates{0};
+
+// Images created at this extent (width << 32 | height) since the last reset. A still of a size nothing
+// else has is decoded into exactly one image of it, so this counts decodes.
+std::atomic<uint64_t> g_countedExtent{0};
+std::atomic<int> g_extentCreates{0};
 
 // Packets sent to the wallpaper's decoder since the last reset. What makes "the decode happened
 // before the images were rebuilt" an observation rather than an inference.
@@ -653,8 +659,16 @@ extern "C" VkResult vkCreateImage(VkDevice device, const VkImageCreateInfo* info
     using Fn = VkResult (*)(VkDevice, const VkImageCreateInfo*, const VkAllocationCallbacks*, VkImage*);
     static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "vkCreateImage"));
     if (real == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
+    if (info != nullptr) {
+        char extent[32] = "";
+        std::snprintf(extent, sizeof(extent), "%ux%u", info->extent.width, info->extent.height);
+        if (g_imageGate.enter(extent)) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
     for (int armed = g_failImageCreates.load(); armed > 0;) {
         if (g_failImageCreates.compare_exchange_weak(armed, armed - 1)) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
+    if (info != nullptr && g_countedExtent.load() == ((uint64_t{info->extent.width} << 32) | info->extent.height)) {
+        g_extentCreates.fetch_add(1);
     }
     return real(device, info, allocator, image);
 }
@@ -1176,13 +1190,10 @@ void runBusChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::strin
     //       The pixels are read by readServedBgra() (tests/served_pixels.h): a LINEAR dma_buf is mapped, an opaque fd
     //       (NVIDIA) is imported by the plugin's own GL importer on the exporting GPU, waiting on the
     //       reply's sync_fds. Mapping alone would leave the target GPU's path ungraded.
-    // CONTROL: renderer/renderers/cover_crop.h's coverCrop() made to return the whole source rectangle,
-    //       which is the stretch commit 602281a replaced -> "FAIL: the video picture is cover-cropped to
-    //       the monitor, like a still image", printing "8 of 16 sampled rows show the wrong band; first:
-    //       monitor row 2 samples clip row 72.5, which is green (0,255,0), but reads (255,24,0)" -- the
-    //       red band that a correct crop removes -- on video_wallpaper (NVIDIA, opaque fd) and on
-    //       video_wallpaper_lavapipe alike. Via control_batch.sh, --phase '^bus$', 2026-10-08; re-run on
-    //       video_wallpaper after the helper moved to served_pixels.h, same lines, held. Reverted.
+    // CONTROL: renderer/renderers/cover_crop.h's placedRegion() made to return the whole source onto the
+    //       whole target for Cover -- a stretch -> "FAIL: the video picture is cover-cropped to the monitor,
+    //       like a still image", on video_wallpaper and video_wallpaper_lavapipe. Via control_batch.sh, phase
+    //       bus, 2026-10-18. Reverted.
     // COVERAGE-ASSERT: the number of rows actually compared is asserted, so a crop that moved the
     //       sampled rows onto a band boundary (where the check abstains) cannot quietly empty it.
     const PixelVerdict pixels = gradeCoverCrop(layoutOf(frame));
@@ -2053,10 +2064,9 @@ void runSessionChecks(const WallpaperManager::Config& config, const std::vector<
                      "open: " + describeFiles(afterNinth));
         // GOAL: S13.126 -- the ninth monitor, once given a session, shows its video cover-cropped,
         //       not merely "committed".
-        // CONTROL: renderer/renderers/cover_crop.h's coverCrop() returning the whole source -> "FAIL: the
-        //       ninth monitor's frame shows its video, cover-cropped", printing "8 of 16 sampled rows show
-        //       the wrong band", on video_wallpaper (NVIDIA, opaque fd) and video_wallpaper_lavapipe. Via
-        //       control_batch.sh, --phase '^session$', 2026-10-08. Reverted.
+        // CONTROL: renderer/renderers/cover_crop.h's placedRegion() returning the whole source for Cover ->
+        //       "FAIL: the ninth monitor's frame shows its video, cover-cropped", on video_wallpaper and
+        //       video_wallpaper_lavapipe. Via control_batch.sh, phase session, 2026-10-18. Reverted.
         gradeServedPicture(manager, refused, "S13.126's picture past the ceiling",
                            "the ninth monitor's frame shows its video, cover-cropped");
     }
@@ -2305,10 +2315,10 @@ void runFailedPassChecks(const WallpaperManager::Config& base, const std::vector
     //       the request opens the file itself to check it can be read (S13.195), and that open,
     //       counted, would make "the pass opened its session" read two where the pass opened one.
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, renderPassLocked()'s first
-    //       `if (!error.empty()) closeFailedVideoSessionLocked(monitorId, fault);` -- the one before
-    //       the commit block -- deleted -> "FAIL: a failed, overtaken pass leaves no session: the
+    //       `closeFailedVideoSessionLocked(monitorId, fault);` -- in the `if (!error.empty())` block
+    //       before the commit block -- deleted -> "FAIL: a failed, overtaken pass leaves no session: the
     //       newer pass opens its own", printing "0 open(s), 0 close(s) after the failure", alone.
-    //       Observed 2026-09-21 on the NVIDIA entry. Reverted.
+    //       Observed 2026-10-18 via control_batch.sh on NVIDIA and Lavapipe. Reverted.
     // COVERAGE-ASSERT: the held pass is asserted to have opened the session, and the injected
     //       failure to have fired.
     if (!show(kMonitorOvertaken, clips[0])) {
@@ -6449,12 +6459,10 @@ void runMemoryRetryChecks(const WallpaperManager::Config& config, const std::vec
     //       path is the picture converter's image inside the decode that opens the session. The
     //       signature graded is that the FILE WAS OPENED TWICE: "it committed" alone is also true of
     //       an attempt that never ran out, and the injection being spent is asserted separately.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, retryAfterEvictionLocked()'s condition
-    //       `!classifyFailure().exhausted` replaced by `true`, so no shortage is ever retried ->
-    //       "FAIL: an open that runs out of memory frees an idle session and commits on the retry",
-    //       printing "did not commit, 1 open(s), 1 close(s), 1 packet(s)", and the three checks after
-    //       it; the eviction staging in runPlaybackBlameChecks then reports its death never came.
-    //       Observed 2026-09-21 on the NVIDIA entry. Reverted.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, retryOnShortageLocked()'s
+    //       `if (!classifyFailure().exhausted) throw;` made `throw;`, so no shortage is ever retried ->
+    //       "FAIL: an open that runs out of memory frees an idle session and commits on the retry", and the
+    //       checks after it. Via control_batch.sh 2026-10-18, phase memoryRetry. Reverted.
     // COVERAGE-ASSERT: the armed shortage is asserted to have been spent, so a run where the
     //       injection never landed fails instead of grading an ordinary open.
     g_failImageCreates.store(1);
@@ -6467,9 +6475,10 @@ void runMemoryRetryChecks(const WallpaperManager::Config& config, const std::vec
                  "what it freed is a session whose monitor owes a render, not one that is showing its video",
                  "open: " + describeFiles(afterRetry));
 
-    // GOAL: S13.139's bound -- the retry is tried ONCE. A second shortage in a row is reported, not
-    //       answered by freeing session after session. False for a loop that keeps evicting while
-    //       anything is idle, which turns one bad allocation into every other screen going dark.
+    // GOAL: S13.139's bound -- each kind of relief is tried ONCE: with no kept still to drop, a second
+    //       shortage in a row is reported, not answered by freeing session after session. False for a loop
+    //       that keeps evicting while anything is idle, which turns one bad allocation into every other
+    //       screen going dark.
     // WHY-THIS-SHAPE: the count graded is OPENS of the new file -- two, the attempt and its one
     //       retry -- rather than closes, which also carry each failed attempt tearing its own
     //       half-built pipeline down and so say nothing about how many sessions were freed. How many
@@ -6477,11 +6486,10 @@ void runMemoryRetryChecks(const WallpaperManager::Config& config, const std::vec
     //       one check: with two, a daemon that retries once and a daemon that retries for ever both
     //       run out of sessions on the same attempt and produce the same counts, so the check could
     //       not have failed at all.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `retried ||` term deleted from
-    //       retryAfterEvictionLocked()'s condition -> "FAIL: a second shortage in a row is reported
-    //       rather than answered by freeing another session", printing "committed, 3 open(s), 4
-    //       close(s), 3 packet(s), 0 shortage(s) left unspent", and the two checks after it.
-    //       Observed 2026-09-21 on the NVIDIA entry. Reverted.
+    // CONTROL: in retryOnShortageLocked() (backend/daemon/wallpaper_manager.cpp), the idle-video step's
+    //       `next = Next::Nothing;` made `next = Next::IdleVideo;`, so sessions are freed while any is idle
+    //       -> "FAIL: a second shortage in a row is reported rather than answered by freeing another
+    //       session", and the check after it. Via control_batch.sh 2026-10-18, phase memoryRetry. Reverted.
     // COVERAGE-ASSERT: the shortages left unspent are printed beside the failure, so a run where
     //       only one of the two landed is visible rather than graded as a bound that held.
     g_failImageCreates.store(2);
@@ -6497,6 +6505,662 @@ void runMemoryRetryChecks(const WallpaperManager::Config& config, const std::vec
     reportUnless(status && status->lastErrorIsDaemonFault && !status->lastError.empty(),
                  "and the monitor records it as the daemon's own failure, not the file's",
                  status ? "last_error: " + status->lastError : std::string("no status"));
+
+    // A kept still beside the idle session on monitor 3, so both kinds of relief are on offer.
+    constexpr int kStill = 6, kLadder = 7, kBound = 8;
+    const std::string still =
+        wallpaperx::testing::writeGradientPng(testAssetDir() + "/memory_retry_still.png", 40, 30);
+    const auto keepStill = [&] {
+        manager.requestWallpaper("static", still, kStill);
+        return manager.renderPending(kStill).rendered;
+    };
+    for (const int id : {kStill, kLadder, kBound}) wallpaperx::testing::nameScreen(manager, id, screenOf(id));
+    // A shortage the checks above left unspent would fail the still instead.
+    g_failImageCreates.store(0);
+    if (!keepStill()) {
+        check(false, "a still is drawn and kept beside the idle session (the premise of the relief-order checks)");
+        return;
+    }
+
+    // GOAL: S15.780 -- a shortage that dropping the kept stills does not relieve then closes an idle video
+    //       session and tries again: two shortages in a row still open the video. False for a daemon that
+    //       stops after the stills, or tries only one kind of relief.
+    // WHY-THIS-SHAPE: two shortages, a kept still and one idle session; three opens of the new file is the
+    //       attempt and its two retries, and which session closed is asserted by name.
+    // CONTROL: control_batch.sh 2026-10-18, phase memoryRetry, reverted: in retryOnShortageLocked()
+    //       (backend/daemon/wallpaper_manager.cpp) the still step's `next = relief == ... ? Next::IdleVideo :
+    //       Next::Nothing;` made `next = Next::Nothing;` -> this line, and S13.139's lines above (no still kept there).
+    // COVERAGE-ASSERT: both shortages are asserted spent.
+    manager.requestWallpaper("video", clips[6], kLadder);
+    g_failImageCreates.store(2);
+    const PassCost ladder = renderCounted(manager, kLadder);
+    reportUnless(g_failImageCreates.load() == 0 && ladder.outcome.rendered && ladder.opens == 3 &&
+                     g_files.closes(clips[3]) == 1,
+                 "a shortage the kept stills do not relieve closes the idle session and commits on the second retry",
+                 describe(ladder) + ", idle session closed " + std::to_string(g_files.closes(clips[3])) + " time(s), " +
+                     std::to_string(g_failImageCreates.load()) + " shortage(s) unspent");
+
+    // GOAL: S15.780's bound -- at most two retries, one per kind of relief: a third shortage is reported even
+    //       with a second idle session to close. False for a ladder that keeps closing sessions.
+    // WHY-THIS-SHAPE: TWO idle sessions are left for it, so a daemon that closed a second one would commit on
+    //       its fourth attempt and the check could tell; with one, both would fail alike.
+    // CONTROL: control_batch.sh 2026-10-18, phase memoryRetry, reverted: retryOnShortageLocked()'s idle-video
+    //       step `next = Next::Nothing;` made `next = Next::IdleVideo;` (backend/daemon/wallpaper_manager.cpp)
+    //       -> this line, the one above, and S13.139's bound lines.
+    std::vector<int> idle;
+    for (const int id : {kMemoryMonitors[0], kMemoryMonitors[4]}) {
+        manager.setOutputSize(screenOf(id), kResizedWidth, kResizedHeight, idle);
+    }
+    if (!keepStill() || idle.size() != 2) {
+        check(false, "a still kept again and two sessions left idle (the premise of the two-retry bound)");
+        return;
+    }
+    manager.requestWallpaper("video", clips[8], kBound);
+    g_failImageCreates.store(3);
+    const PassCost bound = renderCounted(manager, kBound);
+    const int idleClosed = g_files.closes(clips[0]) + g_files.closes(clips[4]);
+    reportUnless(g_failImageCreates.load() == 0 && !bound.outcome.rendered && bound.opens == 3 && idleClosed == 1,
+                 "a third shortage in a row is reported: one kept-still retry and one idle-session retry, no more",
+                 describe(bound) + ", " + std::to_string(idleClosed) + " idle session(s) closed, " +
+                     std::to_string(g_failImageCreates.load()) + " shortage(s) unspent");
+}
+
+// --------------------------------------------------------------------------- //
+// Positioning on the daemon: which property changes redraw, and the still's decoded image kept between
+// passes. Manager-level, no worker, so every render is one the phase asked for.
+// --------------------------------------------------------------------------- //
+constexpr uint32_t kKeptStillWidth = 40;
+constexpr uint32_t kKeptStillHeight = 30;
+
+struct StillPass {
+    bool rendered = false;
+    int decodes = 0;
+    uint64_t generation = 0;
+};
+
+StillPass drawCounted(WallpaperManager& manager, int monitorId) {
+    g_extentCreates.store(0);
+    StillPass pass;
+    pass.rendered = manager.renderPending(monitorId).rendered;
+    pass.decodes = g_extentCreates.load();
+    if (const auto status = monitorStatus(manager, monitorId)) pass.generation = status->generation;
+    return pass;
+}
+
+std::string describe(const StillPass& pass) {
+    return std::string(pass.rendered ? "committed" : "did not commit") + ", " + std::to_string(pass.decodes) +
+           " decode(s), generation " + std::to_string(pass.generation);
+}
+
+bool owesRender(const WallpaperManager& manager, int monitorId) {
+    const auto status = monitorStatus(manager, monitorId);
+    return !status || status->renderOutstanding;
+}
+
+std::optional<bool> leftEdgeBlack(WallpaperManager& manager, int monitorId, std::string& reason);
+
+void runKeptStillChecks(const WallpaperManager::Config& base, const std::vector<std::string>& clips) {
+    const char* kGoals = "S15.743-S15.749 (the still's decoded image kept between passes)";
+    using wallpaperx::PositionMode;
+    WallpaperManager::Config config = base;
+    config.stillKeptFor = std::chrono::milliseconds(400);
+    PhaseGrade grade("the kept-still phase");
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    struct Disarm {
+        ~Disarm() {
+            g_failImageCreates.store(0);
+            g_countedExtent.store(0);
+        }
+    } disarm;
+    g_countedExtent.store((uint64_t{kKeptStillWidth} << 32) | kKeptStillHeight);
+    const std::string dir = testAssetDir();
+    const std::string a = wallpaperx::testing::writeGradientPng(dir + "/kept_still_a.png", kKeptStillWidth, kKeptStillHeight);
+    const std::string c = wallpaperx::testing::writeGradientPng(dir + "/kept_still_c.png", kKeptStillWidth, kKeptStillHeight);
+    const std::string c2 = wallpaperx::testing::writeGradientPng(dir + "/kept_still_c2.png", kKeptStillWidth, kKeptStillHeight);
+    const std::string shader = writeUndecodable("kept_still_shader.frag");
+    constexpr int kA = 0, kVideo = 1, kC = 2;
+    for (const int id : {kA, kVideo, kC}) wallpaperx::testing::nameScreen(manager, id, screenOf(id));
+
+    manager.requestWallpaper("static", a, kA);
+    const StillPass first = drawCounted(manager, kA);
+    if (!first.rendered) {
+        grade.expectNoDevice();
+        notVerified(kGoals, "the first still render on this host produced no frame");
+        return;
+    }
+    // COVERAGE-ASSERT: the counter sees the still's own image, so a zero below is a pass that decoded nothing.
+    check(first.decodes == 1, "the first draw of a still is seen decoding it once");
+
+    // GOAL: S15.743 -- a layout change on a still is owed one render and draws it from the kept image: one new
+    //       frame, no decode, nothing owed after.
+    // CONTROL: control_batch.sh 2026-10-18, phase keptStill, each alone, reverted: in renderPassLocked
+    //       (backend/daemon/wallpaper_manager.cpp) the m_keptStills lookup made `find(-1)` -> this line, the
+    //       free-mode and resize lines (re-run 2026-10-18, NVIDIA); in setWallpaperProperties `++state.requestSeq;
+    //       return true;` made `return false;` -> this line and every later line that redraws after a change.
+    const bool fitOwed = manager.setWallpaperProperties(kA, {{"position", PositionMode::Fit}});
+    const StillPass fit = drawCounted(manager, kA);
+    reportUnless(fitOwed && fit.rendered && fit.generation == first.generation + 1 && fit.decodes == 0 && !owesRender(manager, kA),
+                 "a layout change on an unchanged still redraws it once without decoding the file", describe(fit));
+
+    // GOAL: S15.744 -- a speed-only change, and a zoom or offset change outside free mode, redraw nothing.
+    // CONTROL: control_batch.sh 2026-10-18, phase keptStill, reverted: `const bool relaid = placement(...) !=
+    //       placement(properties);` made `= true` (backend/daemon/wallpaper_manager.cpp) -> this line alone.
+    const bool speedOwed = manager.setWallpaperProperties(kA, {{"position", PositionMode::Fit}, {"speed", 2.0}});
+    const bool speedOutstanding = owesRender(manager, kA);
+    const bool zoomOwed = manager.setWallpaperProperties(
+        kA, {{"position", PositionMode::Fit}, {"speed", 2.0}, {"position.zoom", 3.0}, {"position.x", 1.0}});
+    check(!speedOwed && !speedOutstanding && !zoomOwed && !owesRender(manager, kA),
+          "a speed-only change and a zoom/offset change outside free mode redraw nothing");
+
+    const bool freeOwed = manager.setWallpaperProperties(kA, {{"position", PositionMode::Free}, {"position.zoom", 3.0}});
+    const StillPass free = drawCounted(manager, kA);
+    const bool zoomInFreeOwed =
+        manager.setWallpaperProperties(kA, {{"position", PositionMode::Free}, {"position.zoom", 2.0}, {"position.x", 0.5}});
+    const StillPass freeAgain = drawCounted(manager, kA);
+    reportUnless(freeOwed && zoomInFreeOwed && free.rendered && freeAgain.rendered && free.decodes == 0 && freeAgain.decodes == 0,
+                 "in free mode, a zoom or offset change redraws without decoding", describe(free) + "; " + describe(freeAgain));
+
+    // GOAL: S15.743 -- a resize of an unchanged still draws from the kept image.
+    std::vector<int> owed;
+    manager.setOutputSize(screenOf(kA), kResizedWidth, kResizedHeight, owed);
+    const StillPass resized = drawCounted(manager, kA);
+    reportUnless(contains(owed, kA) && resized.rendered && resized.decodes == 0,
+                 "a resize of an unchanged still redraws without decoding the file", describe(resized));
+
+    // GOAL: S15.745 -- a file touched, rewritten with the same bytes, or replaced behind the daemon is decoded
+    //       again at the next redraw; one deleted fails that redraw.
+    // WHY-THIS-SHAPE: the same bytes and size are written back, so only the identity (times, inode) can tell.
+    // CONTROL: control_batch.sh 2026-10-18, phase keptStill, reverted: StillImage::load's `kept->m_file ==
+    //       identity` made `kept` (renderer/renderers/static_renderer.cpp) -> the touched/rewritten/replaced lines.
+    PositionMode laidOut = PositionMode::Free;
+    const auto layOut = [&](PositionMode mode) {
+        laidOut = mode;
+        return manager.setWallpaperProperties(kA, {{"position", mode}});
+    };
+    const auto relayout = [&] { return layOut(laidOut == PositionMode::Centre ? PositionMode::Fit : PositionMode::Centre); };
+    const auto bytesOf = [](const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    const std::string original = bytesOf(a);
+    const std::vector<std::pair<const char*, std::function<void()>>> changes{
+        {"touched", [&] { std::filesystem::last_write_time(a, std::filesystem::last_write_time(a) + std::chrono::seconds(5)); }},
+        {"rewritten with the same bytes", [&] { std::ofstream(a, std::ios::binary | std::ios::trunc) << original; }},
+        {"replaced by a rename", [&] {
+             std::ofstream(a + ".new", std::ios::binary) << original;
+             std::filesystem::rename(a + ".new", a);
+         }},
+    };
+    for (const auto& [what, change] : changes) {
+        change();
+        const bool changeOwed = relayout();
+        const StillPass pass = drawCounted(manager, kA);
+        reportUnless(changeOwed && pass.rendered && pass.decodes == 1,
+                     (std::string("a still ") + what + " behind the daemon is decoded again at the next redraw").c_str(),
+                     describe(pass));
+    }
+
+    layOut(PositionMode::Stretch);
+    g_submitFailGate.arm(CallGate::Mode::Fail);
+    const StillPass failed = drawCounted(manager, kA);
+    g_submitFailGate.release();
+    check(!failed.rendered, "a draw failed at its submission commits nothing (the premise of S15.746 and S15.801)");
+
+    // GOAL: S15.801 -- a layout change on a monitor whose last render failed posts no redraw, and the new
+    //       layout is still saved: the next redraw by another cause draws with it (Fit leaves the left edge
+    //       black, Stretch before it did not).
+    // CONTROL: control_batch.sh 2026-10-18, phase keptStill, NVIDIA and Lavapipe, each alone, reverted, in
+    //       setWallpaperProperties (backend/daemon/wallpaper_manager.cpp): `|| !state.lastError.empty()` deleted
+    //       -> "...posts no redraw" alone; `if (!state.lastError.empty()) return false;` added above the save ->
+    //       "...draws the layout at the next redraw" alone, "the left edge is not black".
+    const bool failedOwed = layOut(PositionMode::Fit);
+    check(!failedOwed && !owesRender(manager, kA), "a layout change on a monitor whose last render failed posts no redraw");
+
+    // GOAL: S15.746 -- a pass that fails keeps nothing: the redraw after it decodes the unchanged file again.
+    // WHY-THIS-SHAPE: the redraw is a resize; a new request would make a new wallpaperSeq, whose stale-image
+    //       drop decodes afresh whether the failure kept anything or not.
+    // CONTROL: control_batch.sh 2026-10-18, phase keptStill, NVIDIA and Lavapipe, reverted: the `if
+    //       (!error.empty()) m_keptStills.erase(monitorId);` after the commit block deleted (backend/daemon/
+    //       wallpaper_manager.cpp) -> this line alone, "committed, 0 decode(s)" (a failed submission is inside
+    //       the commit block, which the earlier erase misses).
+    owed.clear();
+    manager.setOutputSize(screenOf(kA), kResizedAgainWidth, kResizedAgainHeight, owed);
+    const StillPass afterFailure = drawCounted(manager, kA);
+    reportUnless(contains(owed, kA) && afterFailure.rendered && afterFailure.decodes == 1,
+                 "after a failed draw the next redraw decodes the file again", describe(failed) + "; " + describe(afterFailure));
+    std::string edgeReason;
+    const std::optional<bool> fitAfterFailure = leftEdgeBlack(manager, kA, edgeReason);
+    reportUnless(fitAfterFailure.value_or(false), "a layout set while the last render had failed draws the layout at the next redraw",
+                 fitAfterFailure ? "the left edge is not black" : "unreadable: " + edgeReason);
+
+    // GOAL: S15.747 -- setting the same path again decodes it afresh.
+    // CONTROL: control_batch.sh 2026-10-18, phase keptStill, reverted: dropStaleKeptStillLocked's
+    //       `&& it->second.wallpaperSeq == wallpaperSeq` deleted (backend/daemon/wallpaper_manager.cpp) -> this line.
+    manager.requestWallpaper("static", a, kA);
+    const StillPass again = drawCounted(manager, kA);
+    reportUnless(again.rendered && again.decodes == 1, "setting the same path again decodes the file afresh", describe(again));
+
+    // GOAL: S15.748 -- the kept image is freed stillKeptFor after its last draw by the clock round, which
+    //       asks to be woken for it until then.
+    // WHY-THIS-SHAPE: advanceVideo is handed the time, so the expiry is reached without sleeping on it.
+    // CONTROL: control_batch.sh 2026-10-18, phase keptStill, reverted: the releaseExpiredStillsLocked call
+    //       deleted from advanceVideo (backend/daemon/wallpaper_manager.cpp) -> this line.
+    const auto drawnAt = std::chrono::steady_clock::now();
+    const wallpaperx::ClockRound pending = manager.advanceVideo(drawnAt);
+    manager.advanceVideo(drawnAt + config.stillKeptFor + std::chrono::milliseconds(200));
+    relayout();
+    const StillPass expired = drawCounted(manager, kA);
+    reportUnless(pending.nextDue.has_value() && *pending.nextDue <= drawnAt + config.stillKeptFor && expired.rendered &&
+                     expired.decodes == 1,
+                 "the kept image is freed stillKeptFor after its last draw, with a wake asked for until then",
+                 describe(expired) + (pending.nextDue ? "" : "; no wake asked for"));
+
+    // An idle video session: drawn, then owing a render after a resize, as in the memory-retry phase.
+    manager.requestWallpaper("video", clips[0], kVideo);
+    const PassCost video = renderCounted(manager, kVideo);
+    owed.clear();
+    manager.setOutputSize(screenOf(kVideo), kResizedWidth, kResizedHeight, owed);
+    manager.requestWallpaper("static", c, kC);
+    const bool setUp = video.outcome.rendered && contains(owed, kVideo) && drawCounted(manager, kC).rendered;
+    check(setUp, "an idle video session and a second still are set up for the shortage cases");
+    if (!setUp) return;
+
+    // GOAL: S15.749 -- running out of GPU memory frees the kept still images before an idle video session.
+    // CONTROL: control_batch.sh 2026-10-18, phase keptStill, reverted: in retryOnShortageLocked()
+    //       (backend/daemon/wallpaper_manager.cpp) `Next next = Next::KeptStills;` made `Next::IdleVideo` ->
+    //       this line and the replaced-still line below.
+    // COVERAGE-ASSERT: the injected shortage is asserted spent.
+    g_files.resetCounts();
+    manager.requestWallpaper("static", c2, kC);
+    g_failImageCreates.store(1);
+    const StillPass shortC = drawCounted(manager, kC);
+    check(g_failImageCreates.load() == 0, "the injected shortage was spent on the still's image");
+    relayout();
+    const StillPass aAfterShortage = drawCounted(manager, kA);
+    reportUnless(shortC.rendered && g_files.closes(clips[0]) == 0 && aAfterShortage.decodes == 1,
+                 "a shortage frees the kept stills, not the idle video session, and the retry commits",
+                 describe(shortC) + "; video closed " + std::to_string(g_files.closes(clips[0])) + " time(s); the other "
+                     "still then " + describe(aAfterShortage));
+
+    // GOAL: S15.747 -- another wallpaper taking the screen frees its kept image: with none kept anywhere, the
+    //       next shortage has only the idle video session to free. Also S15.782: a relief step that frees
+    //       nothing does not spend the retry.
+    // CONTROL: control_batch.sh 2026-10-18, phase keptStill, each alone, reverted (backend/daemon/
+    //       wallpaper_manager.cpp): the dropStaleKeptStillLocked call deleted from renderPassLocked -> this
+    //       line and the same-path line; in retryOnShortageLocked() `freed = dropKeptStillsLocked();` made
+    //       `dropKeptStillsLocked(); freed = true;` -> this line.
+    manager.requestWallpaper("shader", shader, kA);
+    manager.renderPending(kA);
+    g_files.resetCounts();
+    manager.requestWallpaper("static", c, kC);
+    g_failImageCreates.store(1);
+    const StillPass shortAgain = drawCounted(manager, kC);
+    reportUnless(g_failImageCreates.load() == 0 && shortAgain.rendered && g_files.closes(clips[0]) >= 1,
+                 "a still replaced by another wallpaper keeps nothing, so a shortage frees the idle video session",
+                 describe(shortAgain) + "; video closed " + std::to_string(g_files.closes(clips[0])) + " time(s)");
+}
+
+// Whether the left edge of the monitor's served frame, half way down, is black. Empty when unreadable.
+std::optional<bool> leftEdgeBlack(WallpaperManager& manager, int monitorId, std::string& reason) {
+    wallpaperx::FrameExport exported = exportDelivered(manager, monitorId);
+    if (!exported.handle) {
+        reason = "no frame was served";
+        return std::nullopt;
+    }
+    const FrameLayout layout = layoutOf(*exported.handle);
+    const std::vector<unsigned char> image = readServedBgra(layout, reason);
+    if (exported.handle->frame.fd >= 0) close(exported.handle->frame.fd);
+    if (exported.handle->acquireFd >= 0) close(exported.handle->acquireFd);
+    if (image.size() < size_t{layout.width} * layout.height * 4) return std::nullopt;
+    const unsigned char* px = &image[(size_t{layout.height / 2} * layout.width) * 4];
+    return px[0] < 8 && px[1] < 8 && px[2] < 8;
+}
+
+void runPositionVideoChecks(const WallpaperManager::Config& base, const std::string& clip, const std::string& onePicture) {
+    const char* kGoals = "S15.750-S15.751 (a video takes a layout change)";
+    using wallpaperx::PositionMode;
+    PhaseGrade grade("the video position phase");
+    WallpaperManager::Config config = base;
+    config.unwatchedAfter = std::chrono::hours(1);  // plays with no consumer for the whole phase
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    constexpr int kPlaying = 0, kStopped = 1;
+    for (const int id : {kPlaying, kStopped}) wallpaperx::testing::nameScreen(manager, id, screenOf(id));
+    manager.requestWallpaper("video", clip, kPlaying);
+    if (!renderCounted(manager, kPlaying).outcome.rendered) {
+        grade.expectNoDevice();
+        notVerified(kGoals, "the first video render on this host produced no frame");
+        return;
+    }
+    std::string reason;
+    const std::optional<bool> coverBlack = leftEdgeBlack(manager, kPlaying, reason);
+    if (!coverBlack.has_value() || *coverBlack) {
+        notVerified(kGoals, coverBlack ? "the cover frame's left edge is already black" : "the frame was unreadable: " + reason);
+        return;
+    }
+
+    // GOAL: S15.750 -- a playing video takes a layout change at its next picture: no render owed, no file
+    //       reopened, no decoder torn down, and the next picture shown is laid out the new way (a 4:3 clip
+    //       fitted to a 64x24 screen leaves the left edge black).
+    // WHY-THIS-SHAPE: the wait has a deadline whose failure is graded, so a stalled clock cannot pass as shown.
+    // CONTROL: control_batch.sh 2026-10-18, phase positionVideo, each alone, reverted: in advanceSessionLocked
+    //       (backend/daemon/wallpaper_manager.cpp) the clock's `placement(it->second.properties)` made
+    //       `wallpaperx::Placement{}` -> "...is laid out the new way"; in setWallpaperProperties the Playing
+    //       early return deleted -> "...owes no render" and "showed a picture within 5 s" (an owed render stops it).
+    g_files.resetCounts();
+    g_codecFrees.store(0);
+    const bool owed = manager.setWallpaperProperties(kPlaying, {{"position", PositionMode::Fit}});
+    check(!owed && !owesRender(manager, kPlaying), "a layout change on a playing video owes no render");
+    bool shown = false;
+    for (const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+         !shown && std::chrono::steady_clock::now() < deadline;) {
+        for (const wallpaperx::ClockRound::Shown& s : manager.advanceVideo(std::chrono::steady_clock::now()).shown) {
+            shown = shown || s.monitorId == kPlaying;
+        }
+        if (!shown) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    check(shown, "the playing video showed a picture within 5 s of the change");
+    if (shown) {
+        const std::optional<bool> fitBlack = leftEdgeBlack(manager, kPlaying, reason);
+        reportUnless(fitBlack.value_or(false), "the playing video's next picture is laid out the new way",
+                     fitBlack ? "the left edge is not black" : "unreadable: " + reason);
+        reportUnless(g_files.opens(clip) == 0 && g_codecFrees.load() == 0, "and the video was not restarted for it",
+                     std::to_string(g_files.opens(clip)) + " open(s), " + std::to_string(g_codecFrees.load()) + " decoder(s) freed");
+    }
+
+    // GOAL: S15.751 -- a video that is not playing (a one-picture file, parked on its picture) is redrawn once
+    //       for a layout change, in the new layout.
+    // CONTROL: control_batch.sh 2026-10-18, phase positionVideo, reverted: setWallpaperProperties's
+    //       `++state.requestSeq; return true;` made `return false;` (backend/daemon/wallpaper_manager.cpp) -> this line.
+    manager.requestWallpaper("video", onePicture, kStopped);
+    if (!renderCounted(manager, kStopped).outcome.rendered) {
+        check(false, "the parked video monitor is drawn");
+        return;
+    }
+    for (int round = 0; round < 3; ++round) manager.advanceVideo(std::chrono::steady_clock::now());
+    const bool stoppedOwed = manager.setWallpaperProperties(kStopped, {{"position", PositionMode::Fit}});
+    const uint64_t before = monitorStatus(manager, kStopped) ? monitorStatus(manager, kStopped)->generation : 0;
+    const bool redrawn = manager.renderPending(kStopped).rendered;
+    const uint64_t after = monitorStatus(manager, kStopped) ? monitorStatus(manager, kStopped)->generation : 0;
+    const std::optional<bool> stoppedBlack = leftEdgeBlack(manager, kStopped, reason);
+    reportUnless(stoppedOwed && redrawn && after == before + 1 && !owesRender(manager, kStopped) && stoppedBlack.value_or(false),
+                 "a video that is not playing is redrawn once in the new layout",
+                 std::string(stoppedOwed ? "owed" : "not owed") + ", generation " + std::to_string(before) + " -> " +
+                     std::to_string(after) + (stoppedBlack.value_or(false) ? "" : ", left edge not black"));
+}
+
+void runRelaidReleaseChecks(const WallpaperManager::Config& base, const std::string& clip, const std::string& onePicture) {
+    using wallpaperx::PositionMode;
+    const char* kGoals = "S15.783 (a layout change on a video whose decoder was released is drawn)";
+    PhaseGrade grade("the relaid-release phase");
+    WallpaperManager::Config config = base;
+    config.idleSessionRelease = std::chrono::milliseconds(200);
+    config.pausedSessionRelease = std::chrono::milliseconds(400);
+    config.unwatchedAfter = std::chrono::milliseconds(300);
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    // Its own copy, so the paused monitor's reopened session closing again is not counted as this one's.
+    const std::string unwatchedClip = testAssetDir() + "/relaid_unwatched.mp4";
+    std::filesystem::copy_file(clip, unwatchedClip, std::filesystem::copy_options::overwrite_existing);
+    g_files.watch(unwatchedClip);
+    struct Variant {
+        int id;
+        const char* what;
+        std::string path;
+        bool pause;
+        bool plays;
+    };
+    const Variant variants[] = {{0, "a video paused past pausedSessionRelease", clip, true, true},
+                                {1, "an unwatched video", unwatchedClip, false, true},
+                                {2, "a parked one-picture video", onePicture, false, false}};
+    for (const Variant& v : variants) {
+        wallpaperx::testing::nameScreen(manager, v.id, screenOf(v.id));
+        manager.requestWallpaper("video", v.path, v.id);
+        if (!renderCounted(manager, v.id).outcome.rendered) {
+            if (v.id == 0) {
+                grade.expectNoDevice();
+                notVerified(kGoals, "the first video render on this host produced no frame");
+                return;
+            }
+            check(false, (std::string(v.what) + " is drawn first").c_str());
+            continue;
+        }
+        std::string reason;
+        const std::optional<bool> coverBlack = leftEdgeBlack(manager, v.id, reason);
+        if (!coverBlack.has_value() || *coverBlack) {
+            notVerified(kGoals, std::string(v.what) + ": the cover frame's left edge is not readable, or already black");
+            continue;
+        }
+        // A picture shown by the clock spends the credit a new video is watched on.
+        bool shown = !v.plays;
+        for (const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+             !shown && std::chrono::steady_clock::now() < deadline;) {
+            for (const wallpaperx::ClockRound::Shown& s : manager.advanceVideo(std::chrono::steady_clock::now()).shown) {
+                shown = shown || s.monitorId == v.id;
+            }
+            if (!shown) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (!shown) {
+            check(false, (std::string(v.what) + " shows a picture within 5 s (the premise of S15.783)").c_str());
+            continue;
+        }
+        if (v.pause) manager.setMonitorPause(v.id, "always_paused");
+        // Past unwatchedAfter on the real clock, which is the one watchedLocked() reads.
+        std::this_thread::sleep_for(config.unwatchedAfter + std::chrono::milliseconds(100));
+        g_files.resetCounts();
+        bool released = false;
+        auto at = std::chrono::steady_clock::now();
+        for (int round = 0; round < 20 && !released; ++round, at += std::chrono::milliseconds(250)) {
+            manager.advanceVideo(at);
+            released = g_files.closes(v.path) >= 1;
+        }
+        if (!released) {
+            check(false, (std::string(v.what) + " has its decoder released (the premise of S15.783)").c_str());
+            continue;
+        }
+
+        // GOAL: S15.783 -- a layout change on a video whose decoder was released is drawn: the reopened session
+        //       catches up to the picture on screen and draws it in the new layout. False for a daemon that takes
+        //       the picture on screen as already shown, leaving the old layout up until the video next plays.
+        // WHY-THIS-SHAPE: three ways a session is released, each its own monitor; the redraw is graded by the
+        //       generation and the frame's pixels (4:3 fitted to 64x24 leaves the left edge black), not by
+        //       "rendered" alone, which a pass that kept the old frame could also report.
+        // CONTROL: control_batch.sh 2026-10-18, phase relaidRelease, reverted: in renderPassLocked
+        //       (backend/daemon/wallpaper_manager.cpp) `&& it->second.shownPlacement == placement(...)` deleted from
+        //       keepsFrame -> this line, for each of the three.
+        const uint64_t before = monitorStatus(manager, v.id) ? monitorStatus(manager, v.id)->generation : 0;
+        const bool owed = manager.setWallpaperProperties(v.id, {{"position", PositionMode::Fit}});
+        const PassCost redraw = renderCounted(manager, v.id);
+        const uint64_t after = monitorStatus(manager, v.id) ? monitorStatus(manager, v.id)->generation : 0;
+        const std::optional<bool> fitBlack = leftEdgeBlack(manager, v.id, reason);
+        reportUnless(owed && redraw.outcome.rendered && after == before + 1 && !owesRender(manager, v.id) &&
+                         fitBlack.value_or(false),
+                     (std::string(v.what) + ", its decoder released, is redrawn in the new layout").c_str(),
+                     std::string(owed ? "owed" : "not owed") + ", " + describe(redraw) + ", generation " +
+                         std::to_string(before) + " -> " + std::to_string(after) +
+                         (fitBlack.value_or(false) ? "" : ", left edge not black"));
+    }
+}
+
+// A still pass held inside its decode while the screen's settings change under it, on a render worker
+// because the hold must be on the thread the Device is pinned to.
+void runLayoutDragChecks(const WallpaperManager::Config& config) {
+    using wallpaperx::PositionMode;
+    const char* kGoals = "S15.784-S15.786 (a still pass overtaken by layout changes alone commits)";
+    constexpr int kDrag = 0;
+    PhaseGrade grade("the layout-drag phase");
+    FrameReadyLog signals;
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    RenderWorker worker(manager, [&signals](int id, uint64_t g) { signals.record(id, g); });
+    struct Disarm {
+        RenderWorker& worker;
+        ~Disarm() {
+            g_imageGate.release();
+            g_framebufferGate.release();
+            g_framebufferLostGate.release();
+            g_failImageCreates.store(0);
+            g_countedExtent.store(0);
+            worker.stop();
+        }
+    } disarm{worker};
+    const std::string dir = testAssetDir();
+    const std::string a = wallpaperx::testing::writeGradientPng(dir + "/layout_drag_a.png", 40, 30);
+    const std::string b = wallpaperx::testing::writeGradientPng(dir + "/layout_drag_b.png", 40, 30);
+    wallpaperx::testing::nameScreen(manager, kDrag, screenOf(kDrag));
+    const auto generation = [&] {
+        const auto status = monitorStatus(manager, kDrag);
+        return status ? status->generation : 0;
+    };
+    manager.requestWallpaper("static", a, kDrag);
+    worker.post(kDrag);
+    if (!drainWorker(worker) || generation() == 0) {
+        grade.expectNoDevice();
+        notVerified(kGoals, "the first still render on this host produced no frame");
+        return;
+    }
+    // A pass that decodes `path` afresh, held inside the creation of the still's own image.
+    const auto holdPass = [&](const std::string& path) {
+        g_imageGate.arm(CallGate::Mode::Hold, "40x30");
+        manager.requestWallpaper("static", path, kDrag);
+        worker.post(kDrag);
+        const bool held = g_imageGate.waitFired(std::chrono::seconds(30));
+        check(held, "a redraw is held inside its decode (the premise of the layout-drag checks)");
+        return held;
+    };
+    const auto edgeBlack = [&]() -> std::optional<bool> {
+        auto answer = std::make_shared<std::promise<std::optional<bool>>>();
+        std::future<std::optional<bool>> future = answer->get_future();
+        worker.postTask([answer, &manager](RenderWorker::TaskState state) {
+            std::optional<bool> black;
+            std::string reason;
+            if (state == RenderWorker::TaskState::Run) {
+                try {
+                    black = leftEdgeBlack(manager, kDrag, reason);
+                } catch (const std::exception&) {
+                }
+            }
+            answer->set_value(black);
+        });
+        if (future.wait_for(std::chrono::seconds(60)) != std::future_status::ready) return std::optional<bool>{};
+        return future.get();
+    };
+    const auto settle = [&] {
+        worker.post(kDrag);
+        return drainWorker(worker) && !owesRender(manager, kDrag);
+    };
+
+    // GOAL: S15.784 -- a still pass overtaken only by a layout change commits, laid out the newest way, and
+    //       leaves nothing owed. False for a daemon that discards it, which during a slider drag discards
+    //       every pass and shows nothing until the drag stops.
+    // WHY-THIS-SHAPE: the pass is held inside its own decode while the change lands, and no render is posted
+    //       for the change, so a frame after the release can only be the held pass's. Fit on a 64x24 screen
+    //       blacks the left edge, which the held pass's cover start does not.
+    // CONTROL: control_batch.sh 2026-10-18, phase layoutDrag, reverted: in renderPassLocked
+    //       (backend/daemon/wallpaper_manager.cpp) `|| (error.empty() && !keepsFrame && relaidOnlySince(...))`
+    //       deleted from `current` -> this line alone.
+    {
+        const uint64_t before = generation();
+        if (!holdPass(a)) return;
+        const bool owed = manager.setWallpaperProperties(kDrag, {{"position", PositionMode::Fit}});
+        g_imageGate.release();
+        const bool drained = drainWorker(worker);
+        const uint64_t after = generation();
+        const bool stillOwed = owesRender(manager, kDrag);
+        const std::optional<bool> black = edgeBlack();
+        reportUnless(owed && drained && after == before + 1 && !stillOwed && black.value_or(false),
+                     "a still pass overtaken only by a layout change commits, laid out the newest way",
+                     std::string(owed ? "owed" : "not owed") + ", generation " + std::to_string(before) + " -> " +
+                         std::to_string(after) + (stillOwed ? ", a render owed" : "") +
+                         (black.value_or(false) ? "" : ", left edge not black"));
+    }
+
+    // GOAL: S15.785 -- any other change discards the pass, before or after a layout change: a new wallpaper
+    //       set while it is held means its picture is never committed, and the newer request stays owed.
+    // WHY-THIS-SHAPE: both orders, because the daemon tracks the latest unbroken run of layout changes: a
+    //       new wallpaper after the run ends it, and one before means the run does not reach back to the pass.
+    // CONTROL: control_batch.sh 2026-10-18, phase layoutDrag, each alone, reverted, in relaidOnlySince()
+    //       (backend/daemon/wallpaper_manager.cpp): `state.relaid.to == state.requestSeq &&` deleted -> the
+    //       "layout change and then" line; `state.relaid.from <= seq &&` deleted -> the "and then a layout
+    //       change" line.
+    const auto discardedBy = [&](const char* what, const std::function<bool()>& change) {
+        if (!settle()) {
+            check(false, "the screen settles between the layout-drag cases");
+            return;
+        }
+        const uint64_t before = generation();
+        if (!holdPass(a)) return;
+        const bool owed = change();
+        g_imageGate.release();
+        const bool drained = drainWorker(worker);
+        const uint64_t after = generation();
+        const bool stillOwed = owesRender(manager, kDrag);
+        reportUnless(owed && drained && after == before && stillOwed, what,
+                     std::string(owed ? "owed" : "not owed") + ", generation " + std::to_string(before) + " -> " +
+                         std::to_string(after) + (stillOwed ? "" : ", nothing owed"));
+    };
+    discardedBy("a still pass overtaken by a layout change and then a new wallpaper is discarded", [&] {
+        const bool owed = manager.setWallpaperProperties(kDrag, {{"position", PositionMode::Free}, {"position.zoom", 2.0}});
+        manager.requestWallpaper("static", b, kDrag);
+        return owed;
+    });
+    discardedBy("a still pass overtaken by a new wallpaper and then a layout change is discarded", [&] {
+        manager.requestWallpaper("static", b, kDrag);
+        return manager.setWallpaperProperties(kDrag, {{"position", PositionMode::Free}, {"position.zoom", 2.5}});
+    });
+
+    // GOAL: S15.786 -- a pass that failed is discarded when only a layout change overtook it: it records no
+    //       failure in the newer request's name, and that request stays owed. False for a daemon that lets a
+    //       failed pass through as current, which marks the layout change serviced and never draws it.
+    // WHY-THIS-SHAPE: the shortage is injected into the held creation itself, with no kept still or idle
+    //       session to free, so no retry can turn it into a success.
+    // CONTROL: control_batch.sh 2026-10-18, phase layoutDrag, reverted: `error.empty() &&` deleted from
+    //       renderPassLocked's `current` (backend/daemon/wallpaper_manager.cpp) -> this line, "nothing owed".
+    // COVERAGE-ASSERT: the injected shortage is asserted spent, so the pass graded is one that failed.
+    discardedBy("a failed still pass overtaken by a layout change is discarded, and the change stays owed", [&] {
+        const bool owed = manager.setWallpaperProperties(kDrag, {{"position", PositionMode::Free}, {"position.zoom", 3.0}});
+        g_failImageCreates.store(1);
+        return owed;
+    });
+    check(g_failImageCreates.load() == 0, "the shortage injected into the failed pass was spent on it");
+
+    // GOAL: S15.802 -- a still pass that failed after keeping its decoded image, and was overtaken, keeps
+    //       nothing: the newer pass decodes the unchanged file again. False for a daemon that erases the
+    //       kept image only after the commit block, which an overtaken pass returns from inside.
+    // WHY-THIS-SHAPE: held inside the image rebuild of a resize (after the kept image is back in the map),
+    //       overtaken there by a layout change, then failed as a lost device: a shortage would have its relief
+    //       drop every kept still anyway. The decode count is of images at the still's own 40x30 size.
+    // CONTROL: control_batch.sh 2026-10-18, phase layoutDrag, NVIDIA and Lavapipe, reverted: in renderPassLocked
+    //       (backend/daemon/wallpaper_manager.cpp) the `m_keptStills.erase(monitorId);` before the commit block
+    //       deleted -> this line alone, "generation 5 -> 6, 0 decode(s)".
+    // COVERAGE-ASSERT: the hold and the injected failure are asserted to have fired.
+    if (!settle()) {
+        check(false, "the screen settles before the overtaken-failure case");
+        return;
+    }
+    g_countedExtent.store((uint64_t{40} << 32) | 30);
+    g_framebufferGate.arm(CallGate::Mode::Hold, extentOf(kResizedWidth, kResizedHeight));
+    g_framebufferLostGate.arm(CallGate::Mode::Fail, extentOf(kResizedWidth, kResizedHeight));
+    std::vector<int> resized;
+    manager.setOutputSize(screenOf(kDrag), kResizedWidth, kResizedHeight, resized);
+    worker.post(kDrag);
+    const bool heldInRebuild = g_framebufferGate.waitFired(std::chrono::seconds(30));
+    check(heldInRebuild && contains(resized, kDrag), "a still's resize pass is held inside its image rebuild (the premise)");
+    if (!heldInRebuild) return;
+    const bool relaidOwed = manager.setWallpaperProperties(kDrag, {{"position", PositionMode::Fit}});
+    const uint64_t before = generation();
+    g_extentCreates.store(0);
+    g_framebufferGate.release();
+    worker.post(kDrag);
+    const bool drained = drainWorker(worker);
+    const bool failedLost = g_framebufferLostGate.waitFired(std::chrono::seconds(0));
+    check(relaidOwed && drained && failedLost, "the held pass is overtaken by a layout change and fails (the premise)");
+    const int decodes = g_extentCreates.load();
+    reportUnless(generation() == before + 1 && decodes == 1,
+                 "a failed still pass that was overtaken keeps nothing: the newer pass decodes the file again",
+                 "generation " + std::to_string(before) + " -> " + std::to_string(generation()) + ", " +
+                     std::to_string(decodes) + " decode(s)");
 }
 
 constexpr int kMonitorRetry = 0;
@@ -8435,6 +9099,138 @@ void runPauseChecks(const WallpaperManager::Config& base, const std::string& cli
 
 constexpr int32_t kMonitorResume = 0;
 
+// The frame number the monitor's served frame shows, read in process. Empty, with why, when unreadable.
+std::optional<int> servedCounter(WallpaperManager& manager, int monitorId, std::string& reason) {
+    wallpaperx::FrameExport exported = exportDelivered(manager, monitorId);
+    if (!exported.handle) {
+        reason = "no frame was served";
+        return std::nullopt;
+    }
+    const FrameLayout layout = layoutOf(*exported.handle);
+    const std::vector<unsigned char> image = readServedBgra(layout, reason);
+    if (exported.handle->frame.fd >= 0) close(exported.handle->frame.fd);
+    if (exported.handle->acquireFd >= 0) close(exported.handle->acquireFd);
+    if (image.size() < size_t{layout.width} * layout.height * 4) return std::nullopt;
+    const std::optional<int> counter = wallpaperx::testing::counterFromBgra(image, layout.width, layout.height);
+    if (!counter) reason = "the frame number could not be read from the frame";
+    return counter;
+}
+
+// A video that will not play on -- paused, or unwatched -- with its next picture already decoded, laid
+// out again: each its own manager, the counter fixture on a 4:3 screen so every layout here reads whole.
+void runStoppedRelayoutChecks(const WallpaperManager::Config& base) {
+    using wallpaperx::PositionMode;
+    const char* kGoals = "S15.803-S15.804 (a stopped video laid out again shows the picture on screen)";
+    const std::string counterClip = counterClipPath();
+    if (!std::filesystem::exists(counterClip)) {
+        notVerified(kGoals, "the counter fixture " + counterClip + " was not built");
+        return;
+    }
+    g_files.watch(counterClip);
+    constexpr int kStopped = 0;
+    struct Variant {
+        const char* what;
+        bool pause;
+    };
+    for (const Variant& v : {Variant{"a paused video", true}, Variant{"an unwatched video", false}}) {
+        PhaseGrade grade("the stopped-relayout phase");
+        WallpaperManager::Config config = base;
+        config.unwatchedAfter = v.pause ? std::chrono::milliseconds(3600000) : std::chrono::milliseconds(600);
+        config.pausedSessionRelease = std::chrono::hours(1);
+        config.idleSessionRelease = std::chrono::hours(1);
+        WallpaperManager manager(config);
+        CaptureGradeOnExit captureGrade{grade, manager};
+        wallpaperx::testing::nameScreen(manager, kStopped, screenOf(kStopped));
+        std::vector<int> owed;
+        manager.setOutputSize(screenOf(kStopped), 160, 120, owed);
+        manager.requestWallpaper("video", counterClip, kStopped);
+        if (!renderCounted(manager, kStopped).outcome.rendered) {
+            grade.expectNoDevice();
+            notVerified(kGoals, "the first video render on this host produced no frame");
+            return;
+        }
+        manager.setWallpaperProperties(kStopped, {{"position", PositionMode::Stretch}});
+        manager.renderPending(kStopped);
+
+        // Three pictures shown by the clock, then one round right after a show: it decodes the next
+        // picture and waits for its time, which is the state under test.
+        int shown = 0;
+        for (const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+             shown < 3 && std::chrono::steady_clock::now() < deadline;) {
+            for (const wallpaperx::ClockRound::Shown& s : manager.advanceVideo(std::chrono::steady_clock::now()).shown) {
+                if (s.monitorId == kStopped) ++shown;
+            }
+            if (shown < 3) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        bool decodedAhead = false;
+        for (int attempt = 0; shown >= 3 && attempt < 20 && !decodedAhead; ++attempt) {
+            g_decodeCalls.store(0);
+            bool showedAgain = false;
+            for (const wallpaperx::ClockRound::Shown& s : manager.advanceVideo(std::chrono::steady_clock::now()).shown) {
+                showedAgain = showedAgain || s.monitorId == kStopped;
+            }
+            decodedAhead = !showedAgain && g_decodeCalls.load() > 0;
+        }
+        if (v.pause) manager.setMonitorPause(kStopped, "always_paused");
+        std::string reason;
+        const std::optional<int> frozen = servedCounter(manager, kStopped, reason);
+        if (!decodedAhead || !frozen) {
+            check(false, (std::string(v.what) + " shows three pictures, decodes the next ahead and is read (the premise)").c_str());
+            std::fprintf(stderr, "  %d shown, %s, %s\n", shown, decodedAhead ? "decoded ahead" : "not decoded ahead",
+                         frozen ? ("showing " + std::to_string(*frozen)).c_str() : reason.c_str());
+            continue;
+        }
+        if (!v.pause) std::this_thread::sleep_for(config.unwatchedAfter + std::chrono::milliseconds(200));
+
+        // GOAL: S15.803 -- a layout change on a video that will not play on, with its next picture already
+        //       decoded, shows the picture that was on screen, not the one decoded ahead; S15.804 -- only the
+        //       first change may reopen the file, every later one is a plain redraw with no open.
+        // WHY-THIS-SHAPE: read from the served frame after every change, each change owed and drawn. The first
+        //       change's open count is printed and bounded (at most one), not required to be one: reopening is
+        //       how the daemon gets back to the on-screen picture today, not the property.
+        // CONTROL: control_batch.sh 2026-10-18, phase positionVideo, NVIDIA and Lavapipe, each alone, reverted, in
+        //       renderPassLocked (backend/daemon/wallpaper_manager.cpp): `if (!playsOn)` made `if (!playsOn &&
+        //       false)` -> "...shows the picture that was on screen" for both variants, "on screen 3, then read 4,
+        //       4, 4, 4"; `!pausedLocked(monitorId) &&` deleted -> the paused variant alone; `watchedLocked(...)`
+        //       made `true` -> the unwatched variant alone; `std::holds_alternative<VideoSession::Waiting>(...) &&`
+        //       deleted -> "...later changes open nothing" for both, "1 open(s) at the first change, 3 at the later ones".
+        // COVERAGE-ASSERT: every change is asserted owed and drawn, so each reading is of a new draw.
+        g_files.resetCounts();
+        const PositionMode modes[] = {PositionMode::Free, PositionMode::Stretch, PositionMode::Free, PositionMode::Stretch};
+        // An unwatched video read by a consumer is watched again, so it takes the first two changes only.
+        const int changes = v.pause ? 4 : 2;
+        int firstOpens = -1, laterOpens = 0, drawn = 0;
+        std::string readings;
+        bool allFrozen = true;
+        for (int i = 0; i < changes; ++i) {
+            const int opensBefore = g_files.opens(counterClip);
+            const bool changeOwed = manager.setWallpaperProperties(kStopped, {{"position", modes[i]}});
+            const bool rendered = manager.renderPending(kStopped).rendered;
+            const int opens = g_files.opens(counterClip) - opensBefore;
+            if (changeOwed && rendered) ++drawn;
+            if (i == 0) {
+                firstOpens = opens;
+            } else {
+                laterOpens += opens;
+            }
+            if (!v.pause && i + 1 < changes) continue;
+            const std::optional<int> now = servedCounter(manager, kStopped, reason);
+            readings += (readings.empty() ? "" : ", ") + (now ? std::to_string(*now) : "unreadable (" + reason + ")");
+            allFrozen = allFrozen && now == frozen;
+        }
+        check(drawn == changes, (std::string(v.what) + ": every layout change is owed and drawn").c_str());
+        reportUnless(allFrozen, (std::string(v.what) + " laid out again shows the picture that was on screen").c_str(),
+                     "on screen " + std::to_string(*frozen) + ", then read " + readings);
+        reportUnless(firstOpens <= 1 && laterOpens == 0,
+                     (std::string(v.what) + " laid out again: the first change opens the file at most once, later "
+                                            "changes open nothing").c_str(),
+                     std::to_string(firstOpens) + " open(s) at the first change, " + std::to_string(laterOpens) +
+                         " at the later ones");
+        std::printf("%s laid out again: on screen %d, read %s; %d open(s) at the first change\n", v.what, *frozen,
+                    readings.c_str(), firstOpens);
+    }
+}
+
 // Where each counter picture lies in the fixture, from libavcodec driven directly.
 struct CounterOrder {
     std::vector<int> ids;
@@ -10232,6 +11028,13 @@ int main(int argc, char** argv) {
         phase("departure", [&] { runDepartureChecks(config, onePicture); });
         phase("resumeCredit", [&] { runResumeCreditChecks(config, clip, still, onePicture); });
         phase("memoryRetry", [&] { runMemoryRetryChecks(config, clips); });
+        phase("keptStill", [&] { runKeptStillChecks(config, clips); });
+        phase("positionVideo", [&] {
+            runPositionVideoChecks(config, clip, onePicture);
+            runStoppedRelayoutChecks(config);
+        });
+        phase("relaidRelease", [&] { runRelaidReleaseChecks(config, clip, onePicture); });
+        phase("layoutDrag", [&] { runLayoutDragChecks(config); });
         phase("playbackRetry", [&] { runPlaybackRetryChecks(config, clips); });
         phase("gpuFault", [&] { runGpuFaultChecks(config, clips, still); });
         phase("shortage", [&] { runShortageChecks(config, clips); });

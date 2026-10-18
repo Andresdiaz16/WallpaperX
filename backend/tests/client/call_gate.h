@@ -27,11 +27,13 @@ class CallGate {
 public:
     enum class Mode { Hold, Fail };
 
-    // `path`, when given, limits the gate to calls naming that path.
-    void arm(Mode mode, std::string path = {}) {
+    // `path`, when given, limits the gate to calls naming that path. A Fail gate fails `times`
+    // calls in a row; a Hold gate holds one.
+    void arm(Mode mode, std::string path = {}, int times = 1) {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_mode = mode;
         m_path = std::move(path);
+        m_remaining = mode == Mode::Fail ? times : 1;
         m_fired = false;
         m_released = false;
         m_armed.store(true);
@@ -43,12 +45,18 @@ public:
         if (!m_armed.load()) return false;
         std::unique_lock<std::mutex> lock(m_mutex);
         if (!m_armed.load() || (!m_path.empty() && (path == nullptr || m_path != path))) return false;
-        m_armed.store(false);
+        if (--m_remaining <= 0) m_armed.store(false);
         m_fired = true;
         m_changed.notify_all();
         if (m_mode == Mode::Fail) return true;
         m_changed.wait_for(lock, std::chrono::seconds(60), [this] { return m_released; });
         return false;
+    }
+
+    // Fail calls the gate has yet to make.
+    int remaining() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_armed.load() ? m_remaining : 0;
     }
 
     bool waitFired(std::chrono::seconds limit) {
@@ -70,6 +78,7 @@ private:
     std::condition_variable m_changed;
     Mode m_mode = Mode::Hold;
     std::string m_path;
+    int m_remaining = 0;
     bool m_fired = false;
     bool m_released = false;
 };

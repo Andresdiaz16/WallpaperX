@@ -23,7 +23,7 @@ bool VideoPipeline::renderNext(OffscreenTargetManager& targets, const OffscreenT
     // caller used, not the one it delegates to.
     m_device.assertGpuThread("VideoPipeline::renderNext");
     if (!decodeNext()) return false;
-    draw(targets, target);
+    draw(targets, target, Placement{});
     return true;
 }
 
@@ -85,12 +85,13 @@ VideoPipeline::PictureTiming VideoPipeline::timing() const {
     return *m_timing;
 }
 
-void VideoPipeline::draw(OffscreenTargetManager& targets, const OffscreenTarget& target) {
+void VideoPipeline::draw(OffscreenTargetManager& targets, const OffscreenTarget& target, const Placement& placement) {
     m_device.assertGpuThread("VideoPipeline::draw");
     convert();
     // A stage exists exactly once a picture has been converted into it, so this is the one state
     // that has nothing to show.
     if (!m_stage) throw std::logic_error("VideoPipeline::draw: no picture has been decoded");
+    m_stage->renderer.place(placement);
     targets.render(m_stage->renderer, target);
     m_shownPosition = m_convertedPosition;
 }

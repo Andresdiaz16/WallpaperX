@@ -10587,6 +10587,81 @@ void runPropertiesRestartChecks() {
     }
 }
 
+void runPositionRestartChecks() {
+    constexpr const char* kGoals = "S15.742 (a wallpaper's position is saved and restored; a saved tile on a video is "
+                                   "restored without it and counted as dropped)";
+    const ScratchDir scratch("positionrestart");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 2);
+    if (!paths) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    WallpaperManager::Config managerConfig;
+    managerConfig.configFile = paths->config;
+    const WallpaperProperties framed{{"position", wallpaperx::PositionMode::Free},
+                                     {"position.zoom", 2.5},
+                                     {"position.x", -0.75},
+                                     {"position.y", 0.25}};
+    const nlohmann::json framedText = {{"position", "free"}, {"position.zoom", 2.5}, {"position.x", -0.75}, {"position.y", 0.25}};
+    {
+        WallpaperManager manager(managerConfig);
+        manager.requestWallpaper("static", paths->wallpapers[0].string(), 2, {{"position", wallpaperx::PositionMode::Tile}});
+        manager.setWallpaperProperties(2, framed);
+        // GOAL: S15.742 -- a position set over the bus is written to the config file, mode as its name and the
+        //       three numbers as numbers.
+        // CONTROL: control_batch.sh 2026-10-18, phase '^a wallpaper.s position across a restart$', reverted:
+        //       toJson's PositionMode arm (backend/daemon/wallpaper_properties.cpp) writing "cover" -> "FAIL: the
+        //       position set last is what the config file holds" alone (the phase stops there).
+        const bool landed = waitForFile([&] {
+            const nlohmann::json row = rowJsonIn(paths->config, 2);
+            return row.is_object() && row.value("properties", nlohmann::json()) == framedText;
+        });
+        check(landed, "the position set last is what the config file holds");
+        if (!landed) {
+            std::fprintf(stderr, "  config.json: %s\n", readFile(paths->config).c_str());
+            return;
+        }
+    }
+    {
+        WallpaperManager restarted(managerConfig);
+        restarted.restoreSaved();
+        const WallpaperManager::Snapshot snap = restarted.snapshot();
+        check(snap.monitors.count(2) == 1 && snap.monitors.at(2).properties == framed,
+              "a monitor holds the same position after a restart");
+    }
+
+    // GOAL: S15.742 -- a saved tile on a video is restored without `position`, the rest of the row kept, and
+    //       counted as a dropped value; a tile on a still and a fit on a video are restored as saved.
+    // WHY-THIS-SHAPE: the dropped count is exact and the clean rows are restored in the same start, so a
+    //       restore that drops every position, or none, goes red.
+    // CONTROL: control_batch.sh 2026-10-18, same phase, reverted: in WallpaperManager::restoreSaved()
+    //       (backend/daemon/wallpaper_manager.cpp) `++dropped;` deleted from the positionError arm -> "FAIL: a
+    //       saved tile on a video is restored without it and counted"; the erase deleted -> the same line.
+    nlohmann::json monitors = nlohmann::json::array();
+    const auto row = [&](int id, const std::string& type, const nlohmann::json& properties) {
+        nlohmann::json out = configRow(id, type, paths->wallpapers[id % 2].string(), "");
+        out["properties"] = properties;
+        return out;
+    };
+    monitors.push_back(row(0, "video", {{"position", "tile"}, {"speed", 2}}));
+    monitors.push_back(row(1, "static", {{"position", "tile"}}));
+    monitors.push_back(row(3, "video", {{"position", "fit"}}));
+    if (!writeFile(paths->config, nlohmann::json({{"version", 1}, {"monitors", monitors}}).dump())) {
+        notVerified(kGoals, "the second config file this phase reads could not be written");
+        return;
+    }
+    WallpaperManager manager(managerConfig);
+    manager.restoreSaved();
+    const WallpaperManager::Snapshot snap = manager.snapshot();
+    const auto holds = [&snap](int id, const WallpaperProperties& expected) {
+        return snap.monitors.count(id) == 1 && snap.monitors.at(id).properties == expected;
+    };
+    const std::optional<int> dropped =
+        clauseCount(snap.health.persistence.detail, " wallpaper property values dropped, unusable");
+    check(holds(0, {{"speed", 2.0}}) && dropped == 1, "a saved tile on a video is restored without it and counted");
+    check(holds(1, {{"position", wallpaperx::PositionMode::Tile}}) && holds(3, {{"position", wallpaperx::PositionMode::Fit}}),
+          "a saved tile on a still and a fit on a video are restored as saved");
+    if (dropped != 1 || !holds(0, {{"speed", 2.0}})) std::fprintf(stderr, "  detail: %s\n", snap.health.persistence.detail.c_str());
+}
+
 void runPropertiesOlderConfigChecks() {
     constexpr const char* kGoals = kPropertiesRestoreGoals;
     {
@@ -12195,6 +12270,7 @@ int main() {
         {"the speed a video is played at", runPlaybackSpeedChecks},
         {"when a wallpaper's properties are written", runPropertiesWriteChecks},
         {"a wallpaper's properties across a restart", runPropertiesRestartChecks},
+        {"a wallpaper's position across a restart", runPositionRestartChecks},
         {"a config written before properties existed", runPropertiesOlderConfigChecks},
         {"property values a start cannot use", runPropertiesRepairChecks},
         {"a kept row's properties, exactly", runKeptPropertiesVerbatimChecks},

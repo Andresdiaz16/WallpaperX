@@ -3829,8 +3829,9 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
         } else if (!limit.health.ok()) {
             check(false, "the resource-limit daemon answered /health with a parseable 200");
         } else {
-            // CONTROL: renderer/renderers/static_renderer.cpp:336, "StaticRenderer: vkCreateSampler" made
-            //       "StaticRenderer: sampler", control_batch 2026-10-15, http_config_lavapipe -> "FAIL: a render that
+            // CONTROL: in renderer/renderers/static_renderer.cpp, the sampler's failure message "StaticRenderer:
+            //       vkCreateSampler" made "StaticRenderer: sampler", control_batch 2026-10-15, re-run 2026-10-18,
+            //       http_config_lavapipe -> "FAIL: a render that
             //       fails on a resource limit tells the caller which driver call failed", with "FAIL: the gpu
             //       detail names the object create that failed"; restored, green.
             check(limit.lastError.find("StaticRenderer: vkCreateSampler") != std::string::npos,

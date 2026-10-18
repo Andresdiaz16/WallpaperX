@@ -93,8 +93,8 @@ private:
     // Rounds that have thrown in a row, so an episode is logged once and retried more slowly the
     // longer it lasts. Worker thread only.
     unsigned m_clockFailures = 0;
-    // One clock round and its announcements. Returns when the next is due, or nothing while no
-    // video plays.
+    // One clock round and its announcements. Returns when the next is due, or nothing while nothing
+    // waits on time.
     std::optional<std::chrono::steady_clock::time_point> runClock();
 
     // True when a job or a clock round left the device lost in a daemon that stops for it (see

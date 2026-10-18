@@ -1906,6 +1906,114 @@ void runPropertiesWireChecksOn(wallpaperx::WallpaperManager& manager, const std:
         }
     }
 
+    // GOAL: S15.740 -- `position` is a string naming cover, fit, center, tile, stretch or free;
+    //       position.zoom a number in 0.1..10; position.x/.y numbers in -10..10. Anything else is refused
+    //       InvalidArgs by both methods, all-or-nothing: the held set and the config file are unchanged.
+    // WHY-THIS-SHAPE: each bad entry rides beside "mute": false, which would change the held set if the rest
+    //       applied; the bounds are probed just past each end, so a rule at the wrong bound or missing goes red.
+    // CONTROL: control_batch.sh 2026-10-18, phase propertiesWire, each alone, reverted: in propertyError
+    //       (backend/daemon/wallpaper_properties.cpp) the position.zoom rule made `if (false)` -> the zoom 0.0999,
+    //       10.001 and bool lines (the `i` stays refused by the wire); `positionOffsetAllowed` made `isfinite`
+    //       (shared/wallpaper_position.h) -> the x -10.001, y 10.001 and y -10.001 lines; the position rule made
+    //       to accept any value -> the number and colour lines. Each also turned red "a refused position call
+    //       applies nothing" and the replace-whole check below, whose starting set the leak changed.
+    // COVERAGE-ASSERT: the number of refusals driven is asserted.
+    {
+        const Variant keep(false);
+        const auto text = [](const char* s) { return Variant(std::string(s)); };
+        const std::vector<std::pair<const char*, WireProperties>> positionRefusals{
+            {"position named centre", {{"position", text("centre")}, {"mute", keep}}},
+            {"position named COVER", {{"position", text("COVER")}, {"mute", keep}}},
+            {"position as a number", {{"position", Variant(1.0)}, {"mute", keep}}},
+            {"position as a colour", {{"position", text("#000000")}, {"mute", keep}}},
+            {"a mode under another key", {{"fill", text("fit")}, {"mute", keep}}},
+            {"position.zoom 0.0999", {{"position.zoom", Variant(0.0999)}, {"mute", keep}}},
+            {"position.zoom 10.001", {{"position.zoom", Variant(10.001)}, {"mute", keep}}},
+            {"position.zoom as a bool", {{"position.zoom", Variant(true)}, {"mute", keep}}},
+            {"position.zoom of D-Bus type i", {{"position.zoom", Variant(int32_t{1})}, {"mute", keep}}},
+            {"position.x -10.001", {{"position.x", Variant(-10.001)}, {"mute", keep}}},
+            {"position.x as a mode", {{"position.x", text("fit")}, {"mute", keep}}},
+            {"position.y 10.001", {{"position.y", Variant(10.001)}, {"mute", keep}}},
+            {"position.y -10.001", {{"position.y", Variant(-10.001)}, {"mute", keep}}},
+        };
+        const std::string fileBeforePosition = configTextOnceIdle(manager, configFile);
+        const nlohmann::json before = entryOf(kMonitorPropsHeld);
+        int positionDriven = 0;
+        for (const auto& [what, properties] : positionRefusals) {
+            const std::string viaSet = errorNameFrom(
+                [&] { setWallpaperWithProperties(proxy, "static", imagePath, kMonitorPropsHeld, properties); });
+            const std::string viaReplace = replaceProperties(kMonitorPropsHeld, properties);
+            check(viaSet == kInvalidArgs && viaReplace == kInvalidArgs,
+                  (std::string("a call with ") + what + " is refused as InvalidArgs by both methods").c_str());
+            if (viaSet != kInvalidArgs || viaReplace != kInvalidArgs) {
+                std::fprintf(stderr, "  %s: answered '%s' and '%s'\n", what, viaSet.c_str(), viaReplace.c_str());
+            }
+            ++positionDriven;
+        }
+        check(positionDriven == 13, "every position refusal was driven through both methods");
+        const nlohmann::json after = entryOf(kMonitorPropsHeld);
+        const std::string fileAfterPosition = configTextOnceIdle(manager, configFile);
+        check(before.is_object() && after == before && !fileBeforePosition.empty() && fileAfterPosition == fileBeforePosition,
+              "a refused position call applies nothing and writes nothing");
+        if (after != before) std::fprintf(stderr, "  entry %s -> %s\n", before.dump().c_str(), after.dump().c_str());
+
+        // GOAL: S15.740's other side -- every mode but tile, and free at both ends of each bound, is
+        //       accepted by both methods on a wallpaper that is not a still, and listed as set.
+        // CONTROL: control_batch.sh 2026-10-18, phase propertiesWire, reverted: positionZoomAllowed's `<=` made
+        //       `<` (shared/wallpaper_position.h) -> "FAIL: free at zoom 10, x 10, y -10 is accepted" alone;
+        //       `positionModeShowsVideo` made `mode == PositionMode::Cover` -> the fit, center, stretch and free
+        //       lines, both free-bound lines and "all five modes ... were graded".
+        int acceptedModes = 0;
+        for (const char* mode : {"cover", "fit", "center", "stretch", "free"}) {
+            const std::string viaSet = withProperties(kMonitorPropsCap, {{"position", text(mode)}});
+            const std::string viaReplace = replaceProperties(kMonitorPropsCap, {{"position", text(mode)}, {"mute", Variant(true)}});
+            const nlohmann::json entry = entryOf(kMonitorPropsCap);
+            const bool ok = viaSet.empty() && viaReplace.empty() && entry.is_object() &&
+                            entry.value("properties", nlohmann::json()) == nlohmann::json({{"position", mode}, {"mute", true}});
+            check(ok, (std::string("position ") + mode + " is accepted by both methods and listed as set").c_str());
+            if (!ok) std::fprintf(stderr, "  answered '%s' and '%s'; entry %s\n", viaSet.c_str(), viaReplace.c_str(), entry.dump().c_str());
+            acceptedModes += ok ? 1 : 0;
+        }
+        for (const double end : {1.0, -1.0}) {
+            const WireProperties free{{"position", text("free")},
+                                      {"position.zoom", Variant(end > 0 ? 10.0 : 0.1)},
+                                      {"position.x", Variant(10.0 * end)},
+                                      {"position.y", Variant(-10.0 * end)}};
+            const std::string viaSet = withProperties(kMonitorPropsCap, free);
+            const std::string viaReplace = replaceProperties(kMonitorPropsCap, free);
+            const nlohmann::json entry = entryOf(kMonitorPropsCap);
+            const nlohmann::json want = {{"position", "free"}, {"position.zoom", end > 0 ? 10.0 : 0.1},
+                                         {"position.x", 10.0 * end}, {"position.y", -10.0 * end}};
+            const bool ok = viaSet.empty() && viaReplace.empty() && entry.is_object() &&
+                            entry.value("properties", nlohmann::json()) == want;
+            check(ok, end > 0 ? "free at zoom 10, x 10, y -10 is accepted by both methods"
+                              : "free at zoom 0.1, x -10, y 10 is accepted by both methods");
+            if (!ok) std::fprintf(stderr, "  answered '%s' and '%s'; entry %s\n", viaSet.c_str(), viaReplace.c_str(), entry.dump().c_str());
+        }
+
+        // GOAL: S15.741 -- tile is refused for anything but a still image: by SetWallpaperWithProperties
+        //       for a video, and by SetWallpaperProperties against the wallpaper the screen holds (a shader here).
+        // WHY-THIS-SHAPE: the message is read, since every refusal is InvalidArgs; the screen keeps its set.
+        // CONTROL: control_batch.sh 2026-10-18, phase propertiesWire, each alone, reverted: positionError()
+        //       deleted from WallpaperManager::requestWallpaper (backend/daemon/wallpaper_manager.cpp) -> "FAIL:
+        //       SetWallpaperWithProperties refuses tile for a video" and the next line (the accepted call replaced
+        //       the screen's set); deleted from setWallpaperProperties -> "FAIL: SetWallpaperProperties refuses tile
+        //       for a screen holding no still" alone.
+        const nlohmann::json capBefore = entryOf(kMonitorPropsCap);
+        const std::string forVideo = errorMessageFrom([&] {
+            setWallpaperWithProperties(proxy, "video", imagePath, kMonitorPropsCap, {{"position", text("tile")}});
+        });
+        check(forVideo.find("is for still images only") != std::string::npos,
+              "SetWallpaperWithProperties refuses tile for a video");
+        if (forVideo.find("is for still images only") == std::string::npos) std::fprintf(stderr, "  answered '%s'\n", forVideo.c_str());
+        const std::string forHeld =
+            errorMessageFrom([&] { setWallpaperProperties(proxy, kMonitorPropsCap, {{"position", text("tile")}}); });
+        check(forHeld.find("is for still images only") != std::string::npos && entryOf(kMonitorPropsCap) == capBefore,
+              "SetWallpaperProperties refuses tile for a screen holding no still, and keeps its set");
+        if (forHeld.find("is for still images only") == std::string::npos) std::fprintf(stderr, "  answered '%s'\n", forHeld.c_str());
+        check(acceptedModes == 5, "all five modes a non-still may take were graded");
+    }
+
     // GOAL: S15.99's wire half -- SetWallpaperProperties replaces the WHOLE set and keeps the
     //       wallpaper: a key it does not name is gone afterwards, and an empty set empties it.
     // WHY-THIS-SHAPE: the new set shares one key with the old and drops three, so a merge keeps
@@ -6485,11 +6593,12 @@ void runResizeBarrierChecks(const wallpaperx::WallpaperManager::Config& config, 
     //       record is looked for while it is held -- a check before or after the pass cannot see the
     //       span at all.
     // CONTROL: in WallpaperManager::renderPassLocked (backend/daemon/wallpaper_manager.cpp), the still's
-    //       build given the pass's own record instead of the attempt's -- the retryAfterEvictionLocked()
-    //       call replaced by `applying.emplace(m_config.stateDir, monitorId, type, path);
-    //       still.emplace(...);`, so the record spans ensureTargets() -> exactly "FAIL: no crash record
-    //       naming the wallpaper is on disk while its images are created at the new size". Observed
-    //       2026-09-21 on the NVIDIA entry. Reverted.
+    //       build given the pass's own record instead of the attempt's -- inside the
+    //       retryOnShortageLocked(Relief::KeptStillsThenIdleVideo, ...) lambda, `const ApplyingRecord
+    //       building(...)` replaced by `applying.emplace(m_config.stateDir, monitorId, type, path);`, so the
+    //       record spans ensureTargets() -> exactly "FAIL: no crash record naming the wallpaper is on disk
+    //       while its images are created at the new size". Re-run via control_batch.sh 2026-10-18, phase
+    //       resizeBarrier, that line alone. Reverted.
     // COVERAGE-ASSERT: the same pass is required to have created the monitor's record at least twice --
     //       around the decode and around the draw -- so its absence at the hold is not a record this
     //       manager never writes.
@@ -6549,26 +6658,57 @@ void runResizeBarrierChecks(const wallpaperx::WallpaperManager::Config& config, 
     }
     g_framebufferGate.release();
 
-    // GOAL: S13.100's creation-failure clause -- a resize redraw whose image creation fails clears the frame
-    //       and reports last_error and RenderFailed like any failed render, and is not retried.
-    // WHY-THIS-SHAPE: the failure is injected into the real creation call for exactly one call, so the
-    //       daemon takes its own GpuFailure path; the state is read after the worker has drained.
-    // CONTROL: it takes two mutations, both in backend/daemon/wallpaper_manager.cpp, because two clears
-    //       withdraw the frame: `it->second.hasFrame = false;` in WallpaperManager::forgetImages AND the same
-    //       line in the commit block's error arm of WallpaperManager::renderPassLocked. The forgetImages one
-    //       alone left every check green on both ICDs, measured 2026-09-15. Both together -> "FAIL: and has
-    //       no frame, rather than keep the old one" and "FAIL: and an export answers RenderFailed", the
-    //       export throwing "marked as rendered but has no offscreen target", with the lost-file pair
-    //       (served as ExportFailed) and the never-both pair red beside them. Reverted.
     if (!firstFrame(kMonitorCreateFails, "DP-NOIMAGE", imagePath)) {
         check(false, "the monitor whose image creation will fail is drawn first");
         return;
     }
+
+    // GOAL: S15.781 -- a resize whose image creation runs out of memory once is retried after the kept
+    //       still images are given back, and draws at the new size. False if one shortage fails the resize.
+    // WHY-THIS-SHAPE: one injected failure in the real creation call; the pass's own still is kept by then,
+    //       so there is something to give back. Graded by the served size, not "committed" alone.
+    // CONTROL: control_batch.sh 2026-10-18, phase resizeBarrier, reverted: in renderPassLocked
+    //       (backend/daemon/wallpaper_manager.cpp) `retryOnShortageLocked(Relief::KeptStills, [&] {` around
+    //       ensureTargets() made a plain call -> this line, and the coverage line of S13.100 below.
     g_framebufferGate.arm(CallGate::Mode::Fail);
     resize("DP-NOIMAGE", kReportedWidth, kReportedHeight);
+    const bool failedOnce = g_framebufferGate.waitFired(kGateLimit);
+    check(failedOnce, "the image creation for the new size was reached, and failed once");
+    if (failedOnce && drained()) {
+        const wallpaperx::MonitorStatus once = monitorStatus(manager, kMonitorCreateFails);
+        std::future<Exported> answer = exportOnWorker(kMonitorCreateFails);
+        const bool exportAnswered = answer.wait_for(std::chrono::seconds(60)) == std::future_status::ready;
+        const Exported got = exportAnswered ? answer.get() : Exported{};
+        const bool redrawn = once.hasFrame && once.lastError.empty() && got.served && got.width == kReportedWidth &&
+                             got.height == kReportedHeight;
+        check(redrawn, "a resize whose image creation runs out of memory once is retried and draws at the new size");
+        if (!redrawn) {
+            std::fprintf(stderr, "  has_frame %d, last_error \"%s\", the export got %s\n", once.hasFrame ? 1 : 0,
+                         once.lastError.c_str(), exportAnswered ? describeExport(got).c_str() : "(no answer)");
+        }
+    }
+    g_framebufferGate.release();
+
+    // GOAL: S13.100's creation-failure clause -- a resize redraw whose image creation still fails after the
+    //       kept stills are given back clears the frame, reports last_error and RenderFailed like any failed
+    //       render, and is not retried again.
+    // WHY-THIS-SHAPE: the failure is injected into the real creation call for exactly TWO calls -- the attempt
+    //       and the one retry a shortage earns once kept stills are dropped -- so the daemon takes its own
+    //       GpuFailure path; one injected failure is now relieved, which is S15.781 above. The state is read
+    //       after the worker has drained.
+    // CONTROL: control_batch.sh 2026-10-18, phase resizeBarrier, reverted: the `hasFrame = false;` clears deleted
+    //       from both WallpaperManager::forgetImages and WallpaperManager::recordFailureLocked
+    //       (backend/daemon/wallpaper_manager.cpp) -> "and has no frame, rather than keep the old one" and "and an
+    //       export answers RenderFailed", with the never-both and lost-file lines red beside them.
+    // COVERAGE-ASSERT: both armed failures are asserted spent, so the clause is graded on a pass that did retry.
+    g_framebufferGate.arm(CallGate::Mode::Fail, {}, 2);
+    resize("DP-NOIMAGE", kResizedWidth, kResizedHeight);
     const bool failedInside = g_framebufferGate.waitFired(kGateLimit);
     check(failedInside, "the image creation for the new size was reached, and failed");
     if (failedInside && drained()) {
+        const int unspent = g_framebufferGate.remaining();
+        check(unspent == 0, "both injected creation failures were spent: the shortage was retried once, and failed again");
+        if (unspent != 0) std::fprintf(stderr, "  %d injected failure(s) unspent\n", unspent);
         const wallpaperx::MonitorStatus after = monitorStatus(manager, kMonitorCreateFails);
         check(!after.lastError.empty(), "a resize redraw whose image creation fails reports last_error");
         check(!after.hasFrame, "and has no frame, rather than keep the old one");

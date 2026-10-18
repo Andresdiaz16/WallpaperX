@@ -507,8 +507,18 @@ void manifestDepthLimit() {
     }
 }
 
-// What the daemon makes of a wallpaper.json's properties as declared: its own propertiesError() on
-// every default, and on a "volume"'s min and max, the two ends its slider can reach. Empty: accepted.
+// The position keys at their defaults, written out rather than read from the app, since the app
+// sends them beside every wallpaper's own properties.
+void addPositionDefaults(std::vector<std::pair<std::string, DaemonValue>>& set) {
+    set.emplace_back("position", std::string("cover"));
+    set.emplace_back("position.zoom", 1.0);
+    set.emplace_back("position.x", 0.0);
+    set.emplace_back("position.y", 0.0);
+}
+
+// What the daemon makes of a wallpaper.json's properties as declared, sent with the position keys:
+// its own propertiesError() on every default, and on a "volume"'s min and max, the two ends its
+// slider can reach. Empty: accepted.
 std::string daemonVerdict(const OrderedJson& properties) {
     std::vector<std::pair<std::string, DaemonValue>> defaults;
     std::string extremes;
@@ -529,6 +539,7 @@ std::string daemonVerdict(const OrderedJson& properties) {
             defaults.emplace_back(key, spec.at("default").get<std::string>());
         }
     }
+    addPositionDefaults(defaults);
     const std::string why = daemonPropertiesError(defaults);
     return why.empty() ? extremes : why;
 }
@@ -544,17 +555,19 @@ DaemonValue toDaemon(const QVariant& value) {
 }
 
 // What the daemon makes of everything the app can send for a usable wallpaper: the whole set of
-// defaults as the app stored them, then that set with each offered choice in its property's place,
-// so rules on the whole set (the property count) apply to every probe. Empty: all accepted.
+// defaults as the app stored them with the position keys, then that set with each offered choice in
+// its property's place, so rules on the whole set (the property count) apply to every probe. Empty:
+// all accepted.
 std::string daemonVerdictOnOffered(const QList<WallpaperProperty>& properties) {
     std::vector<std::pair<std::string, DaemonValue>> set;
     for (const WallpaperProperty& property : properties) {
         set.emplace_back(property.key.toStdString(), toDaemon(property.defaultValue));
     }
+    addPositionDefaults(set);
     if (std::string why = daemonPropertiesError(set); !why.empty()) {
         return why;
     }
-    for (std::size_t i = 0; i < set.size(); ++i) {
+    for (std::size_t i = 0; i < std::size_t(properties.size()); ++i) {
         const DaemonValue stored = set[i].second;
         for (const double choice : properties[static_cast<qsizetype>(i)].choices()) {
             set[i].second = choice;
@@ -593,14 +606,15 @@ void daemonPropertyRules() {
     // GOAL: S15.221 -- a property key outside [A-Za-z0-9_.-]{1,64} lists the wallpaper broken with
     //       that reason; a key of 64 allowed characters, and keys using every allowed character, are
     //       usable.
-    // GOAL: S15.222 -- at most 64 properties: 64 are usable, 65 list it broken saying so.
+    // GOAL: S15.720 -- at most 60 properties of a wallpaper's own: 60 are usable, 61 list it broken
+    //       saying so, so the four position keys sent beside them stay within the daemon's 64.
     // GOAL: S15.223 -- "speed" is refused, naming its declared range, exactly when no playback speed
     //       (0.5, 1 or 2) lies inside that range; a range holding at least one is usable, however far
     //       it reaches past them; "Speed" is another key and is not restricted.
     // GOAL: S15.224 -- a "speed" that is not a float lists broken. ("mute" and "volume" are judged where
     //       the folder is read, knowing whether they are kept: soundPropertyRules.)
     // WHY-THIS-SHAPE: each refusal is paired with the usable case on the other side of its boundary
-    //       (64/65 characters and properties; a range ending at 0.5 or starting at 2, inclusive, beside
+    //       (64/65 characters, 60/61 properties; a range ending at 0.5 or starting at 2, inclusive, beside
     //       ones just short of them, 0.4999 and 2.0001), so neither a
     //       validator that refuses too much nor one that refuses too little passes; each refusal's
     //       sentence is matched, so a refusal for some other reason is red.
@@ -608,8 +622,7 @@ void daemonPropertyRules() {
     //       2026-10-04, inside anchoredPattern): isPropertyKey's
     //       `.arg(kMaxPropertyKeyBytes)` made `.arg(kMaxPropertyKeyBytes + 1)` -> red, "S15.221: a
     //       65-character key was accepted"; `[A-Za-z0-9_.-]` made `[ -~]` -> red, "S15.221: the key
-    //       "my key" was accepted"; `> kMaxProperties` made `> kMaxProperties + 1` -> red, "S15.222: 65
-    //       properties was accepted"; the not-a-float test made `if (false)` -> red, "S15.224: a bool
+    //       "my key" was accepted"; the not-a-float test made `if (false)` -> red, "S15.224: a bool
     //       speed was refused with "...allows 0 to 0, ...", not "...is not a float..."" (the empty
     //       choices catch it, with the wrong sentence). S15.223, control_batch 2026-10-14: choices()'s
     //       `speed >= minimum && speed <= maximum` made `speed > minimum && speed < maximum` -> red,
@@ -636,8 +649,8 @@ void daemonPropertyRules() {
         {"S15.221", "a non-ASCII key", one("\xc3\xa9", flag), badKey},
         {"S15.221", "letters as a key", one("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", flag), nullptr},
         {"S15.221", "digits and _.- as a key", one("0123456789_.-", flag), nullptr},
-        {"S15.222", "64 properties", many(64), nullptr},
-        {"S15.222", "65 properties", many(65), "wallpaper.json has 65 properties; WallpaperX takes at most 64."},
+        {"S15.720", "60 properties", many(60), nullptr},
+        {"S15.720", "61 properties", many(61), "wallpaper.json has 61 properties; WallpaperX takes at most 60."},
         {"S15.223", "speed from 0.1 to 2", one("speed", spec(R"({"type": "float", "default": 1, "min": 0.1, "max": 2})")), nullptr},
         {"S15.223", "speed from -1 to 3", one("speed", spec(R"({"type": "float", "default": 1, "min": -1, "max": 3})")), nullptr},
         {"S15.223", "speed from 0.1 to 0.5", one("speed", spec(R"({"type": "float", "default": 0.5, "min": 0.1, "max": 0.5})")), nullptr},
@@ -667,8 +680,8 @@ void daemonPropertyRules() {
     }
     // GOAL: S15.225 -- everything the app can send for a usable wallpaper passes the daemon's own
     //       propertiesError() (backend/daemon/wallpaper_properties.cpp, compiled in): every default as
-    //       the app stored it, and every choice it offers; and a wallpaper the app lists broken is one
-    //       whose declared defaults the daemon refuses too.
+    //       the app stored it with the four position keys, and every choice it offers; and a wallpaper
+    //       the app lists broken is one whose declared defaults, so sent, the daemon refuses too.
     // WHY-THIS-SHAPE: graded against the daemon's code rather than this table, so a rule changed on
     //       either side alone is red here even where the table above was changed to match. The usable
     //       side is judged on the parsed values, not the declared ones: a declared speed default
@@ -677,9 +690,10 @@ void daemonPropertyRules() {
     //       (control_batch, 2026-10-04) -> red, "S15.225: a 65-character key: the app lists it usable,
     //       the daemon would refuse it (property name "kkk..." must be 1 to 64 ASCII letters, digits,
     //       '_', '-' or '.')"; each break above gave its own S15.225 line beside its row's. The count
-//       (the whole set is sent, so the daemon's 64-property rule applies): `> kMaxProperties` made
-//       `> kMaxProperties + 1` (control_batch, 2026-10-15) -> red, "S15.225: 65 properties: the app
-//       lists it usable, the daemon would refuse it (at most 64 properties, got 65)". Choices:
+    //       and the cap (the whole set is sent, position keys included, so the daemon's 64 applies):
+    //       kMaxWallpaperProperties (app/library/wpx_package.h) one higher (control_batch 2026-10-18) ->
+    //       red, "S15.720: 61 properties was accepted" and "S15.225: 61 properties: the app lists it usable, the
+    //       daemon would refuse it (at most 64 properties, got 65)". Choices:
     //       both sides read kPlaybackSpeeds from shared/playback_speed.h, so the list cannot differ; what can
     //       is choices() (app/library/wpx_package.cpp) offering a value off it. Its `within.append(speed)`
     //       made `within.append(speed == 2.0 ? 1.5 : speed)` (control_batch 2026-10-15) -> red, "S15.225:
@@ -1879,7 +1893,7 @@ void soundProperties(const QString& root) {
     still["file"] = "assets/video.mp4";
     OrderedJson full = planManifest();
     full["properties"] = OrderedJson::object();
-    for (int i = 0; i < int(kMaxProperties); ++i) {
+    for (int i = 0; i < 60; ++i) {
         full["properties"]["k" + std::to_string(i)] = OrderedJson::parse(R"({"type": "bool", "default": true})");
     }
     if (!write("added", jsonBytes(undeclared), soundVideo()) || !write("declared", jsonBytes(declared), soundVideo()) ||
@@ -1898,7 +1912,7 @@ void soundProperties(const QString& root) {
     //       `volume` (float 0 to 1, default 1) after its declared properties when wallpaper.json declares
     //       neither; declared ones keep their own default, range and label, and nothing is added twice.
     //       A silent video, and a still, list neither, a declared one included, and keep every other
-    //       property. With wallpaper.json at the 64-property cap nothing is added.
+    //       property. With wallpaper.json at the 60-property cap (S15.720) nothing is added.
     // WHY-THIS-SHAPE: the same declared manifest read over a video with sound, a silent video and as a
     //       still, so only the probe and the type decide; the cap case has no sound key of its own.
     // CONTROL: via control_batch.sh, --phase '^soundProperties$', 2026-10-11, each alone, reverted, in
@@ -1907,8 +1921,8 @@ void soundProperties(const QString& root) {
     //       `== AudioStreams::Absent` strip made `if (false)` -> "... a silent video reads speed,mute,tint,volume
     //       and a still speed,mute,tint,volume"; audioOf()'s not-a-video answer deleted, so a still is probed ->
     //       "... a silent video reads speed,tint and a still speed,mute,tint,volume"; the cap test dropped from
-    //       `declared` -> "... at the property cap reads 66 properties"; mute added whether declared or not ->
-    //       "... declaring both reads speed,mute,tint,volume,mute" and the cap line (65).
+    //       `declared` (re-run 2026-10-18 at the 60 cap) -> "... at the property cap reads 62 properties"; mute added whether declared or not ->
+    //       "... declaring both reads speed,mute,tint,volume,mute" and the cap line.
     const Wallpaper added = at("added");
     const WallpaperProperty* mute = find(added, "mute");
     const WallpaperProperty* volume = find(added, "volume");
@@ -1930,7 +1944,7 @@ void soundProperties(const QString& root) {
                keysOf(stillRead.properties) == u"speed,tint",
            QStringLiteral("S15.473: declaring both, a silent video reads %1 and a still %2").arg(keysOf(silent.properties), keysOf(stillRead.properties)));
     const Wallpaper fullRead = at("full");
-    expect(fullRead.usable() && fullRead.properties.size() == kMaxProperties && find(fullRead, "mute") == nullptr,
+    expect(fullRead.usable() && fullRead.properties.size() == 60 && find(fullRead, "mute") == nullptr,
            QStringLiteral("S15.473: a video with sound at the property cap reads %1 properties (usable %2)")
                .arg(fullRead.properties.size()).arg(fullRead.usable()));
 }
@@ -2152,6 +2166,202 @@ void probeReuse(const QString& root) {
            QStringLiteral("S15.490: with the modification time moved, a rescan given the first scan read %1, not Unknown").arg(audioIn(touched)));
 }
 
+QString typedMap(const QVariantMap& map) {
+    QStringList parts;
+    for (auto it = map.cbegin(); it != map.cend(); ++it) {
+        parts.append(QStringLiteral("%1=%2(%3)").arg(it.key(), it.value().toString(), QLatin1StringView(it.value().typeName())));
+    }
+    return u'{' + parts.join(u", ") + u'}';
+}
+
+// S15.721-S15.724
+void positionValues(const QString& root) {
+    const auto wallpaperOf = [](const char* type, bool ownProperties) -> std::optional<Wallpaper> {
+        auto parsed = parseManifest(edited([&](OrderedJson& j) {
+            j["type"] = type;
+            if (!ownProperties) {
+                j.erase("properties");
+            }
+        }));
+        if (!parsed) {
+            return std::nullopt;
+        }
+        parsed->filePath = QStringLiteral("/nowhere/wallpaper");
+        return *parsed;
+    };
+    const auto still = wallpaperOf("static", false);
+    const auto video = wallpaperOf("video", true);
+    const auto shader = wallpaperOf("shader", true);
+    if (!still || !video || !shader || !still->usable() || !video->usable() || !shader->usable()) {
+        harnessFailure("S15.721-S15.723: the still, video or shader manifest could not be read");
+        return;
+    }
+    const auto daemonShows = [](const QString& mode, const char* type) {
+        return daemonShowError({{"position", mode.toStdString()}}, type).empty();
+    };
+
+    // GOAL: S15.721 -- positionModes() lists all six modes for a still, in the daemon's order, and every
+    //       mode but tile for a video or a shader: each listed exactly when the daemon's own positionError()
+    //       (backend/daemon/wallpaper_properties.cpp, compiled in) would show that type in it.
+    // WHY-THIS-SHAPE: the literal lists catch a mode left out on both sides; the daemon cross-check catches
+    //       the app's type rule drifting from the daemon's, which a check against positionModeShowsVideo()
+    //       alone could not, since the app calls that very function.
+    // CONTROL: app/library/wpx_package.cpp positionModes()'s `type == u"static"` made `type != u"video"`
+    //       (control_batch 2026-10-18, reverted) -> red, "S15.721: a still offers [...], a shader
+    //       [cover,fit,center,tile,stretch,free]" and "S15.721: a shader offers tile, the daemon would refuse it".
+    // COVERAGE-ASSERT: 18 mode-and-type comparisons with the daemon.
+    const QStringList all{QStringLiteral("cover"), QStringLiteral("fit"), QStringLiteral("center"), QStringLiteral("tile"), QStringLiteral("stretch"),
+                          QStringLiteral("free")};
+    QStringList moving = all;
+    moving.removeAll(QStringLiteral("tile"));
+    expect(still->positionModes() == all && video->positionModes() == moving && shader->positionModes() == moving,
+           QStringLiteral("S15.721: a still offers [%1], a video [%2], a shader [%3]")
+               .arg(still->positionModes().join(u','), video->positionModes().join(u','), shader->positionModes().join(u',')));
+    int compared = 0;
+    for (const auto& [wallpaper, type] : {std::pair{&*still, "static"}, std::pair{&*video, "video"}, std::pair{&*shader, "shader"}}) {
+        for (const QString& mode : all) {
+            ++compared;
+            expect(wallpaper->positionModes().contains(mode) == daemonShows(mode, type),
+                   QStringLiteral("S15.721: a %1 %2 %3, the daemon would %4 it")
+                       .arg(QLatin1StringView(type), wallpaper->positionModes().contains(mode) ? QStringLiteral("offers") : QStringLiteral("does not offer"), mode,
+                            daemonShows(mode, type) ? QStringLiteral("show") : QStringLiteral("refuse")));
+        }
+    }
+    expect(compared == 18, QStringLiteral("S15.721: %1 mode comparisons, not 18").arg(compared));
+
+    // GOAL: S15.722 -- defaultValues() holds every declared property at its default, then position "cover"
+    //       as a string and position.zoom 1, position.x 0 and position.y 0 as doubles, also for a wallpaper
+    //       declaring nothing; a broken wallpaper has none.
+    // WHY-THIS-SHAPE: compared as text naming each value's type, since QVariant's == takes the int 1 for
+    //       the double 1.0, and an int would reach D-Bus as a type the daemon refuses.
+    // CONTROL: app/library/wpx_package.cpp, control_batch 2026-10-18, each reverted: defaultValues()'s zoom
+    //       inserted as `int(standard.zoom)` -> red, "S15.722: a still's defaults read {..., position.zoom=1(int)}";
+    //       its `if (!usable())` made `if (false)` -> red, "... a broken one's {mute=true(bool), ...".
+    const QString positionDefaults = QStringLiteral("position=cover(QString), position.x=0(double), position.y=0(double), position.zoom=1(double)");
+    Wallpaper broken = *video;
+    broken.problem = QStringLiteral("broken");
+    expect(typedMap(still->defaultValues()) == u'{' + positionDefaults + u'}' &&
+               typedMap(video->defaultValues()) == QStringLiteral("{mute=true(bool), ") + positionDefaults + QStringLiteral(", speed=1(double), tint=#ffffff(QString)}") &&
+               broken.defaultValues().isEmpty(),
+           QStringLiteral("S15.722: a still's defaults read %1, a video's %2, a broken one's %3")
+               .arg(typedMap(still->defaultValues()), typedMap(video->defaultValues()), typedMap(broken.defaultValues())));
+
+    // GOAL: S15.723 -- accept() keeps a position mode only as a string positionModes() lists, and a zoom or
+    //       offset only as a finite number within the shared bounds (zoom 0.1 to 10, offsets -10 to 10),
+    //       ends included, stored as a double even when handed an integer; it refuses NaN, infinity, text
+    //       or a bool for a number, any other "position.*" key, and every key on a broken wallpaper.
+    //       Every value it keeps is one the daemon would show that wallpaper with.
+    // WHY-THIS-SHAPE: each bound is probed on both sides; the integer rows are the case QML produces, and
+    //       their stored type is asserted, not only their value. The daemon cross-check runs on what was
+    //       kept; the refused rows are judged against the literal answer, since an int or a bool is not a
+    //       value the daemon could be sent and position.foo is refused by the app alone, by decision.
+    // CONTROL: app/library/wpx_package.cpp Wallpaper::accept(), control_batch 2026-10-18, each reverted:
+    //       the number kept as `value` -> red, "a video given position.zoom = 2(int) kept 2(int), not 2(double)"
+    //       and its daemon line; the positionModes() test dropped -> red, "position = tile(QString) kept
+    //       tile(QString), not refused" (centre, Cover, shader tile too); positionOffsetAllowed made
+    //       `!(fabs > max)` -> red, "position.y = nan(double) kept nan(double)"; isPositionKey made a
+    //       "position." prefix test -> red, "position.foo = 1(double) kept 1(double)"; the `!usable()` refusal
+    //       made `false` -> red, "position.zoom = 1(double) kept 1(double), not refused" (the broken rows).
+    // COVERAGE-ASSERT: the row count, and the kept rows cross-checked with the daemon.
+    struct Row {
+        const Wallpaper* wallpaper;
+        const char* type;
+        const char* key;
+        QVariant value;
+        QVariant kept; // invalid: refused
+    };
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    const Row rows[] = {
+        {&*still, "static", "position", QStringLiteral("tile"), QStringLiteral("tile")},
+        {&*video, "video", "position", QStringLiteral("tile"), {}},
+        {&*shader, "shader", "position", QStringLiteral("tile"), {}},
+        {&*video, "video", "position", QStringLiteral("center"), QStringLiteral("center")},
+        {&*video, "video", "position", QStringLiteral("free"), QStringLiteral("free")},
+        {&*video, "video", "position", QStringLiteral("centre"), {}},
+        {&*video, "video", "position", QStringLiteral("Cover"), {}},
+        {&*video, "video", "position", 1, {}},
+        {&*video, "video", "position.zoom", 2, 2.0},
+        {&*video, "video", "position.zoom", qlonglong(3), 3.0},
+        {&*video, "video", "position.zoom", 0.1, 0.1},
+        {&*video, "video", "position.zoom", 10.0, 10.0},
+        {&*video, "video", "position.zoom", 0.0999, {}},
+        {&*video, "video", "position.zoom", 10.0001, {}},
+        {&*video, "video", "position.zoom", nan, {}},
+        {&*video, "video", "position.zoom", QStringLiteral("2"), {}},
+        {&*video, "video", "position.x", -3, -3.0},
+        {&*video, "video", "position.x", 10.0, 10.0},
+        {&*video, "video", "position.x", -10.0, -10.0},
+        {&*video, "video", "position.x", 10.5, {}},
+        {&*video, "video", "position.x", true, {}},
+        {&*video, "video", "position.y", nan, {}},
+        {&*video, "video", "position.y", inf, {}},
+        {&*video, "video", "position.y", -inf, {}},
+        {&*video, "video", "position.y", 0.25, 0.25},
+        {&*video, "video", "position.foo", 1.0, {}},
+        {&*video, "video", "position.", 1.0, {}},
+        {&broken, "video", "position", QStringLiteral("cover"), {}},
+        {&broken, "video", "position.zoom", 1.0, {}},
+    };
+    int checked = 0;
+    int crossChecked = 0;
+    for (const Row& row : rows) {
+        ++checked;
+        const auto got = row.wallpaper->accept(QString::fromLatin1(row.key), row.value);
+        const QString gotText = got ? QStringLiteral("%1(%2)").arg(got->toString(), QLatin1StringView(got->typeName())) : QStringLiteral("refused");
+        const QString wantText = row.kept.isValid() ? QStringLiteral("%1(%2)").arg(row.kept.toString(), QLatin1StringView(row.kept.typeName())) : QStringLiteral("refused");
+        expect(gotText == wantText, QStringLiteral("S15.723: a %1 given %2 = %3(%4) kept %5, not %6")
+                                        .arg(QLatin1StringView(row.type), QLatin1StringView(row.key), row.value.toString(), QLatin1StringView(row.value.typeName()),
+                                             gotText, wantText));
+        if (got) {
+            ++crossChecked;
+            const DaemonValue sent = got->typeId() == QMetaType::Double ? DaemonValue(got->toDouble()) : DaemonValue(got->toString().toStdString());
+            const std::string daemon = daemonShowError({{row.key, sent}}, row.type);
+            expect(daemon.empty(), QStringLiteral("S15.723: a %1 keeps %2 = %3, which the daemon refuses: %4")
+                                       .arg(QLatin1StringView(row.type), QLatin1StringView(row.key), gotText, QString::fromStdString(daemon)));
+        }
+    }
+    expect(checked == 29 && crossChecked == 11, QStringLiteral("S15.723: %1 rows checked, %2 kept and cross-checked; expected 29 and 11").arg(checked).arg(crossChecked));
+
+    // GOAL: S15.724 -- a wallpaper.json declaring "position" or any "position.<name>" is refused with the
+    //       reserved-key sentence, also when read from a folder; keys that only start alike ("positions",
+    //       "Position", "my.position") are usable.
+    // WHY-THIS-SHAPE: the near-miss keys are what a prefix test without the dot, or a case-blind one,
+    //       would refuse; "position.foo" is a key the daemon itself would take, so only this rule refuses it.
+    // CONTROL: app/library/wpx_package.cpp parseProperty's reserved test, control_batch 2026-10-18, each
+    //       reverted: made `key.startsWith(reserved)` -> red, "S15.724: declaring "positions" was refused: ...";
+    //       made `key == reserved` -> red, "declaring "position.zoom" was accepted" and "a folder declaring
+    //       position.zoom is listed usable".
+    // COVERAGE-ASSERT: the row count.
+    const OrderedJson aFloat = OrderedJson::parse(R"({"type": "float", "default": 1, "min": 0.1, "max": 2})");
+    const char* reservedKeys[] = {"position", "position.zoom", "position.x", "position.y", "position.foo", "position."};
+    const char* freeKeys[] = {"positions", "Position", "my.position", "positionx"};
+    int keysChecked = 0;
+    for (const char* key : reservedKeys) {
+        ++keysChecked;
+        const auto parsed = parseManifest(edited([&](OrderedJson& j) { j["properties"][key] = aFloat; }));
+        const QString want = QStringLiteral("Property \"%1\" in wallpaper.json is reserved: WallpaperX sets a wallpaper's position itself.").arg(QLatin1StringView(key));
+        expect(!parsed && parsed.error() == want,
+               QStringLiteral("S15.724: declaring \"%1\" was %2").arg(QLatin1StringView(key), parsed ? QStringLiteral("accepted") : QStringLiteral("refused with: ") + parsed.error()));
+    }
+    for (const char* key : freeKeys) {
+        ++keysChecked;
+        const auto parsed = parseManifest(edited([&](OrderedJson& j) { j["properties"][key] = aFloat; }));
+        expect(parsed.has_value(), QStringLiteral("S15.724: declaring \"%1\" was refused: %2").arg(QLatin1StringView(key), parsed ? QString() : parsed.error()));
+    }
+    expect(keysChecked == 10, QStringLiteral("S15.724: %1 keys checked, not 10").arg(keysChecked));
+    OrderedJson reservedJson = planManifest();
+    reservedJson["properties"]["position.zoom"] = aFloat;
+    const QString folder = root + QStringLiteral("/reserved");
+    if (!writeFolder(folder, planEntries(jsonBytes(reservedJson))).isEmpty()) {
+        harnessFailure("S15.724: the reserved-key folder could not be written");
+        return;
+    }
+    const Wallpaper read = readWallpaperFolder(folder);
+    expect(!read.usable() && read.problem.endsWith(QStringLiteral("Property \"position.zoom\" in wallpaper.json is reserved: WallpaperX sets a wallpaper's position itself.")),
+           QStringLiteral("S15.724: a folder declaring position.zoom is listed %1: \"%2\"").arg(read.usable() ? QStringLiteral("usable") : QStringLiteral("broken"), read.problem));
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -2186,5 +2396,6 @@ int main(int argc, char* argv[]) {
     runPhase("soundProperties", [&] { soundProperties(root); });
     runPhase("soundPropertyRules", [&] { soundPropertyRules(root); });
     runPhase("probeReuse", [&] { probeReuse(root); });
+    runPhase("positionValues", [&] { positionValues(root); });
     return verdict();
 }

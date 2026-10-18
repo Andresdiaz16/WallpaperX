@@ -25,6 +25,7 @@
 #include <future>
 #include <iterator>
 #include <memory>
+#include <new>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -198,6 +199,7 @@ WallpaperManager::Config withCheckedTiming(WallpaperManager::Config config) {
     check(config.pausedSessionRelease, "pausedSessionRelease");
     check(config.refusalLogInterval, "refusalLogInterval");
     check(config.cleanPlayAfter, "cleanPlayAfter");
+    check(config.stillKeptFor, "stillKeptFor");
     return config;
 }
 
@@ -1149,6 +1151,7 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
     }
     requireValidMonitorId(monitorId);
     if (const std::string why = propertiesError(properties); !why.empty()) throw InvalidRequest(why);
+    if (const std::string why = positionError(properties, type); !why.empty()) throw InvalidRequest(why);
 
     // An early-out, not a guarantee: rendering is asynchronous, so without this the commonest
     // user error returns success and then silence. Both halves matter -- the type check alone
@@ -1235,7 +1238,7 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
     awaitPersisted();
 }
 
-void WallpaperManager::setWallpaperProperties(int monitorId, const WallpaperProperties& properties) {
+bool WallpaperManager::setWallpaperProperties(int monitorId, const WallpaperProperties& properties) {
     requireValidMonitorId(monitorId);
     if (const std::string why = propertiesError(properties); !why.empty()) throw InvalidRequest(why);
 
@@ -1245,18 +1248,33 @@ void WallpaperManager::setWallpaperProperties(int monitorId, const WallpaperProp
         throw InvalidRequest("monitor " + std::to_string(monitorId) +
                              " holds no wallpaper; properties are set with SetWallpaperWithProperties");
     }
+    MonitorState& state = it->second;
+    if (const std::string why = positionError(properties, state.type); !why.empty()) throw InvalidRequest(why);
     // The rule re-asserting a screen's size follows: unchanged writes only while the file is not
     // known to hold it. Which is why a save that cannot be queued undoes the change: kept, it
     // would make the retry look unchanged and on disk.
-    if (it->second.properties == properties && m_writer.outcome().onDisk()) return;
+    if (state.properties == properties && m_writer.outcome().onDisk()) return false;
+    const bool relaid = placement(state.properties) != placement(properties);
     WallpaperProperties next = properties;
-    it->second.properties.swap(next);
+    state.properties.swap(next);
     try {
         queuePersist(configToWriteLocked());
     } catch (...) {
-        it->second.properties.swap(next);
+        state.properties.swap(next);
         throw;
     }
+
+    // A playing video lays out each picture as it draws it, so its next one shows the change.
+    // Anything else is drawn again, or the frame laid out the old way would stay.
+    // A monitor whose last render failed has no frame to lay out again; the paths that retry it
+    // draw with these properties.
+    if (!relaid || !isRenderableType(state.type) || state.quarantined || !state.lastError.empty()) return false;
+    if (drawableType(state.type) == Drawable::Clip && motionLocked(monitorId, state.wallpaperSeq) == Motion::Playing) {
+        return false;
+    }
+    if (state.relaid.to != state.requestSeq) state.relaid.from = state.requestSeq;
+    state.relaid.to = ++state.requestSeq;
+    return true;
 }
 
 bool WallpaperManager::setMonitorOutput(int monitorId, const std::string& outputName, std::vector<int>& redraw) {
@@ -1904,6 +1922,10 @@ std::vector<int> WallpaperManager::restoreSaved() {
         int snapped = 0;
         state.properties =
             usableProperties(propertiesFromJson(entry.propertiesJson, dropped), dropped, clamped, snapped);
+        if (!positionError(state.properties, entry.type).empty()) {
+            state.properties.erase(std::string(kPositionKey));
+            ++dropped;
+        }
         droppedPropertiesOn[entry.monitorId] = dropped;
         clampedVolumesOn[entry.monitorId] = clamped;
         snappedSpeedsOn[entry.monitorId] = snapped;
@@ -2256,14 +2278,52 @@ bool WallpaperManager::evictIdleVideoSessionLocked() {
 }
 
 template <typename Attempt>
-void WallpaperManager::retryAfterEvictionLocked(Attempt&& attempt) {
-    for (bool retried = false;; retried = true) {
+void WallpaperManager::retryOnShortageLocked(Relief relief, Attempt&& attempt) {
+    // Cheapest first: a kept still costs only a decode to bring back. Each step is tried once, and
+    // one that frees nothing is passed over rather than spending a retry.
+    enum class Next { KeptStills, IdleVideo, Nothing };
+    Next next = Next::KeptStills;
+    for (;;) {
         try {
             attempt();
             return;
         } catch (const std::exception&) {
-            if (retried || !classifyFailure().exhausted || !evictIdleVideoSessionLocked()) throw;
+            if (!classifyFailure().exhausted) throw;
+            bool freed = false;
+            if (next == Next::KeptStills) {
+                freed = dropKeptStillsLocked();
+                next = relief == Relief::KeptStillsThenIdleVideo ? Next::IdleVideo : Next::Nothing;
+            }
+            if (!freed && next == Next::IdleVideo) {
+                freed = evictIdleVideoSessionLocked();
+                next = Next::Nothing;
+            }
+            if (!freed) throw;
         }
+    }
+}
+
+bool WallpaperManager::dropKeptStillsLocked() {
+    const bool dropped = !m_keptStills.empty();
+    m_keptStills.clear();
+    return dropped;
+}
+
+void WallpaperManager::dropStaleKeptStillLocked(int monitorId, std::optional<Drawable> kind, uint64_t wallpaperSeq) {
+    const auto it = m_keptStills.find(monitorId);
+    if (it == m_keptStills.end()) return;
+    if (kind == Drawable::Still && it->second.wallpaperSeq == wallpaperSeq) return;
+    m_keptStills.erase(it);
+}
+
+void WallpaperManager::releaseExpiredStillsLocked(SteadyTime now, ClockRound& round) {
+    for (auto it = m_keptStills.begin(); it != m_keptStills.end();) {
+        if (it->second.until <= now) {
+            it = m_keptStills.erase(it);
+            continue;
+        }
+        if (!round.nextDue || it->second.until < *round.nextDue) round.nextDue = it->second.until;
+        ++it;
     }
 }
 
@@ -2306,7 +2366,7 @@ WallpaperManager::VideoSession& WallpaperManager::videoSessionLocked(int monitor
     // Per attempt, and declared first so a pipeline that fails is freed under it and the record is
     // withdrawn before an eviction frees another file's decoder.
     const auto open = [&] {
-        retryAfterEvictionLocked([&] {
+        retryOnShortageLocked(Relief::KeptStillsThenIdleVideo, [&] {
             std::optional<ApplyingRecord> applying;
             std::optional<PlayingBlame> resuming;
             if (startAt) {
@@ -2684,10 +2744,12 @@ AudioTrack* WallpaperManager::loopParkedSoundLocked(int monitorId, VideoSession&
     }
 }
 
-uint64_t WallpaperManager::commitFrameLocked(MonitorState& state, const OffscreenTarget& target) {
+uint64_t WallpaperManager::commitFrameLocked(MonitorState& state, const OffscreenTarget& target,
+                                             const Placement& drawnWith) {
     ++state.generation;
     const bool hadFrame = state.hasFrame;
     state.hasFrame = true;
+    state.shownPlacement = drawnWith;
     // The oldest uncollected picture of this published run. Not this one, because what says a
     // consumer has stopped collecting is how long the first picture it ignored has been waiting;
     // and not an older one either, since a monitor whose frame was thrown away -- a new wallpaper,
@@ -2704,6 +2766,10 @@ uint64_t WallpaperManager::commitFrameLocked(MonitorState& state, const Offscree
     // Refusals since the last frame, so it says how far behind this monitor is now.
     state.deferredRenders = 0;
     return state.generation;
+}
+
+bool WallpaperManager::relaidOnlySince(const MonitorState& state, uint64_t seq) {
+    return state.relaid.to == state.requestSeq && state.relaid.from <= seq && seq < state.requestSeq;
 }
 
 WallpaperManager::RenderFailure WallpaperManager::classifyFailure() {
@@ -2795,6 +2861,7 @@ ClockRound WallpaperManager::advanceVideo(SteadyTime now) {
         if (due && (!round.nextDue || *due < *round.nextDue)) round.nextDue = due;
     }
     reopenVideosLocked(now, m_videoSessions.size() < sessionsBefore, round);
+    releaseExpiredStillsLocked(now, round);
     return round;
 }
 
@@ -3108,8 +3175,9 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
             if (std::holds_alternative<Session::Undrawn>(session.clock) && session.openedAt) {
                 delivered = healthCheck(HealthStatus::Ok, m_gpuStatus.name + " (" + m_gpuStatus.descriptorTier + ")");
             }
-            session.pipeline->draw(*m_targets, *target);
-            generation = commitFrameLocked(it->second, *target);
+            const Placement drawnWith = placement(it->second.properties);
+            session.pipeline->draw(*m_targets, *target, drawnWith);
+            generation = commitFrameLocked(it->second, *target, drawnWith);
             if (delivered) m_health.gpu = std::move(*delivered);
             // A picture shown is playback working, so the reopens start again from here: what the
             // budget bounds is failures with nothing shown between them.
@@ -3236,6 +3304,7 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
 
     const std::optional<Drawable> kind = drawableType(type);
     dropStaleVideoSessionLocked(monitorId, kind, wallpaperSeq);
+    dropStaleKeptStillLocked(monitorId, kind, wallpaperSeq);
     if (!kind) {
         // Recorded only; nothing here draws a shader yet. Release the target --
         // nothing will read it again, and holding a full-size image per monitor for a
@@ -3300,20 +3369,50 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
             // pass belongs to the manager, not to this monitor's images, and the draw takes its
             // extent from the target.
             //
-            // The still's renderer is not retained past this call: a texture and a pipeline per
-            // monitor for something nothing re-renders. render() does not wait, so what keeps it
-            // from being destroyed out from under the GPU is its own destructor, which waits for
-            // the device to go idle.
+            // The still's renderer is this pass's alone; only its decoded image is kept, for a
+            // redraw at another layout or size. render() does not wait, so what keeps either from
+            // being destroyed out from under the GPU is its own destructor, which waits for the
+            // device to go idle.
             if (*kind == Drawable::Still) {
+                // Out of the map while it is in use, so a failure below leaves nothing kept.
+                std::shared_ptr<const StillImage> image;
+                if (const auto kept = m_keptStills.find(monitorId); kept != m_keptStills.end()) {
+                    image = std::move(kept->second.image);
+                    m_keptStills.erase(kept);
+                }
                 // The record is the attempt's own, so it is off disk while the images are made, for
                 // ensureGpu()'s reason: their size is the screen's, and a driver dying on it is not
                 // this picture's doing.
-                retryAfterEvictionLocked([&] {
+                retryOnShortageLocked(Relief::KeptStillsThenIdleVideo, [&] {
                     const ApplyingRecord building(m_config.stateDir, monitorId, type, path);
-                    still.emplace(*m_device, m_targets->renderPass(), path, m_resolvedShaderDir);
+                    image = StillImage::load(*m_device, path, std::move(image));
+                    still.emplace(*m_device, m_targets->renderPass(), image, m_resolvedShaderDir);
                 });
+                // Losing the copy costs the next redraw a decode, not this one its frame.
+                try {
+                    m_keptStills.insert_or_assign(
+                        monitorId, KeptStill{wallpaperSeq, std::move(image),
+                                             std::chrono::steady_clock::now() + m_config.stillKeptFor});
+                } catch (const std::bad_alloc&) {
+                }
             } else {
                 clip = &videoSessionLocked(monitorId, path, wallpaperSeq);
+                if (std::holds_alternative<VideoSession::Waiting>(clip->clock) && clip->pipeline->shownPosition()) {
+                    // The pipeline holds the picture after the one on screen. Playing, it is due soon
+                    // and is drawn early; stopped, it is reopened at the one on screen, as a released
+                    // session would be, and the catch-up below decodes that picture again.
+                    bool playsOn = false;
+                    {
+                        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+                        const auto it = m_monitors.find(monitorId);
+                        playsOn = it != m_monitors.end() && !pausedLocked(monitorId) &&
+                                  watchedLocked(monitorId, it->second);
+                    }
+                    if (!playsOn) {
+                        releaseVideoSessionLocked(monitorId);
+                        clip = &videoSessionLocked(monitorId, path, wallpaperSeq);
+                    }
+                }
                 if (std::holds_alternative<VideoSession::CatchingUp>(clip->clock)) {
                     // While the GPU lock is held only a new request can drop the frame, and that
                     // supersedes this pass, so a frame found here is the one in place at the commit.
@@ -3321,14 +3420,18 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
                         std::lock_guard<std::mutex> stateLock(m_stateMutex);
                         const auto it = m_monitors.find(monitorId);
                         keepsFrame = it != m_monitors.end() && it->second.hasFrame &&
-                                     it->second.wallpaperSeq == wallpaperSeq;
+                                     it->second.wallpaperSeq == wallpaperSeq &&
+                                     it->second.shownPlacement == placement(it->second.properties);
                     }
                     if (!keepsFrame) clip = &caughtUpSessionLocked(monitorId, *clip, path, wallpaperSeq);
                 }
             }
 
             if (!keepsFrame) {
-                if (ensureTargets(monitorId, size)) rebuilt = true;
+                // Kept stills only: `clip` may be the session an eviction would choose.
+                retryOnShortageLocked(Relief::KeptStills, [&] {
+                    if (ensureTargets(monitorId, size)) rebuilt = true;
+                });
 
                 // Nothing can claim an image between here and the submit: a hand-over needs
                 // m_gpuMutex, which this pass holds, and a release only ever frees one.
@@ -3340,7 +3443,7 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
                 if (!deferred) {
                     applying.emplace(m_config.stateDir, monitorId, type, path);
                     // A picture the clock decoded and has not converted, so the draw below is a blit.
-                    if (clip != nullptr) clip->pipeline->convert();
+                    if (clip != nullptr) retryOnShortageLocked(Relief::KeptStills, [&] { clip->pipeline->convert(); });
                 }
             }
         }
@@ -3379,8 +3482,12 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
     }
 
     // Here, not only after the commit block, which an overtaken pass returns from inside: the newer
-    // pass must not draw on a device this failure may have lost.
-    if (!error.empty()) closeFailedVideoSessionLocked(monitorId, fault);
+    // pass must not draw on a device this failure may have lost, nor reuse what it kept. `still`
+    // holds the kept image until its own teardown.
+    if (!error.empty()) {
+        m_keptStills.erase(monitorId);
+        closeFailedVideoSessionLocked(monitorId, fault);
+    }
 
     bool committed = false;
     uint64_t generation = 0;
@@ -3395,7 +3502,12 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
         // waits on a draw, never on a decode.
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
         auto it = m_monitors.find(monitorId);
-        if (it == m_monitors.end() || it->second.requestSeq != seq) {
+        // A pass overtaken only by layout changes still draws: it lays out at the commit, so it shows
+        // the newest one, and a dragged position control is not left discarding every pass.
+        const bool current = it != m_monitors.end() &&
+                             (it->second.requestSeq == seq ||
+                              (error.empty() && !keepsFrame && relaidOnlySince(it->second, seq)));
+        if (!current) {
             // Superseded. Nothing has been submitted, so kept images still hold exactly what the
             // consumer was last told about; replaced ones hold nothing, and renderPending() draws
             // the newer request at once. Leave servicedSeq alone so the newer request's own pass
@@ -3403,14 +3515,16 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
             return RenderPass{{}, true};
         }
 
+        const Placement drawnWith = placement(it->second.properties);
         if (error.empty() && !keepsFrame) {
             try {
                 // One of the two is always set here: every path that leaves both unset sets
                 // `error`, which the guard above excludes.
                 if (*kind == Drawable::Still) {
+                    still->place(drawnWith);
                     m_targets->render(*still, *target);
                 } else {
-                    clip->pipeline->draw(*m_targets, *target);
+                    clip->pipeline->draw(*m_targets, *target, drawnWith);
                     markShown(*clip, std::chrono::steady_clock::now(), playbackSpeed(it->second.properties));
                 }
             } catch (const std::exception&) {
@@ -3425,13 +3539,13 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
         // Marked for every outcome, not just success: a failed render must not be
         // retried by a duplicate queue entry either, or a broken image file would be
         // decoded again for every spurious post.
-        it->second.servicedSeq = seq;
+        it->second.servicedSeq = it->second.requestSeq;
 
         if (!error.empty()) {
             recordFailureLocked(it->second, error, fault);
         } else if (!keepsFrame) {
             committed = true;
-            generation = commitFrameLocked(it->second, *target);
+            generation = commitFrameLocked(it->second, *target, drawnWith);
             // A render asked for and delivered is the GPU working, so it clears a failure an
             // earlier one recorded, with the detail ensureGpu() records. Here and not in the
             // commit helper: a video's pictures commit many times a second, unasked, which would
@@ -3444,6 +3558,8 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
     // filesystem must not hold up GetStatus. Both teardowns run under this pass's own record only
     // when the file is what failed, for closeFailedVideoSessionLocked()'s reason.
     if (!error.empty() && fault != Fault::File) applying.reset();
+    // A failed pass keeps nothing. Erased first, so the image goes with the renderer, under the same record.
+    if (!error.empty()) m_keptStills.erase(monitorId);
     still.reset();
     // A draw that threw leaves its pipeline unusable.
     if (!error.empty()) closeFailedVideoSessionLocked(monitorId, fault);

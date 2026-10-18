@@ -73,8 +73,8 @@ std::string requestRefusal(const std::string& client) {
            " requests waiting to be answered; wait for their replies, then ask again";
 }
 
-// Each value by its D-Bus type -- d, b, or s holding "#rrggbb" -- and nothing converted: an i for
-// a float property is a client that does not know what it is sending. A key given twice is
+// Each value by its D-Bus type -- d, b, or s holding "#rrggbb" or a position mode -- and nothing
+// converted: an i for a float property is a client that does not know what it is sending. A key given twice is
 // refused, since keeping either would accept a value never checked. Which keys and values are
 // acceptable is the manager's rule.
 WallpaperProperties fromWire(const std::vector<sdbus::DictEntry<std::string, sdbus::Variant>>& wire) {
@@ -93,11 +93,13 @@ WallpaperProperties fromWire(const std::vector<sdbus::DictEntry<std::string, sdb
         } else if (value.containsValueOfType<bool>()) {
             properties.emplace(key, value.get<bool>());
         } else if (value.containsValueOfType<std::string>()) {
-            const std::optional<Colour> colour = parseColour(value.get<std::string>());
-            if (!colour) {
-                throw InvalidRequest("property " + sanitizeForLog(key, 128) + " is a string but not a colour \"#rrggbb\"");
+            std::optional<PropertyValue> text = propertyFromText(value.get<std::string>());
+            if (!text) {
+                throw InvalidRequest("property " + sanitizeForLog(key, 128) +
+                                     " is a string but neither a colour \"#rrggbb\" nor a position mode (" +
+                                     positionModesText("or") + ")");
             }
-            properties.emplace(key, *colour);
+            properties.emplace(key, *text);
         } else {
             const char* signature = value.peekValueType();
             throw InvalidRequest("property " + sanitizeForLog(key, 128) + " has D-Bus type " +
@@ -458,8 +460,9 @@ void DbusService::setWallpaper(const char* method, const std::string& type, cons
 void DbusService::setWallpaperProperties(int32_t monitorId, const WireProperties& properties) {
     // Refusals only: a slider sends one of these per step, and a line for each accepted one would
     // bury everything else in the journal.
+    bool redraw = false;
     try {
-        m_manager.setWallpaperProperties(monitorId, fromWire(properties));
+        redraw = m_manager.setWallpaperProperties(monitorId, fromWire(properties));
     } catch (const InvalidRequest& e) {
         std::fprintf(stderr, "wallpaperx-daemon: SetWallpaperProperties rejected (monitor=%d): %s\n", monitorId,
                      e.what());
@@ -470,8 +473,9 @@ void DbusService::setWallpaperProperties(int32_t monitorId, const WireProperties
         throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
     }
 
-    // No render: the picture on screen is still right. The round this wakes times the picture
-    // waiting after it at the new speed, which the worker's current sleep was computed without.
+    // The round this wakes times the picture waiting after it at the new speed, which the worker's
+    // current sleep was computed without, and lays it out anew.
+    if (redraw) m_worker.post(monitorId);
     m_worker.wake();
 }
 

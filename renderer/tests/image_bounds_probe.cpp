@@ -1012,14 +1012,14 @@ struct RedirectPhase {
 //       replacement on both opens and passes identically -- measured, see CONTROL (b).
 //       Phase 1 (identical copy) is the attribution control; phase 3 arms the old swap at
 //       open 2 and requires it to deliver nothing.
-// CONTROL: (a) in renderer/renderers/static_renderer.cpp, the decode given a second
-//       descriptor from the same path (openWallpaperFile + fdopen feeding
-//       stbi_load_from_file) -> 10 FAILs here, four on the differently-sized phase
-//       ("...(1044995 bytes): NO", "...(264453 bytes): it did", "saw: header-vs-decoder
-//       disagreement", "exactly 1 open (saw 2)") and five on the old-swap phase, "0
-//       redirects expected, saw 1" among them. Phase 1 reddened only on the open count, as
-//       designed. (b) (a) re-run with redirectMaxCount=0 -> the differently-sized phase's
-//       three substantive checks all went GREEN. Both reverted, re-measured 2026-09-20.
+// CONTROL: (a) in renderer/renderers/static_renderer.cpp, StillImage::upload's decode given a
+//       second descriptor from the same path (openWallpaperFile + fdopen feeding
+//       stbi_load_from_file), control_batch.sh 2026-10-18 -> 10 FAILs here, four on the
+//       differently-sized phase ("...(1044995 bytes): NO", "...(264453 bytes): it did", "saw:
+//       header-vs-decoder disagreement", "exactly 1 open (saw 2)") and five on the old-swap
+//       phase, "0 redirects expected, saw 1" among them. Phase 1 reddened only on the open
+//       count, as designed. (b) (a) with redirectMaxCount=0 -> the differently-sized phase's
+//       three substantive checks all went GREEN (2026-09-20, not re-run). Both reverted.
 // COVERAGE-ASSERT: per-phase open and redirect counts, plus phasesRun == kPhaseCount.
 //       Controlled: `p.redirectFromOpen` -> 99 gives "1 redirects expected, saw 0"; an
 //       `if (phasesRun == 1) break;` gives "every interposition phase ran (1 of 3)"; and

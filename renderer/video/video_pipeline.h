@@ -50,8 +50,8 @@ public:
     VideoPipeline(const VideoPipeline&) = delete;
     VideoPipeline& operator=(const VideoPipeline&) = delete;
 
-    // Renders the next picture not yet shown onto `target`, which `targets` owns. False, with
-    // nothing rendered, once the stream is exhausted; when looping, only when the stream has shown
+    // Renders the next picture not yet shown onto `target`, which `targets` owns, laid out as Cover.
+    // False, with nothing rendered, once the stream is exhausted; when looping, only when the stream has shown
     // nothing or has no picture to start again from. Throws WallpaperContentError for a file or
     // picture this pipeline cannot show, GpuFailure for a GPU that has stopped answering, and
     // std::runtime_error and std::logic_error as the decoder, converter and renderer do. After a
@@ -63,10 +63,11 @@ public:
     // abandon it, and draw() of a converted picture is one blit.
     //
     // decodeNext() decodes and converts, and answers as renderNext() does and throws as it does.
-    // draw() shows the picture decoded last, converting it first if it is not yet, throws
-    // std::logic_error when there is none, and otherwise throws as renderNext() does.
+    // draw() shows the picture decoded last laid out as `placement` says, converting it first if it
+    // is not yet, throws std::logic_error when there is none, std::invalid_argument for a placement
+    // VideoRenderer::place() refuses, and otherwise throws as renderNext() does.
     bool decodeNext();
-    void draw(OffscreenTargetManager& targets, const OffscreenTarget& target);
+    void draw(OffscreenTargetManager& targets, const OffscreenTarget& target, const Placement& placement);
 
     // decodeNext() without the conversion, that gives up for now once the decoder has dropped
     // `dropLimit` pictures on its way to the next one it returns, as VideoDecoder::next(dropLimit)

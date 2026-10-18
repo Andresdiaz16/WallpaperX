@@ -281,15 +281,15 @@ void runGeometryChecks(Device& device, OffscreenTargetManager& targets) {
     //       monitor and taller than it take opposite arms, an exact aspect takes neither, and
     //       512x2 on an 8x64 monitor is the case whose computed crop width is zero before the
     //       clamp.
-    // CONTROL: three, all reverted. (a) and (b) are in coverCrop, which
-    //       renderer/renderers/cover_crop.h shares with the still-image renderer. (a) `if
-    //       (sourceWide > targetWide)` -> `if (false)`, so a frame wider than the monitor is
-    //       squeezed: "FAIL: a frame wider than the monitor is cropped left and right, not
-    //       squeezed / 5 of 25 sampled pixels came from the right column (worst miss 63.5 px,
-    //       tolerance 4.0)", the sliver case (also wider than its monitor) red too, and the
-    //       taller-than-monitor case green -- the two arms are separable. (b) `const uint64_t x0
-    //       = (sourceWidth - width) / 2;` and its y twin -> `= 0`, an anchored crop: four cases
-    //       red, each naming the axis it was cropped on (worst miss 64.5 px). (c) the blit's
+    // CONTROL: three, all reverted. (a) and (b) are in placedRegion, which
+    //       renderer/renderers/cover_crop.h shares with the still-image renderer, run via
+    //       control_batch on both ICDs. (a) Cover's scale `std::max(widthRatio, heightRatio)` ->
+    //       `widthRatio`, so a frame wider than the monitor is squeezed: "FAIL: a frame wider than
+    //       the monitor is cropped left and right, not squeezed / 3 of 25 sampled pixels came from
+    //       the right column (worst miss 190.5 px, tolerance 4.0)", the sliver case (also wider
+    //       than its monitor) red too, and the taller-than-monitor case green -- the two shapes
+    //       are separable. (b) Cover's `left` and `top` -> 0, an anchored crop: four cases red,
+    //       each naming the axis it was cropped on (worst miss 64.5 px). (c) the blit's
     //       `dstOffsets[1]` in VideoRenderer::record (renderer/renderers/video_renderer.cpp)
     //       halved, so the frame occupies a quarter of the monitor: all five cases red on both
     //       the geometry and the "came from the frame rather than from a border" check beside it.
@@ -312,11 +312,10 @@ void runGeometryChecks(Device& device, OffscreenTargetManager& targets) {
         //       cached it, which is the plausible refactor this guards. 128x32 is chosen so the
         //       2:1 frame is *taller* than the 4:1 monitor and the other arm of the branch runs
         //       -- the two calls together cover both arms through one renderer.
-        // CONTROL: the anchored-crop mutation (b) above reddens this case with a *row* miss of
-        //       32.2 px while the case above it goes red on columns, which is the measurement
-        //       showing the two calls exercise opposite arms through one renderer. Mutation (a),
-        //       which disables the wider-than-monitor arm, leaves this case green -- so it is
-        //       not a second copy of the check above it.
+        // CONTROL: the anchored-crop mutation (b) above reddens this case while the case above
+        //       it goes red on columns, which shows the two calls crop opposite axes through one
+        //       renderer. Mutation (a), which squeezes a frame wider than the monitor, leaves this
+        //       case green -- so it is not a second copy of the check above it.
         gradeCover(device, targets, renderer, wide, /*monitorId=*/2, 128, 32,
                    "the same frame on a wider monitor is cropped top and bottom instead");
     }
@@ -340,10 +339,10 @@ void runGeometryChecks(Device& device, OffscreenTargetManager& targets) {
         //       column wide, so every destination pixel must come from column 255 give or take
         //       the tolerance. The y half is weak here by construction -- the frame is two rows
         //       tall, less than the tolerance -- and is graded by the three cases above.
-        // CONTROL: the wider-than-monitor arm's `std::max<uint64_t>(1, ...)` in coverCrop
-        //       (renderer/renderers/cover_crop.h) changed to `std::max<uint64_t>(64, ...)`, a
-        //       wrong clamp -> this case red alone, "0 of 25 sampled pixels came from the right
-        //       column (worst miss 28.6 px, tolerance 2.6)". Reverted.
+        // CONTROL: placeSpan's `std::clamp(std::round(exact1), source0 + 1, whole)` in
+        //       renderer/renderers/cover_crop.h made a floor of `source0 + 64`, a wrong clamp ->
+        //       this case red alone, "0 of 25 sampled pixels came from the right column (worst
+        //       miss 58.7 px, tolerance 2.6)", both ICDs, via control_batch. Reverted.
         //
         //       WHAT THIS DOES NOT GRADE, measured rather than assumed: deleting the clamp
         //       outright -- so the crop really is zero pixels wide -- leaves the whole probe
@@ -429,12 +428,13 @@ void runFrameRestoreChecks(Device& device, OffscreenTargetManager& targets) {
         //       the property a caller depends on (a decoder holds a frame across several display
         //       frames), and it is graded by the validation layer as well -- a wrong restore
         //       makes the second render's barrier name a layout the image is not in.
-        // CONTROL: a `mutable int m_renders` member added to VideoRenderer in
-        //       renderer/renderers/video_renderer.h, and `if (m_renders++ > 0) crop.x0 += 8;`
-        //       after the coverCrop call in renderer/renderers/video_renderer.cpp's record() --
-        //       a renderer that carries state between renders -> "FAIL: the
-        //       same frame rendered twice produces the same picture / 64 of 64 rows differ
-        //       between the two renders of one frame", for both declared layouts. Reverted.
+        // CONTROL: an `int m_renders` member added to VideoRenderer in
+        //       renderer/renderers/video_renderer.h, and `if (region && m_renders++ > 0)
+        //       region->source.x0 += 8;` after the placedRegion call in
+        //       renderer/renderers/video_renderer.cpp's record() -- a renderer that carries state
+        //       between renders -> "FAIL: the same frame rendered twice produces the same
+        //       picture" on both ICDs, alongside the geometry and refusal-phase checks that also
+        //       render one renderer twice. Reverted.
         //       Note what this check cannot do: deleting the restoring barrier does NOT redden
         //       it, because the layout it leaves behind is the one the next blit wants. That
         //       failure is caught by the barrier pair above and by the layer, not here.
@@ -623,6 +623,22 @@ void runRefusalChecks(Device& device, OffscreenTargetManager& targets) {
     check(wallpaperx::testing::variesInBothAxes(reference, 64, 64),
           "the frame on the monitor before the refusals varies in both axes, so a later render that showed "
           "something else would be told apart from it");
+
+    // GOAL: S15.705 -- the video renderer refuses tile (a blit cannot repeat) with
+    //       std::invalid_argument, and the refusal leaves the layout it had.
+    // WHY-THIS-SHAPE: the render after the refusal is compared with the reference, so a place()
+    //       that stored the mode before throwing would also fail, not only one that accepted it.
+    // CONTROL: renderer/renderers/video_renderer.cpp's `positionModeShowsVideo` test in place()
+    //       made `if (false)` -> "a video renderer refuses tile / it was accepted" and "after
+    //       refusing tile the video renderer still draws the layout it had", both ICDs. Reverted.
+    refuses("a video renderer refuses tile", Expected::InvalidArgument,
+            [&] { renderer.place({wallpaperx::PositionMode::Tile}); });
+    {
+        const OffscreenTarget& after = targets.create(/*monitorId=*/31, 64, 64);
+        targets.render(renderer, after);
+        check(wallpaperx::testing::reclaimAndReadback(device, targets, after) == reference,
+              "after refusing tile the video renderer still draws the layout it had");
+    }
 
     struct Case {
         const char* what;

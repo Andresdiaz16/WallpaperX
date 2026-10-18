@@ -490,7 +490,7 @@ PipelineRun runPipeline(Device& device, const std::string& file, size_t expected
                     more = pipeline.renderNext(targets, target);
                 } else {
                     more = pipeline.decodeWithin(UINT32_MAX, plan.skip) == VideoPipeline::Decode::Decoded;
-                    if (more) pipeline.draw(targets, target);
+                    if (more) pipeline.draw(targets, target, wallpaperx::Placement{});
                 }
             } catch (...) {
                 if (failing) endFailingCall();
@@ -5392,7 +5392,7 @@ void runHalvesChecks(Device& device, const std::string& label, bool onDevice) {
         {
             VideoPipeline pipeline(device, asset(file), kShaderDir, VideoPipeline::Playback::Once);
             try {
-                pipeline.draw(targets, target);
+                pipeline.draw(targets, target, wallpaperx::Placement{});
             } catch (const std::logic_error&) {
                 drawBeforeDecodeThrew = true;
             } catch (const std::exception& e) {
@@ -5401,7 +5401,7 @@ void runHalvesChecks(Device& device, const std::string& label, bool onDevice) {
 
             decodedFirst = pipeline.decodeNext();
             if (decodedFirst) {
-                pipeline.draw(targets, target);
+                pipeline.draw(targets, target, wallpaperx::Placement{});
                 afterFirstDraw = shown();
 
                 // Decoded and converted, deliberately not drawn: what the daemon does for a pass it may
@@ -5410,7 +5410,7 @@ void runHalvesChecks(Device& device, const std::string& label, bool onDevice) {
                 decodedSecond = pipeline.decodeNext();
                 if (decodedSecond) {
                     publishedAfterLoneDecode = target.published();
-                    pipeline.draw(targets, target);
+                    pipeline.draw(targets, target, wallpaperx::Placement{});
                     publishedAfterDraw = target.published();
                     // Read back only once published: a reclaim of an unpublished target throws, which would
                     // report this run as having thrown instead of naming the check below.

@@ -426,8 +426,15 @@ void selectionAndValues(const QString& root) {
     }
     Counts c;
     countSignals(m, c);
-    const QVariantMap defaults{{QStringLiteral("speed"), 1.0}, {QStringLiteral("mute"), true}, {QStringLiteral("tint"), QStringLiteral("#ffffff")},
-                               {QStringLiteral("volume"), 1.0}};
+    // Every wallpaper takes the four position keys besides its own properties (S15.722).
+    const QVariantMap positions{{QStringLiteral("position"), QStringLiteral("cover")}, {QStringLiteral("position.zoom"), 1.0},
+                                {QStringLiteral("position.x"), 0.0}, {QStringLiteral("position.y"), 0.0}};
+    const auto withPositions = [&](QVariantMap values) {
+        values.insert(positions);
+        return values;
+    };
+    const QVariantMap defaults = withPositions({{QStringLiteral("speed"), 1.0}, {QStringLiteral("mute"), true}, {QStringLiteral("tint"), QStringLiteral("#ffffff")},
+                                                {QStringLiteral("volume"), 1.0}});
 
     // GOAL: S15.38 -- only a usable wallpaper in the list can be opened: select() of a broken or
     //       unknown path returns false and changes and emits nothing.
@@ -443,19 +450,18 @@ void selectionAndValues(const QString& root) {
            QStringLiteral("S15.38: selecting ocean gave \"%1\" with %2 selection signal(s)").arg(m.selectedPath()).arg(c.selection));
 
     // GOAL: S15.40 -- propertyValues holds every property of the open wallpaper at its default
-    //       before any edit.
-    // CONTROL: app/library/library_manager.cpp, propertyValues()'s `m_edits.value(property.key, property.defaultValue)`
-    //       made `m_edits.value(property.key, QVariant())` -> red, "S15.40: the defaults read {mute=,
-    //       speed=, tint=, volume=}" (control_batch, re-run 2026-10-11 on a video with sound); restored.
+    //       before any edit, the four position keys included.
+    // CONTROL: app/library/library_manager.cpp, propertyValues() starting from an empty map instead of
+    //       defaultValues() (control_batch 2026-10-18) -> red, "S15.40: the defaults read {}"; restored.
     expect(m.propertyValues() == defaults, QStringLiteral("S15.40: the defaults read %1").arg(describe(m.propertyValues())));
 
     c.values = 0;
     // CONTROL: app/library/wpx_package.cpp, control_batch 2026-10-15: the speed choices' `>=`/`<=` range
     //       test made `>`/`<` (2, the range's max, no longer offered) -> red, "S15.40: an accepted edit of
-    //       speed to 2 read {mute=true, speed=1, tint=#ffffff, volume=1} with 0 signal(s)"; restored.
+    //       speed to 2 read {mute=true, ..., speed=1, ...} with 0 signal(s)"; restored.
     // CONTROL: app/library/library_manager.cpp:262, setPropertyValue emitting propertyValuesChanged a second time,
     //       control_batch 2026-10-15, app_library_manager '^selectionAndValues$' -> "FAIL: S15.40: an accepted edit
-    //       of speed to 2 read {mute=true, speed=2, tint=#ffffff, volume=1} with 2 signal(s)"; restored, green.
+    //       of speed to 2 read {mute=true, ..., speed=2, ...} with 2 signal(s)"; restored, green.
     const bool tookSpeed = m.setPropertyValue(QStringLiteral("speed"), 2.0);
     expect(tookSpeed && m.propertyValues().value(QStringLiteral("speed")) == QVariant(2.0) && c.values == 1,
            QStringLiteral("S15.40: an accepted edit of speed to 2 read %1 with %2 signal(s)").arg(describe(m.propertyValues())).arg(c.values));
@@ -482,8 +488,8 @@ void selectionAndValues(const QString& root) {
                    .arg(QLatin1String(key), value.toString()).arg(took).arg(describe(m.propertyValues())).arg(c.values));
     }
     // CONTROL: app/library/wpx_package.cpp, accept()'s `if (value.typeId() == QMetaType::QColor) {`
-    //       made `if (false) {` -> red, "S15.40: a QColor tint and mute=false read {mute=false,
-    //       speed=2, tint=#ffffff, volume=1}" (control_batch, re-run 2026-10-11); restored.
+    //       made `if (false) {` -> red, "S15.40: a QColor tint and mute=false read {mute=false, ...,
+    //       tint=#ffffff, volume=1}" (control_batch, re-run 2026-10-11); restored.
     const bool tookColour = m.setPropertyValue(QStringLiteral("tint"), QColor(255, 0, 0));
     const bool tookMute = m.setPropertyValue(QStringLiteral("mute"), false);
     expect(tookColour && tookMute && m.propertyValues().value(QStringLiteral("tint")) == QVariant(QStringLiteral("#ff0000")) &&
@@ -492,21 +498,22 @@ void selectionAndValues(const QString& root) {
 
     // GOAL: S15.40 -- resetPropertyValues() puts every value back to its default, and says so.
     // CONTROL: app/library/library_manager.cpp, resetPropertyValues()'s `m_edits.clear();` made
-    //       `m_edits.remove(QStringLiteral("speed"));` -> red, "S15.40: after a reset the values read
-    //       {mute=false, speed=1, tint=#ff0000, volume=1}" (control_batch, re-run 2026-10-11); restored.
+    //       `m_edits.remove(QStringLiteral("speed"));` (control_batch, re-run 2026-10-18) -> red, "S15.40: after a reset the values read {mute=false, position=cover, ..., tint=#ff0000,
+    //       volume=1}"; restored.
     c.values = 0;
     m.resetPropertyValues();
     expect(m.propertyValues() == defaults && c.values == 1,
            QStringLiteral("S15.40: after a reset the values read %1 with %2 signal(s)").arg(describe(m.propertyValues())).arg(c.values));
 
-    // GOAL: S15.38 -- opening another wallpaper drops the edits made on the previous one;
-    //       re-selecting the open one keeps them.
+    // GOAL: S15.38 -- opening another wallpaper drops the edits made on the previous one, a position
+    //       edit included; re-selecting the open one keeps them. A still declaring nothing has the
+    //       position keys alone.
     // CONTROL: app/library/library_manager.cpp, the `m_edits.clear();` inside select()'s
-    //       changeSelection deleted -> red, "S15.38: re-select kept edits 1, the other wallpaper had
-    //       none 1; after coming back speed read 2" (control_batch, re-run 2026-10-15); restored.
-    const bool setSpeed = m.setPropertyValue(QStringLiteral("speed"), 2.0);
+    //       changeSelection deleted (control_batch, re-run 2026-10-18) -> red, "S15.38: re-select kept edits 1, the other wallpaper had none 0; after coming
+    //       back speed read 2"; restored.
+    const bool setSpeed = m.setPropertyValue(QStringLiteral("speed"), 2.0) && m.setPropertyValue(QStringLiteral("position"), QStringLiteral("fit"));
     const bool reselect = setSpeed && m.select(ocean) && m.propertyValues().value(QStringLiteral("speed")) == QVariant(2.0);
-    const bool other = m.select(still) && m.propertyValues().isEmpty();
+    const bool other = m.select(still) && m.propertyValues() == positions;
     const bool back = m.select(ocean);
     expect(reselect && other && back && m.propertyValues() == defaults,
            QStringLiteral("S15.38: re-select kept edits %1, the other wallpaper had none %2; after coming back speed read %3")
@@ -520,12 +527,10 @@ void selectionAndValues(const QString& root) {
     //       moment, not only the end state, since the first emission after the rescan is the one a
     //       binding (and Apply) would read. The rewrite drops tint, not mute: a video with sound
     //       always offers mute (S15.473), so only a property it does not add can be dropped.
-    // CONTROL: app/library/library_manager.cpp, control_batch, re-run 2026-10-15: settle()'s pruning
-    //       `property.accept(m_edits.value(property.key))` made `std::optional<QVariant>(m_edits.value(property.key))`
-    //       -> red, "S15.40: after the rewrite (reread 1) ... the values read {mute=false, speed=2, volume=1,
-    //       zoom=2}, not {mute=false, speed=1, volume=1, zoom=2}" and "1 emission(s) checked; an emission
-    //       exposed speed=2"; settle()'s `m_edits = std::move(edits);` made `m_edits.clear();` -> red,
-    //       "...the values read {mute=true, speed=1, volume=1, zoom=2}, not ..."; restored.
+    // CONTROL: app/library/library_manager.cpp, control_batch, re-run 2026-10-18: settle()'s pruning
+    //       `kept->accept(it.key(), it.value())` made `std::optional<QVariant>(it.value())` -> red,
+    //       "S15.40: after the rewrite (reread 1) ... the values read {..., speed=2, tint=#00ff00, ...}" and
+    //       "1 emission(s) checked; an emission exposed speed=2, tint=#00ff00"; restored.
     // COVERAGE-ASSERT: at least one emission was checked.
     if (!m.setPropertyValue(QStringLiteral("speed"), 2.0) || !m.setPropertyValue(QStringLiteral("mute"), false) ||
         !m.setPropertyValue(QStringLiteral("tint"), QStringLiteral("#00ff00"))) {
@@ -537,9 +542,9 @@ void selectionAndValues(const QString& root) {
     const auto guard = QObject::connect(&m, &LibraryManager::propertyValuesChanged, [&] {
         ++emissionsChecked;
         const QVariantMap values = m.propertyValues();
-        for (const WallpaperProperty& p : m.selectedWallpaper().properties) {
-            if (!p.accept(values.value(p.key))) {
-                exposed.append(p.key + QLatin1Char('=') + values.value(p.key).toString());
+        for (auto it = values.cbegin(); it != values.cend(); ++it) {
+            if (!m.selectedWallpaper().accept(it.key(), it.value())) {
+                exposed.append(it.key() + QLatin1Char('=') + it.value().toString());
             }
         }
     });
@@ -552,8 +557,8 @@ void selectionAndValues(const QString& root) {
         return;
     }
     const bool reread = waitUntil([&] { return m.selectedWallpaper().properties.size() == 4 && m.selectedWallpaper().properties[2].key == u"zoom"; }, kWaitMs);
-    const QVariantMap want{{QStringLiteral("speed"), 1.0}, {QStringLiteral("mute"), false}, {QStringLiteral("zoom"), 2.0},
-                           {QStringLiteral("volume"), 1.0}};
+    const QVariantMap want = withPositions({{QStringLiteral("speed"), 1.0}, {QStringLiteral("mute"), false}, {QStringLiteral("zoom"), 2.0},
+                                            {QStringLiteral("volume"), 1.0}});
     expect(reread && m.selectedPath() == ocean && m.propertyValues() == want,
            QStringLiteral("S15.40: after the rewrite (reread %1) the open wallpaper is \"%2\" and the values read %3, not %4")
                .arg(reread).arg(m.selectedPath(), describe(m.propertyValues()), describe(want)));
@@ -567,18 +572,17 @@ void selectionAndValues(const QString& root) {
     // WHY-THIS-SHAPE: follows the S15.40 rewrite on the same open wallpaper, so the edits it made
     //       (speed 2, tint green) are exactly the ones the narrowing refused or dropped; mute's edit,
     //       still valid throughout, stays.
-    // CONTROL: app/library/library_manager.cpp, control_batch, re-run 2026-10-15: settle()'s pruning made to
-    //       keep every edit, as for S15.40 -> red, "S15.57: after the file was widened again (reread 1) the
-    //       values read {mute=false, speed=2, tint=#ffffff, volume=1}, not {mute=false, speed=1, ...}"; restored. (The 2026-10-02 control, filtering
-    //       in propertyValues() instead of pruning in settle(), was not re-run.)
+    // CONTROL: app/library/library_manager.cpp, control_batch, re-run 2026-10-18: settle()'s pruning made to
+    //       keep every edit, as for S15.40 -> red, "S15.57: after the file was widened again (reread 1) the values read
+    //       {..., speed=2, tint=#00ff00, volume=1}, not {..., speed=1, tint=#ffffff, volume=1}"; restored.
     if (reread) {
         if (!writeBytes(oceanManifest, QByteArray(kPlanManifest))) {
             harnessFailure("S15.57: the widened wallpaper.json could not be written");
             return;
         }
         const bool widened = waitUntil([&] { return m.selectedWallpaper().properties.size() == 4 && m.selectedWallpaper().properties[2].key == u"tint"; }, kWaitMs);
-        const QVariantMap wantBack{{QStringLiteral("speed"), 1.0}, {QStringLiteral("mute"), false}, {QStringLiteral("tint"), QStringLiteral("#ffffff")},
-                                   {QStringLiteral("volume"), 1.0}};
+        const QVariantMap wantBack = withPositions({{QStringLiteral("speed"), 1.0}, {QStringLiteral("mute"), false},
+                                                    {QStringLiteral("tint"), QStringLiteral("#ffffff")}, {QStringLiteral("volume"), 1.0}});
         expect(widened && m.selectedPath() == ocean && m.propertyValues() == wantBack,
                QStringLiteral("S15.57: after the file was widened again (reread %1) the values read %2, not %3")
                    .arg(widened).arg(describe(m.propertyValues()), describe(wantBack)));
@@ -1284,6 +1288,114 @@ void probeReused(const QString& root) {
                .arg(oceanAudio()).arg(int(AudioStreams::Present)).arg(rescanned));
 }
 
+QString typed(const QVariantMap& values) {
+    QStringList out;
+    for (auto it = values.cbegin(); it != values.cend(); ++it) {
+        if (it.key().startsWith(u"position")) {
+            out.append(QStringLiteral("%1=%2(%3)").arg(it.key(), it.value().toString(), QLatin1StringView(it.value().typeName())));
+        }
+    }
+    return QLatin1Char('{') + out.join(u", ") + QLatin1Char('}');
+}
+
+// S15.725, S15.726
+void positionEdits(const QString& root) {
+    const QString dir = root + QStringLiteral("/positions");
+    const QString art = dir + QStringLiteral("/art");
+    OrderedJson stillJson = planManifest();
+    stillJson["type"] = "static";
+    if (const QString why = makeLibrary(dir, {{QStringLiteral("art"), jsonBytes(stillJson)}}); !why.isEmpty()) {
+        fault("S15.725", QStringLiteral("the library could not be built: ") + why);
+        return;
+    }
+    LibraryManager m(dir, kSettleMs);
+    m.rescan();
+    if (!readyWith(m, 1) || !m.select(art) || m.selectedWallpaper().type != u"static") {
+        fault("S15.725", QStringLiteral("the still could not be listed and opened"));
+        return;
+    }
+    Counts c;
+    countSignals(m, c);
+
+    // GOAL: S15.726 -- through the manager, an integer zoom or offset (what QML hands over) is kept and
+    //       given back as a double, tile is taken for a still, and a bad mode, an out-of-range zoom or
+    //       offset, NaN or an unknown "position.*" key is refused, changing nothing and emitting nothing.
+    // WHY-THIS-SHAPE: read back as text naming each type: QVariant's == takes the int 2 for 2.0, so a
+    //       map comparison would pass an int that the daemon then refuses on the wire.
+    // CONTROL: app/library/wpx_package.cpp, control_batch 2026-10-18, each reverted: Wallpaper::accept()
+    //       keeping `value` for a number -> red, "S15.726: the edits were taken 1 and read {..., position.x=1(int),
+    //       ..., position.zoom=2(int)}"; its positionModes() test dropped -> red, "S15.726: the refused edit
+    //       position = centre returned 1".
+    const bool took = m.setPropertyValue(QStringLiteral("position"), QStringLiteral("tile")) && m.setPropertyValue(QStringLiteral("position.zoom"), 2) &&
+                      m.setPropertyValue(QStringLiteral("position.x"), 1) && m.setPropertyValue(QStringLiteral("position.y"), -0.5);
+    const QString edited = QStringLiteral("{position=tile(QString), position.x=1(double), position.y=-0.5(double), position.zoom=2(double)}");
+    expect(took && typed(m.propertyValues()) == edited && c.values == 4,
+           QStringLiteral("S15.726: the edits were taken %1 and read %2 with %3 signal(s)").arg(took).arg(typed(m.propertyValues())).arg(c.values));
+    const QVariantMap before = m.propertyValues();
+    c.values = 0;
+    const std::pair<const char*, QVariant> refused[] = {
+        {"position", QStringLiteral("centre")}, {"position.zoom", 0.05}, {"position.x", 10.5},
+        {"position.y", std::numeric_limits<double>::quiet_NaN()}, {"position.foo", 1.0},
+    };
+    for (const auto& [key, value] : refused) {
+        const bool tookBad = m.setPropertyValue(QString::fromLatin1(key), value);
+        expect(!tookBad && m.propertyValues() == before && c.values == 0,
+               QStringLiteral("S15.726: the refused edit %1 = %2 returned %3; values now %4, %5 signal(s)")
+                   .arg(QLatin1String(key), value.toString()).arg(tookBad).arg(typed(m.propertyValues())).arg(c.values));
+    }
+
+    // GOAL: S15.787 -- LibraryManager::setPropertyValues takes the whole set or none of it: one refused value
+    //       leaves every value unchanged with no signal, and an accepted set is one change notice.
+    // WHY-THIS-SHAPE: the refused value sorts last (position.zoom after position.x), so an implementation that
+    //       applies key by key has already changed position.x when it meets the refusal.
+    // CONTROL: app/library/library_manager.cpp, control_batch 2026-10-18, each reverted: setPropertyValues()'s
+    //       `return false;` made `continue;` -> the refused-set line; its `changeSelection([&] {
+    //       m_edits.insert(accepted); });` made one changeSelection per accepted key -> the accepted-set line,
+    //       "3 signal(s)".
+    {
+        c.values = 0;
+        const bool tookMixed = m.setPropertyValues({{QStringLiteral("position.x"), 0.25}, {QStringLiteral("position.zoom"), 0.05}});
+        expect(!tookMixed && m.propertyValues() == before && c.values == 0,
+               QStringLiteral("S15.787: a set with one refused value returned %1; values now %2, %3 signal(s)")
+                   .arg(tookMixed).arg(typed(m.propertyValues())).arg(c.values));
+        const bool tookSet = m.setPropertyValues(
+            {{QStringLiteral("position.x"), 0.25}, {QStringLiteral("position.y"), 0.5}, {QStringLiteral("position.zoom"), 3}});
+        const QString set = QStringLiteral("{position=tile(QString), position.x=0.25(double), position.y=0.5(double), position.zoom=3(double)}");
+        expect(tookSet && typed(m.propertyValues()) == set && c.values == 1,
+               QStringLiteral("S15.787: an accepted set returned %1, reads %2, with %3 signal(s)")
+                   .arg(tookSet).arg(typed(m.propertyValues())).arg(c.values));
+        m.setPropertyValues({{QStringLiteral("position.x"), 1.0}, {QStringLiteral("position.y"), -0.5}, {QStringLiteral("position.zoom"), 2.0}});
+    }
+
+    // GOAL: S15.725 -- when a rescan turns the open still into a video, its tile choice is dropped (the
+    //       mode reads cover) while the framing it can still hold is kept, and no emission along the way
+    //       exposes tile on the video.
+    // WHY-THIS-SHAPE: every emission is checked, as for S15.40, since the first after the rescan is the
+    //       one a binding and a live edit read; the end state alone would miss tile sent in between.
+    // CONTROL: app/library/library_manager.cpp settle()'s pruning `kept->accept(...)` made
+    //       `std::optional<QVariant>(it.value())` (control_batch 2026-10-18, reverted) -> red, "S15.725: after
+    //       the still became a video (seen 1) it reads {position=tile(QString), ...}, ... tile exposed in [...]".
+    // COVERAGE-ASSERT: at least one emission was checked.
+    int emissionsChecked = 0;
+    QStringList exposed;
+    const auto guard = QObject::connect(&m, &LibraryManager::propertyValuesChanged, [&] {
+        ++emissionsChecked;
+        if (m.selectedWallpaper().type == u"video" && m.propertyValues().value(QStringLiteral("position")) == QVariant(QStringLiteral("tile"))) {
+            exposed.append(typed(m.propertyValues()));
+        }
+    });
+    if (!writeBytes(art + QStringLiteral("/wallpaper.json"), QByteArray(kPlanManifest))) {
+        harnessFailure("S15.725: the still's wallpaper.json could not be rewritten as a video");
+        return;
+    }
+    const bool turned = waitUntil([&] { return m.selectedWallpaper().type == u"video"; }, kWaitMs);
+    const QString want = QStringLiteral("{position=cover(QString), position.x=1(double), position.y=-0.5(double), position.zoom=2(double)}");
+    expect(turned && m.selectedPath() == art && typed(m.propertyValues()) == want && exposed.isEmpty() && emissionsChecked >= 1,
+           QStringLiteral("S15.725: after the still became a video (seen %1) it reads %2, not %3; %4 emission(s) checked, tile exposed in [%5]")
+               .arg(turned).arg(typed(m.propertyValues()), want).arg(emissionsChecked).arg(exposed.join(u" | ")));
+    QObject::disconnect(guard);
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -1308,5 +1420,6 @@ int main(int argc, char* argv[]) {
     runPhase("idleLibrary", [&] { idleLibrary(root); });
     runPhase("revealed", [&] { revealed(root); });
     runPhase("probeReused", [&] { probeReused(root); });
+    runPhase("positionEdits", [&] { positionEdits(root); });
     return verdict();
 }

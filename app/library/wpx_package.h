@@ -5,17 +5,22 @@
 #include "audio_probe.h"
 #include "playback_speed.h"
 #include "unique_fd.h"
+#include "wallpaper_position.h"
 
 #include <QByteArray>
 #include <QList>
+#include <QObject>
 #include <QString>
 #include <QStringList>
 #include <QUrl>
 #include <QVariant>
+#include <QVariantMap>
 #include <QtQml/qqmlregistration.h>
 
 #include <expected>
+#include <iterator>
 #include <optional>
+#include <string_view>
 
 struct stat;
 
@@ -87,6 +92,7 @@ struct Wallpaper {
     Q_PROPERTY(QString assetPath MEMBER assetPath CONSTANT)
     Q_PROPERTY(QUrl previewSource READ previewSource CONSTANT)
     Q_PROPERTY(QList<wallpaperx::WallpaperProperty> properties MEMBER properties CONSTANT)
+    Q_PROPERTY(QStringList positionModes READ positionModes CONSTANT)
 
 public:
     // Absolute path of the wallpaper's folder, or of the archive, as decodeFileName gives it.
@@ -124,8 +130,43 @@ public:
     // An image://wallpaperx-preview URL naming this version of the preview, so a rewritten one
     // gets a new URL instead of a cached image. Empty for a broken wallpaper.
     QUrl previewSource() const;
+    // The names of the position modes the daemon shows it in: every one for a still, all but tile
+    // for anything else, as the daemon's positionError() rules.
+    QStringList positionModes() const;
+    // Every value the user can set on it, at its default: each property in `properties`, then the
+    // four position keys, which every wallpaper takes without declaring them.
+    QVariantMap defaultValues() const;
+    // `value` as `key` keeps it, or nothing when `key` is not in defaultValues() or cannot hold it:
+    // WallpaperProperty::accept() for a declared key; for a position key, a name positionModes()
+    // lists, or a finite number within the key's bounds, kept as a double.
+    std::optional<QVariant> accept(const QString& key, const QVariant& value) const;
 
     friend bool operator==(const Wallpaper&, const Wallpaper&) = default;
+};
+
+// The position keys and bounds from wallpaper_position.h, for QML.
+class Positioning : public QObject {
+    Q_OBJECT
+    QML_ELEMENT
+    QML_SINGLETON
+    Q_PROPERTY(QString modeKey READ modeKey CONSTANT)
+    Q_PROPERTY(QString zoomKey READ zoomKey CONSTANT)
+    Q_PROPERTY(QString xKey READ xKey CONSTANT)
+    Q_PROPERTY(QString yKey READ yKey CONSTANT)
+    Q_PROPERTY(double minimumZoom READ minimumZoom CONSTANT)
+    Q_PROPERTY(double maximumZoom READ maximumZoom CONSTANT)
+    Q_PROPERTY(double maximumOffset READ maximumOffset CONSTANT)
+
+public:
+    using QObject::QObject;
+
+    static QString modeKey() { return QString::fromLatin1(kPositionKey); }
+    static QString zoomKey() { return QString::fromLatin1(kPositionZoomKey); }
+    static QString xKey() { return QString::fromLatin1(kPositionXKey); }
+    static QString yKey() { return QString::fromLatin1(kPositionYKey); }
+    static double minimumZoom() { return kMinPositionZoom; }
+    static double maximumZoom() { return kMaxPositionZoom; }
+    static double maximumOffset() { return kMaxPositionOffset; }
 };
 
 inline constexpr const char* kPreviewProviderId = "wallpaperx-preview";
@@ -142,6 +183,13 @@ constexpr double kMaxVolume = 1.0;
 // removed from a wallpaper known to have none.
 constexpr const char* kMuteKey = "mute";
 constexpr const char* kVolumeKey = "volume";
+
+// The keys every wallpaper takes besides its own; "position" and any "position.*" are refused in
+// wallpaper.json.
+constexpr std::string_view kPositionKeys[] = {kPositionKey, kPositionZoomKey, kPositionXKey, kPositionYKey};
+// A wallpaper's own properties, the sound keys added included: the daemon's cap less room for the
+// position keys, which are sent with them.
+constexpr qsizetype kMaxWallpaperProperties = kMaxProperties - qsizetype(std::size(kPositionKeys));
 
 // The manifest fields of a wallpaper.json; the file fields are left empty. The error is a
 // sentence for the user.

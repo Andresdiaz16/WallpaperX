@@ -4,6 +4,8 @@
 
 #include "renderer_base.h"
 
+#include "wallpaper_position.h"
+
 #include <cstdint>
 
 namespace wallpaperx {
@@ -42,12 +44,13 @@ struct VideoFrame {
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
 };
 
-// Puts a caller-owned decoded frame onto an offscreen target by blitting it: scaled to cover
-// the target and cropped centrally to the target's aspect, never stretched or letterboxed.
+// Puts a caller-owned decoded frame onto an offscreen target by blitting it, laid out as place()
+// says: scaled to cover the target and cropped centrally until told otherwise.
 //
 // Owns no Vulkan object at all -- no pipeline, sampler or descriptor -- so it is cheap to
 // build and destroy, works identically on every descriptor tier, and record() costs two
-// barriers and one blit.
+// barriers and one blit, plus a clear and a barrier when the frame leaves part of the target
+// black.
 //
 // The frame's owner keeps every lifetime obligation. A shown frame is read by every render()
 // recorded while it is shown -- one per monitor, per display frame -- so the batch to outlive
@@ -78,6 +81,11 @@ public:
     // PREINITIALIZED.
     void show(const VideoFrame& frame);
 
+    // How every later record() lays the frame on its target; Cover until called. Throws
+    // std::invalid_argument for Tile, which a blit cannot draw, and for a placement
+    // placementAllowed() refuses.
+    void place(const Placement& placement);
+
     [[nodiscard]] VkImageLayout record(VkCommandBuffer cmd, const OffscreenTarget& target) override;
 
 private:
@@ -88,6 +96,7 @@ private:
     // what tells "nothing shown yet" from a shown frame whose declaration happens to be all
     // defaults; the source alone cannot, as a caller can supply that value too.
     VideoFrame m_frame;
+    Placement m_placement;
 };
 
 }

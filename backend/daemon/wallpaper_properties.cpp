@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <format>
 
 namespace wallpaperx {
 namespace {
@@ -16,7 +17,8 @@ namespace {
 constexpr const char* kSpeed = "speed";
 constexpr const char* kMute = "mute";
 constexpr const char* kVolume = "volume";
-constexpr std::string_view kAppliedKeys[] = {kSpeed, kMute, kVolume};
+constexpr std::string_view kAppliedKeys[] = {kSpeed, kMute, kVolume, kPositionKey, kPositionZoomKey, kPositionXKey,
+                                             kPositionYKey};
 
 std::optional<std::uint8_t> hexByte(char high, char low) {
     const auto digit = [](char c) -> int {
@@ -43,6 +45,18 @@ std::string propertyError(const std::string& key, const PropertyValue& value) {
     }
     const double* number = std::get_if<double>(&value);
     if (number != nullptr && !std::isfinite(*number)) return "property " + key + " is not a finite number";
+    const bool mode = std::holds_alternative<PositionMode>(value);
+    if (key == kPositionKey) {
+        return mode ? std::string() : "property position must be " + positionModesText("or");
+    }
+    if (mode) return "property " + key + " is a string but not a colour \"#rrggbb\"";
+    if (key == kPositionZoomKey && (number == nullptr || !positionZoomAllowed(*number))) {
+        return "property position.zoom must be a number from " + std::format("{} to {}", kMinPositionZoom, kMaxPositionZoom);
+    }
+    if ((key == kPositionXKey || key == kPositionYKey) && (number == nullptr || !positionOffsetAllowed(*number))) {
+        return "property " + key + " must be a number from " +
+               std::format("{} to {}", -kMaxPositionOffset, kMaxPositionOffset);
+    }
     if (key == kSpeed && (number == nullptr || !std::ranges::contains(kPlaybackSpeeds, *number))) {
         return "property speed must be " + playbackSpeedsText("or");
     }
@@ -55,6 +69,7 @@ std::string propertyError(const std::string& key, const PropertyValue& value) {
 
 nlohmann::json toJson(const PropertyValue& value) {
     if (const auto* colour = std::get_if<Colour>(&value)) return toString(*colour);
+    if (const auto* mode = std::get_if<PositionMode>(&value)) return toString(*mode);
     if (const auto* flag = std::get_if<bool>(&value)) return *flag;
     return std::get<double>(value);
 }
@@ -68,6 +83,12 @@ std::optional<Colour> parseColour(std::string_view text) {
     const auto blue = hexByte(text[5], text[6]);
     if (!red || !green || !blue) return std::nullopt;
     return Colour{*red, *green, *blue};
+}
+
+std::optional<PropertyValue> propertyFromText(std::string_view text) {
+    if (const auto colour = parseColour(text)) return *colour;
+    if (const auto mode = positionModeFromName(text)) return *mode;
+    return std::nullopt;
 }
 
 std::string toString(Colour colour) {
@@ -116,6 +137,30 @@ WallpaperProperties usableProperties(const WallpaperProperties& properties, int&
         if (!std::ranges::contains(kAppliedKeys, std::string_view(key))) consider(key, read);
     }
     return usable;
+}
+
+std::string positionError(const WallpaperProperties& properties, std::string_view type) {
+    const PositionMode mode = placement(properties).mode;
+    if (positionModeAllowed(type, mode)) return {};
+    return "property position " + std::string(toString(mode)) + " is for still images only";
+}
+
+Placement placement(const WallpaperProperties& properties) {
+    const auto number = [&](std::string_view key, double fallback) {
+        const auto it = properties.find(std::string(key));
+        const double* value = it == properties.end() ? nullptr : std::get_if<double>(&it->second);
+        return value != nullptr ? *value : fallback;
+    };
+    Placement result;
+    const auto it = properties.find(std::string(kPositionKey));
+    if (const auto* mode = it == properties.end() ? nullptr : std::get_if<PositionMode>(&it->second)) {
+        result.mode = *mode;
+    }
+    if (result.mode != PositionMode::Free) return result;
+    result.zoom = number(kPositionZoomKey, result.zoom);
+    result.x = number(kPositionXKey, result.x);
+    result.y = number(kPositionYKey, result.y);
+    return result;
 }
 
 double playbackSpeed(const WallpaperProperties& properties) {
@@ -173,8 +218,8 @@ WallpaperProperties propertiesFromJson(const std::string& text, int& dropped) {
             properties.emplace(key, value.get<double>());
         } else if (value.is_boolean()) {
             properties.emplace(key, value.get<bool>());
-        } else if (const auto colour = value.is_string() ? parseColour(value.get<std::string>()) : std::nullopt) {
-            properties.emplace(key, *colour);
+        } else if (const auto text = value.is_string() ? propertyFromText(value.get<std::string>()) : std::nullopt) {
+            properties.emplace(key, *text);
         } else {
             ++dropped;
         }

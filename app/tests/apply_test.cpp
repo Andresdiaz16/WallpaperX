@@ -56,6 +56,30 @@ QString describeMap(const QVariantMap& map) {
     return u'{' + parts.join(u", ") + u'}';
 }
 
+// `values` with the four position keys at their defaults, as the app sends them beside every
+// wallpaper's own properties.
+QVariantMap withPosition(QVariantMap values) {
+    values.insert({{QStringLiteral("position"), QStringLiteral("cover")}, {QStringLiteral("position.zoom"), 1.0},
+                   {QStringLiteral("position.x"), 0.0}, {QStringLiteral("position.y"), 0.0}});
+    return values;
+}
+
+// What the daemon's own rules (daemon_rules.h) make of `values` as sent for a wallpaper of `type`:
+// empty when it would show it. A value of a type other than double, bool or string is refused here,
+// as the daemon refuses it on the wire.
+std::string daemonVerdictOnSent(const QVariantMap& values, const char* type) {
+    std::vector<std::pair<std::string, DaemonValue>> sent;
+    for (auto it = values.cbegin(); it != values.cend(); ++it) {
+        switch (it.value().typeId()) {
+        case QMetaType::Double: sent.emplace_back(it.key().toStdString(), it.value().toDouble()); break;
+        case QMetaType::Bool: sent.emplace_back(it.key().toStdString(), it.value().toBool()); break;
+        case QMetaType::QString: sent.emplace_back(it.key().toStdString(), it.value().toString().toStdString()); break;
+        default: return "property " + it.key().toStdString() + " is a " + it.value().typeName() + ", which the daemon does not take";
+        }
+    }
+    return daemonShowError(sent, type);
+}
+
 // Plasma's screens in an order unlike KScreen's listing (DP-1 first there), and desktops of four
 // activities: A is current; B has a desktop saved on each screen; C saved nothing; D saved an empty
 // lastScreen; E saved lastScreen as a number rather than as text.
@@ -467,9 +491,9 @@ void applyOrder() {
     //       `m_daemon.setWallpaper(...)` (Plasma asked first; control_batch, 2026-10-02) -> red,
     //       "S15.233: Apply sent [GetStatus,SetMonitorOutput,evaluateScript,SetWallpaperWithProperties,
     //       evaluateScript] and ended 2: Ocean Waves is on DP-1.". The values line: the added volume's default
-    //       made 0.5 in settleSoundProperties (app/library/wpx_package.cpp; control_batch, 2026-10-15) -> red,
-    //       "S15.233: SetWallpaperWithProperties carried ssia{sv} .../ocean/assets/video.mp4 0 {mute=true(bool),
-    //       speed=2(double), tint=#ffffff(QString), volume=0.5(double)}".
+    //       made 0.5 in settleSoundProperties (app/library/wpx_package.cpp; control_batch, re-run 2026-10-18) ->
+    //       red, "S15.233: SetWallpaperWithProperties carried ssia{sv} .../ocean/assets/video.mp4 0 {mute=true(bool),
+    //       position=cover(QString), ..., volume=0.5(double)}".
     rig.library->select(rig.ocean);
     rig.library->setPropertyValue(QStringLiteral("speed"), 2.0);
     rig.log.clear();
@@ -490,14 +514,13 @@ void applyOrder() {
     const auto set = rig.sent("SetWallpaperWithProperties");
     expect(bind.size() == 1 && bind[0].signature == u"is" && bind[0].args == QVariantList{0, QStringLiteral("DP-1")},
            QStringLiteral("S15.233: the screen was bound as %1").arg(bind.isEmpty() ? QStringLiteral("(nothing)") : bind[0].signature + u' ' + bind[0].args.value(0).toString() + u' ' + bind[0].args.value(1).toString()));
-    const QVariantMap wantValues{{QStringLiteral("speed"), 2.0}, {QStringLiteral("mute"), true}, {QStringLiteral("tint"), QStringLiteral("#ffffff")},
-                                 {QStringLiteral("volume"), 1.0}};
+    const QVariantMap wantValues = withPosition({{QStringLiteral("speed"), 2.0}, {QStringLiteral("mute"), true},
+                                                 {QStringLiteral("tint"), QStringLiteral("#ffffff")}, {QStringLiteral("volume"), 1.0}});
     const QVariantMap values = set.isEmpty() ? QVariantMap() : set[0].args.value(3).toMap();
+    // Compared as text naming each type: QVariant's == takes an int 1 for the double 1.0.
     expect(set.size() == 1 && set[0].signature == u"ssia{sv}" && set[0].args.value(0).toString() == u"video" &&
                set[0].args.value(1) == QString(rig.ocean + QStringLiteral("/assets/video.mp4")) && set[0].args.value(2) == 0 &&
-               values == wantValues && values.value(QStringLiteral("speed")).typeId() == QMetaType::Double &&
-               values.value(QStringLiteral("mute")).typeId() == QMetaType::Bool && values.value(QStringLiteral("tint")).typeId() == QMetaType::QString &&
-               values.value(QStringLiteral("volume")).typeId() == QMetaType::Double,
+               describeMap(values) == describeMap(wantValues),
            QStringLiteral("S15.233: SetWallpaperWithProperties carried %1 %2 %3 %4")
                .arg(set.isEmpty() ? QStringLiteral("(nothing)") : set[0].signature, set.isEmpty() ? QString() : set[0].args.value(1).toString(),
                     set.isEmpty() ? QString() : set[0].args.value(2).toString(), describeMap(values)));
@@ -508,14 +531,14 @@ void applyOrder() {
     //       wallpaper.json declares mute over a video with no sound, is applied with speed and tint alone.
     // CONTROL: via control_batch.sh, --phase '^applyOrder$', 2026-10-11, settleSoundProperties' `==
     //       AudioStreams::Absent` strip made `if (false)` (app/library/wpx_package.cpp) -> "FAIL: S15.473: a silent
-    //       video was applied with {mute=true(bool), speed=1(double), tint=#ffffff(QString), volume=1(double)}
-    //       (2 call(s))". Reverted.
+    //       video was applied with {mute=true(bool), position=cover(QString), ..., volume=1(double)} (2 call(s))"
+    //       (re-run 2026-10-18). Reverted.
     rig.library->select(rig.river);
     const bool riverFinished = rig.apply();
     const auto riverSet = rig.sent("SetWallpaperWithProperties");
     const QVariantMap riverValues = riverSet.size() == 2 ? riverSet[1].args.value(3).toMap() : QVariantMap();
     expect(riverFinished && riverSet.size() == 2 &&
-               riverValues == QVariantMap{{QStringLiteral("speed"), 1.0}, {QStringLiteral("tint"), QStringLiteral("#ffffff")}},
+               describeMap(riverValues) == describeMap(withPosition({{QStringLiteral("speed"), 1.0}, {QStringLiteral("tint"), QStringLiteral("#ffffff")}})),
            QStringLiteral("S15.473: a silent video was applied with %1 (%2 call(s))").arg(describeMap(riverValues)).arg(riverSet.size()));
     rig.library->select(rig.ocean);
 
@@ -823,8 +846,8 @@ void liveEdits() {
     // CONTROL: app/daemon/apply_controller.cpp, control_batch, re-run 2026-10-15: `startLive(...)` added
     //       right after apply()'s Working state (live before the daemon accepted) -> red, "S15.237:
     //       after a refused Apply an edit sent 1 call(s), live on "DP-1""; sendLive()'s setProperties
-    //       given only `speed` -> red, "S15.237: with Plasma refusing (live on "DP-1"), the edit after
-    //       Apply sent [ia{sv} 0 {speed=0.5(double)}] (1 call(s))".
+    //       given only `speed` (re-run 2026-10-18) -> red, "S15.237: with Plasma refusing (live on "DP-1"),
+    //       the edit after Apply sent [ia{sv} 0 {speed=0.5(double)}] (1 call(s))".
     rig.library->setPropertyValue(QStringLiteral("speed"), 0.5);
     const bool beforeDrained = rig.daemonDrained();
     expect(beforeDrained && edits().isEmpty(), QStringLiteral("S15.237: an edit before any Apply sent %1 call(s)").arg(edits().size()));
@@ -845,11 +868,11 @@ void liveEdits() {
     rig.library->setPropertyValue(QStringLiteral("speed"), 0.5);
     const bool sentOne = waitUntil([&] { return !edits().isEmpty(); }, kWaitMs);
     const bool afterDrained = rig.daemonDrained();
-    const QVariantMap want{{QStringLiteral("speed"), 0.5}, {QStringLiteral("mute"), true}, {QStringLiteral("tint"), QStringLiteral("#ffffff")},
-                           {QStringLiteral("volume"), 1.0}};
+    const QVariantMap want = withPosition({{QStringLiteral("speed"), 0.5}, {QStringLiteral("mute"), true},
+                                           {QStringLiteral("tint"), QStringLiteral("#ffffff")}, {QStringLiteral("volume"), 1.0}});
     const QVariantMap got = edits().isEmpty() ? QVariantMap() : edits().back().args.value(1).toMap();
     expect(applied && sentOne && afterDrained && rig.applier->applyState() == Progress::Failed && rig.applier->liveOutput() == u"DP-1" &&
-               edits().size() == 1 && edits()[0].signature == u"ia{sv}" && edits()[0].args.value(0) == 0 && got == want,
+               edits().size() == 1 && edits()[0].signature == u"ia{sv}" && edits()[0].args.value(0) == 0 && describeMap(got) == describeMap(want),
            QStringLiteral("S15.237: with Plasma refusing (live on \"%1\"), the edit after Apply sent [%2 %3 %4] (%5 call(s))")
                .arg(rig.applier->liveOutput(), edits().isEmpty() ? QString() : edits()[0].signature,
                     edits().isEmpty() ? QString() : edits()[0].args.value(0).toString(), describeMap(got))
@@ -974,6 +997,91 @@ void liveEdits() {
     }
     expect(heldSet && landed && editSent && speeds == QStringList{QStringLiteral("2")},
            QStringLiteral("S15.240: the edit made during Apply was sent as [%1] (held %2, landed %3)").arg(joined(speeds)).arg(heldSet).arg(landed));
+}
+
+// S15.732-S15.734
+void positionOnTheWire() {
+    constexpr const char* goals = "S15.732-S15.734";
+    Rig rig;
+    if (!build(rig, goals, QStringLiteral("position"))) {
+        return;
+    }
+    const auto withProperties = [&] { return rig.sent("SetWallpaperWithProperties"); };
+    const auto edits = [&] { return rig.sent("SetWallpaperProperties"); };
+    const auto lastOf = [](const QList<FakeCall>& calls, int index) { return calls.isEmpty() ? QVariantMap() : calls.back().args.value(index).toMap(); };
+    // What the detail page hands over: a mode name, and numbers QML may give as integers.
+    if (!rig.library->select(rig.ocean) || !rig.library->setPropertyValue(QStringLiteral("position"), QStringLiteral("free")) ||
+        !rig.library->setPropertyValue(QStringLiteral("position.zoom"), 2) || !rig.library->setPropertyValue(QStringLiteral("position.x"), -0.25)) {
+        harnessFailure(std::string(goals) + ": ocean could not be opened and framed");
+        return;
+    }
+    const QVariantMap own{{QStringLiteral("speed"), 1.0}, {QStringLiteral("mute"), true}, {QStringLiteral("tint"), QStringLiteral("#ffffff")},
+                          {QStringLiteral("volume"), 1.0}};
+    const auto framed = [&](const char* mode, double zoom, double x, double y) {
+        QVariantMap values = own;
+        values.insert({{QStringLiteral("position"), QString::fromLatin1(mode)}, {QStringLiteral("position.zoom"), zoom},
+                       {QStringLiteral("position.x"), x}, {QStringLiteral("position.y"), y}});
+        return values;
+    };
+
+    // GOAL: S15.732 -- Apply sends the position with the wallpaper's own values in SetWallpaperWithProperties:
+    //       the mode as a string, zoom and offsets as doubles even when set from integers, all four always,
+    //       and the set is one the daemon's own rules would show a video with.
+    // WHY-THIS-SHAPE: compared as text naming each type, since QVariant's == takes an int for a double;
+    //       the daemon cross-check refuses any type but double, bool and string, as the wire does.
+    // CONTROL: app/library/wpx_package.cpp Wallpaper::accept() keeping `value` for a number (control_batch
+    //       2026-10-18, reverted) -> red, "S15.732: Apply sent {..., position.zoom=2(int), ...} (1 call(s)), not
+    //       {..., position.zoom=2(double), ...}", and the S15.733 and S15.734 lines likewise.
+    const bool applied = rig.apply();
+    const QVariantMap sent = lastOf(withProperties(), 3);
+    const QVariantMap wantApplied = framed("free", 2.0, -0.25, 0.0);
+    const std::string appliedVerdict = daemonVerdictOnSent(sent, "video");
+    expect(applied && withProperties().size() == 1 && describeMap(sent) == describeMap(wantApplied) && appliedVerdict.empty(),
+           QStringLiteral("S15.732: Apply sent %1 (%2 call(s)), not %3; the daemon would say \"%4\"")
+               .arg(describeMap(sent)).arg(withProperties().size()).arg(describeMap(wantApplied), QString::fromStdString(appliedVerdict)));
+    if (!applied || rig.applier->liveOutput() != u"DP-1") {
+        harnessFailure(std::string(goals) + ": the Apply did not leave DP-1 live, so no live edit can be graded");
+        return;
+    }
+
+    // GOAL: S15.733 -- while live, a position edit sends SetWallpaperProperties(id, the whole set) with the
+    //       new value typed for the daemon: an integer offset as a double, a mode as a string.
+    // CONTROL: the same break -> red, "S15.733: the live edit sent {..., position.y=1(int), position.zoom=2(int),
+    //       ...} (1 call(s)), not {..., position.y=1(double), position.zoom=2(double), ...}".
+    const bool settled = rig.repliesHandled() && rig.daemonDrained();
+    rig.daemonFake->calls.clear();
+    rig.library->setPropertyValue(QStringLiteral("position.y"), 1);
+    const bool editSent = waitUntil([&] { return !edits().isEmpty(); }, kWaitMs) && rig.daemonDrained();
+    const QVariantMap edited = lastOf(edits(), 1);
+    const QVariantMap wantEdited = framed("free", 2.0, -0.25, 1.0);
+    const std::string editVerdict = daemonVerdictOnSent(edited, "video");
+    expect(settled && editSent && edits().size() == 1 && edits()[0].signature == u"ia{sv}" && describeMap(edited) == describeMap(wantEdited) &&
+               editVerdict.empty(),
+           QStringLiteral("S15.733: the live edit sent %1 (%2 call(s)), not %3; the daemon would say \"%4\"")
+               .arg(describeMap(edited)).arg(edits().size()).arg(describeMap(wantEdited), QString::fromStdString(editVerdict)));
+
+    // GOAL: S15.734 -- a mode changed while the daemon is gone reaches the daemon that returns in the
+    //       SetWallpaperWithProperties re-send, the framing kept beside it.
+    // WHY-THIS-SHAPE: graded on the call the returned stand-in received, as S15.647 is; the wait's deadline
+    //       fails the check.
+    // CONTROL: app/daemon/daemon_client.cpp `emit serviceStarted();` deleted (control_batch 2026-10-18,
+    //       reverted) -> red, "S15.734: after the daemon returned it received {} (0 call(s)), not {..., position=fit(QString), ...}".
+    const bool quiet = rig.repliesHandled() && rig.daemonDrained();
+    rig.daemonFake->stop();
+    const bool gone = waitUntil([&] { return rig.client->state() == DaemonClient::State::Unavailable; }, kWaitMs);
+    rig.library->setPropertyValue(QStringLiteral("position"), QStringLiteral("fit"));
+    const bool refusedShown = waitUntil([&] { return !rig.applier->liveError().isEmpty(); }, kWaitMs);
+    rig.daemonFake->calls.clear();
+    const QString restarted = rig.daemonFake->start();
+    if (!quiet || !gone || !refusedShown || !restarted.isEmpty()) {
+        harnessFailure(std::string(goals) + ": the daemon's restart could not be staged: " + restarted.toStdString());
+        return;
+    }
+    const QVariantMap wantResent = framed("fit", 2.0, -0.25, 1.0);
+    const bool resent = waitUntil([&] { return describeMap(lastOf(withProperties(), 3)) == describeMap(wantResent); }, kWaitMs);
+    expect(resent && daemonVerdictOnSent(lastOf(withProperties(), 3), "video").empty(),
+           QStringLiteral("S15.734: after the daemon returned it received %1 (%2 call(s)), not %3")
+               .arg(describeMap(lastOf(withProperties(), 3))).arg(withProperties().size()).arg(describeMap(wantResent)));
 }
 
 void failureSentences() {
@@ -1980,6 +2088,7 @@ int main(int argc, char* argv[]) {
     runPhase("freeIds", freeIds);
     runPhase("bindQueue", bindQueue);
     runPhase("liveEdits", liveEdits);
+    runPhase("positionOnTheWire", positionOnTheWire);
     runPhase("failureSentences", failureSentences);
     runPhase("pauseModes", pauseModes);
     runPhase("daemonPresence", daemonPresence);

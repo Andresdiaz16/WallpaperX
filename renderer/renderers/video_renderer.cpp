@@ -12,6 +12,7 @@
 #include "../vulkan/offscreen.h"
 
 #include <array>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -142,11 +143,22 @@ void VideoRenderer::show(const VideoFrame& frame) {
     m_frame = frame;
 }
 
+void VideoRenderer::place(const Placement& placement) {
+    if (!positionModeShowsVideo(placement.mode)) {
+        throw std::invalid_argument(std::string("VideoRenderer: a video cannot be drawn in position mode ") +
+                                    toString(placement.mode));
+    }
+    if (!placementAllowed(placement)) {
+        throw std::invalid_argument("VideoRenderer: a zoom or offset outside what Free mode allows");
+    }
+    m_placement = placement;
+}
+
 VkImageLayout VideoRenderer::record(VkCommandBuffer cmd, const OffscreenTarget& target) {
-    // The blit covers every pixel of the target, so whatever it held is discarded. The frame's
-    // device writes are made visible from whichever stage produced them -- a decode, a copy, a
-    // draw -- since nothing here knows which; host writes need only have been flushed before
-    // the submit, which orders them itself.
+    // Whatever the target held is discarded: either the blit covers every pixel, or the clear
+    // below does first. The frame's device writes are made visible from whichever stage produced
+    // them -- a decode, a copy, a draw -- since nothing here knows which; host writes need only
+    // have been flushed before the submit, which orders them itself.
     const std::array<VkImageMemoryBarrier, 2> before{
         imageLayoutBarrier(target.image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                       VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT),
@@ -156,18 +168,37 @@ VkImageLayout VideoRenderer::record(VkCommandBuffer cmd, const OffscreenTarget& 
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                          nullptr, static_cast<uint32_t>(before.size()), before.data());
 
-    const Crop crop = coverCrop(m_frame.source.width, m_frame.source.height, target.width, target.height);
+    const std::optional<Region> region =
+        placedRegion(m_placement, m_frame.source.width, m_frame.source.height, target.width, target.height);
+    const bool covers = region && region->target.x0 == 0 && region->target.y0 == 0 &&
+                        region->target.x1 == static_cast<int32_t>(target.width) &&
+                        region->target.y1 == static_cast<int32_t>(target.height);
+    if (!covers) {
+        constexpr VkClearColorValue kBlack{{0.0f, 0.0f, 0.0f, 1.0f}};
+        constexpr VkImageSubresourceRange kWhole{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cmd, target.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &kBlack, 1, &kWhole);
+        if (region) {
+            const VkImageMemoryBarrier cleared =
+                imageLayoutBarrier(target.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                   VK_ACCESS_TRANSFER_WRITE_BIT);
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                                 0, nullptr, 1, &cleared);
+        }
+    }
 
-    VkImageBlit blit{};
-    blit.srcSubresource = kBaseLayer;
-    blit.srcOffsets[0] = {crop.x0, crop.y0, 0};
-    blit.srcOffsets[1] = {crop.x1, crop.y1, 1};
-    blit.dstSubresource = kBaseLayer;
-    blit.dstOffsets[0] = {0, 0, 0};
-    blit.dstOffsets[1] = {static_cast<int32_t>(target.width), static_cast<int32_t>(target.height), 1};
+    if (region) {
+        VkImageBlit blit{};
+        blit.srcSubresource = kBaseLayer;
+        blit.srcOffsets[0] = {region->source.x0, region->source.y0, 0};
+        blit.srcOffsets[1] = {region->source.x1, region->source.y1, 1};
+        blit.dstSubresource = kBaseLayer;
+        blit.dstOffsets[0] = {region->target.x0, region->target.y0, 0};
+        blit.dstOffsets[1] = {region->target.x1, region->target.y1, 1};
 
-    vkCmdBlitImage(cmd, m_frame.image, kBlitSourceLayout, target.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                   &blit, VK_FILTER_LINEAR);
+        vkCmdBlitImage(cmd, m_frame.image, kBlitSourceLayout, target.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &blit, VK_FILTER_LINEAR);
+    }
 
     // Back to the owner's layout, ordered before anything it submits next. The batch either runs
     // whole or not at all, so the frame is in that layout on both sides of every render and no

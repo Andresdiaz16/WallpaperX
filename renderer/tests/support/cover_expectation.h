@@ -2,10 +2,10 @@
 
 #pragma once
 
-// The region of a source that "scaled to cover, cropped centrally" shows, stated in real
-// arithmetic for the probes that grade it. Deliberately NOT renderers/cover_crop.h's
-// integer-product form: a copy of the implementation would agree with it however both were
-// wrong. The two differ by under a texel, which each caller's tolerance accounts for.
+// The region of a source that "scaled to cover, cropped centrally" shows, stated as a crop rather
+// than through renderers/cover_crop.h's placedRegion(), which works from a scale and a start: a
+// copy of the implementation would agree with it however both were wrong. It is the exact crop a
+// still samples; a video's blit rounds its cut edges to whole texels, which each caller allows for.
 
 #include <algorithm>
 #include <cstdint>

@@ -95,9 +95,9 @@ Wallpaper LibraryManager::selectedWallpaper() const
 
 QVariantMap LibraryManager::propertyValues() const
 {
-    QVariantMap values;
-    for (const WallpaperProperty& property : selectedWallpaper().properties) {
-        values.insert(property.key, m_edits.value(property.key, property.defaultValue));
+    QVariantMap values = selectedWallpaper().defaultValues();
+    for (auto it = m_edits.cbegin(); it != m_edits.cend(); ++it) {
+        values.insert(it.key(), it.value());
     }
     return values;
 }
@@ -172,9 +172,9 @@ void LibraryManager::settle(State state, QString reason, QList<Wallpaper> wallpa
             m_edits.clear();
         } else {
             QVariantMap edits;
-            for (const WallpaperProperty& property : kept->properties) {
-                if (const auto value = m_edits.contains(property.key) ? property.accept(m_edits.value(property.key)) : std::nullopt) {
-                    edits.insert(property.key, *value);
+            for (auto it = m_edits.cbegin(); it != m_edits.cend(); ++it) {
+                if (const auto value = kept->accept(it.key(), it.value())) {
+                    edits.insert(it.key(), *value);
                 }
             }
             m_edits = std::move(edits);
@@ -249,16 +249,21 @@ void LibraryManager::reveal(const QString& filePath)
 
 bool LibraryManager::setPropertyValue(const QString& key, const QVariant& value)
 {
-    const QList<WallpaperProperty> properties = selectedWallpaper().properties;
-    const auto it = std::ranges::find(properties, key, &WallpaperProperty::key);
-    if (it == properties.end()) {
-        return false;
+    return setPropertyValues({{key, value}});
+}
+
+bool LibraryManager::setPropertyValues(const QVariantMap& values)
+{
+    const Wallpaper selected = selectedWallpaper();
+    QVariantMap accepted;
+    for (auto it = values.cbegin(); it != values.cend(); ++it) {
+        const auto value = selected.accept(it.key(), it.value());
+        if (!value) {
+            return false;
+        }
+        accepted.insert(it.key(), *value);
     }
-    const auto accepted = it->accept(value);
-    if (!accepted) {
-        return false;
-    }
-    changeSelection([&] { m_edits.insert(key, *accepted); });
+    changeSelection([&] { m_edits.insert(accepted); });
     return true;
 }
 

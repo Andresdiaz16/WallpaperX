@@ -103,6 +103,8 @@ add_library(wallpaperx-renderer STATIC
 target_include_directories(wallpaperx-renderer
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
+        # wallpaper_position.h, which the daemon and the app include too.
+        ${CMAKE_CURRENT_SOURCE_DIR}/../shared
         ${Vulkan_INCLUDE_DIRS}
         ${STB_INCLUDE_DIR}
         ${VMA_INCLUDE_DIR}

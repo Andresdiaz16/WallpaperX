@@ -14,12 +14,16 @@
 
 namespace wallpaperx::apptest {
 
-// A property value as SetWallpaperWithProperties carries it: double, bool, or "#rrggbb".
+// A property value as SetWallpaperWithProperties carries it: double, bool, or "#rrggbb" or a
+// position mode's name.
 using DaemonValue = std::variant<double, bool, std::string>;
 
 // backend/daemon/wallpaper_properties.cpp's propertiesError(): empty when the daemon would store
-// `properties`, otherwise its reason. A colour that is not "#rrggbb" comes back as a reason too.
+// `properties`, otherwise its reason. A string that is neither comes back as a reason too.
 std::string daemonPropertiesError(const std::vector<std::pair<std::string, DaemonValue>>& properties);
+// The same, then positionError() for a wallpaper of `type` ("static", "video", ...): empty when the
+// daemon would show a wallpaper of that type with `properties`.
+std::string daemonShowError(const std::vector<std::pair<std::string, DaemonValue>>& properties, const std::string& type);
 
 // backend/daemon/pause_mode.h: the names SetMonitorPause takes, in the daemon's order.
 std::vector<std::string> daemonPauseModeNames();

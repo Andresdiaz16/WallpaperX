@@ -709,6 +709,182 @@ void importerViews(QQmlEngine& engine, QQuickWindow& window, const QString& root
            QStringLiteral("S15.82: after Dismiss the notices are [%1]").arg(importer.notices().join(QStringLiteral(" | "))));
 }
 
+// S15.727-S15.731: the detail view's position controls, on a still and a video of their own.
+void positionControls(QQmlEngine& engine, QQuickWindow& window, const QString& scratchPath) {
+    constexpr const char* goals = "S15.727-S15.731";
+    const QString dir = scratchPath + QStringLiteral("/positions");
+    OrderedJson still = planManifest();
+    still["type"] = "static";
+    still.erase("properties");
+    if (!writeFolder(dir + QStringLiteral("/art"), planEntries(jsonBytes(still))).isEmpty() ||
+        !writeFolder(dir + QStringLiteral("/clip"), planEntries(QByteArray(kPlanManifest))).isEmpty()) {
+        harnessFailure(std::string(goals) + ": the wallpaper folders could not be written");
+        return;
+    }
+    LibraryManager library(dir, 30);
+    KScreenClient kscreen(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.KScreen.unowned"));
+    DaemonClient daemon(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.Daemon.unowned"));
+    PlasmaController plasma(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.PlasmaShell.unowned"));
+    ApplyController applier(kscreen, library, daemon, plasma);
+    library.rescan();
+    if (!waitUntil([&] { return library.state() == LibraryManager::State::Ready && library.wallpapers().size() == 2; }, kWaitMs) ||
+        !library.select(dir + QStringLiteral("/art"))) {
+        harnessFailure(std::string(goals) + ": the still was never listed and opened");
+        return;
+    }
+    const auto view = load(engine, window, "WallpaperDetail", library, nullptr, &applier);
+    if (!view || !settleEvents(window)) {
+        notVerified(goals, "the detail view did not load or was never laid out");
+        return;
+    }
+    const auto buttonText = [&](const QString& text) -> QQuickItem* {
+        for (QQuickItem* b : allInheriting(view.get(), "QQuickAbstractButton")) {
+            if (b->property("text").toString() == text) {
+                return b;
+            }
+        }
+        return nullptr;
+    };
+    const auto shown = [&](const QString& text) { QQuickItem* b = buttonText(text); return b && b->isVisible(); };
+    const auto press = [&](const QString& text) {
+        QQuickItem* b = buttonText(text);
+        if (!b || !b->isVisible()) {
+            return false;
+        }
+        QTest::mouseClick(&window, Qt::LeftButton, {}, centreOf(b));
+        return settleEvents(window);
+    };
+    // A still declaring nothing has no other slider, so the visible ones are the free rows: zoom, x, y.
+    const auto sliders = [&] {
+        QList<QQuickItem*> out;
+        for (QQuickItem* s : allInheriting(view.get(), "QQuickSlider")) {
+            if (s->isVisible()) {
+                out.append(s);
+            }
+        }
+        std::ranges::sort(out, {}, [](const QQuickItem* s) { return s->mapToScene(QPointF(0, 0)).y(); });
+        return out;
+    };
+    // As a drag ends: the value set, then the moved() signal the slider emits for a user's change.
+    const auto drag = [&](QQuickItem* slider, double value) {
+        slider->setProperty("value", value);
+        QMetaObject::invokeMethod(slider, "moved");
+        settleEvents(window);
+    };
+    const auto value = [&](const char* key) { return library.propertyValues().value(QString::fromLatin1(key)); };
+    const auto framing = [&] {
+        return QStringLiteral("%1 zoom %2 x %3 y %4").arg(value("position").toString()).arg(value("position.zoom").toDouble()).arg(value("position.x").toDouble()).arg(value("position.y").toDouble());
+    };
+    const QStringList modes{QStringLiteral("Cover"), QStringLiteral("Fit"), QStringLiteral("Center"), QStringLiteral("Tile"), QStringLiteral("Stretch"), QStringLiteral("Free")};
+    const auto shownModes = [&] {
+        QStringList out;
+        for (const QString& mode : modes) {
+            if (shown(mode)) {
+                out.append(mode);
+            }
+        }
+        return out.join(u',');
+    };
+
+    // GOAL: S15.727 -- the detail view offers one button per mode the wallpaper takes (all six for a still,
+    //       no Tile for a video), clicking one sets "position", and the zoom and offset rows and Frame as
+    //       Cover are shown only in Free.
+    // WHY-THIS-SHAPE: clicked through the window, so a button that is drawn but sets nothing is red; the
+    //       free rows are counted as visible sliders, which a still declaring nothing has no others of.
+    // CONTROL: app/qml/WallpaperDetail.qml, control_batch 2026-10-18, each reverted: the mode button's onClicked
+    //       made `{}` -> red, "S15.727: the still shows [Cover,...,Free], free rows hidden in cover 1, Tile took 0,
+    //       Free took 0 and shows 0 slider(s)"; Frame as Cover's `visible:` made `true` -> red, "... free rows
+    //       hidden in cover 0, ...".
+    const bool coverHidden = sliders().isEmpty() && !shown(QStringLiteral("Frame as Cover"));
+    const QString stillModes = shownModes();
+    const bool tiled = press(QStringLiteral("Tile")) && value("position") == QVariant(QStringLiteral("tile")) && sliders().isEmpty();
+    const bool freed = press(QStringLiteral("Free")) && value("position") == QVariant(QStringLiteral("free"));
+    const QList<QQuickItem*> freeSliders = sliders();
+    expect(coverHidden && stillModes == modes.join(u',') && tiled && freed && freeSliders.size() == 3 && shown(QStringLiteral("Frame as Cover")),
+           QStringLiteral("S15.727: the still shows [%1], free rows hidden in cover %2, Tile took %3, Free took %4 and shows %5 slider(s)")
+               .arg(stillModes).arg(coverHidden).arg(tiled).arg(freed).arg(freeSliders.size()));
+    if (freeSliders.size() != 3) {
+        return;
+    }
+    QQuickItem* zoomSlider = freeSliders[0];
+    QQuickItem* xSlider = freeSliders[1];
+
+    // GOAL: S15.728 -- the zoom slider runs on a log scale from 0.1 to 10: at zoom 1 it sits halfway, and
+    //       dragging it to three quarters sets zoom to the square root of 10.
+    // WHY-THIS-SHAPE: the drag goes through the slider's own moved() handler, so a linear mapping (0.5 ->
+    //       zoom 0.5) is red, and reading the slider's position at zoom 1 catches a wrong value binding.
+    // CONTROL: app/qml/WallpaperDetail.qml the zoom slider's `onMoved: root.setZoom(Math.pow(10, value))` made
+    //       `root.setZoom(value)` (control_batch 2026-10-18, reverted) -> red, "S15.728: the zoom slider sat at 0.5
+    //       of its track at zoom 1, and three quarters set free zoom 0.5 x 0 y 0".
+    const double from = zoomSlider->property("from").toDouble();
+    const double to = zoomSlider->property("to").toDouble();
+    const double atOne = zoomSlider->property("position").toDouble();
+    drag(zoomSlider, from + (to - from) * 0.75);
+    expect(std::abs(atOne - 0.5) < 1e-9 && std::abs(value("position.zoom").toDouble() - std::sqrt(10.0)) < 1e-9 &&
+               value("position.zoom").typeId() == QMetaType::Double,
+           QStringLiteral("S15.728: the zoom slider sat at %1 of its track at zoom 1, and three quarters set %2").arg(atOne).arg(framing()));
+
+    // GOAL: S15.729 -- the offset sliders reach min(10, zoom/2 + 0.4) each way, and lowering the zoom with
+    //       its slider pulls an offset beyond the new reach back to it, keeping its sign.
+    // WHY-THIS-SHAPE: offsets of 2 and -3 are set first (both legal at zoom 10), then zoom is dragged to 0.5,
+    //       whose reach is 0.65, so a page that only bounded the sliders and not the stored values is red.
+    //       The drag that pulls both offsets in is one change notice (S15.787).
+    // CONTROL: app/qml/WallpaperDetail.qml, control_batch 2026-10-18, each reverted: setZoom()'s
+    //       `if (Math.abs(offset) > reach)` made `if (false)` -> red, "S15.729: ... after the drag it reads free
+    //       zoom 0.5 x 2 y -3"; the offset slider's `from: -root.offsetReach(root.zoom)` made
+    //       `-Positioning.maximumOffset` -> red, "... -10 to 0.65 at zoom 0.5 ..."; setZoom()'s
+    //       `root.library.setPropertyValues(values);` made one setPropertyValue per key -> red, "... in 3 notice(s)".
+    const bool spread = library.setPropertyValue(QStringLiteral("position.zoom"), 10.0) && library.setPropertyValue(QStringLiteral("position.x"), 2.0) &&
+                        library.setPropertyValue(QStringLiteral("position.y"), -3.0) && settleEvents(window);
+    const double reachAtTen = xSlider->property("to").toDouble();
+    int notices = 0;
+    const auto noticeCount = QObject::connect(&library, &LibraryManager::propertyValuesChanged, [&notices] { ++notices; });
+    drag(zoomSlider, std::log10(0.5));
+    const int dragNotices = notices;
+    const double reachAtHalf = xSlider->property("to").toDouble();
+    const double fromAtHalf = xSlider->property("from").toDouble();
+    expect(spread && std::abs(reachAtTen - 5.4) < 1e-9 && std::abs(reachAtHalf - 0.65) < 1e-9 && std::abs(fromAtHalf + 0.65) < 1e-9 &&
+               std::abs(value("position.zoom").toDouble() - 0.5) < 1e-9 && std::abs(value("position.x").toDouble() - 0.65) < 1e-9 &&
+               std::abs(value("position.y").toDouble() + 0.65) < 1e-9 && dragNotices == 1,
+           QStringLiteral("S15.729: the offset reach was %1 at zoom 10 and %2 to %3 at zoom 0.5; after the drag it reads %4, in %5 notice(s)")
+               .arg(reachAtTen).arg(fromAtHalf).arg(reachAtHalf).arg(framing()).arg(dragNotices));
+
+    // GOAL: S15.731 -- choosing another mode and coming back to Free keeps the zoom and offsets.
+    // CONTROL: app/qml/WallpaperDetail.qml the mode button's onClicked also setting zoom to 1 (control_batch
+    //       2026-10-18, reverted) -> red, "S15.731: framed as "free zoom 0.5 x 0.3 y -0.65", Fit took 1, and back
+    //       in Free it reads "free zoom 1 x 0.3 y -0.65"".
+    drag(xSlider, 0.3);
+    const QString before = framing();
+    const bool fit = press(QStringLiteral("Fit")) && value("position") == QVariant(QStringLiteral("fit"));
+    const bool back = press(QStringLiteral("Free"));
+    expect(fit && back && framing() == before && std::abs(value("position.x").toDouble() - 0.3) < 1e-9,
+           QStringLiteral("S15.731: framed as \"%1\", Fit took %2, and back in Free it reads \"%3\"").arg(before).arg(fit).arg(framing()));
+
+    // GOAL: S15.730 -- Frame as Cover puts zoom back to 1 and both offsets to 0, as doubles, and stays in Free;
+    //       S15.787 -- in one change notice.
+    // CONTROL: app/qml/WallpaperDetail.qml, control_batch 2026-10-18, each reverted: the `[Positioning.zoomKey]: 1.0`
+    //       entry deleted from Frame as Cover's map -> red, "S15.730: after Frame as Cover it reads "free zoom 0.5
+    //       x 0 y 0" ..."; its one setPropertyValues call made three setPropertyValue calls -> red, "... in 3 notice(s)".
+    notices = 0;
+    const bool reframed = press(QStringLiteral("Frame as Cover"));
+    const int coverNotices = notices;
+    QObject::disconnect(noticeCount);
+    expect(reframed && framing() == u"free zoom 1 x 0 y 0" && value("position.zoom").typeId() == QMetaType::Double &&
+               value("position.x").typeId() == QMetaType::Double && value("position.y").typeId() == QMetaType::Double &&
+               coverNotices == 1,
+           QStringLiteral("S15.730: after Frame as Cover it reads \"%1\" (%2, %3, %4), in %5 notice(s)")
+               .arg(framing(), QLatin1StringView(value("position.zoom").typeName()), QLatin1StringView(value("position.x").typeName()),
+                    QLatin1StringView(value("position.y").typeName()))
+               .arg(coverNotices));
+
+    // GOAL: S15.727 for a video -- no Tile button, the other five shown.
+    // CONTROL: app/qml/WallpaperDetail.qml the mode Repeater's `model: root.chosen.positionModes` made a
+    //       literal list of all six (control_batch 2026-10-18, reverted) -> red, "S15.727: the video (opened 1)
+    //       shows [Cover,Fit,Center,Tile,Stretch,Free]".
+    const bool video = library.select(dir + QStringLiteral("/clip")) && settleEvents(window);
+    expect(video && shownModes() == u"Cover,Fit,Center,Stretch,Free", QStringLiteral("S15.727: the video (opened %1) shows [%2]").arg(video).arg(shownModes()));
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -768,6 +944,7 @@ int main(int argc, char* argv[]) {
             detail(engine, window, *library, *applier, ocean);
             busyGrid(engine, window, scratch.path());
             importerViews(engine, window, scratch.path());
+            positionControls(engine, window, scratch.path());
         }
     }
     applier.reset();
