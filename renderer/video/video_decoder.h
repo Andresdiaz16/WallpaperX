@@ -49,9 +49,9 @@ struct FrameColour {
 // same questions of either. A device picture sits at its image's origin, and the image can be
 // larger: AV1 keeps its images across a change to a smaller size.
 //
-// GPU thread only, destruction included: the destructor may have to ask the Device whether the
-// GPU has finished reading the image, and that is asked nowhere else. Must be destroyed before
-// the Device that decoded it. Destroying the last frame of a decoder that is already gone tears
+// Made on whichever thread decodes; used and destroyed on the GPU thread only: the destructor may
+// have to ask the Device whether the GPU has finished reading the image, and that is asked nowhere
+// else. Must be destroyed before the Device that decoded it. Destroying the last frame of a decoder that is already gone tears
 // the decoder's image pool down, which waits without bound for every batch that read those
 // images; the destructor leaks the pool instead when a batch of this renderer's has not
 // finished. Using a moved-from frame throws std::logic_error.
@@ -105,7 +105,8 @@ public:
         // the decoder's next barrier on this image names this layout as the old one.
         VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     };
-    // Throws std::logic_error on a host frame.
+    // Read under ffmpeg's lock on the frame, which must not be held by the caller: it is a plain
+    // mutex. Throws std::logic_error on a host frame.
     DeviceImage deviceImage() const;
 
     // Submits a batch that reads the device image, ordered after the decoder's write of it and
@@ -114,11 +115,15 @@ public:
     // frame's value, signal one higher, and record the new value only once the submit has
     // succeeded -- a recorded value nothing signals hangs the decoder's teardown forever.
     //
+    // `record` is given the image as it stands under ffmpeg's lock on the frame, which is held
+    // until the batch is submitted: a decoder on another thread can move the image to another
+    // layout while it references the picture, and does so under that lock.
+    //
     // `readStage` is where the batch first reads the image. `scope` is the caller's other
     // ordering, kept intact. Throws what Device::submit throws, and std::logic_error on a host
     // frame. GPU thread only.
-    Device::SubmitTicket submit(const std::function<void(VkCommandBuffer)>& record, VkPipelineStageFlags readStage,
-                                Device::SubmitScope scope = {});
+    Device::SubmitTicket submit(const std::function<void(VkCommandBuffer, const DeviceImage&)>& record,
+                                VkPipelineStageFlags readStage, Device::SubmitScope scope = {});
 
     struct HostPlanes {
         uint32_t count = 0;
@@ -134,6 +139,8 @@ private:
     DecodedFrame(Device& device, AVFrame* frame);
     const AVFrame& frame() const;
     void release() noexcept;
+    // deviceImage() for a caller already holding the frame's lock.
+    DeviceImage deviceImageLocked() const;
 
     Device* m_device = nullptr;
     AVFrame* m_frame = nullptr;
@@ -147,8 +154,10 @@ private:
 
 // Demuxes one file and decodes its video stream on this GPU's hardware decoder when the device
 // can, and in software when it cannot -- which is a property of the device and the stream, not
-// a failure. Every entry point is GPU thread only: ffmpeg submits to the decode queue and,
-// preparing images, to the graphics queue too, and neither is free-threaded.
+// a failure. Made and destroyed on the GPU thread. next() and restart() are called by one thread
+// at a time, which is the GPU thread unless Device::queuesInternallySynchronized(): ffmpeg
+// submits to the decode queue and, preparing images, to the graphics queue the Device submits
+// to. Decoding off the GPU thread also needs askDeviceThrough().
 //
 // A refusal and a fault are told apart deliberately rather than by ffmpeg's own fallback,
 // which retries in software after any failure. The device is asked whether it accepts the
@@ -160,9 +169,9 @@ private:
 // means decoding continues in software, as next() describes.
 //
 // The decoder ffmpeg is asked for is the one that can use this device, which for AV1 is a
-// hardware-only shim, and it is opened single-threaded so ffmpeg never touches a queue off
-// the GPU thread. Neither suits software, so a refusal reopens the stream on ffmpeg's default
-// decoder with its default threads.
+// hardware-only shim, and it is opened single-threaded so ffmpeg touches the queues only on the
+// thread that calls next(). Neither suits software, so a refusal reopens the stream on ffmpeg's
+// default decoder with its default threads.
 //
 // Frames handed out may outlive this decoder but not the Device. A size or format change
 // mid-stream leaves an image pool no picture uses, and a switch to software leaves the hardware
@@ -283,6 +292,17 @@ public:
 
     Path path() const { return m_path; }
 
+    // How a decoder whose next() runs off the GPU thread asks whether the device still answers,
+    // which only the GPU thread can find out: `ask` must put the question to it and return its
+    // answer, or false when it will not be answered. Unset, the decoder asks the Device itself.
+    // Not used by the destructor, which is on the GPU thread.
+    void askDeviceThrough(std::function<bool()> ask) { m_askDevice = std::move(ask); }
+
+    // The question askDeviceThrough() routes: an empty batch through `device`, which a device
+    // that is lost or has stopped fails. GPU thread only. Throws what Device::immediateSubmit
+    // throws but GpuFailure.
+    static bool deviceAnswers(Device& device);
+
     // The highest level next() applies, decided by the codec; one asked above it is applied as this.
     // H.264 and HEVC: NonKey in software, Unreferenced while the stream is or may be decoded on the
     // device, where FFmpeg 9.0.2's Vulkan decode, given a reference picture skipped, binds a stand-in
@@ -293,8 +313,10 @@ public:
 
 private:
     std::variant<std::optional<DecodedFrame>, Dropping> decode(std::optional<uint32_t> dropLimit, PictureSkip skip);
-    // ffmpeg's format negotiation. A software codec's frame threads call it off the GPU thread, so on
-    // that path it reads nothing of the decoder and writes only m_softwareFormatRefused.
+    // Aborts off the GPU thread unless the device's queues are internally synchronised.
+    void assertMayDecodeHere(const char* what) const;
+    // ffmpeg's format negotiation. A software codec's frame threads call it off the thread that calls
+    // next(), so on that path it reads nothing of the decoder and writes only m_softwareFormatRefused.
     static AVPixelFormat chooseFormat(AVCodecContext* codec, const AVPixelFormat* offered);
     AVPixelFormat choose(AVCodecContext* codec, const AVPixelFormat* offered);
     bool attachHardwareFrames(AVCodecContext* codec);
@@ -475,11 +497,12 @@ private:
     std::optional<int64_t> m_startedAfter;
     // A failure decided inside the format callback, which cannot throw through ffmpeg's frames;
     // rethrown when ffmpeg reports the error that follows. Hardware only, whose codec is
-    // single-threaded and so calls back on the GPU thread.
+    // single-threaded and so calls back on the thread that called next().
     std::exception_ptr m_parkedFailure;
     // A software codec's stream offered no plain format. Set by the format callback on whichever
     // frame thread runs it; decode() turns it into the file's failure. Per codec: openDecoder() clears it.
     std::atomic<bool> m_softwareFormatRefused{false};
+    std::function<bool()> m_askDevice;
 };
 
 }

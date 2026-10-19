@@ -92,13 +92,23 @@ public:
 
     // Every decode family this device was created with; empty exactly when
     // info().videoDecodeOps is zero. Nothing in this Device submits to these queues. They exist
-    // to be handed to a decoder library, and every one of them -- the shared graphics queue
-    // above all -- is externally synchronised, so that library has to submit on the GPU thread.
+    // to be handed to a decoder library, which also submits to the graphics queue. Unless
+    // queuesInternallySynchronized(), every queue is externally synchronised and that library
+    // has to submit on the GPU thread.
     //
     // What that library submits is invisible here: wait(), waitForSubmissions(), safeToFree()
     // and teardown cover only batches this Device submitted, so a decoder's outstanding work is
     // the decoder's to drain before anything it read or wrote is freed.
     const std::vector<VideoDecodeFamily>& videoDecodeFamilies() const { return m_videoDecodeFamilies; }
+
+    // Whether every queue this device has was created internally synchronised
+    // (VK_KHR_internally_synchronized_queues), so a decoder library may submit to it from
+    // another thread while this Device submits from the GPU thread. Only asked for where there
+    // is a decoder to share the queues with. Read off the feature chain the library is given,
+    // which is also how the library learns to fetch its queues the same way.
+    bool queuesInternallySynchronized() const {
+        return m_features.internallySynchronizedQueues.internallySynchronizedQueues == VK_TRUE;
+    }
 
     const DeviceInfo& info() const { return m_info; }
     DescriptorTier descriptorTier() const { return m_selectedTier; }
@@ -267,6 +277,14 @@ public:
     // child of it lives is invalid even once the GPU has caught up.
     void recordLeak(const char* whatIsLeaked) noexcept;
 
+    // recordLeak() for a caller that has left a thread running which still uses this Device: one
+    // it told to stop and could wait for no longer. From then on no Device in this process is
+    // freed (DeviceDeleter), and the process must end without running static destructors, which
+    // would unload the driver and ffmpeg under that thread.
+    void recordThreadLeftRunning(const char* whatIsLeaked) noexcept;
+    // Whether recordThreadLeftRunning() has been called in this process. Any thread.
+    static bool threadLeftRunning() noexcept;
+
     // Whether a queue submission or a fence query on this Device has returned
     // VK_ERROR_DEVICE_LOST. Permanent once true, as the loss is: nothing this Device submits can
     // run again. Object creation still succeeds on a lost device, so no creation call is asked.
@@ -274,11 +292,13 @@ public:
 
     // Names the most recent batch submitted, or nothing at all when there has been none.
     // What a caller records when it stops using something the GPU may be reading: no batch
-    // submitted after this point can reach it, so this is the last one that could.
+    // submitted after this point can reach it, so this is the last one that could. Any thread.
     SubmitTicket lastSubmission() const;
 
     // Whether `ticket`'s batch has completed, without blocking. Only ever goes from false to
-    // true, and retires whatever has finished on the way.
+    // true. On the GPU thread it retires whatever has finished on the way; on any other it
+    // answers from the GPU thread's last look, so it can still say false for a batch that has
+    // finished since -- never true for one that has not.
     bool hasCompleted(SubmitTicket ticket);
 
     // Aborts unless called from the thread that created this Device.
@@ -302,9 +322,10 @@ public:
     // check and "externally synchronised" is not. This is the escape hatch for the one
     // legitimate handoff: an owner that has *joined* the render thread and is now tearing
     // the device down from its own. The caller must guarantee no other thread can touch
-    // the Device; calling it while the worker still runs re-points the check at the wrong
-    // thread and disables the very protection it exists for.
-    void adoptGpuThread() { m_gpuThread = std::this_thread::get_id(); }
+    // the Device but through lastSubmission() and hasCompleted(); calling it while the worker
+    // still runs re-points the check at the wrong thread and disables the very protection it
+    // exists for.
+    void adoptGpuThread() { m_gpuThread.store(std::this_thread::get_id(), std::memory_order_relaxed); }
 
 private:
     // Bounded wait for every batch still pending, for a caller that cannot throw. False means
@@ -389,10 +410,11 @@ private:
     std::vector<const char*> m_enabledDeviceExtensions;
 
     // The feature chain vkCreateDevice was given, kept whole so it can be read back. Linked
-    // from features2 through vulkan11, vulkan12, vulkan13, then the extension structs of the
-    // descriptor tier in use. A struct is linked and its flags set in one place, or neither:
-    // that is what lets an unlinked struct read VK_FALSE throughout, which every accessor
-    // above relies on. The links point into this object, which is why the Device is not movable.
+    // from features2 through vulkan11, vulkan12, vulkan13, the extension structs of the
+    // descriptor tier in use, then internallySynchronizedQueues. A struct is linked and its
+    // flags set in one place, or neither: that is what lets an unlinked struct read VK_FALSE
+    // throughout, which every accessor above relies on. The links point into this object,
+    // which is why the Device is not movable.
     struct EnabledFeatures {
         VkPhysicalDeviceFeatures2 features2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         VkPhysicalDeviceVulkan11Features vulkan11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
@@ -405,6 +427,8 @@ private:
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_UNTYPED_POINTERS_FEATURES_KHR};
         VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptorBuffer{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
+        VkPhysicalDeviceInternallySynchronizedQueuesFeaturesKHR internallySynchronizedQueues{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INTERNALLY_SYNCHRONIZED_QUEUES_FEATURES_KHR};
 
         EnabledFeatures() = default;
         EnabledFeatures(const EnabledFeatures&) = delete;
@@ -415,7 +439,9 @@ private:
     // The thread that constructed this Device, and therefore the only one allowed to
     // touch it. Captured rather than configured: whoever created the device is by
     // definition the GPU thread.
-    std::thread::id m_gpuThread = std::this_thread::get_id();
+    // Atomic because hasCompleted() reads it from a decoder's thread, which can still be running
+    // when an owner adopts the Device for teardown.
+    std::atomic<std::thread::id> m_gpuThread{std::this_thread::get_id()};
 
     DeviceInfo m_info;
     DescriptorTier m_selectedTier = DescriptorTier::Classic;
@@ -429,7 +455,11 @@ private:
     std::vector<VkCommandBuffer> m_freeCommandBuffers;
     // Every fence here is unsignalled -- retireCompleted() resets one before it lands.
     std::vector<VkFence> m_freeFences;
-    uint64_t m_nextSerial = 1;
+    // Written on the GPU thread only; atomic so lastSubmission() and hasCompleted() answer on
+    // any thread. Every serial up to m_completedThrough has completed, as retireCompleted()
+    // last found.
+    std::atomic<uint64_t> m_nextSerial{1};
+    std::atomic<uint64_t> m_completedThrough{0};
 
     // Whether something the GPU may still have been reading was left unfreed. Written only by
     // abandon(); destroying the device or the VMA allocator around an orphan is a validation

@@ -30,6 +30,10 @@
 # plain races between instrumented threads visible, which is what makes it so convincing
 # and so dangerous.
 
+# The tests' own pthread interposers send calls from every `called_from_lib` library below straight to
+# libc, as the sanitizer would (renderer/tests/support/sanitizer_ignored_caller.h). Add a library here
+# and add it there too, or an interposed lock from it reappears as a false lock-order cycle.
+
 # Most entries here match nothing on this machine; they cover hardware and configurations
 # this tier does not run. Do not delete one for matching zero. To re-measure, add
 # `print_suppressions=1` -- and keep the ICD pinned to Lavapipe, or the run selects NVIDIA
@@ -84,6 +88,26 @@ called_from_lib:libavutil.so
 # sd-bus runs the connection's event loop; its internal reference counting is
 # uninstrumented and shows up on every signal emission from the render thread.
 called_from_lib:libsystemd.so
+# sdbus-c++, the C++ layer over it, on the in-process bus tests (video_wallpaper resume phases,
+# both drivers; observed 2026-10-19). On a dispatch thread, pthread_mutex_lock is called from
+# libsdbus-c++.so, inside sdbus's deserializeArraySlow, on a mutex in a block libsdbus-c++.so
+# allocated on the main thread -- both accesses are sdbus-c++'s own, ordered through sd-bus where
+# the sanitizer cannot see. By function, deliberately: `called_from_lib:libsdbus-c++.so` hides
+# sdbus's own locks, and with it the order between a method handler and DbusService's destructor
+# -- measured that day, it turned every resume phase red with races that do not exist. Cost: a
+# race whose stack passes through sdbus's array deserialisation, which calls none of our code.
+race:sdbus::Message::deserializeArraySlow
+
+# The NVIDIA driver, seen only by the real-GPU tier (ctest -L tsan-gpu). A lock-order cycle
+# between two of the driver's own locks (observed 2026-10-19, video_pipeline probe on driver
+# 615.78.08): one taken by pthread_rwlock_wrlock called from libnvidia-eglcore.so inside
+# vkCreateDevice, the other by pthread_mutex_lock called from libnvidia-glsi.so inside a decode
+# submit; every acquisition in the report is the driver's own call. `deadlock:` only, not
+# `called_from_lib:`, so a data race touching the driver is still reported. Cost: a lock-order
+# report is hidden whenever one of its acquisition stacks passes through either library. No
+# version in the names, for the reason given at libgallium.
+deadlock:libnvidia-eglcore.so
+deadlock:libnvidia-glsi.so
 
 # Dormant: the only test these three cover, `qml_states`, is `no-tsan` and disabled in the
 # sanitizer tier. Kept for when that label is lifted.

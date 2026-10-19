@@ -662,6 +662,8 @@ void runHardwareChecks(Device& device) {
     //       does not wait on and signal exactly one semaphore"; (4) the signal moved to a fresh timeline
     //       semaphore, the stored value left -> "FAIL: the frame's batch waits on one semaphore and signals
     //       another". The value lines index only when the batch carried values, so (3) reports, not overreads.
+    //       Re-run 2026-10-19 (T7), video_decoder_hardware (RTX), submit() now reading the image under the frame's
+    //       lock: (1) and (2) held, the same lines.
     // COVERAGE-ASSERT: each bracket asserts that exactly one submit was recorded inside it, so a
     //       future change that routes the frame's work somewhere else -- or lets ffmpeg's own
     //       submissions fall into the window -- fails here rather than grading the wrong batch.
@@ -669,7 +671,7 @@ void runHardwareChecks(Device& device) {
 
     g_submits.clear();
     g_recordingSubmits = true;
-    Device::SubmitTicket ticket = first->submit([](VkCommandBuffer) {}, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    Device::SubmitTicket ticket = first->submit([](VkCommandBuffer, const DecodedFrame::DeviceImage&) {}, VK_PIPELINE_STAGE_TRANSFER_BIT);
     g_recordingSubmits = false;
     if (g_submits.size() != 1) {
         std::fprintf(stderr, "FAIL: reading the frame produced %zu submissions, not one\n", g_submits.size());
@@ -696,6 +698,7 @@ void runHardwareChecks(Device& device) {
     //       DecodedFrame::submit() waiting at VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, not `readStage` -> "FAIL: the
     //       frame's batch does not wait at the stage the caller named". A batch without exactly one stage is
     //       already red at the one-semaphore check above.
+    //       Re-run 2026-10-19 (T7), RTX: held, the same line.
     if (firstSubmit.waitStages.size() == 1) {
         check(firstSubmit.waitStages[0] == VK_PIPELINE_STAGE_TRANSFER_BIT,
               "the frame's batch does not wait at the stage the caller named");
@@ -709,7 +712,7 @@ void runHardwareChecks(Device& device) {
     // A second read must wait where the first one signalled: the stored value advanced.
     g_submits.clear();
     g_recordingSubmits = true;
-    ticket = first->submit([](VkCommandBuffer) {}, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    ticket = first->submit([](VkCommandBuffer, const DecodedFrame::DeviceImage&) {}, VK_PIPELINE_STAGE_TRANSFER_BIT);
     g_recordingSubmits = false;
     if (g_submits.size() != 1) {
         fail("the frame's second read batch could not be identified");
@@ -733,10 +736,11 @@ void runHardwareChecks(Device& device) {
     //       advanced the frame's stored semaphore value", then the wait for that batch reporting
     //       the Device's ten-second bound, and the process hanging in teardown until killed at a
     //       300-second timeout -- the teardown hang the header warns about. Reverted.
+    //       Re-run 2026-10-19 (T7), control_batch.sh, RTX: held, the same line, the hang included.
     bool submitThrew = false;
     g_failNextSubmitOnce = true;
     try {
-        (void)first->submit([](VkCommandBuffer) {}, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        (void)first->submit([](VkCommandBuffer, const DecodedFrame::DeviceImage&) {}, VK_PIPELINE_STAGE_TRANSFER_BIT);
     } catch (const std::exception&) {
         submitThrew = true;
     }
@@ -744,11 +748,12 @@ void runHardwareChecks(Device& device) {
     // CONTROL: control_batch.sh 2026-10-15, reverted, video_decoder_hardware (RTX), renderer/video/video_decoder.cpp: submit()
     //       catching the Device's exception and returning lastSubmission() -> "FAIL: an injected vkQueueSubmit
     //       failure did not reach the caller as an exception".
+    //       Re-run 2026-10-19 (T7), RTX: held, the same line.
     check(submitThrew, "an injected vkQueueSubmit failure did not reach the caller as an exception");
 
     g_submits.clear();
     g_recordingSubmits = true;
-    ticket = first->submit([](VkCommandBuffer) {}, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    ticket = first->submit([](VkCommandBuffer, const DecodedFrame::DeviceImage&) {}, VK_PIPELINE_STAGE_TRANSFER_BIT);
     g_recordingSubmits = false;
     if (g_submits.size() != 1) {
         fail("the read batch after the failed submit could not be identified");
@@ -1034,6 +1039,9 @@ void runClassifierChecks(Device& device, bool deviceStops) {
     //       on a device that no longer answers did not raise GpuFailure". The mirrored mutation,
     //       `if (true)`, makes the refusal entry print "FAIL: a hardware failure on a device that
     //       still answers raised GpuFailure". Both reverted.
+    //       Re-run 2026-10-19 (T7), `if (false)` at av_hwframe_ctx_init's refusal, deviceHealthy() now routed
+    //       through deviceAnswers(): held, the fault entry's line. The SoftwareCodec and `if (true)` breaks
+    //       re-run 2026-10-19 (T7b) on the refusal entry: each held, its line.
     g_failNextFramesInit = true;
     g_deviceLost = deviceStops;
 

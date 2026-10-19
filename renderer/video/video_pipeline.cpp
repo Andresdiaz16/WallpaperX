@@ -5,6 +5,8 @@
 #include "../vulkan/device.h"
 #include "../vulkan/offscreen.h"
 
+#include <exception>
+#include <new>
 #include <stdexcept>
 #include <utility>
 #include <variant>
@@ -15,8 +17,12 @@ VideoPipeline::Stage::Stage(Device& device, const DecodedFrame& first, const std
     : converter(device, first, shaderDir), renderer(device, converter.frame()) {}
 
 VideoPipeline::VideoPipeline(Device& device, const std::string& file, const std::string& shaderDir,
-                             Playback playback, std::optional<StreamPosition> startAt)
-    : m_device(device), m_shaderDir(shaderDir), m_playback(playback), m_decoder(device, file, startAt) {}
+                             Playback playback, std::optional<StreamPosition> startAt, DecodeHooks hooks)
+    : m_device(device),
+      m_shaderDir(shaderDir),
+      m_hooks(std::move(hooks)),
+      m_decoding(std::make_unique<PictureSource>(device, file, playback, startAt)),
+      m_deepest(std::get<std::unique_ptr<PictureSource>>(m_decoding)->decoder().deepestSkip()) {}
 
 bool VideoPipeline::renderNext(OffscreenTargetManager& targets, const OffscreenTarget& target) {
     // Asserted here as well as in the two halves: the abort has to name the entry point the
@@ -29,14 +35,19 @@ bool VideoPipeline::renderNext(OffscreenTargetManager& targets, const OffscreenT
 
 bool VideoPipeline::decodeNext() {
     m_device.assertGpuThread("VideoPipeline::decodeNext");
-    if (decode(std::nullopt, PictureSkip::Nothing) != Decode::Decoded) return false;
+    if (decode(std::nullopt, std::nullopt, Waiting::ForPicture) != Decode::Decoded) return false;
     convert();
     return true;
 }
 
 VideoPipeline::Decode VideoPipeline::decodeWithin(uint32_t dropLimit, PictureSkip skip) {
     m_device.assertGpuThread("VideoPipeline::decodeWithin");
-    return decode(dropLimit, skip);
+    return decode(dropLimit, skip, Waiting::ForPicture);
+}
+
+VideoPipeline::Decode VideoPipeline::takeReady(PictureSkip skip) {
+    m_device.assertGpuThread("VideoPipeline::takeReady");
+    return decode(1, skip, Waiting::Never);
 }
 
 void VideoPipeline::convert() {
@@ -53,31 +64,57 @@ void VideoPipeline::convert() {
     m_unconverted.reset();
 }
 
-VideoPipeline::Decode VideoPipeline::decode(std::optional<uint32_t> dropLimit, PictureSkip skip) {
-    std::optional<DecodedFrame> frame;
-    if (dropLimit) {
-        auto step = m_decoder.next(*dropLimit, skip);
-        if (std::holds_alternative<VideoDecoder::Dropping>(step)) return Decode::Dropping;
-        frame = std::move(std::get<std::optional<DecodedFrame>>(step));
-    } else {
-        frame = m_decoder.next(skip);
+VideoPipeline::Decode VideoPipeline::decode(std::optional<uint32_t> dropLimit, std::optional<PictureSkip> skip,
+                                            Waiting waiting) {
+    if (auto* ahead = std::get_if<std::unique_ptr<DecodeAhead>>(&m_decoding)) {
+        if (waiting == Waiting::ForPicture) return accept((*ahead)->wait(skip));
+        std::optional<DecodeAhead::Item> item = (*ahead)->take(skip.value_or(PictureSkip::Nothing));
+        return item ? accept(std::move(*item)) : Decode::Pending;
     }
-    bool startsPass = !m_timing && !m_decoder.startedMidStream();
-    std::optional<std::chrono::nanoseconds> passEnded;
-    // No timing means nothing was ever decoded, and a stream with nothing to show must not spin here.
-    if (!frame && m_playback == Playback::Loop && m_timing) {
-        passEnded = m_decoder.readThrough();
-        m_decoder.restart();
-        // Unbounded: a restarted pass has returned nothing to resume after, so it drops nothing.
-        frame = m_decoder.next(skip);
-        startsPass = true;
-    }
-    if (!frame) return Decode::Exhausted;
-
-    m_timing = PictureTiming{frame->presentationTime(), frame->duration(), startsPass, frame->skip(), passEnded,
-                             frame->keptThrough(), frame->readSince()};
-    m_unconverted = std::move(*frame);
+    PictureSource::Step step =
+        std::get<std::unique_ptr<PictureSource>>(m_decoding)->next(dropLimit, skip.value_or(PictureSkip::Nothing));
+    if (std::holds_alternative<PictureSource::Dropping>(step)) return Decode::Dropping;
+    if (std::holds_alternative<PictureSource::End>(step)) return Decode::Exhausted;
+    hold(std::move(std::get<PictureSource::Picture>(step)));
+    decodeAheadIfSafe();
     return Decode::Decoded;
+}
+
+VideoPipeline::Decode VideoPipeline::accept(DecodeAhead::Item item) {
+    if (auto* picture = std::get_if<PictureSource::Picture>(&item)) {
+        hold(std::move(*picture));
+        return Decode::Decoded;
+    }
+    if (std::holds_alternative<PictureSource::End>(item)) return Decode::Exhausted;
+    std::rethrow_exception(std::get<std::exception_ptr>(item));
+}
+
+void VideoPipeline::hold(PictureSource::Picture picture) {
+    m_timing = picture.timing;
+    m_deepest = picture.deepest;
+    m_unconverted = std::move(picture.frame);
+}
+
+// After a picture, which settles whether the device decodes the stream. A stream decoded in
+// software stays on this thread, as does one on a system that had no thread to give, which is told
+// once. Out of memory leaves the picture decoded and the next one tries again.
+void VideoPipeline::decodeAheadIfSafe() {
+    std::unique_ptr<PictureSource>& source = std::get<std::unique_ptr<PictureSource>>(m_decoding);
+    if (m_noDecodeThread || source->decoder().path() != VideoDecoder::Path::Hardware ||
+        !m_device.queuesInternallySynchronized()) {
+        return;
+    }
+    std::unique_ptr<DecodeAhead> ahead;
+    try {
+        ahead = DecodeAhead::start(m_device, source, m_hooks.around, m_hooks.ready);
+    } catch (const std::bad_alloc&) {
+        return;
+    }
+    if (ahead) {
+        m_decoding = std::move(ahead);
+    } else {
+        m_noDecodeThread = true;
+    }
 }
 
 VideoPipeline::PictureTiming VideoPipeline::timing() const {

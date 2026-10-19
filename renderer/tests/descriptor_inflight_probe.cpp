@@ -301,6 +301,8 @@ constexpr VkDeviceSize kBusyBytes = 64ull << 20;
 //          clause. The no-wait clause has its own: a m_device.wait() added ahead of
 //          acquire()'s fresh-slot branch in renderer/vulkan/descriptor_slots.cpp reddens that
 //          clause alone, with the index comparison still green.
+//          Both breaks re-run 2026-10-19 (T7), heap tier, RTX, against the atomic lastSubmission() and
+//          hasCompleted()'s new early answer: held, the reuse line.
 Outcome heapKeepsAnInFlightSlot(uint32_t copies) {
     constexpr const char* kPhase = "heap in-flight";
     unsetenv("WALLPAPERX_FORCE_TIER");
@@ -451,6 +453,7 @@ Outcome heapReusesACompletedSlot(uint32_t copies) {
 //                 oracle: a slow allocate and a blocking one are the same number.
 // CONTROL: renderer/vulkan/descriptor_slots.cpp -- release() stamping Device::SubmitTicket{}
 //          instead of m_device.lastSubmission(). Observed red: no wait, batch still running.
+//          Re-run 2026-10-19 (T7), RTX: held, the same line.
 Outcome bufferTierBlocksOnItsOnlySlot(uint32_t copies) {
     constexpr const char* kPhase = "buffer single-slot";
     setenv("WALLPAPERX_FORCE_TIER", "buffer", 1);

@@ -606,6 +606,8 @@ int main() {
                 //       the creating thread -> "FAIL: the creating thread performs the same four calls
                 //       without aborting", "threw instead: refused", on device_affinity_probe_lavapipe.
                 //       Reverted.
+                //       Re-run 2026-10-19 (T7) with the throw on every thread: held, this line, beside "exporting a
+                //       frame from a non-GPU thread aborts".
                 check(true, "the creating thread performs the same four calls without aborting");
             } catch (const std::exception& e) {
                 check(false, "the creating thread performs the same four calls without aborting");

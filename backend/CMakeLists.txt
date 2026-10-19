@@ -544,6 +544,9 @@ set_target_properties(wallpaperx-log-pump-test PROPERTIES AUTOMOC OFF AUTOUIC OF
 # Vulkan device is not a thing to do for convenience.
 add_executable(wallpaperx-crash-quarantine-test tests/crash_quarantine_test.cpp)
 target_link_libraries(wallpaperx-crash-quarantine-test PRIVATE wallpaperx-daemon-lib)
+# The shared children aim their death inside a turn (the test's `aim` namespace); the daemon's code is unchanged.
+target_link_options(wallpaperx-crash-quarantine-test PRIVATE
+    "LINKER:--wrap=_ZN10wallpaperx12PlayingBlameC1ERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE")
 # renderer/tests for support/test_image.h, the shared PNG fixture writer.
 target_include_directories(wallpaperx-crash-quarantine-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
@@ -1138,6 +1141,10 @@ add_executable(wallpaperx-audio-playback-test tests/audio_playback_test.cpp)
 # libswresample comes with the renderer, through wallpaperx-daemon-lib.
 target_link_libraries(wallpaperx-audio-playback-test PRIVATE wallpaperx-daemon-lib
     PkgConfig::WALLPAPERX_TEST_PIPEWIRE ${CMAKE_DL_LIBS})
+# The test's own view of clock rounds and session turns (its `turns` namespace); the daemon's code is unchanged.
+target_link_options(wallpaperx-audio-playback-test PRIVATE
+    "LINKER:--wrap=_ZN10wallpaperx16WallpaperManager12advanceVideoENSt6chrono10time_pointINS1_3_V212steady_clockENS1_8durationIlSt5ratioILl1ELl1000000000EEEEEE"
+    "LINKER:--wrap=_ZN10wallpaperx12PlayingBlameC1ERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE")
 target_include_directories(wallpaperx-audio-playback-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests ${CMAKE_CURRENT_SOURCE_DIR}/../renderer)
 set_target_properties(wallpaperx-audio-playback-test PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
@@ -1183,7 +1190,8 @@ add_dependencies(wallpaperx-daemon-system-test wallpaperx-test-wedge-shim)
 # control file it arms.
 add_library(wallpaperx-test-alloc-fail-shim SHARED tests/alloc_fail_shim.cpp)
 target_link_libraries(wallpaperx-test-alloc-fail-shim PRIVATE ${CMAKE_DL_LIBS})
-target_include_directories(wallpaperx-test-alloc-fail-shim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(wallpaperx-test-alloc-fail-shim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
 set_target_properties(wallpaperx-test-alloc-fail-shim PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 target_compile_definitions(wallpaperx-daemon-system-test PRIVATE
     WALLPAPERX_ALLOC_FAIL_SHIM="$<TARGET_FILE:wallpaperx-test-alloc-fail-shim>")
@@ -2403,6 +2411,53 @@ elseif(WALLPAPERX_SANITIZE STREQUAL "thread")
         endforeach()
     endforeach()
 
+    # Entries that stage a SIGSEGV in a child and grade how it died. The sanitizer's own SEGV handler
+    # would take the fault, print "SEGV on unknown address" and exit 66, so the child never dies of the
+    # signal and the test can only report a harness fault. handle_segv=0 leaves the fault to the
+    # daemon's handler, as in the shipped build; race detection is unaffected.
+    set(_tsan_segv_entries crash_quarantine_lavapipe video_wallpaper_lavapipe.resumeBlame
+        video_wallpaper_lavapipe.playbackBlame daemon_system_lavapipe)
+    foreach(_phase Named Quarantine Outside Closing RoutineClose)
+        list(APPEND _tsan_segv_entries audio_playback_lavapipe.soundFault${_phase})
+    endforeach()
+    get_property(_tsan_backend_tests DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" PROPERTY TESTS)
+    foreach(_t IN LISTS _tsan_segv_entries)
+        if(NOT _t IN_LIST _tsan_backend_tests)
+            message(FATAL_ERROR "TSan tier: ${_t}, a staged-SIGSEGV entry, is not registered")
+        endif()
+        set_property(TEST "${_t}" APPEND PROPERTY ENVIRONMENT "${_tsan_env}:handle_segv=0")
+    endforeach()
+
+    # Checks graded on wall-clock bounds, which the sanitizer's slowdown misses with no report printed:
+    # rateCap's "moved only onto a pass's start" (a mid-pass sound seek once the sound drifts past its bound)
+    # and dbus_service_test's configChangedWire, whose SetMonitorOutput is refused when the config write
+    # misses its wait. Left out here only; the normal build grades both, and their threads stay covered
+    # by the other entries in this tier. configChangedWire is one phase of a whole-binary entry, so that
+    # entry runs every other phase. dbus_service_classic_lavapipe misses the same write wait in two more
+    # phases that set a monitor's choice before grading it (pauseWire, soundWire), so it leaves out all three.
+    set(_tsan_timing_entries audio_playback_lavapipe.rateCap)
+    foreach(_t IN LISTS _tsan_timing_entries)
+        if(NOT _t IN_LIST _tsan_backend_tests)
+            message(FATAL_ERROR "TSan tier: ${_t}, a timing-graded entry left out, is not registered")
+        endif()
+        set_property(TEST "${_t}" PROPERTY DISABLED TRUE)
+    endforeach()
+    foreach(_t IN ITEMS dbus_service_lavapipe dbus_service_classic_lavapipe)
+        if(NOT _t IN_LIST _tsan_backend_tests)
+            message(FATAL_ERROR "TSan tier: ${_t}, whose config-write-bound phases are left out, is not registered")
+        endif()
+    endforeach()
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/tests/dbus_service_test.cpp" _dbus_service_source)
+    foreach(_phase IN ITEMS configChangedWire pauseWire soundWire)
+        string(FIND "${_dbus_service_source}" "phase(\"${_phase}\"" _at)
+        if(_at LESS 0)
+            message(FATAL_ERROR "TSan tier: dbus_service_test.cpp no longer offers the ${_phase} phase left out here")
+        endif()
+    endforeach()
+    set_property(TEST dbus_service_lavapipe APPEND PROPERTY ENVIRONMENT "WALLPAPERX_TEST_PHASE=^(?!configChangedWire$)")
+    set_property(TEST dbus_service_classic_lavapipe APPEND PROPERTY ENVIRONMENT
+                 "WALLPAPERX_TEST_PHASE=^(?!(configChangedWire|pauseWire|soundWire)$)")
+
     # A tier that disabled everything is the failure this block is most likely to have,
     # and the one least likely to be noticed: ctest prints "0 tests failed out of 0" and
     # exits 0, which reads exactly like a clean gate. It happens whenever the lavapipe
@@ -2414,6 +2469,63 @@ elseif(WALLPAPERX_SANITIZE STREQUAL "thread")
     # reaches TSan through a lavapipe entry. Without the ICD that is what the tier degrades
     # to, and it still exits 0. The live counts are in the configure-time message below,
     # which cannot go stale because it is computed.
+    # The real-GPU tier: the only entries under the sanitizer that start a decode thread, which needs a
+    # hardware decoder Lavapipe lacks. Labelled tsan-gpu and neither lavapipe nor novulkan, so CI (no
+    # GPU) never selects them; run with `ctest -L tsan-gpu`. The shim lets the NVIDIA driver's own
+    # thread be seen by the sanitizer (renderer/tests/support/tsan_dlvsym_shim.c); it is built
+    # without the sanitizer, preloaded into these entries only, and linked into nothing.
+    enable_language(C)
+    set(_tsan_shim_dir "${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests/support")
+    add_library(wallpaperx-tsan-dlvsym-shim SHARED "${_tsan_shim_dir}/tsan_dlvsym_shim.c")
+    set_target_properties(wallpaperx-tsan-dlvsym-shim PROPERTIES COMPILE_OPTIONS "" LINK_OPTIONS ""
+                          LINK_DEPENDS "${_tsan_shim_dir}/tsan_dlvsym_shim.map")
+    target_link_options(wallpaperx-tsan-dlvsym-shim PRIVATE
+                        "LINKER:--version-script=${_tsan_shim_dir}/tsan_dlvsym_shim.map")
+    set(_tsan_gpu_env ${_tsan_env} ${_tsan_waiver}
+        "LD_PRELOAD=$<TARGET_FILE:wallpaperx-tsan-dlvsym-shim>")
+
+    # device_loss_restart runs every phase in one entry; only its two decode-thread phases are here.
+    # The decode thread runs in the daemon child, whose exit status the test grades as its own, so a
+    # sanitizer report there is caught by its relayed text instead.
+    wallpaperx_add_test(NAME device_loss_restart_decode_thread_tsan
+             COMMAND $<TARGET_FILE:wallpaperx-device-loss-restart-test>)
+    set_tests_properties(device_loss_restart_decode_thread_tsan PROPERTIES SKIP_RETURN_CODE 77
+        FAIL_REGULAR_EXPRESSION "WARNING: ThreadSanitizer"
+        ENVIRONMENT "WALLPAPERX_TEST_PHASE=^(decodeThreadLeftRunning|decodeThreadStuckAtSigterm)$")
+
+    set(_tsan_gpu_renderer "")
+    foreach(_mode depth pending failure catch_up hidden software alloc left_running pools resume)
+        list(APPEND _tsan_gpu_renderer video_pipeline_decode_thread_${_mode})
+    endforeach()
+    list(APPEND _tsan_gpu_renderer video_pipeline_device_completed_off_thread video_pipeline_device_queue_flags)
+    # resumeBlame and playbackBlame are left out: they grade how a child died, and under the sanitizer
+    # the child's exit status is the sanitizer's.
+    set(_tsan_gpu_backend device_loss_restart_decode_thread_tsan)
+    foreach(_phase sharedRelease sharedEviction sharedFailure sharedSpeed sharedGpuFault resume resumeEviction
+                   resumeFallback resumeCatchUp resumeGpuFault resumeGpuFaultRender resumeHealth resumeHold resumeCredit)
+        list(APPEND _tsan_gpu_backend video_wallpaper.${_phase})
+    endforeach()
+    set(_tsan_gpu 0)
+    foreach(_pair "${CMAKE_CURRENT_SOURCE_DIR}/../renderer|${_tsan_gpu_renderer}"
+                  "${CMAKE_CURRENT_SOURCE_DIR}|${_tsan_gpu_backend}")
+        string(FIND "${_pair}" "|" _bar)
+        string(SUBSTRING "${_pair}" 0 ${_bar} _dir)
+        math(EXPR _bar "${_bar} + 1")
+        string(SUBSTRING "${_pair}" ${_bar} -1 _names)
+        get_property(_dir_tests DIRECTORY "${_dir}" PROPERTY TESTS)
+        foreach(_t IN LISTS _names)
+            # A renamed entry must fail the configure, not drop out of the tier unseen.
+            if(NOT _t IN_LIST _dir_tests)
+                message(FATAL_ERROR "TSan GPU tier: no entry named ${_t} in ${_dir}")
+            endif()
+            set_property(TEST "${_t}" DIRECTORY "${_dir}" PROPERTY DISABLED FALSE)
+            set_property(TEST "${_t}" DIRECTORY "${_dir}" APPEND PROPERTY ENVIRONMENT ${_tsan_gpu_env})
+            set_property(TEST "${_t}" DIRECTORY "${_dir}" APPEND PROPERTY LABELS tsan-gpu)
+            math(EXPR _tsan_gpu "${_tsan_gpu} + 1")
+        endforeach()
+    endforeach()
+    message(STATUS "  TSan tier: ${_tsan_gpu} real-GPU decode-thread test(s) labelled tsan-gpu, with the dlvsym shim")
+
     if(_tsan_lavapipe EQUAL 0)
         message(WARNING
             "TSan tier: no lavapipe test survived, so this tree detects no races at all "

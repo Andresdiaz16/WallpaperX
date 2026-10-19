@@ -29,6 +29,9 @@
 //   WALLPAPERX_TEST_SLOW_EXIT_MS=n          that destructor says so on descriptor 2, then sleeps n
 //                                           milliseconds: a static destruction slower than the
 //                                           daemon's teardown deadline.
+//   WALLPAPERX_TEST_WEDGE_DECODE_THREAD=1   a picture asked of the daemon's own decoder on a thread other
+//                                           than the one that first asked it (a per-session decode
+//                                           thread) never returns, after a line on stderr saying so.
 //   WALLPAPERX_TEST_FAIL_SHUTDOWN_WATCH=1   the first mutex lock a thread makes after sigwait()
 //                                           returns fails with EINVAL, which std::mutex throws: the
 //                                           daemon's signal thread fails as it starts a stop.
@@ -36,6 +39,7 @@
 // Not linked into anything shipped.
 
 #include "support/forked_child.h"
+#include "support/sanitizer_ignored_caller.h"
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -82,6 +86,13 @@ bool isDecodersContext(const AVCodecContext* context) { return context != nullpt
 
 std::mutex g_deliveredMutex;
 std::map<const AVCodecContext*, int> g_delivered;
+std::map<const AVCodecContext*, pid_t> g_firstAsker;  // under g_deliveredMutex
+
+// Whether this call is on a thread other than the first to ask `context` for a picture.
+bool askedOffItsFirstThread(const AVCodecContext* context) {
+    std::lock_guard<std::mutex> lock(g_deliveredMutex);
+    return g_firstAsker.emplace(context, ::gettid()).first->second != ::gettid();
+}
 
 bool hasDelivered(const AVCodecContext* context) {
     std::lock_guard<std::mutex> lock(g_deliveredMutex);
@@ -115,6 +126,14 @@ using MutexLockFn = int (*)(pthread_mutex_t*);
 std::atomic<SigwaitFn> g_realSigwait{nullptr};
 std::atomic<MutexLockFn> g_realMutexLock{nullptr};
 
+#if defined(__SANITIZE_THREAD__)
+// A lock taken by a library the sanitizer ignores goes straight to libc (support/sanitizer_ignored_caller.h).
+std::atomic<MutexLockFn> g_libcMutexLock{nullptr};
+__attribute__((constructor)) void resolveLibcMutexLock() {
+    g_libcMutexLock.store(wallpaperx::testing::ignored_caller::libcSymbol<MutexLockFn>("pthread_mutex_lock"));
+}
+#endif
+
 }  // namespace
 
 extern "C" int sigwait(const sigset_t* set, int* sig) {
@@ -134,6 +153,12 @@ extern "C" int pthread_mutex_lock(pthread_mutex_t* mutex) {
         t_failNextLock = false;
         return EINVAL;
     }
+#if defined(__SANITIZE_THREAD__)
+    if (const MutexLockFn libc = g_libcMutexLock.load();
+        libc != nullptr && wallpaperx::testing::ignored_caller::fromIgnoredLibrary(__builtin_return_address(0))) {
+        return libc(mutex);
+    }
+#endif
     MutexLockFn real = g_realMutexLock.load();
     if (real == nullptr) {
         real = reinterpret_cast<MutexLockFn>(::dlsym(RTLD_NEXT, "pthread_mutex_lock"));
@@ -158,6 +183,11 @@ extern "C" int avcodec_receive_frame(AVCodecContext* context, AVFrame* frame) {
     using Fn = int (*)(AVCodecContext*, AVFrame*);
     static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "avcodec_receive_frame"));
     if (real == nullptr) return -1;
+    if (enabled("WALLPAPERX_TEST_WEDGE_DECODE_THREAD") && isDecodersContext(context) && ::gettid() != ::getpid() &&
+        askedOffItsFirstThread(context)) {
+        writeLine("wedge_shim: holding a decode inside ffmpeg on a decode thread\n");
+        for (;;) ::pause();
+    }
     const int result = real(context, frame);
     if (result == 0 && isDecodersContext(context)) {
         std::lock_guard<std::mutex> lock(g_deliveredMutex);

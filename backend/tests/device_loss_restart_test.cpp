@@ -2304,8 +2304,177 @@ void checkCrashFlushIsBounded(NameWatcher& names, Destination dest) {
                       : "still running at the bound, killed");
 }
 
+// GOAL: S15.889, daemon half -- a session's decode thread still inside ffmpeg past DecodeAhead's 10 s
+//       stop bound is abandoned safely: the daemon goes on, the Device is not torn down under the thread
+//       at the stop, the process ends through _Exit (no static destructors) with its log flushed, and no
+//       crash record names the video.
+// WHY-THIS-SHAPE: tests/wedge_shim.cpp holds the restored video's decoder forever, only on a thread other
+//       than the one that first decoded it -- the session's decode thread. Replacing the video retires the
+//       session on the render thread while the daemon runs, which is where the 10 s bound is met: a
+//       SIGTERM's own teardown is cut at kTeardownDeadline (3 s), before that bound. No-static-destructor
+//       is read from the shim's own destructor line, whose load line is required first.
+// CONTROL: via control_batch.sh, 2026-10-19, RTX 3080 Ti, bytes restored, each red alone: main.cpp's
+//       threadLeftRunning() made to ignore Device::threadLeftRunning() (backend/daemon/main.cpp) -> "no
+//       static destructor runs"; DeviceDeleter's threadLeftRunning() test removed
+//       (renderer/vulkan/device.cpp) -> "the Device is not torn down under the decode thread".
+void checkDecodeThreadLeftRunning(NameWatcher& names, const std::string& blue) {
+    constexpr const char* kGoals = "S15.889 (a decode thread left inside ffmpeg is abandoned safely)";
+    const std::string phase = "decode thread left running";
+    const std::string clip = std::string(WALLPAPERX_VIDEO_ASSET_DIR) + "/wallpaper_bands.mp4";
+    Home home("devloss_leftrunning");
+    std::error_code ec;
+    if (!fs::exists(clip, ec)) {
+        notVerified(kGoals, phase + ": the video fixture " + clip + " was not generated (no ffmpeg at build time)");
+        return;
+    }
+    if (!home.ok()) {
+        notVerified(kGoals, phase + ": a scratch HOME could not be created under the temp directory");
+        return;
+    }
+    fs::create_directories(home.configFile().parent_path(), ec);
+    {
+        nlohmann::json monitors = nlohmann::json::array();
+        monitors.push_back({{"monitor_id", kMonitorVideo}, {"type", "video"}, {"path", clip}});
+        std::ofstream out(home.configFile(), std::ios::trunc);
+        out << nlohmann::json{{"version", 1}, {"monitors", std::move(monitors)}}.dump();
+        if (!out) {
+            harnessFailure(phase + ": the saved video could not be written");
+            return;
+        }
+    }
+    if (!nameFree(names, phase)) return;
+    FrameReadyLog frames;
+    auto proxy = subscribeFrameReady(frames);
+    std::vector<std::string> env = withWedgeShim(home.env(false), "WALLPAPERX_TEST_WEDGE_DECODE_THREAD");
+    env.push_back("WALLPAPERX_TEST_LINE_AT_EXIT=1");
+    SpawnedDaemon daemon(env, SpawnedDaemon::Stdout::Captured, {}, 0, kDaemonArgs);
+    if (!cameUp(names, daemon, kGoals, phase)) return;
+    if (daemon.output().find("wedge_shim: loaded") == std::string::npos) {
+        daemon.shutdown(SIGTERM);
+        harnessFailure(phase + ": " WALLPAPERX_WEDGE_SHIM " did not say it loaded with its exit line armed");
+        return;
+    }
+    if (!daemon.waitForOutput("wedge_shim: holding a decode inside ffmpeg", kWait)) {
+        daemon.shutdown(SIGTERM);
+        notVerified(kGoals, phase + ": no decode thread decoded the restored video here (software decoding, or no "
+                                    "internally synchronised queues), so none could be held");
+        return;
+    }
+    (void)setWallpaper(*proxy, "static", blue, kMonitorVideo);
+    if (!daemon.waitForOutput("a video decoder still inside ffmpeg", std::chrono::seconds(40))) {
+        daemon.shutdown(SIGTERM);
+        notVerified(kGoals, phase + ": replacing the video did not stop its session within 40 s, so no decode "
+                                    "thread was left running");
+        return;
+    }
+    check(frames.wait(kMonitorVideo, 1), (phase + ": the daemon goes on and draws the replacement").c_str());
+    const int exitCode = daemon.shutdown(SIGTERM);
+    const std::string out = daemon.output();
+    checkStatus(daemon, exitCode, 0, phase + ": exits 0");
+    check(out.find(kCleanStop) != std::string::npos,
+          (phase + ": the clean stop's line reaches the log before the process ends").c_str());
+    check(out.find("a thread left running may still use the device, so it is not torn down") != std::string::npos,
+          (phase + ": the Device is not torn down under the decode thread left running").c_str());
+    check(out.find("wedge_shim: written after main returned") == std::string::npos,
+          (phase + ": no static destructor runs (the process ends through _Exit)").c_str());
+    const std::optional<wallpaperx::PlayingHistory> history = wallpaperx::readPlayingRecord(home.stateDir());
+    const bool blamed = history && ((history->died && history->died->path == clip) || history->signal.has_value());
+    check(!blamed, (phase + ": no crash record names the video").c_str());
+}
+
+// GOAL: S15.894 -- a daemon sent SIGTERM while a session's decode thread is stuck inside ffmpeg ends within its
+//       3 s shutdown deadline (kTeardownDeadline, backend/daemon/main.cpp), well before DecodeAhead's 10 s stop
+//       bound, with its log flushed, no static destructor run under the stuck thread, and no crash record.
+// WHY-THIS-SHAPE: the same wedge as decodeThreadLeftRunning, but SIGTERM arrives with the video still playing,
+//       so the render thread's teardown waits on the stuck thread and only the deadline can end the process.
+//       Time is measured from the signal to the reap; "shutdown blocked, exiting now" proves the deadline's
+//       exit was the one taken, so a fast clean stop (a thread that was not stuck) cannot pass.
+// CONTROL: per check below; all via control_batch.sh, 2026-10-19, RTX 3080 Ti, bytes restored, each alone.
+void checkDecodeThreadStuckAtSigterm(NameWatcher& names) {
+    constexpr const char* kGoals = "S15.894 (SIGTERM with a decode thread stuck in ffmpeg ends within its deadline)";
+    const std::string phase = "decode thread stuck at SIGTERM";
+    const std::string clip = std::string(WALLPAPERX_VIDEO_ASSET_DIR) + "/wallpaper_bands.mp4";
+    Home home("devloss_stuckterm");
+    std::error_code ec;
+    if (!fs::exists(clip, ec)) {
+        notVerified(kGoals, phase + ": the video fixture " + clip + " was not generated (no ffmpeg at build time)");
+        return;
+    }
+    if (!home.ok()) {
+        notVerified(kGoals, phase + ": a scratch HOME could not be created under the temp directory");
+        return;
+    }
+    fs::create_directories(home.configFile().parent_path(), ec);
+    {
+        nlohmann::json monitors = nlohmann::json::array();
+        monitors.push_back({{"monitor_id", kMonitorVideo}, {"type", "video"}, {"path", clip}});
+        std::ofstream out(home.configFile(), std::ios::trunc);
+        out << nlohmann::json{{"version", 1}, {"monitors", std::move(monitors)}}.dump();
+        if (!out) {
+            harnessFailure(phase + ": the saved video could not be written");
+            return;
+        }
+    }
+    if (!nameFree(names, phase)) return;
+    std::vector<std::string> env = withWedgeShim(home.env(false), "WALLPAPERX_TEST_WEDGE_DECODE_THREAD");
+    env.push_back("WALLPAPERX_TEST_LINE_AT_EXIT=1");
+    SpawnedDaemon daemon(env, SpawnedDaemon::Stdout::Captured, {}, 0, kDaemonArgs);
+    if (!cameUp(names, daemon, kGoals, phase)) return;
+    if (daemon.output().find("wedge_shim: loaded") == std::string::npos) {
+        daemon.shutdown(SIGTERM);
+        harnessFailure(phase + ": " WALLPAPERX_WEDGE_SHIM " did not say it loaded with its exit line armed");
+        return;
+    }
+    if (!daemon.waitForOutput("wedge_shim: holding a decode inside ffmpeg", kWait)) {
+        daemon.shutdown(SIGTERM);
+        notVerified(kGoals, phase + ": no decode thread decoded the restored video here (software decoding, or no "
+                                    "internally synchronised queues), so none could be held");
+        return;
+    }
+    const Clock::time_point signalled = Clock::now();
+    const int exitCode = daemon.shutdown(SIGTERM);
+    const double took = std::chrono::duration<double>(Clock::now() - signalled).count();
+    const std::string out = daemon.output();
+    std::printf("device_loss_restart_test: %s: ended %.2f s after SIGTERM, exit code %d\n", phase.c_str(), took,
+                exitCode);
+    // Two deadlines of kTeardownDeadline end this stop and race: the shutdown watch's exitNow (status 1) and
+    // the SIGALRM handler, which dies of SIGALRM. Either is a legal end; which one is the scheduler's choice.
+    const bool watchExit = out.find("wallpaperx-daemon: shutdown blocked, exiting now") != std::string::npos;
+    const bool alarmExit = out.find("wallpaperx-daemon: teardown deadline passed, exiting now") != std::string::npos;
+    // CONTROL: kTeardownDeadline 3 s -> 12 s (backend/daemon/main.cpp) -> "FAIL: decode thread stuck at
+    //       SIGTERM: ends within the 3 s shutdown deadline, not the 10 s stop bound", and the next and the
+    //       exit-status lines red too (the 10 s bound then passes and the stop ends cleanly).
+    check(!daemon.timedOut() && took < 5.0,
+          (phase + ": ends within the 3 s shutdown deadline, not the 10 s stop bound").c_str());
+    // CONTROL: exitNow()'s and onTeardownDeadline()'s flushBeforeExit(...) dropped (backend/daemon/main.cpp) ->
+    //       "FAIL: ...: a deadline's exit is the one taken, and its line reaches the log". Lines queued earlier
+    //       (the SIGTERM line) still arrived under that break -- the log writer had written them already -- so
+    //       no check here claims the queue's flush.
+    check(watchExit || alarmExit, (phase + ": a deadline's exit is the one taken, and its line reaches the log").c_str());
+    // CONTROL: the kTeardownDeadline break above -> "exits 1" red (exit 0); the crash-record break below ->
+    //       "dies of the teardown alarm" red (it died of SIGSEGV).
+    if (daemon.exitedNormally()) {
+        checkStatus(daemon, exitCode, 1, phase + ": exits 1, the blocked stop's status");
+    } else {
+        check(daemon.termSignal() == SIGALRM && alarmExit,
+              (phase + ": a stop that dies of a signal dies of the teardown alarm, after saying so").c_str());
+    }
+    // CONTROL: exitNow()'s std::_Exit made std::exit, and onTeardownDeadline() ending by std::exit
+    //       (backend/daemon/main.cpp) -> "FAIL: ...: no static destructor runs under the stuck thread".
+    check(out.find("wedge_shim: written after main returned") == std::string::npos,
+          (phase + ": no static destructor runs under the stuck thread (the process ends through _Exit)").c_str());
+    // CONTROL: none held. manager.endPlayingRecord() deleted and both deadline exits ending by raise(SIGSEGV)
+    //       (backend/daemon/main.cpp) left this line green: the handler names a video only for a thread working
+    //       on one, and the one such thread here is held in the shim's pause(). Kept as a guard, not a claim.
+    const std::optional<wallpaperx::PlayingHistory> history = wallpaperx::readPlayingRecord(home.stateDir());
+    const bool blamed = history && ((history->died && history->died->path == clip) || history->signal.has_value());
+    check(!blamed, (phase + ": no crash record names the video").c_str());
+}
+
 void runLossAndStallPhases(NameWatcher& names, const std::string& blue, const std::string& red) {
     using wallpaperx::testing::phaseSelected;
+    if (phaseSelected("decodeThreadLeftRunning")) checkDecodeThreadLeftRunning(names, blue);
+    if (phaseSelected("decodeThreadStuckAtSigterm")) checkDecodeThreadStuckAtSigterm(names);
     if (phaseSelected("staticLossAndRestart")) checkStaticLossAndRestart(names, blue, red);
     if (phaseSelected("repeatedVideoLoss")) checkRepeatedVideoLoss(names);
     if (phaseSelected("noDeviceIsNotLoss")) checkNoDeviceIsNotLoss(names, blue, red);

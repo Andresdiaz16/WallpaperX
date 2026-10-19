@@ -86,6 +86,15 @@ void pwInitOnce() {
     std::call_once(once, [] { pw_init(nullptr, nullptr); });
 }
 
+// pw_context_new fills in the user name through getpwuid and the host name through a static buffer,
+// neither safe on two threads at once, and each screen with sound connects from its own thread.
+// Nothing else this file calls into reaches them; the loop is not running yet, so nothing is waited on.
+pw_context* newContext(pw_loop* loop, pw_properties* properties) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    return pw_context_new(loop, properties, 0);
+}
+
 // The socket libpipewire connects to: PIPEWIRE_REMOTE, a name or an absolute path, else pipewire-0,
 // in PIPEWIRE_RUNTIME_DIR, else XDG_RUNTIME_DIR, else USERPROFILE. Nothing when no directory is set.
 std::optional<std::pair<std::string, std::string>> serverSocket() {
@@ -1063,7 +1072,7 @@ bool AudioOutput::connect() {
             // ordinary priority, which a loaded machine can make late.
             pw_properties* properties = pw_properties_new("module.rt", "false", "support.dbus", "false",
                                                           PW_KEY_APP_NAME, "WallpaperX", nullptr);
-            if (properties != nullptr) m_context = pw_context_new(pw_thread_loop_get_loop(m_loop), properties, 0);
+            if (properties != nullptr) m_context = newContext(pw_thread_loop_get_loop(m_loop), properties);
         }
         if (m_context == nullptr || pw_thread_loop_start(m_loop) != 0) {
             why = std::strerror(errno);

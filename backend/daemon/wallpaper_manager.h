@@ -16,6 +16,7 @@
 #include "video/picture_skip.h"
 #include "video/stream_position.h"
 #include "vulkan/frame_export.h"
+#include "vulkan/owned_device.h"
 #include "wallpaper_properties.h"
 
 #include <cstdint>
@@ -24,6 +25,7 @@
 #include <map>
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <chrono>
 #include <condition_variable>
 #include <memory>
@@ -427,10 +429,10 @@ public:
     // covers up to the 15 screens kMaxDescriptorsPerClient does.
     static constexpr int kMaxQueuedRequestsPerClient = 16;
 
-    // Video wallpapers holding an open decode session at once: a ceiling on the video memory
-    // decoders hold, not a hardware session limit. Monitor ids are the client's to choose and each
-    // session holds a decoder and its picture pool sized by the stream, so kMaxMonitors is not a
-    // usable bound.
+    // Decode sessions open at once: a ceiling on the video memory decoders hold, not a hardware
+    // session limit. Screens showing one file at one speed share a session, so this counts files
+    // being played, not screens. Monitor ids are the client's to choose and each session holds a
+    // decoder and its picture pool sized by the stream, so kMaxMonitors is not a usable bound.
     //
     // A ceiling, not an allowance: what the card can actually hold is decided by trying, since a
     // decoder's pool is ffmpeg's to size and no query predicts it. Room for a new session is made
@@ -718,8 +720,9 @@ public:
     ClockRound advanceVideo(std::chrono::steady_clock::time_point now);
 
     // What asks the render worker for a clock round when something only a round acts on changes off
-    // its thread -- a video's sound found to be there or gone. Set by the worker while it runs and
-    // emptied before it stops; must not block, nor call into this manager. Any thread.
+    // its thread -- a video's sound found to be there or gone, a picture decoded ahead. Set by the
+    // worker while it runs and emptied before it stops; must not block, nor call into this manager.
+    // Any thread.
     void setClockWake(std::function<void()> wake);
 
     // Whether the device this manager built has been lost and Config::onDeviceLost, which the loss
@@ -1024,8 +1027,8 @@ private:
         // The consumers this monitor's current video session has handed a picture to, so the log
         // records a consumer starting to read rather than every picture it takes; a single name
         // would not do, since two readers would each find the other there. About the session, and
-        // emptied when one opens. Kept here and not on the session so a consumer leaving the bus
-        // can be forgotten under this lock alone: the bus thread must never wait on m_gpuMutex.
+        // emptied when this monitor joins one. Kept here and not on the session so a consumer leaving
+        // the bus can be forgotten under this lock alone: the bus thread must never wait on m_gpuMutex.
         std::vector<ConsumerReport> served;
 
         // When this monitor published a picture that nothing has collected since, or nothing while
@@ -1061,9 +1064,9 @@ private:
         };
         ResumeCredit resumeCredit;
 
-        // Where the wallpaper `forSeq` names stood when its session was released, so the session
-        // that replaces it starts on the picture that stayed on screen. Held here because the
-        // session is gone; spent by the next attempt to open one for this monitor, whatever it plays.
+        // Where the wallpaper `forSeq` names stood when this monitor left its session keeping its
+        // picture, so the session that replaces it starts on the picture that stayed on screen. Held
+        // here because the session is gone; spent by the next session this monitor opens or joins.
         struct ReleasedAt {
             uint64_t forSeq = 0;
             StreamPosition shown;
@@ -1139,6 +1142,26 @@ private:
     RenderPass renderPassLocked(int monitorId, bool& rebuilt);
 
     struct VideoSession;
+    // A screen a session draws. A monitor is a member of at most one session, for the wallpaper
+    // `wallpaperSeq` names.
+    struct VideoSessionMember {
+        int monitorId = 0;
+        uint64_t wallpaperSeq = 0;
+        // Where the picture on that screen lies in the file, once known: the position it joined or
+        // was opened at, then each picture its session draws there.
+        std::optional<StreamPosition> shown;
+    };
+
+    // What a path named when a session opened it, so a screen asking for the same path later joins
+    // that session only while the path still names those bytes: a file rewritten in place must not
+    // be shown from a decoder opened on what it held before.
+    struct FileIdentity {
+        uint64_t device = 0;
+        uint64_t inode = 0;
+        int64_t size = 0;
+        int64_t modifiedNs = 0;
+        bool operator==(const FileIdentity&) const = default;
+    };
 
     // Publishes the frame just drawn into `target` laid out as `drawnWith`, returning its generation,
     // or records why a render or a picture produced none. Caller must hold m_stateMutex.
@@ -1176,19 +1199,22 @@ private:
     // first reaches Config::cleanPlayAfter. Caller must hold m_stateMutex.
     bool creditCleanPlayLocked(MonitorState& state, std::chrono::steady_clock::time_point now, bool onTime) const;
 
-    // advanceVideo() for one session: when it next needs a round, or nothing while its monitor is
-    // not playing. Appends to `round` what it showed and what it left owed. A decode dropping pictures
-    // on the way to its next one stops at `catchUpUntil`, having dropped at least one, and carries on
-    // next round. Caller must hold m_gpuMutex.
+    // advanceVideo() for one session: when it next needs a round, or nothing while none of its
+    // screens is playing. Each picture is drawn into every screen playing it. Screens that no longer
+    // hold the wallpaper they joined for leave first, and so do those whose speed has moved away from
+    // the session's, keeping their picture for a session of their own. Appends to `round` what it
+    // showed and what it left owed. A decode dropping pictures on the way to its next one stops at
+    // `catchUpUntil`, having dropped at least one, and carries on next round. Caller must hold
+    // m_gpuMutex.
     std::optional<std::chrono::steady_clock::time_point> advanceSessionLocked(
-        int monitorId, std::chrono::steady_clock::time_point now,
+        uint64_t sessionId, std::chrono::steady_clock::time_point now,
         std::chrono::steady_clock::time_point catchUpUntil, ClockRound& round);
 
     // A CatchingUp session caught up in one go, for a pass that must draw now. A failure that gives the
     // position up closes the session and opens the file again at its first picture; any other closes it
-    // and is rethrown. Throws what videoSessionLocked() throws.
+    // and is rethrown. `blame` is the pass's own playingBlameLine(). Throws what videoSessionLocked() throws.
     VideoSession& caughtUpSessionLocked(int monitorId, VideoSession& session, const std::string& path,
-                                        uint64_t wallpaperSeq);
+                                        uint64_t wallpaperSeq, bool keepsPicture, const std::string& blame);
 
     // Whether `failure`, met by a CatchingUp session on its way to its saved position, gives that
     // position up so the file plays from its first picture: a content error, since the position may be
@@ -1197,26 +1223,65 @@ private:
     // the position having been spent by the one before.
     static bool givesUpPosition(int monitorId, const RenderFailure& failure);
 
-    // The four entries to a monitor's retained decode session, all on the GPU thread with
+    // The ends of a decode session and of a monitor's place in one, all on the GPU thread with
     // m_gpuMutex held. A routine teardown -- a screen gone dark, an eviction, a wallpaper replaced --
     // re-enters ffmpeg and the driver but blames nothing: it is not the file's content running, so
     // a death in it must not refuse a working wallpaper. A caller that holds a record keeps it.
-    void closeVideoSessionLocked(int monitorId);
+    void closeVideoSessionLocked(uint64_t sessionId);
 
     // The same for a session freed only to have its memory back, which the next session for the
-    // same wallpaper resumes from: it records the picture on screen as MonitorState::releasedAt.
+    // same wallpaper resumes from: it records each screen's picture as its MonitorState::releasedAt.
     // Takes m_stateMutex.
-    void releaseVideoSessionLocked(int monitorId);
+    void releaseVideoSessionLocked(uint64_t sessionId);
 
-    // The same after `failure` broke the session, named to the fatal-signal handler only when the
-    // failure was the file's: freeing a pipeline on a device that has just failed can itself crash
-    // the driver, and that death says nothing about the video.
-    void closeFailedVideoSessionLocked(int monitorId, Fault failure);
+    // The same after `failure` broke the session, freed under `blame` -- the session's own line when
+    // null -- only when the failure was the file's: freeing a pipeline on a device that has just
+    // failed can itself crash the driver, and that death says nothing about the video. The members in
+    // `failing` are the caller's to report. Every other member still holding its wallpaper keeps its
+    // picture and resumes at it, as after a release -- from the first picture if the session was still
+    // catching up, since that position may be what failed; reopenVideosLocked() posts those that play.
+    // After a GPU fault they lose their frames too, with nothing posted. Returns the members. Takes
+    // m_stateMutex.
+    std::vector<VideoSessionMember> closeFailedVideoSessionLocked(uint64_t sessionId, const RenderFailure& failure,
+                                                                  const std::bitset<kMaxMonitors>& failing,
+                                                                  const std::string* blame = nullptr);
 
-    // Keeps the session only if a pass for this wallpaper would draw with it. Called before the
-    // branches that draw or release a target, so no type and no failure leaves a decoder and its
-    // picture pool open for a file nothing shows.
+    // Takes `monitorId` out of its session, closing the session if no screen is left in it. With
+    // `keepPosition` the picture it shows is recorded as its releasedAt, as a release does. Takes
+    // m_stateMutex.
+    void leaveVideoSessionLocked(int monitorId, bool keepPosition);
+
+    // Keeps this monitor in its session only if a pass for this wallpaper would draw with it. Called
+    // before the branches that draw or release a target, so no type and no failure leaves a decoder
+    // and its picture pool open for a file nothing shows.
     void dropStaleVideoSessionLocked(int monitorId, std::optional<Drawable> kind, uint64_t wallpaperSeq);
+
+    // The session drawing `monitorId` and its key; a null session when it has none. Caller must hold
+    // m_gpuMutex.
+    struct VideoSessionRef {
+        uint64_t id = 0;
+        VideoSession* session = nullptr;
+    };
+    VideoSessionRef videoSessionOfLocked(int monitorId);
+
+    // What `path` names now; nothing when it cannot be asked.
+    static std::optional<FileIdentity> fileIdentityOf(const std::string& path);
+
+    // Points the session's blame at its first member, the screen a death while the clock works on it
+    // is counted against. Costs a compare when it already does; a rebuild that fails is tried again
+    // at the next call.
+    static void blameFirstMember(VideoSession& session) noexcept;
+
+    // Whether every member still showing the session's wallpaper asks for the session's speed. Until
+    // it does, the session's own round has a speed change to apply, so no screen joins or merges into
+    // it. Caller must hold m_stateMutex.
+    bool speedSettledLocked(const VideoSession& session) const;
+
+    // Folds sessions playing the same file at the same settled speed into one, so a screen that left
+    // to keep its own picture, or to play at another speed, rejoins the others' playback -- once a
+    // screen of either moves: until then a stopped screen keeps the picture it left for. Caller must
+    // hold m_gpuMutex and not m_stateMutex.
+    void mergeSharedSessionsLocked();
 
     // The request whose committed frame a video of `wallpaperSeq` still shows, or nothing when it
     // shows something else: no frame, a render owed, another wallpaper since, or a file with one
@@ -1295,14 +1360,17 @@ private:
     void dropStaleKeptStillLocked(int monitorId, std::optional<Drawable> kind, uint64_t wallpaperSeq);
     void releaseExpiredStillsLocked(std::chrono::steady_clock::time_point now, ClockRound& round);
 
-    // The session to draw this monitor's video with, opened and decoded into when it has none for
-    // this wallpaper -- so a re-post costs the blit of the picture already held. One opened where a
-    // released session stood is left CatchingUp, with nothing decoded. Never advances a
-    // session that exists: that is advanceVideo()'s alone. ensureGpu() and this pass's
-    // dropStaleVideoSessionLocked() must have run: a session found here is reused without asking
-    // which wallpaper it was opened for. Throws what VideoPipeline's constructor and decodeNext()
-    // throw, retaining nothing when it does.
-    VideoSession& videoSessionLocked(int monitorId, const std::string& path, uint64_t wallpaperSeq);
+    // The session to draw this monitor's video with: the one it is in; else one already playing the
+    // same file at the same speed, which it joins; else one opened and decoded into -- so a re-post
+    // costs the blit of the picture already held. One opened where a released session stood is left
+    // CatchingUp, with nothing decoded. `keepsPicture`: the monitor is not playing, so one holding a
+    // picture of its own to return to opens a session at that picture rather than join one showing
+    // another. Never advances a session that exists: that is advanceVideo()'s alone. ensureGpu()
+    // and this pass's dropStaleVideoSessionLocked() must have run: a session found here is reused
+    // without asking which wallpaper it was opened for. Throws what VideoPipeline's constructor and
+    // decodeNext() throw, retaining nothing when it does.
+    VideoSession& videoSessionLocked(int monitorId, const std::string& path, uint64_t wallpaperSeq,
+                                     bool keepsPicture);
 
     // Drops every claim on a monitor whose images have just been freed or replaced, and the
     // frame they held: hasFrame promises an export that the images it names still exist. Takes
@@ -1480,8 +1548,9 @@ private:
     mutable std::mutex m_stateMutex;
 
     // Guarded by m_gpuMutex. Declaration order is destruction order reversed: targets
-    // hold a Device&, so the Device must outlive them.
-    std::unique_ptr<Device> m_device;
+    // hold a Device&, so the Device must outlive them. Leaked instead of freed once a video's
+    // decode thread was left running: before the video sessions, so that is known by then.
+    OwnedDevice m_device;
     std::unique_ptr<OffscreenTargetManager> m_targets;
 
     // Each consumer's acquire timeline, by DBus unique name. Split between the two locks: the list
@@ -1528,11 +1597,13 @@ private:
     std::map<std::string, QueuedRequests> m_queuedRequests;
     std::string m_resolvedShaderDir;
 
-    // One monitor's open video file, looping: the decoder, its picture pool, one converted picture
-    // and where that picture stands against the clock. Held so a re-post -- a screen reporting its
-    // size, a consumer reporting its layouts -- draws the held picture instead of rebuilding a
-    // decode session for it. A resize keeps it: nothing in a session is sized to the target, since
-    // the blit that shows the picture scales to whatever extent it is given.
+    // One open video file, looping, and the screens showing it at one speed: the decoder, its
+    // picture pool, one converted picture and where that picture stands against the clock. Every
+    // screen playing is drawn each picture with its own placement into its own images; one that is
+    // not keeps the picture it has. Held so a re-post -- a screen reporting its size, a consumer
+    // reporting its layouts -- draws the held picture instead of rebuilding a decode session for
+    // it. A resize keeps it: nothing in a session is sized to the target, since the blit that shows
+    // the picture scales to whatever extent it is given.
     //
     // Guarded by m_gpuMutex and not m_stateMutex, which is why it cannot live in MonitorState: a
     // pipeline is GPU-thread-only, destruction included, while MonitorState is read by bus
@@ -1540,20 +1611,34 @@ private:
     // also what frees the pipelines at shutdown -- on the thread ~WallpaperManager adopts, and
     // before the Device they were built on. Holds at most kMaxVideoSessions entries.
     struct VideoSession {
-        uint64_t wallpaperSeq = 0;
+        using Member = VideoSessionMember;
+        // Never empty while the session is in the map.
+        std::vector<Member> members;
+        // What its pictures are timed at; a member set to another speed leaves.
+        double speed = 1.0;
         // Which draw this session was last wanted for, against m_videoSessionUse. Eviction picks
         // the smallest.
         uint64_t lastUsed = 0;
-        // The file this pipeline opened, which its teardown is attributed to. Not a copy of the
+        // The file this pipeline opened, which its teardown is attributed to. Not a copy of a
         // monitor's path: that names what the monitor has been asked for since.
         std::string path;
-        // What names this session to the fatal-signal handler while it is being worked on. On the
-        // heap so its bytes stay put when the session is moved: the handler holds their address.
-        std::unique_ptr<const std::string> blame;
+        // Nothing when the path could not be asked about, which no screen then joins.
+        std::optional<FileIdentity> file;
+        // What names this session to the fatal-signal handler while the clock or the pipeline's
+        // decode thread works on it: its first member's monitor and the path, so a death counts
+        // against a screen still showing it. A render pass names its own monitor instead. Replaced
+        // whole, never edited: a thread naming the old line holds it until its work is done. On the
+        // heap so its address stays put when the session is moved: the decode thread reads it there.
+        struct BlameLine {
+            std::atomic<std::shared_ptr<const std::string>> line;
+        };
+        std::unique_ptr<BlameLine> blame;
+        // The monitor `blame` names: the first member's, unless rebuilding the line ran out of memory.
+        int blamed = -1;
         std::unique_ptr<VideoPipeline> pipeline;
-        // The MonitorState::releasedAt this session was opened at: the picture on screen until the
-        // session draws one of its own.
-        std::optional<StreamPosition> openedAt;
+        // Opened at a MonitorState::releasedAt, so its first picture drawn delivers the render that
+        // opened it.
+        bool openedAtPosition = false;
 
         // The held picture: the first, never drawn; the one on screen, whose successor is decoded
         // next; or that successor, waiting for `due`. `timeline` is a picture's place on the file's
@@ -1600,15 +1685,20 @@ private:
         };
         std::variant<Undrawn, OnScreen, Waiting, CatchingUp> clock;
 
-        // When the clock first found this session's monitor not playing, or nothing while it is.
-        // The whole off switch: a video nobody can see stops at once and keeps its picture, and
+        // When the clock first found none of this session's screens playing, or nothing while one
+        // is. The whole off switch: a video nobody can see stops at once and keeps its picture, and
         // this is what says how long it has been stopped, whatever stopped it. Which release delay
-        // runs from it is decided each round by what stops it then.
+        // runs from it is decided each round by what stops it then: the paused one while any of its
+        // screens is paused.
         std::optional<std::chrono::steady_clock::time_point> idleSince;
 
-        // The file's sound, made the first time its screen is heard and kept, silent, while it is
-        // not. Its anchor is the one record of where the sound was told to be.
+        // The file's sound, made the first time one of its screens is heard and kept, silent, while
+        // none is; made again when another of its screens is heard. It follows the session's one
+        // clock. Its anchor is the one record of where the sound was told to be.
         std::unique_ptr<AudioTrack> audio;
+        // The monitor `audio` was made for, is named after and blames: it plays only while that
+        // screen is heard.
+        int audioScreen = -1;
         // Where every pass through the file starts and ends in its own time, from the first loop on,
         // for a pass long enough that its sound is handed to the next ahead of time.
         struct Pass {
@@ -1698,12 +1788,16 @@ private:
         };
         DecodeLoad decodeLoad;
     };
-    // Before the output, whose thread calls it until the output is destroyed.
+    // Before the output and the sessions, whose threads call it until they are destroyed.
     std::mutex m_clockWakeMutex;
     std::function<void()> m_clockWake;
+    // Calls m_clockWake, if set. Any thread.
+    void wakeClock();
     // Before the sessions, whose tracks it must outlive.
     std::unique_ptr<AudioOutput> m_audio;
-    std::map<int, VideoSession> m_videoSessions;
+    // By a number of their own, since a session outlives any one of its screens.
+    std::map<uint64_t, VideoSession> m_videoSessions;
+    uint64_t m_lastVideoSessionId = 0;
 
     // A still's decoded image, kept past the pass that drew it for Config::stillKeptFor, and only for
     // the wallpaper it was decoded for. A pass for any other, or one that fails, lets it go; one for

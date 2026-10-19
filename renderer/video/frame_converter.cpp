@@ -799,13 +799,10 @@ Device::SubmitTicket FrameConverter::convert(DecodedFrame& frame) {
     // Everything that can refuse the frame happens before the queue is touched. The record
     // callbacks capture one pointer besides `this`, which keeps std::function from allocating.
     if (m_picture.storage == DecodedFrame::Storage::DeviceImage) {
-        struct Job {
-            DecodedFrame::DeviceImage source;
-            ConvertPush push;
-        };
-        const Job job{frame.deviceImage(), pushFor(frame)};
-        return frame.submit([this, &job](VkCommandBuffer cmd) { recordDevice(cmd, job.source, job.push); },
-                            VK_PIPELINE_STAGE_TRANSFER_BIT);
+        const ConvertPush push = pushFor(frame);
+        return frame.submit([this, &push](VkCommandBuffer cmd, const DecodedFrame::DeviceImage& source) {
+            recordDevice(cmd, source, push);
+        }, VK_PIPELINE_STAGE_TRANSFER_BIT);
     }
 
     struct Job {

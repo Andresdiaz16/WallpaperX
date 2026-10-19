@@ -366,21 +366,27 @@ VkRect2D DecodedFrame::visible() const {
 
 DecodedFrame::DeviceImage DecodedFrame::deviceImage() const {
     if (storage() != Storage::DeviceImage) throw std::logic_error("DecodedFrame: a host frame has no device image");
+    const FrameLock lock(framesContext(frame()), vkFrame(frame()));
+    return deviceImageLocked();
+}
+
+DecodedFrame::DeviceImage DecodedFrame::deviceImageLocked() const {
     const AVVkFrame* vk = vkFrame(frame());
     const auto* frames = static_cast<const AVVulkanFramesContext*>(framesContext(frame())->hwctx);
     return DeviceImage{vk->img[0], frames->format[0], vk->tiling, frames->usage, vk->layout[0]};
 }
 
-Device::SubmitTicket DecodedFrame::submit(const std::function<void(VkCommandBuffer)>& record,
+Device::SubmitTicket DecodedFrame::submit(const std::function<void(VkCommandBuffer, const DeviceImage&)>& record,
                                           VkPipelineStageFlags readStage, Device::SubmitScope scope) {
     if (storage() != Storage::DeviceImage) throw std::logic_error("DecodedFrame: a host frame has nothing to submit");
     AVVkFrame* vk = vkFrame(frame());
 
     const FrameLock lock(framesContext(frame()), vk);
+    const DeviceImage image = deviceImageLocked();
     const uint64_t current = vk->sem_value[0];
     scope.timelineWait.emplace_back(vk->sem[0], current, readStage);
     scope.timelineSignal.emplace_back(vk->sem[0], current + 1);
-    const Device::SubmitTicket ticket = m_device->submit(record, scope);
+    const Device::SubmitTicket ticket = m_device->submit([&](VkCommandBuffer cmd) { record(cmd, image); }, scope);
     vk->sem_value[0] = current + 1;
     return ticket;
 }
@@ -425,22 +431,24 @@ void VideoDecoder::closeAll() noexcept {
     m_reader.close();
 }
 
-// The one bounded question this renderer can ask of the GPU: an empty batch through the
-// Device, which a device that is lost or has stopped fails.
-bool VideoDecoder::deviceHealthy() {
+// The one bounded question this renderer can ask of the GPU.
+bool VideoDecoder::deviceAnswers(Device& device) {
     try {
-        m_device.immediateSubmit([](VkCommandBuffer) {});
+        device.immediateSubmit([](VkCommandBuffer) {});
         return true;
     } catch (const GpuFailure&) {
         return false;
     }
 }
 
-// The same question as deviceHealthy(), from a destructor. Anything the probe throws is an
-// unhealthy answer: the alternative is entering ffmpeg's unbounded wait from a noexcept path.
+bool VideoDecoder::deviceHealthy() { return m_askDevice ? m_askDevice() : deviceAnswers(m_device); }
+
+// The same question as deviceHealthy(), from a destructor, which is on the GPU thread. Anything
+// the probe throws is an unhealthy answer: the alternative is entering ffmpeg's unbounded wait
+// from a noexcept path.
 bool VideoDecoder::decodeWorkCanDrain() noexcept {
     try {
-        return deviceHealthy();
+        return deviceAnswers(m_device);
     } catch (...) {
         return false;
     }
@@ -554,8 +562,9 @@ void VideoDecoder::openDecoder() {
     m_softwareFormatRefused.store(false, std::memory_order_relaxed);
     m_codec->opaque = this;
     m_codec->get_format = &VideoDecoder::chooseFormat;
-    // Frame threads would decode -- and submit to the decode and graphics queues -- off the GPU
-    // thread; the graphics queue is shared with the Device and not free-threaded. Software
+    // Frame threads would decode -- and submit to the decode and graphics queues -- off the thread
+    // that calls next(), which is the GPU thread on a device whose queues are not internally
+    // synchronised; and the format and picture callbacks assume one decoding thread. Software
     // submits nothing and takes ffmpeg's default.
     m_codec->thread_count = hardware ? 1 : 0;
     // Cropping is reported, not applied: ffmpeg cannot move a device image's origin, so applying
@@ -863,8 +872,12 @@ bool VideoDecoder::PacketMark::matches(const AVPacket& packet) const {
            packet.pts == pts && packet.size == size;
 }
 
+void VideoDecoder::assertMayDecodeHere(const char* what) const {
+    if (!m_device.queuesInternallySynchronized()) m_device.assertGpuThread(what);
+}
+
 void VideoDecoder::restart() {
-    m_device.assertGpuThread("VideoDecoder::restart");
+    assertMayDecodeHere("VideoDecoder::restart");
     avcodec_flush_buffers(m_codec);
     m_flushed = false;
     m_skipping = PictureSkip::Nothing;
@@ -1242,12 +1255,12 @@ void VideoDecoder::failDecode(const char* what, int err) {
 }
 
 std::optional<DecodedFrame> VideoDecoder::next(PictureSkip skip) {
-    m_device.assertGpuThread("VideoDecoder::next");
+    assertMayDecodeHere("VideoDecoder::next");
     return std::get<std::optional<DecodedFrame>>(decode(std::nullopt, skip));
 }
 
 std::variant<std::optional<DecodedFrame>, VideoDecoder::Dropping> VideoDecoder::next(uint32_t dropLimit, PictureSkip skip) {
-    m_device.assertGpuThread("VideoDecoder::next");
+    assertMayDecodeHere("VideoDecoder::next");
     return decode(dropLimit, skip);
 }
 

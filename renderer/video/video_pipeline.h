@@ -3,14 +3,18 @@
 #pragma once
 
 #include "../renderers/video_renderer.h"
+#include "decode_ahead.h"
 #include "frame_converter.h"
+#include "picture_source.h"
 #include "video_decoder.h"
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <variant>
 
 namespace wallpaperx {
 
@@ -23,8 +27,8 @@ struct OffscreenTarget;
 // first picture in the call after the last, on the same stage when their shape matches.
 //
 // Each picture the decoder returns is shown once, in its output order; the decoder is what keeps
-// a hardware failure from returning one twice. The call that meets the failure returns once
-// software has caught up, and the target keeps the last picture shown until then.
+// a hardware failure from returning one twice. The picture after a failure comes once software has
+// caught up, and the target keeps the last picture shown until then.
 //
 // A picture of a different shape -- a new size or crop, or host planes after device images --
 // gets a new converter, built before the old one is freed, in the call that shows it. The target
@@ -37,15 +41,33 @@ struct OffscreenTarget;
 // ordered against the decoder's next write of that image by the frame's semaphore. The blit
 // needs nothing beyond submission order: both batches go to the graphics queue, blit second.
 //
-// GPU thread only, destruction included. Must be destroyed before the Device.
+// The first picture is decoded on the calling thread. From the second on, a stream the device
+// decodes is decoded on a thread of its own, a few pictures ahead (DecodeAhead), when the device's
+// queues are internally synchronised and the thread can be had; otherwise every picture is decoded
+// on the calling thread. Only takeReady() and decodeWithin() set what that thread's decodes skip.
+//
+// GPU thread only, destruction included. Must be destroyed before the Device. Destruction waits
+// for the decode thread to leave the decode call it is in.
 class VideoPipeline {
 public:
-    enum class Playback { Once, Loop };
+    using Playback = PictureSource::Playback;
+    using PictureTiming = wallpaperx::PictureTiming;
+
+    // What the caller lends the decode thread. Both are optional; what they refer to must outlive
+    // this pipeline.
+    struct DecodeHooks {
+        // Wraps each decode the thread makes, as DecodeAhead::Around: whatever names the work for
+        // whoever has to know which file the thread is decoding.
+        DecodeAhead::Around around;
+        // As DecodeAhead::Ready: a takeReady() that answered Pending is worth calling again.
+        DecodeAhead::Ready ready;
+    };
 
     // Opens `file`; nothing is decoded until the first call, which shows the picture at `startAt`
     // when one is given, as VideoDecoder's constructor describes. Throws what that constructor throws.
     VideoPipeline(Device& device, const std::string& file, const std::string& shaderDir,
-                  Playback playback = Playback::Once, std::optional<StreamPosition> startAt = std::nullopt);
+                  Playback playback = Playback::Once, std::optional<StreamPosition> startAt = std::nullopt,
+                  DecodeHooks hooks = {});
 
     VideoPipeline(const VideoPipeline&) = delete;
     VideoPipeline& operator=(const VideoPipeline&) = delete;
@@ -73,44 +95,39 @@ public:
     // `dropLimit` pictures on its way to the next one it returns, as VideoDecoder::next(dropLimit)
     // does. Dropping leaves the picture decoded last, and its timing and position, as they were; the
     // next call carries on. Throws as decodeNext() does, but for the conversion. `skip` is as
-    // PictureSkip: a skipped picture is never returned, so the next one's timing spans it.
-    enum class Decode { Decoded, Exhausted, Dropping };
+    // PictureSkip: a skipped picture is never returned, so the next one's timing spans it. Once a
+    // decode thread runs, the dropping is the thread's, and this waits for the next picture.
+    //
+    // Pending is takeReady()'s alone.
+    enum class Decode { Decoded, Exhausted, Dropping, Pending };
     Decode decodeWithin(uint32_t dropLimit, PictureSkip skip = PictureSkip::Nothing);
+
+    // decodeWithin(1, skip) that never waits for a decode thread: Pending when it has no picture
+    // ready, and the ready hook is called once it has one.
+    Decode takeReady(PictureSkip skip);
 
     // Converts the picture decoded last unless it already is. A caller that draws under a lock calls
     // it first, so the lock waits on a blit alone. Throws as decodeNext() does.
     void convert();
 
-    // When the picture draw() shows belongs on screen, as the decoder reported it. What paces the
-    // pictures is the caller's; this only says where each one falls.
-    struct PictureTiming {
-        std::optional<std::chrono::nanoseconds> presentation;
-        std::optional<std::chrono::nanoseconds> duration;
-        // The first picture of a pass through the file: the first this pipeline showed, unless it
-        // started part way in, or the first after a loop. Its presentation time says nothing about
-        // its distance from the picture before it.
-        bool startsPass = false;
-        // As DecodedFrame::skip().
-        PictureSkip skip = PictureSkip::Nothing;
-        // For the first picture after a loop, where the pass before it ended, as
-        // VideoDecoder::readThrough(): past its last picture shown when that one's successors were skipped.
-        std::optional<std::chrono::nanoseconds> passEnded;
-        // As DecodedFrame::keptThrough() and readSince().
-        PictureSkip keptThrough = PictureSkip::Nothing;
-        uint32_t readSince = 1;
-    };
-    // Throws std::logic_error before the first picture.
+    // When the picture draw() shows belongs on screen, as the decoder reported it. Throws
+    // std::logic_error before the first picture.
     PictureTiming timing() const;
 
-    // As VideoDecoder::deepestSkip().
-    PictureSkip deepestSkip() const { return m_decoder.deepestSkip(); }
+    // As VideoDecoder::deepestSkip(), as of the picture decoded last.
+    PictureSkip deepestSkip() const { return m_deepest; }
 
     // Where the picture draw() last showed lies in the file, for a pipeline opened on it later to
     // start there. Empty before the first draw and when the decoder could not find it again.
     std::optional<StreamPosition> shownPosition() const { return m_shownPosition; }
 
 private:
-    Decode decode(std::optional<uint32_t> dropLimit, PictureSkip skip);
+    enum class Waiting { ForPicture, Never };
+    // No `skip` decodes the whole stream on this thread and leaves a decode thread's level as it is.
+    Decode decode(std::optional<uint32_t> dropLimit, std::optional<PictureSkip> skip, Waiting waiting);
+    Decode accept(DecodeAhead::Item item);
+    void hold(PictureSource::Picture picture);
+    void decodeAheadIfSafe();
 
     // Built and replaced together, so the renderer never outlives the image it shows.
     struct Stage {
@@ -121,8 +138,12 @@ private:
 
     Device& m_device;
     std::string m_shaderDir;
-    Playback m_playback;
-    VideoDecoder m_decoder;
+    DecodeHooks m_hooks;
+    // Who decodes: this thread, until a decode thread takes the source over.
+    std::variant<std::unique_ptr<PictureSource>, std::unique_ptr<DecodeAhead>> m_decoding;
+    // The system had no thread to give, so this thread decodes for good.
+    bool m_noDecodeThread = false;
+    PictureSkip m_deepest;
     // Null until the first picture is converted.
     std::unique_ptr<Stage> m_stage;
     // The picture decoded last, while it is not converted yet.

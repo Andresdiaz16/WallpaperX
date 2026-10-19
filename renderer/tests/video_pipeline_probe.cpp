@@ -23,6 +23,7 @@
 #include "video/video_decoder.h"
 #include "video/video_pipeline.h"
 #include "vulkan/device.h"
+#include "vulkan/owned_device.h"
 #include "vulkan/gpu_fault.h"
 #include "vulkan/offscreen.h"
 
@@ -30,6 +31,7 @@
 #include "support/check.h"
 #include "support/forked_child.h"
 #include "support/gpu_readback.h"
+#include "support/sanitizer_ignored_caller.h"
 #include "support/picture_counter.h"
 #include "support/reset_point_reference.h"
 #include "support/validation_grade.h"
@@ -45,11 +47,20 @@ extern "C" {
 }
 
 #include <dlfcn.h>
+#include <execinfo.h>
+#include <pthread.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <thread>
 #include <cerrno>
 #include <csignal>
 #include <array>
@@ -93,6 +104,11 @@ constexpr uint32_t kTargetHeight = 240;
 
 // Read while a Device is built: strips VK_KHR_video*, so every stream decodes in software.
 bool g_hideVideoExtensions = false;
+
+// Set for the whole process by modes whose checks count or inject inside the caller's own call: strips
+// VK_KHR_internally_synchronized_queues, so the Device keeps its queues to itself and the pipeline decodes
+// on the calling thread, with no thread decoding ahead outside that call.
+bool g_hideSynchronizedQueues = false;
 
 // The decoder's own codec context is the one with `opaque` set; avformat_find_stream_info decodes
 // through the same entry points on contexts of its own, which must neither be failed nor counted.
@@ -261,11 +277,16 @@ struct PoolRecord {
     int freedDuring = kOutsideCalls;
     bool freedWhileOpen = false;
     int pictures = 0;  // pictures the decoder received in it
+    int freedAfterPictures = -1;  // g_trackedPictures when it was freed
+    bool freedOnMainThread = false;
     // A copy of a picture's reference, not a reference of its own: reads the pool's count while
     // `freed` is false, and adds nothing to it.
     AVBufferRef peek{};
 };
 std::vector<PoolRecord> g_pools;
+// Pictures the decoder received while g_trackPools is set, on any thread: when a pool was freed, by
+// playback position rather than by call.
+std::atomic<int> g_trackedPictures{0};
 // Every context whose free callback the probe replaced and that is not yet freed, kept across
 // resetPools() so ffmpeg's own callback is always called. `record` is into g_pools of `generation`.
 struct HookedPool {
@@ -299,6 +320,8 @@ void onPoolFreed(AVHWFramesContext* frames) {
         pool->freed = true;
         pool->freedDuring = g_poolCall;
         pool->freedWhileOpen = g_decoderOpen;
+        pool->freedAfterPictures = g_trackedPictures.load();
+        pool->freedOnMainThread = gettid() == getpid();
     }
     const auto ffmpegFree = hooked->ffmpegFree;
     g_hookedPools.erase(hooked);
@@ -890,6 +913,7 @@ void runEndChecks(Device& device, const std::string& label) {
     //       picture(s): 119 pictures shown against 120 ... 1 never shown". Always walking back: "pictures
     //       after the seek untimestamped: seeks to 163840, 148480, 133120, 102400, 40960, -1024", 822
     //       pictures decoded -- the last being the rewind's seek to packet 1's decode timestamp.
+    //       Both re-run 2026-10-19 (T7b), resume-end, queues hidden: held, the same lines.
     // COVERAGE-ASSERT: failureExercised() on every run, and one seek asserted on the stripped run.
     for (const char* file : {"counter_long.mp4", "counter_seg.ts"}) {
         const std::optional<CounterReference> reference = counterReference(label, file);
@@ -940,6 +964,9 @@ void runEndChecks(Device& device, const std::string& label) {
     //       recordLanding() always setting Landing::Unproven -> "seeks to 489000, 399000, 309000, 126000"
     //       (the MP4 half above red too). 2026-09-30: next()'s skip marking the landing Unproven and decoding the
     //       non-keyframe -- the verdict read at the packet landed on -> the same line, the MP4 half green.
+    //       Re-run 2026-10-19 (T7), queues hidden: recordLanding() always Unproven held, the same line.
+    //       Re-run 2026-10-19 (T7b), queues hidden: the 2026-09-30 break (the landing marked Unproven, the
+    //       skip loop disabled) held, the same line.
     // COVERAGE-ASSERT: the first packet read after the seek must not be a keyframe -- red with
     //       counter_long.mp4 substituted (test-side, by hand, 2026-09-30), "the first landing on a keyframe".
     const char* const transport = "counter_seg.ts";
@@ -1045,6 +1072,7 @@ void runDropCountChecks(Device& device, const std::string& label) {
     //       "91 pictures shown against 90 ... call 41 showed 39 where 40 was due ... 1 shown more than
     //       once". next() returning the end instead of throwing with DropCount pending (its `if` made
     //       `if (false)`): the second case "40 pictures shown, then the stream ended".
+    //       Re-run 2026-10-19 (T7), queues hidden: the first break held, the same line.
     // COVERAGE-ASSERT: at least two recovery passes in the failing call -- red with the refusal never
     //       applied (test-side, `g_refuseFrom = 0`, by hand, re-run 2026-10-01), "1 recovery pass(es) (1
     //       decoder open(s), 0 flush(es))" for both cases.
@@ -1449,9 +1477,10 @@ void runStartAtChecks(Device& device, const std::string& label, bool onDevice, S
     //       control_batch.sh 2026-10-01: startAtResetPoint() handing a window with no reset point to software
     //       (the resume state set, `m_path = Path::SoftwareRefused`, and a reopen in software required) ->
     //       "counter_long.mp4 opened at picture 290, its first seek landing late: 0 device and 55 host
-    //       picture(s)". In
-    //       renderer/video/video_pipeline.cpp, decode()'s `startsPass` made `!m_timing` (re-run via
-    //       control_batch.sh 2026-10-12) -> on start-at-device "its first picture is marked as starting a
+    //       picture(s)" (7 host on the 2026-10-19 re-run). These four re-run 2026-10-19 (T7b), queues hidden on
+    //       start-at-device: all held, the same lines. In
+    //       renderer/video/picture_source.cpp, next()'s `startsPass` made `!m_returnedAny` (re-run there via
+    //       control_batch.sh 2026-10-19, T7, queues hidden) -> on start-at-device "its first picture is marked as starting a
     //       pass" at every point.
     // COVERAGE-ASSERT: the late-landing run must show a second seek aimed further back, or the late landing
     //       was never exercised -- red with the shift set to 0 (test-side, by hand, 2026-09-30, start-at-device),
@@ -1532,7 +1561,7 @@ void runStartAtChecks(Device& device, const std::string& label, bool onDevice, S
         // CONTROL: via control_batch.sh, 2026-09-30, reverted, renderer/video/video_decoder.cpp
         //       startAtResetPoint() seeking to the reset point in the first window too (`back != 0 &&` deleted)
         //       -> on start-at-device "counter_long.mp4 opened at picture 40: seeks to 20479, 20479; a closed-GOP
-        //       MP4 start made more than one seek".
+        //       MP4 start made more than one seek". Re-run 2026-10-19 (T7b), queues hidden: held, the same line.
         if (!transport && !late && run.seeks.size() != 1) {
             std::fprintf(stderr, "FAIL: %s: %s: %s; a closed-GOP MP4 start made more than one seek\n", label.c_str(),
                          what.c_str(), describeSeeks(run.seeks).c_str());
@@ -1551,6 +1580,7 @@ void runStartAtChecks(Device& device, const std::string& label, bool onDevice, S
         //       221999, the first landing on a non-keyframe", pictures still 60-64. Device: startAtResetPoint()
         //       seeking to the reset point in the first window too (`back != 0 &&` deleted) -> on
         //       start-at-device-ts "seeks to 311999, 311999, the first landing on a non-keyframe".
+        //       Both re-run 2026-10-19 (T7b): held, the same lines.
         // COVERAGE-ASSERT: the first packet read after the seek must not be a keyframe, or the skip was never
         //       exercised -- red with counter_long.mp4 substituted (test-side, by hand, 2026-09-30), "seeks to
         //       30719, the first landing on a keyframe".
@@ -1654,8 +1684,8 @@ void runStartAtChecks(Device& device, const std::string& label, bool onDevice, S
     //       picture and plays on: the picture it opened at does not start a pass and the loop's does. The
     //       daemon parks a file whose pass holds one picture -- two successive pass starts -- so a resumed
     //       last picture marked as a pass start would park a playing video for good.
-    // CONTROL: renderer/video/video_pipeline.cpp, decode()'s `startsPass` made `!m_timing` (the S15.141 break
-    //       above), via control_batch.sh 2026-10-15, reverted -> "FAIL: video_pipeline_probe (start-at-host): counter_short.mp4 opened at
+    // CONTROL: renderer/video/picture_source.cpp, next()'s `startsPass` made `!m_returnedAny` (the S15.141 break
+    //       above), via control_batch.sh 2026-10-15 and at its new home 2026-10-19 (T7), reverted -> "FAIL: video_pipeline_probe (start-at-host): counter_short.mp4 opened at
     //       its last picture: showed 19 0 1 where 19 0 1 was due; pass starts 110", on start-at-host (Lavapipe)
     //       and start-at-device (RTX).
     {
@@ -1960,6 +1990,7 @@ void runStartedFailureChecks(Device& device, const std::string& label) {
 //       `if (m_startedAfter && m_returned.count == 0) { restart(); continue; }` clause deleted -> on
 //       start-at-device and start-at-host "counter_long_cut.mp4 opened at picture 300 of counter_long.mp4:
 //       showed  (first marked no) where 0 1 2 3 4 was due".
+//       Re-run 2026-10-19 by T5b, queues hidden: held.
 // COVERAGE-ASSERT: the cut is shorter than the position, both counted from the independent decodes.
 void runPastEndChecks(Device& device, const std::string& label, bool onDevice) {
     if (onDevice ? !hardwareDecoderPresent(device, label) : !videoExtensionsHidden(device, label)) return;
@@ -2962,6 +2993,7 @@ bool gradePools(const std::string& label, const std::string& what, size_t calls,
     //       stream" -- before the end-of-call bound, both two-pool streams stayed green under this one.
     //       closeDecoder() without its unref loop: "the pool in use at the end outlived the pipeline", with the
     //       validation reconcile also red.
+    //       The first break re-run 2026-10-19 by T5b on shape-device, queues hidden: held.
     // COVERAGE-ASSERT: the run must make the pools its size changes imply; a fixture that stopped
     //       changing size, or an interposer never reached, fails here instead of grading nothing. Seen red
     //       both ways: "0 image pool(s) decoded into, where its size changes make 2" with ffmpeg's own free
@@ -2983,9 +3015,10 @@ bool gradePools(const std::string& label, const std::string& what, size_t calls,
         }
         std::fprintf(stderr, "FAIL: %s: %s: pool %zu of %zu (%s) was %s\n", label.c_str(), what.c_str(), n + 1,
                      pools.size(), sizeName(pool.width, pool.height).c_str(),
-                     !pool.freed                                                ? "never freed"
-                     : !pool.freedWhileOpen || pool.freedDuring == kOutsideCalls ? "freed only when the pipeline was destroyed"
-                                                                                 : "freed only by the call that ended the stream");
+                     !pool.freed                        ? "never freed"
+                     : !pool.freedWhileOpen             ? "freed only when the pipeline was destroyed"
+                     : pool.freedDuring == kOutsideCalls ? "freed between calls, outside any call this mode grades"
+                                                         : "freed only by the call that ended the stream");
         fail("a replaced image pool was not freed during playback");
         good = false;
     }
@@ -3211,7 +3244,8 @@ void runShapeDeviceFixture(Device& device, const std::string& label, const SizeC
     //       into"; the three AV1 streams and the declined HEVC stayed green, as none asks again. The
     //       failed-parameters refusal throwing WallpaperContentError: the declined HEVC alone, "the pipeline
     //       threw after 28 pictures" and "raised WallpaperContentError"; the AV1 declines, made in
-    //       allocatePicture(), stayed green.
+    //       allocatePicture(), stayed green. Both re-run 2026-10-19 (T7b), shape-device, queues hidden: held,
+    //       the same lines.
     //       renderer/video/video_pipeline.cpp's rendering-before-converting mutation is now renderNext()
     //       calling draw() before decodeNext(); since the split, draw() with nothing decoded throws
     //       instead of showing a stale picture, so the recorded "call 1 showed -1" no longer describes it.
@@ -3300,7 +3334,8 @@ void runOversizeChecks(Device& device, const std::string& label) {
     //       its image exactly. Two cases, because the guard tests the dimensions separately.
     // CONTROL: renderer/video/video_decoder.cpp DecodedFrame's constructor, each reverted. Its width half
     //       deleted: the wider case "next() returned a picture reporting 321x240". Its height half deleted:
-    //       the taller case "next() returned a picture reporting 320x241".
+    //       the taller case "next() returned a picture reporting 320x241". Both re-run 2026-10-19 (T7b),
+    //       queues hidden: held, the same lines.
     // COVERAGE-ASSERT: the enlargement landed on a device picture, and the picture before it filled its
     //       image -- red with the enlargement never armed, "the enlargement was never applied".
     struct Case {
@@ -3870,6 +3905,8 @@ void runUnansweredProbeTeardownChecks(Device& device, const std::string& label) 
     // CONTROL: renderer/video/video_decoder.cpp closeDecoder() without `(decodeWorkHeld && !decodeWorkCanDrain())`,
     //       reverted: "0 unanswered probe(s) at teardown, not 1". The probe made and its answer ignored, reverted:
     //       "the hardware codec was freed at teardown" and "pool 1 of 1 was freed at teardown". NVIDIA only.
+    //       Re-run 2026-10-19 (T7), decodeWorkCanDrain() now asking deviceAnswers(): the first break held.
+    //       The second re-run 2026-10-19 (T7b): held, "the hardware codec was freed at teardown".
     // COVERAGE-ASSERT: every call before teardown returned a device picture, the codec and a pool were alive when
     //       teardown began, and exactly one wait was refused -- the probe's, since nothing else was held.
     std::string threw;
@@ -4632,9 +4669,14 @@ void runLoopChecks(Device& device, const std::string& label, bool onDevice) {
     //       "call 21 returned false, for a stream of 20 pictures". rewind() dropping packet 1 after a
     //       landing: "call 91 (pass 2, picture 0 of it) showed 24 where 0 was due". seekToFirstPacket()
     //       without the presentation-time seek: counter_bf2.mkv alone, "seeks to byte 617, 1 container
-    //       open(s)". renderer/video/video_pipeline.cpp resetting the stage at the restart: "boundary 1
+    //       open(s)". renderer/video/video_pipeline.cpp hold() resetting the stage at a loop's first picture: "boundary 1
     //       made vkCreateImage x3, ..."; waiting for submissions after that call's render: "vkWaitForFences
     //       x1". The wait placed before the render stayed green: nothing is pending, no Vulkan call is made.
+    //       Re-run 2026-10-19 (T7), loop-device, queues hidden: restart() without its flush and the stage reset held,
+    //       the same lines. Re-run 2026-10-19 (T7b), loop-device, queues hidden, each held: rewind() dropping
+    //       packet 1 ("call 91 (pass 2, picture 0 of it) showed 24", raw H.264 and the transport stream);
+    //       seekToFirstPacket() without the presentation-time seek (the same counter_bf2.mkv line); the wait,
+    //       now in video_pipeline.cpp draw() after the render of a pass's first picture ("vkWaitForFences x1").
     // COVERAGE-ASSERT: the calls made and read back match the plan -- red with every seventh skipped, "60
     //       calls made and 51 read back" -- and the first call is seen building the stage, red with
     //       counting off, "the first call was seen making none". That the WAIT counter is wired is
@@ -5021,8 +5063,8 @@ void runTimingChecks(Device& device, const std::string& label, bool onDevice) {
     //       frame. The timings are compared against the fixture's own recipe rather than against each
     //       other alone: a pipeline reporting a constant would satisfy "consecutive differences are
     //       equal" perfectly.
-    // CONTROL: renderer/video/video_pipeline.cpp, decode()'s `startsPass = true;` after the
-    //       restart deleted -> "FAIL: the first picture after a loop is marked as starting a pass",
+    // CONTROL: renderer/video/picture_source.cpp, next()'s `startsPass = true;` after the
+    //       restart deleted (re-run there 2026-10-19, T7, timing-host on Lavapipe: held) -> "FAIL: the first picture after a loop is marked as starting a pass",
     //       printing "1 mark(s), where 2 were due", and the spacing check with it ("-1900000000 ns at
     //       20" -- the whole file backwards, which is what the mark exists to keep a caller from
     //       using). renderer/video/video_decoder.cpp, next()'s `frame.m_presentation` given
@@ -5031,10 +5073,11 @@ void runTimingChecks(Device& device, const std::string& label, bool onDevice) {
     //       Reverted. The second observed 2026-09-18; the first via control_batch.sh 2026-09-30 on timing-host,
     //       which also printed "39 pair(s) compared, where 38 were due". Via control_batch.sh 2026-10-15, reverted, timing-host on
     //       Lavapipe: timing() returning an empty PictureTiming instead of throwing -> "FAIL: timing() before
-    //       any picture has been decoded throws std::logic_error"; decode() recording no presentation time ->
+    //       any picture has been decoded throws std::logic_error"; PictureSource::next() recording no presentation time (re-run 2026-10-19, T7: held) ->
     //       "FAIL: every picture of a file that carries timestamps reports a presentation time and a duration";
     //       renderer/video/video_decoder.cpp, decode()'s duration from twice the frame's -> "FAIL: and the
-    //       duration each reports is the file's own picture interval".
+    //       duration each reports is the file's own picture interval". The timing(), AVRational{1, 1} and
+    //       duration breaks re-run 2026-10-19 (T7b), timing-host on Lavapipe: each held, its own line.
     // COVERAGE-ASSERT: the number of pictures decoded and the number of successive pairs actually
     //       compared are both asserted, so a run that decoded two pictures cannot report the same
     //       verdict as one that decoded forty.
@@ -5523,8 +5566,8 @@ void runPlayOnceChecks(Device& device, const std::string& label) {
     // WHY-THIS-SHAPE: every packet is refused as damaged, which the decoder skips, so the stream ends
     //       with nothing shown. What is graded is that no seek or open follows: returning false is not
     //       enough, since a restarted empty stream returns false too.
-    // CONTROL: renderer/video/video_pipeline.cpp decode(), its restart's `&& m_timing` dropped, re-observed
-    //       on the Lavapipe loop-host entry via control_batch.sh 2026-10-12: "a looping pipeline that has
+    // CONTROL: renderer/video/picture_source.cpp next(), its restart's `&& m_returnedAny` dropped, re-observed
+    //       on the Lavapipe loop-host entry via control_batch.sh 2026-10-19 (T7): "a looping pipeline that has
     //       shown nothing started its stream again instead of reporting the end". Reverted.
     // COVERAGE-ASSERT: packets were refused -- red with the refusal never switched on.
     g_packetsRefused = 0;
@@ -5574,6 +5617,8 @@ void runLoopCostChecks(Device& device, const std::string& label, bool onDevice) 
     //       reopen lands in software and that entry reports not answerable. restart() seeking once more
     //       after 100 pictures: each boundary green, the
     //       comparison red, "the 3000-picture boundary decoded 1 picture(s), seeks to 0, -1024".
+    //       All three re-run 2026-10-19 (T7b), loop-cost-device, queues hidden: held, the same lines (the
+    //       decoder reopen clearing the path first).
     // COVERAGE-ASSERT: the long file is a hundred times the short -- red with the short one in its place.
     struct Pair {
         const char* container;
@@ -5650,6 +5695,8 @@ void runLoopResumeChecks(Device& device, const std::string& label) {
     //       108 pictures, where playing once cost 18". Keeping m_resume: on the optimised build, counter_bf2.mkv
     //       failing at the boundary, "call 61 (pass 2, picture 0 of it) showed 1 where 0 was due" and "decoded
     //       14 pictures, where playing once cost 12" (an assertion build aborted on an unset std::optional). Reopening a software decoder for the hardware: "2 device pictures from the failure on".
+    //       Re-run 2026-10-19 (T7), queues hidden: keeping m_returned held, "decoded 31 pictures, where playing once cost 7".
+    //       The other three re-run 2026-10-19 (T7b), queues hidden: each held, the same lines.
     // COVERAGE-ASSERT: each failing call opens a software decoder, looping and playing once -- red with
     //       either left unarmed -- and playing once costs at most the pictures up to the failure plus a
     //       keyframe gap: numbers carried across every rewind inflate both alike, "playing once, a failure
@@ -5747,6 +5794,1117 @@ void runLoopResumeChecks(Device& device, const std::string& label) {
     }
 }
 
+// ------------------------------------------------------------------------- //
+// The decode thread (S15.882-S15.888), seen through the probe's own DecodeHooks and interposers
+// ------------------------------------------------------------------------- //
+
+std::atomic<pid_t> g_gpuTid{0};     // the thread that calls the pipeline
+std::atomic<pid_t> g_decodeTid{0};  // learned in the around hook, which only a decode thread calls
+std::atomic<int> g_aroundCalls{0};
+std::atomic<bool> g_inAround{false};
+std::atomic<bool> g_countThreaded{false};
+// Pictures the decoder's context returned while g_countThreaded is set, and how many the caller has
+// taken: incremented BEFORE a call that is known to return one, so a receive never sees it late.
+std::atomic<int> g_threadReceived{0};
+std::atomic<int> g_threadHostReceived{0};
+std::atomic<int> g_receivedOffGpuThread{0};
+std::atomic<int> g_taken{0};
+std::atomic<int> g_maxUntaken{0};
+// avcodec_receive_frame on the decode thread answers AVERROR_EXTERNAL this many times.
+std::atomic<int> g_threadExternal{0};
+std::atomic<bool> g_watchParks{false};
+// operator new on the pipeline's caller fails once inside DecodeAhead::start(): 1 the first allocation
+// there outside the hook's installation, 2 the hook's.
+std::atomic<int> g_failNew{0};
+std::atomic<int> g_newFailures{0};
+// Pictures received on the decode thread while g_countOnThread is set, counted on the interposer's
+// ordinary path: g_countThreaded's returns before g_stripTimestamps is applied.
+std::atomic<bool> g_countOnThread{false};
+std::atomic<int> g_onThreadReceived{0};
+std::atomic<int> g_onThreadHost{0};
+
+// Below under g_threadMutex, every change signalled on g_threadChanged.
+std::mutex g_threadMutex;
+std::condition_variable g_threadChanged;
+int g_parks = 0;  // the decode thread waited on a condition outside a decode: its queue was full
+int g_readyCalls = 0;
+int g_questions = 0;  // ready hook calls from inside a decode: the device-health question
+bool g_gateClosed = false;
+bool g_atGate = false;
+
+// Holding a decode thread inside ffmpeg past DecodeAhead's stop bound (S15.889): set, the decoder's next
+// avcodec_receive_frame on the decode thread waits until it is cleared.
+std::atomic<bool> g_holdInFfmpeg{false};
+std::atomic<bool> g_heldInFfmpeg{false};
+std::atomic<bool> g_decodeThreadGone{false};
+// operator delete reports a free of this address (only where the probe replaces it).
+std::atomic<const void*> g_watchedDevice{nullptr};
+std::atomic<bool> g_watchedDeviceFreed{false};
+
+// Armed on a decode thread by the around hook; its destructor runs as that thread exits.
+struct ThreadExitMark {
+    bool armed = false;
+    ~ThreadExitMark() {
+        if (!armed) return;
+        {
+            std::lock_guard<std::mutex> lock(g_threadMutex);
+            g_decodeThreadGone = true;
+        }
+        g_threadChanged.notify_all();
+    }
+};
+thread_local ThreadExitMark t_exitMark;
+
+void resetThreadWatch() {
+    g_gpuTid = gettid();
+    g_decodeTid = 0;
+    g_aroundCalls = 0;
+    g_inAround = false;
+    g_countThreaded = false;
+    g_threadReceived = 0;
+    g_threadHostReceived = 0;
+    g_receivedOffGpuThread = 0;
+    g_taken = 0;
+    g_maxUntaken = 0;
+    g_threadExternal = 0;
+    g_watchParks = false;
+    g_failNew = 0;
+    g_newFailures = 0;
+    std::lock_guard<std::mutex> lock(g_threadMutex);
+    g_parks = 0;
+    g_readyCalls = 0;
+    g_questions = 0;
+    g_gateClosed = false;
+    g_atGate = false;
+}
+
+// Opens the gate as it goes, so a pipeline destroyed after it never waits out its stop bound on a
+// decode thread the probe still holds. Declare after the pipeline.
+struct ThreadWatchEnd {
+    ~ThreadWatchEnd() {
+        {
+            std::lock_guard<std::mutex> lock(g_threadMutex);
+            g_gateClosed = false;
+        }
+        g_threadChanged.notify_all();
+        g_countThreaded = false;
+        g_watchParks = false;
+        g_threadExternal = 0;
+        g_failNew = 0;
+    }
+};
+
+void setGate(bool closed) {
+    {
+        std::lock_guard<std::mutex> lock(g_threadMutex);
+        g_gateClosed = closed;
+    }
+    g_threadChanged.notify_all();
+}
+
+VideoPipeline::DecodeHooks watchedHooks() {
+    VideoPipeline::DecodeHooks hooks;
+    hooks.around = [](const std::function<void()>& step) {
+        g_decodeTid = gettid();
+        t_exitMark.armed = true;
+        ++g_aroundCalls;
+        // Set before the gate, so the gate's own wait is not taken for the queue-full wait.
+        g_inAround = true;
+        struct Leave {
+            ~Leave() { g_inAround = false; }
+        } leave;
+        {
+            std::unique_lock<std::mutex> lock(g_threadMutex);
+            if (g_gateClosed) {
+                g_atGate = true;
+                g_threadChanged.notify_all();
+                g_threadChanged.wait(lock, [] { return !g_gateClosed; });
+                g_atGate = false;
+            }
+        }
+        step();
+    };
+    hooks.ready = [] {
+        {
+            std::lock_guard<std::mutex> lock(g_threadMutex);
+            ++g_readyCalls;
+            if (gettid() == g_decodeTid.load() && g_inAround.load()) ++g_questions;
+        }
+        g_threadChanged.notify_all();
+    };
+    return hooks;
+}
+
+// Waits for `pred` (called under g_threadMutex); past the bound the wait is a failure named `what`.
+template <class Pred>
+bool waitThread(const std::string& label, const char* what, Pred pred, std::chrono::seconds bound = std::chrono::seconds(10)) {
+    std::unique_lock<std::mutex> lock(g_threadMutex);
+    if (g_threadChanged.wait_for(lock, bound, pred)) return true;
+    std::fprintf(stderr, "FAIL: %s: %s (waited %lld s)\n", label.c_str(), what, static_cast<long long>(bound.count()));
+    fail(what);
+    return false;
+}
+
+int readyCalls() {
+    std::lock_guard<std::mutex> lock(g_threadMutex);
+    return g_readyCalls;
+}
+
+// The next picture through takeReady() alone, called again only after the ready hook was: the way the
+// daemon's clock round uses it. Empty, with the reason failed, when the hook never comes.
+std::optional<VideoPipeline::Decode> takeWhenReady(VideoPipeline& pipeline, wallpaperx::PictureSkip skip,
+                                                   const std::string& label) {
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        const int before = readyCalls();
+        const VideoPipeline::Decode answer = pipeline.takeReady(skip);
+        if (answer != VideoPipeline::Decode::Pending) return answer;
+        if (!waitThread(label, "takeReady() answered Pending and the ready hook never followed",
+                        [before] { return g_readyCalls > before; })) {
+            return std::nullopt;
+        }
+    }
+    std::fprintf(stderr, "FAIL: %s: 16 ready-hook rounds in a row brought no picture\n", label.c_str());
+    fail("the ready hook kept bringing rounds that found no picture");
+    return std::nullopt;
+}
+
+bool queuesShared(const Device& device, const std::string& label) {
+    if (device.queuesInternallySynchronized()) return true;
+    std::printf("%s: %s does not share its queues (no VK_KHR_internally_synchronized_queues), so no decode thread "
+                "runs here -- not answerable\n",
+                label.c_str(), device.info().gpuName.c_str());
+    g_notVerified = true;
+    return false;
+}
+
+constexpr const char* kThreadFixture = "counter_long.mp4";
+
+// A pipeline on kThreadFixture whose first picture is decoded and whose decode thread has filled its
+// queue and stopped. Null, with the reason reported, otherwise.
+std::unique_ptr<VideoPipeline> filledPipeline(Device& device, const std::string& label) {
+    if (!hardwareDecoderPresent(device, label) || !queuesShared(device, label) || !haveAsset(kThreadFixture, label)) {
+        return nullptr;
+    }
+    auto pipeline = std::make_unique<VideoPipeline>(device, asset(kThreadFixture), kShaderDir,
+                                                    VideoPipeline::Playback::Once, std::nullopt, watchedHooks());
+    g_watchParks = true;
+    g_countThreaded = true;
+    g_taken = 1;
+    if (!pipeline->decodeNext()) {
+        std::fprintf(stderr, "FAIL: %s: %s showed no first picture\n", label.c_str(), kThreadFixture);
+        fail("the fixture's first picture was not decoded");
+        return nullptr;
+    }
+    if (g_threadHostReceived != 0) {
+        std::printf("%s: %s decoded in software here -- not answerable\n", label.c_str(), kThreadFixture);
+        g_notVerified = true;
+        return nullptr;
+    }
+    if (!waitThread(label, "the decode thread never stopped with its queue full", [] { return g_parks > 0; })) {
+        return nullptr;
+    }
+    return pipeline;
+}
+
+// Empties the queue of a filledPipeline() and holds its decode thread at the gate, before the decode
+// call that would refill it.
+bool emptyAndHold(VideoPipeline& pipeline, const std::string& label) {
+    setGate(true);
+    for (int i = 0; i < 2; ++i) {
+        ++g_taken;
+        if (pipeline.takeReady(wallpaperx::PictureSkip::Nothing) != VideoPipeline::Decode::Decoded) {
+            std::fprintf(stderr, "FAIL: %s: a full queue had no picture %d to take\n", label.c_str(), i + 1);
+            fail("the harness could not empty a full queue");
+            return false;
+        }
+    }
+    return waitThread(label, "the decode thread never came back for its next decode", [] { return g_atGate; });
+}
+
+// Takes whatever is queued, however much that is, until the decode thread waits at the gate with nothing
+// left to take: once it is there with the gate closed, nothing new can be queued.
+bool drainAndHold(VideoPipeline& pipeline, const std::string& label) {
+    setGate(true);
+    for (int round = 0; round < 8; ++round) {
+        ++g_taken;
+        const VideoPipeline::Decode answer = pipeline.takeReady(wallpaperx::PictureSkip::Nothing);
+        if (answer == VideoPipeline::Decode::Decoded) continue;
+        --g_taken;
+        if (answer != VideoPipeline::Decode::Pending) {
+            std::fprintf(stderr, "FAIL: %s: the stream ended while the harness drained its queue\n", label.c_str());
+            fail("the harness could not drain the decode thread's queue");
+            return false;
+        }
+        bool held = false;
+        {
+            std::lock_guard<std::mutex> lock(g_threadMutex);
+            held = g_atGate;
+        }
+        if (held) {
+            // Held before this Pending was answered or after: either way nothing was queued in between,
+            // since the thread is held before its next decode -- take once more to be sure.
+            ++g_taken;
+            const VideoPipeline::Decode again = pipeline.takeReady(wallpaperx::PictureSkip::Nothing);
+            if (again == VideoPipeline::Decode::Decoded) continue;
+            --g_taken;
+            return true;
+        }
+        if (!waitThread(label, "the decode thread never came back to the gate while its queue was drained",
+                        [] { return g_atGate; })) {
+            return false;
+        }
+    }
+    std::fprintf(stderr, "FAIL: %s: 8 rounds of draining never found the queue empty with the thread held\n",
+                 label.c_str());
+    fail("the harness could not drain the decode thread's queue");
+    return false;
+}
+
+void runDecodeDepthChecks(Device& device, const std::string& label) {
+    resetThreadWatch();
+    std::unique_ptr<VideoPipeline> pipeline = filledPipeline(device, label);
+    const ThreadWatchEnd end;
+    if (!pipeline) return;
+    // GOAL: S15.882 -- the decode thread never holds more than 2 decoded pictures the caller has not taken.
+    // WHY-THIS-SHAPE: counted in the pipeline, at every picture ffmpeg hands the decoder, against the pictures
+    //       taken -- and taken only while the thread is parked on its queue-full wait (pthread_cond_wait from
+    //       the decode thread outside a decode), so no receive can race a take. Inferring the depth from how
+    //       long a take waits would be an assertion on the scheduler.
+    // CONTROL: via control_batch.sh, 2026-10-19, RTX 3080 Ti, bytes restored: kDepth 2 -> 3 in renderer/video/decode_ahead.cpp
+    //       -> "3 decoded pictures were untaken at once, above the 2 the decode thread may hold".
+    // COVERAGE-ASSERT: 40 rounds each parked and took, and the most untaken seen must reach 2, or the
+    //       queue never filled and the bound was never offered.
+    constexpr int kRounds = 40;
+    int seen = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_threadMutex);
+        seen = g_parks;
+    }
+    int rounds = 0;
+    for (; rounds < kRounds; ++rounds) {
+        ++g_taken;
+        if (pipeline->takeReady(wallpaperx::PictureSkip::Nothing) != VideoPipeline::Decode::Decoded) {
+            std::fprintf(stderr, "FAIL: %s: round %d: the parked decode thread had no picture ready\n", label.c_str(),
+                         rounds);
+            fail("a decode thread waiting with a full queue had nothing to take");
+            return;
+        }
+        if (!waitThread(label, "the decode thread did not stop again after a picture was taken",
+                        [&seen] { return g_parks > seen; })) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(g_threadMutex);
+        seen = g_parks;
+    }
+    const int most = g_maxUntaken.load();
+    if (most > 2) {
+        std::fprintf(stderr, "FAIL: %s: %d decoded pictures were untaken at once, above the 2 the decode thread "
+                             "may hold\n",
+                     label.c_str(), most);
+        fail("the decode thread held more than 2 decoded, untaken pictures");
+    } else if (most < 2) {
+        std::fprintf(stderr, "FAIL: %s: at most %d untaken picture(s) seen in %d rounds\n", label.c_str(), most, rounds);
+        fail("the decode thread's queue never filled, so its bound was not exercised");
+    } else {
+        std::printf("%s: %d rounds, at most %d decoded pictures untaken\n", label.c_str(), rounds, most);
+    }
+}
+
+void runDecodePendingChecks(Device& device, const std::string& label) {
+    resetThreadWatch();
+    std::unique_ptr<VideoPipeline> pipeline = filledPipeline(device, label);
+    const ThreadWatchEnd end;
+    if (!pipeline || !emptyAndHold(*pipeline, label)) return;
+    // GOAL: S15.883, first half -- with nothing decoded, takeReady() answers Pending without waiting for the
+    //       decode thread.
+    // WHY-THIS-SHAPE: the thread is held at a test-owned gate, so it cannot produce a picture until the probe
+    //       opens it; a takeReady() that returns while the gate is still shut provably did not wait. A
+    //       watchdog opens the gate after 5 s so a blocking takeReady() is reported, never hung on.
+    // CONTROL: via control_batch.sh, 2026-10-19, RTX 3080 Ti, bytes restored: DecodeAhead::take() in renderer/video/decode_ahead.cpp
+    //       waiting for an item instead of answering nothing -> "takeReady() with no picture decoded returned
+    //       only after the watchdog released the decode thread".
+    bool returned = false;
+    bool watchdogOpened = false;
+    std::optional<VideoPipeline::Decode> answer;
+    {
+        std::jthread watchdog([&returned, &watchdogOpened] {
+            std::unique_lock<std::mutex> lock(g_threadMutex);
+            if (g_threadChanged.wait_for(lock, std::chrono::seconds(5), [&returned] { return returned; })) return;
+            watchdogOpened = true;
+            g_gateClosed = false;
+            g_threadChanged.notify_all();
+        });
+        struct Returned {
+            bool& flag;
+            ~Returned() {
+                {
+                    std::lock_guard<std::mutex> lock(g_threadMutex);
+                    flag = true;
+                }
+                g_threadChanged.notify_all();
+            }
+        } mark{returned};
+        answer = pipeline->takeReady(wallpaperx::PictureSkip::Nothing);
+    }
+    if (watchdogOpened) {
+        std::fprintf(stderr, "FAIL: %s: takeReady() with no picture decoded returned only after the watchdog "
+                             "released the decode thread\n",
+                     label.c_str());
+        fail("takeReady() waited for the decode thread");
+        return;
+    }
+    if (answer != VideoPipeline::Decode::Pending) {
+        std::fprintf(stderr, "FAIL: %s: takeReady() answered %d with the decode thread held\n", label.c_str(),
+                     static_cast<int>(answer.value_or(VideoPipeline::Decode::Pending)));
+        fail("takeReady() did not answer Pending with no picture decoded");
+        return;
+    }
+    // GOAL: S15.883, second half -- the next decoded picture brings the round through the ready hook: no
+    //       timer, and no takeReady() before the hook is called.
+    // WHY-THIS-SHAPE: after Pending the probe calls nothing until the hook fires, so a picture that is
+    //       decoded but never announced leaves the wait to fail by name; polling takeReady() here would pass
+    //       with the hook broken.
+    // CONTROL: via control_batch.sh, 2026-10-19, RTX 3080 Ti, bytes restored: `if (wake) notifyReady(shared);` deleted from
+    //       DecodeAhead::run() (renderer/video/decode_ahead.cpp) -> "a decoded picture after Pending never called
+    //       the ready hook (waited 10 s)".
+    const int before = readyCalls();
+    setGate(false);
+    if (!waitThread(label, "a decoded picture after Pending never called the ready hook",
+                    [before] { return g_readyCalls > before; })) {
+        return;
+    }
+    ++g_taken;
+    if (pipeline->takeReady(wallpaperx::PictureSkip::Nothing) != VideoPipeline::Decode::Decoded) {
+        std::fprintf(stderr, "FAIL: %s: the round the ready hook brought found no picture\n", label.c_str());
+        fail("the ready hook was called with no picture ready");
+        return;
+    }
+    std::printf("%s: Pending while the thread was held; the ready hook brought the next picture\n", label.c_str());
+}
+
+void runDecodeFailureChecks(Device& device, const std::string& label) {
+    resetThreadWatch();
+    std::unique_ptr<VideoPipeline> pipeline = filledPipeline(device, label);
+    const ThreadWatchEnd end;
+    if (!pipeline || !emptyAndHold(*pipeline, label)) return;
+    constexpr auto kAnswerDelay = std::chrono::milliseconds(1500);
+    int questionsBefore = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_threadMutex);
+        questionsBefore = g_questions;
+    }
+    g_threadExternal = 1;
+    setGate(false);
+    // GOAL: S15.884 -- a hardware failure on the decode thread puts its device-health question to the render
+    //       thread (the ready hook, from inside the decode call) and the stream then goes on in software.
+    // WHY-THIS-SHAPE: the failure is injected only on the decode thread, with the queue empty and the
+    //       thread released from the gate, so the decode call that meets it is known. Asking the Device
+    //       directly from that thread would abort on the Device's thread pin, so the hook is the only legal
+    //       route; a question never announced leaves the thread waiting, which the bounded wait reports.
+    // CONTROL: via control_batch.sh, 2026-10-19, RTX 3080 Ti, bytes restored: notifyReady() deleted from DecodeAhead::ask()
+    //       (renderer/video/decode_ahead.cpp) -> "the decode thread's device-health question never reached the
+    //       render thread (waited 10 s)".
+    if (!waitThread(label, "the decode thread's device-health question never reached the render thread",
+                    [questionsBefore] { return g_questions > questionsBefore; })) {
+        return;
+    }
+    std::this_thread::sleep_for(kAnswerDelay);
+    if (g_threadExternal != 0 || !g_inAround) {
+        std::fprintf(stderr, "FAIL: %s: the question was %s\n", label.c_str(),
+                     g_threadExternal != 0 ? "asked without the injected failure" : "abandoned before it was answered");
+        fail("the delayed answer was not spent inside the failing decode call");
+        return;
+    }
+    ++g_taken;
+    const std::optional<VideoPipeline::Decode> first = takeWhenReady(*pipeline, wallpaperx::PictureSkip::Nothing, label);
+    if (first != VideoPipeline::Decode::Decoded) {
+        std::fprintf(stderr, "FAIL: %s: after the answered question the stream %s\n", label.c_str(),
+                     first ? "ended" : "brought no picture");
+        fail("playback stopped after a hardware failure on the decode thread");
+        return;
+    }
+    const auto decodeTime = pipeline->timing().decodeTime;
+    // GOAL: S15.887 -- the time the decode thread waits for the render thread's answer is not decode time.
+    // WHY-THIS-SHAPE: the answer is held back a known 1.5 s (the takeReady() that answers comes only then,
+    //       checked above to be while the failing call still waits), and the queue was empty, so the next
+    //       picture is the one that call returned; a decodeTime of 1.5 s or more contains the wait. A
+    //       software restart of this 320x240 file takes milliseconds.
+    // CONTROL: via control_batch.sh, 2026-10-19, RTX 3080 Ti, bytes restored: `- m_asking` dropped from PictureSource::next()'s
+    //       spend (renderer/video/picture_source.cpp) -> "carries 1511.9 ms of decodeTime, which contains the
+    //       1500 ms the render thread took to answer"; restored it reads 6.7 ms.
+    if (decodeTime >= kAnswerDelay) {
+        std::fprintf(stderr, "FAIL: %s: the picture decoded across the question carries %.1f ms of decodeTime, "
+                             "which contains the %lld ms the render thread took to answer\n",
+                     label.c_str(), std::chrono::duration<double, std::milli>(decodeTime).count(),
+                     static_cast<long long>(kAnswerDelay.count()));
+        fail("time spent waiting for the device-health answer was counted as decode time");
+    } else {
+        std::printf("%s: decodeTime %.1f ms across a %lld ms answer\n", label.c_str(),
+                    std::chrono::duration<double, std::milli>(decodeTime).count(),
+                    static_cast<long long>(kAnswerDelay.count()));
+    }
+    // GOAL: S15.884's "goes on in software" -- every one of the next 30 pictures is a new software decode.
+    // WHY-THIS-SHAPE: the starting count is taken with the queue drained and the thread held at the gate,
+    //       so no picture counted before it can be one of the 30 taken after. Sampled straight after the
+    //       first take, up to 2 already-queued pictures (the queue depth) fell on the wrong side, and the
+    //       check came up short by exactly 2 in some runs.
+    // CONTROL: test-side, 2026-10-19, NVIDIA, ThreadSanitizer build (where the slow caller exposes it): the
+    //       drainAndHold() call deleted -> red in 5 of 8 runs, "5 software pictures at the first after the
+    //       failure, 34 after 30 more"; restored, 8 of 8 green. The normal build stayed green either way (12 runs).
+    if (!drainAndHold(*pipeline, label)) return;
+    const int hostBefore = g_threadHostReceived.load();
+    setGate(false);
+    constexpr int kAfter = 30;
+    for (int i = 0; i < kAfter; ++i) {
+        ++g_taken;
+        if (takeWhenReady(*pipeline, wallpaperx::PictureSkip::Nothing, label) != VideoPipeline::Decode::Decoded) {
+            std::fprintf(stderr, "FAIL: %s: picture %d after the failure never came\n", label.c_str(), i + 2);
+            fail("playback stopped after a hardware failure on the decode thread");
+            return;
+        }
+    }
+    if (hostBefore == 0 || g_threadHostReceived.load() - hostBefore < kAfter) {
+        std::fprintf(stderr, "FAIL: %s: %d software pictures at the first after the failure, %d after %d more\n",
+                     label.c_str(), hostBefore, g_threadHostReceived.load(), kAfter);
+        fail("the stream did not go on in software after a hardware failure on the decode thread");
+        return;
+    }
+    std::printf("%s: question answered on the render thread; %d more pictures in software\n", label.c_str(), kAfter);
+}
+
+void runDecodeCatchUpChecks(Device& device, const std::string& label) {
+    resetThreadWatch();
+    std::unique_ptr<VideoPipeline> pipeline = filledPipeline(device, label);
+    const ThreadWatchEnd end;
+    if (!pipeline) return;
+    constexpr auto kLevel = wallpaperx::PictureSkip::Unreferenced;
+    int inARow = 0;
+    for (int takes = 0; inARow < 4; ++takes) {
+        if (takes == 60) {
+            std::fprintf(stderr, "FAIL: %s: 60 pictures taken at Unreferenced, none 4 in a row carrying it\n",
+                         label.c_str());
+            fail("the skip level asked of the decode thread never reached its pictures");
+            return;
+        }
+        ++g_taken;
+        if (takeWhenReady(*pipeline, kLevel, label) != VideoPipeline::Decode::Decoded) {
+            fail("the fixture ended or stalled before the skip level settled");
+            return;
+        }
+        inARow = pipeline->timing().skip == kLevel ? inARow + 1 : 0;
+    }
+    // GOAL: S15.886 -- a catch-up decodeNext(), which names no level, leaves the decode thread skipping at the
+    //       level the clock last set.
+    // WHY-THIS-SHAPE: 8 pictures through decodeNext(): the 2 queued and the one in flight were decoded at
+    //       the level already, so a thread reset to Nothing shows from the fourth on. Graded on each
+    //       picture's own recorded level, not on how many pictures were dropped.
+    // CONTROL: via control_batch.sh, 2026-10-19, RTX 3080 Ti, bytes restored: DecodeAhead::wait() writing the level
+    //       unconditionally, `skip.value_or(PictureSkip::Nothing)` (renderer/video/decode_ahead.cpp) -> "picture 4
+    //       after a catch-up decodeNext() was decoded at skip level 0".
+    for (int i = 0; i < 8; ++i) {
+        ++g_taken;
+        if (!pipeline->decodeNext()) {
+            fail("the fixture ended during the catch-up");
+            return;
+        }
+        if (pipeline->timing().skip != kLevel) {
+            std::fprintf(stderr, "FAIL: %s: picture %d after a catch-up decodeNext() was decoded at skip level %d, "
+                                 "not the Unreferenced the clock set\n",
+                         label.c_str(), i + 1, static_cast<int>(pipeline->timing().skip));
+            fail("a catch-up decodeNext() reset the decode thread's skip level");
+            return;
+        }
+    }
+    std::printf("%s: 8 catch-up pictures all decoded at the clock's level\n", label.c_str());
+}
+
+// `file` decoded through decodeNext() alone; no decode may run off the calling thread.
+bool noDecodeThreadFor(Device& device, const std::string& label, const char* file, bool software) {
+    resetThreadWatch();
+    if (!haveAsset(file, label)) return false;
+    VideoPipeline pipeline(device, asset(file), kShaderDir, VideoPipeline::Playback::Once, std::nullopt,
+                           watchedHooks());
+    const ThreadWatchEnd end;
+    g_countThreaded = true;
+    for (int i = 0; i < 30; ++i) {
+        if (!pipeline.decodeNext()) {
+            std::fprintf(stderr, "FAIL: %s: %s ended after %d pictures\n", label.c_str(), file, i);
+            fail("the fixture is too short to grade");
+            return false;
+        }
+    }
+    const int received = g_threadReceived.load();
+    const int host = g_threadHostReceived.load();
+    if (software ? host != received : host != 0) {
+        std::printf("%s: %s decoded %d of %d pictures in software, not the path this case needs -- not answerable\n",
+                    label.c_str(), file, host, received);
+        g_notVerified = true;
+        return false;
+    }
+    if (g_aroundCalls != 0 || g_receivedOffGpuThread != 0) {
+        std::fprintf(stderr, "FAIL: %s: %s: a decode thread ran (%d decodes through it, %d pictures received off the "
+                             "calling thread)\n",
+                     label.c_str(), file, g_aroundCalls.load(), g_receivedOffGpuThread.load());
+        fail(software ? "a decode thread started for a stream decoded in software"
+                      : "a decode thread started on a Device without internally synchronised queues");
+        return false;
+    }
+    std::printf("%s: %s: %d pictures, all on the calling thread\n", label.c_str(), file, received);
+    return true;
+}
+
+void runNoDecodeThreadChecks(Device& device, const std::string& label, bool software) {
+    if (!hardwareDecoderPresent(device, label)) return;
+    // GOAL: S15.885 -- no decode thread starts when the Device lacks VK_KHR_internally_synchronized_queues
+    //       (hidden by the probe's interposer, asserted in runGraded), nor for a stream decoded in software.
+    // WHY-THIS-SHAPE: a thread is seen two ways that need no production seam: the around hook, which only
+    //       the decode thread calls, and the thread each picture was received on. The software case runs on
+    //       a Device that DOES share its queues (an MPEG-2 file, which has no Vulkan decoder), then plays
+    //       an H.264 file on the same Device and requires a thread there, so the instrument is shown able
+    //       to see one.
+    // CONTROL: via control_batch.sh, 2026-10-19, RTX 3080 Ti, bytes restored: decodeAheadIfSafe() without its
+    //       software-path test (renderer/video/video_pipeline.cpp) -> software entry "counter_onekey_m2.ts: a decode
+    //       thread ran (31 decodes through it, 30 pictures received off the calling thread)". Without its
+    //       queue-sharing test instead -> hidden entry "the child died by signal 6 (Aborted)": the decoder's own
+    //       assertMayDecodeHere() pin aborts the first off-thread decode, so this check's message is never
+    //       reached there; the forked child is what turns that into a verdict.
+    if (!software) {
+        noDecodeThreadFor(device, label, kThreadFixture, false);
+        return;
+    }
+    if (!queuesShared(device, label)) return;
+    if (!noDecodeThreadFor(device, label, "counter_onekey_m2.ts", true)) return;
+    resetThreadWatch();
+    VideoPipeline pipeline(device, asset(kThreadFixture), kShaderDir, VideoPipeline::Playback::Once, std::nullopt,
+                           watchedHooks());
+    const ThreadWatchEnd end;
+    for (int i = 0; i < 6; ++i) {
+        if (!pipeline.decodeNext()) break;
+    }
+    if (g_aroundCalls == 0) {
+        std::fprintf(stderr, "FAIL: %s: no decode thread seen for %s on the same Device\n", label.c_str(),
+                     kThreadFixture);
+        fail("the probe cannot see a decode thread, so its absence above proves nothing");
+    }
+}
+
+void releaseFfmpegHold() {
+    {
+        std::lock_guard<std::mutex> lock(g_threadMutex);
+        g_holdInFfmpeg = false;
+    }
+    g_threadChanged.notify_all();
+}
+
+// The case's own Device, held as the daemon holds it (OwnedDevice), so the deleter's choice is what is
+// graded. The child it runs in ends by _exit, as the daemon does once a thread is left running.
+int runLeftRunningCase(const std::string& label) {
+    resetThreadWatch();
+    g_holdInFfmpeg = false;
+    g_heldInFfmpeg = false;
+    g_decodeThreadGone = false;
+    g_watchedDeviceFreed = false;
+    wallpaperx::OwnedDevice device(new Device(/*enableValidation=*/true));
+    std::printf("%s: on %s; not graded by the validation layer, since this case ends with the Device leaked "
+                "on purpose\n",
+                label.c_str(), device->info().gpuName.c_str());
+    g_watchedDevice = device.get();
+    const auto verdict = [] {
+        if (wallpaperx::testing::failureCount() > 0) return 1;
+        return g_notVerified ? kNotVerifiedExitCode : 0;
+    };
+    std::unique_ptr<VideoPipeline> pipeline = filledPipeline(*device, label);
+    if (!pipeline) return verdict();
+    // A destruction that waits with no bound would otherwise hang the child until it is killed.
+    std::atomic<bool> watchdogDone{false};
+    std::jthread watchdog([&watchdogDone] {
+        std::unique_lock<std::mutex> lock(g_threadMutex);
+        if (!g_threadChanged.wait_for(lock, std::chrono::seconds(30), [&] { return watchdogDone.load(); })) {
+            g_holdInFfmpeg = false;
+            g_threadChanged.notify_all();
+        }
+    });
+    const auto stopWatchdog = [&watchdogDone] {
+        {
+            std::lock_guard<std::mutex> lock(g_threadMutex);
+            watchdogDone = true;
+        }
+        g_threadChanged.notify_all();
+    };
+    g_holdInFfmpeg = true;
+    ++g_taken;
+    if (pipeline->takeReady(wallpaperx::PictureSkip::Nothing) != VideoPipeline::Decode::Decoded) {
+        std::fprintf(stderr, "FAIL: %s: a full queue had no picture to take\n", label.c_str());
+        fail("the harness could not take a picture from a full queue");
+        releaseFfmpegHold();
+        stopWatchdog();
+        return verdict();
+    }
+    if (!waitThread(label, "the decode thread never entered ffmpeg again after a picture was taken",
+                    [] { return g_heldInFfmpeg.load(); })) {
+        releaseFfmpegHold();
+        stopWatchdog();
+        return verdict();
+    }
+    const auto began = std::chrono::steady_clock::now();
+    pipeline.reset();
+    const double stopSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+    const bool stillHeld = g_holdInFfmpeg.load();
+    const bool flagged = Device::threadLeftRunning();
+    device.reset();
+    const bool freed = g_watchedDeviceFreed.load();
+    releaseFfmpegHold();
+    stopWatchdog();
+    // GOAL: S15.889, renderer half -- a decode thread still inside ffmpeg past DecodeAhead's 10 s stop bound
+    //       is left running without the Device being freed under it: the stop returns after the bound,
+    //       Device::threadLeftRunning() is set, the OwnedDevice's deleter does not free the Device, and the
+    //       thread, let go afterwards, runs to its end.
+    // WHY-THIS-SHAPE: held inside avcodec_receive_frame on the decode thread itself (the probe's interposer),
+    //       not at the around gate, which is outside ffmpeg. The stop's duration is graded first (9-20 s), so
+    //       a thread that was not really held, or a stop with no bound (the watchdog lets go at 30 s), fails
+    //       by name instead of passing on a quick join. A freed Device is seen at operator delete; reading
+    //       memory freed under the thread could pass unnoticed without a sanitizer.
+    // CONTROL: via control_batch.sh, 2026-10-19, RTX 3080 Ti, bytes restored, each red alone: DeviceDeleter's
+    //       threadLeftRunning() test removed (renderer/vulkan/device.cpp) -> "the Device was freed while its
+    //       decode thread was still inside ffmpeg"; ~DecodeAhead calling recordLeak() instead of
+    //       recordThreadLeftRunning() (renderer/video/decode_ahead.cpp) -> "Device::threadLeftRunning() is
+    //       false".
+    if (stopSeconds < 9.0 || stopSeconds > 20.0 || !stillHeld) {
+        std::fprintf(stderr, "FAIL: %s: the pipeline's destruction took %.1f s with its decode thread %s inside "
+                             "ffmpeg; the stop bound is 10 s\n",
+                     label.c_str(), stopSeconds, stillHeld ? "held" : "no longer held");
+        fail("the stop did not wait out its bound for a decode thread held inside ffmpeg");
+    }
+    if (!flagged) {
+        std::fprintf(stderr, "FAIL: %s: Device::threadLeftRunning() is false after a decode thread was left inside "
+                             "ffmpeg\n",
+                     label.c_str());
+        fail("a decode thread left running was not reported to the Device");
+    }
+// The condition that replaces operator delete below; its macro is defined only further down.
+#if !defined(__SANITIZE_ADDRESS__) && !defined(__SANITIZE_THREAD__)
+    if (freed) {
+        std::fprintf(stderr, "FAIL: %s: the Device was freed while its decode thread was still inside ffmpeg\n",
+                     label.c_str());
+        fail("OwnedDevice freed a Device a thread left running still uses");
+    }
+#else
+    static_cast<void>(freed);
+    std::printf("%s: a sanitizer owns operator delete here, so the Device's free is not watched; the sanitizer "
+                "reports a read of freed memory instead\n",
+                label.c_str());
+#endif
+    if (waitThread(label, "the decode thread left running never finished once let go out of ffmpeg",
+                   [] { return g_decodeThreadGone.load(); })) {
+        std::printf("%s: stop took %.1f s; the Device was kept; the thread left running finished once let go\n",
+                    label.c_str(), stopSeconds);
+    }
+    return verdict();
+}
+
+void runCompletedOffThreadChecks(Device& device, const std::string& label) {
+    const auto offThread = [&device](Device::SubmitTicket ticket) {
+        bool answer = false;
+        std::thread([&] { answer = device.hasCompleted(ticket); }).join();
+        return answer;
+    };
+    g_heldFences.clear();
+    g_holdNextSubmission = true;
+    const Device::SubmitTicket held = device.submit([](VkCommandBuffer) {});
+    if (g_heldFences.empty()) {
+        g_holdNextSubmission = false;
+        std::fprintf(stderr, "FAIL: %s: the harness could not hold the batch's fence\n", label.c_str());
+        fail("the harness could not hold a batch unfinished");
+        return;
+    }
+    const Device::SubmitTicket later = device.submit([](VkCommandBuffer) {});
+    device.wait(later);
+    // The GPU thread looks: `later` retires, `held` stays pending, and the watermark moves.
+    const bool laterDone = device.hasCompleted(later);
+    // GOAL: S15.890 -- Device::hasCompleted() off the GPU thread never answers true for a batch the GPU has
+    //       not finished, even after the GPU thread has retired a later one.
+    // WHY-THIS-SHAPE: "not finished" is the driver's answer: the probe's vkGetFenceStatus reports the held
+    //       batch's fence unsignalled, as for a GPU still running it. A batch submitted after it finishes and
+    //       is retired on the GPU thread first, which is what moves the watermark an off-thread answer reads;
+    //       asking with nothing retired would pass with a watermark that ignores what is still pending.
+    // CONTROL: via control_batch.sh, 2026-10-19, RTX 3080 Ti, bytes restored, each red alone: hasCompleted()'s
+    //       off-thread `return false` made `return true`, and retireCompleted() setting the watermark to the
+    //       newest serial whatever is pending (renderer/vulkan/device.cpp) -> "answered true off the GPU thread
+    //       for a batch the GPU has not finished".
+    // COVERAGE-ASSERT: once the batch is let go and the GPU thread has seen it finish, the off-thread
+    //       answer must turn true, so the check is not met by an answer that is always false.
+    if (!laterDone) {
+        std::fprintf(stderr, "FAIL: %s: a batch waited for on the GPU thread still read unfinished there\n",
+                     label.c_str());
+        fail("the harness did not reach a retired later batch behind a held one");
+        g_heldFences.clear();
+        return;
+    }
+    if (offThread(held)) {
+        std::fprintf(stderr, "FAIL: %s: hasCompleted() answered true off the GPU thread for a batch the GPU has not "
+                             "finished\n",
+                     label.c_str());
+        fail("hasCompleted() off the GPU thread answered true early");
+    }
+    // After the off-thread question, so an early answer here cannot hide that one.
+    if (device.hasCompleted(held)) {
+        std::fprintf(stderr, "FAIL: %s: hasCompleted() answered true on the GPU thread for a batch the GPU has not "
+                             "finished\n",
+                     label.c_str());
+        fail("hasCompleted() on the GPU thread answered true early");
+    }
+    g_heldFences.clear();
+    device.wait(held);
+    const bool heldDone = device.hasCompleted(held);
+    if (!heldDone || !offThread(held)) {
+        std::fprintf(stderr, "FAIL: %s: once finished and seen on the GPU thread (%s), the batch still read "
+                             "unfinished off it\n",
+                     label.c_str(), heldDone ? "finished" : "unfinished");
+        fail("hasCompleted() off the GPU thread never answers true, so its false proves nothing");
+        return;
+    }
+    std::printf("%s: off the GPU thread an unfinished batch read unfinished, and finished once retired\n",
+                label.c_str());
+}
+
+// What vkCreateDevice and vkGetDeviceQueue2 were given, recorded while g_recordQueues is set (S15.891).
+bool g_recordQueues = false;
+bool g_createdSynchronized = false;
+int g_queueCreates = 0;
+int g_queueFetches = 0;
+int g_unflaggedQueues = 0;  // printed and counted as each is seen
+int g_plainFetches = 0;     // vkGetDeviceQueue, which carries no flags at all
+
+void runQueueFlagChecks(Device& device, const std::string& label) {
+    g_recordQueues = false;
+    if (!hardwareDecoderPresent(device, label) || !queuesShared(device, label)) return;
+    const int expected = 1 + static_cast<int>(device.videoDecodeFamilies().size());
+    // GOAL: S15.891 -- every queue the Device creates and fetches carries
+    //       VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR when it enables the extension.
+    // WHY-THIS-SHAPE: seen at vkCreateDevice and vkGetDeviceQueue2 themselves (interposed), each queue
+    //       graded as it passes, so a fetch that then fails Device construction still prints its own FAIL;
+    //       queuesInternallySynchronized() alone reports the feature, not the flags on each queue.
+    // CONTROL: via control_batch.sh, 2026-10-19, RTX 3080 Ti, bytes restored, each red alone: the create
+    //       info's `flags = queueFlags` made 0 -> "created without the internally-synchronized flag"; the
+    //       fetch's `info.flags = queueFlags` made 0 -> "fetched without the internally-synchronized flag"
+    //       (both renderer/vulkan/device.cpp).
+    // COVERAGE-ASSERT: the device must have been created with the extension, with at least one queue, and
+    //       fetched at least 1 + its decode families' queues, so an interposer that saw nothing fails.
+    if (!g_createdSynchronized || g_queueCreates < 1 || g_queueFetches < expected || g_plainFetches != 0) {
+        std::fprintf(stderr, "FAIL: %s: saw %s, %d queue(s) created, %d fetched through vkGetDeviceQueue2 (%d "
+                             "expected) and %d through vkGetDeviceQueue\n",
+                     label.c_str(), g_createdSynchronized ? "the extension enabled" : "no extension enabled",
+                     g_queueCreates, g_queueFetches, expected, g_plainFetches);
+        fail("the queues the Device made were not all seen with their flags");
+    }
+    if (g_unflaggedQueues == 0) {
+        std::printf("%s: %d queue(s) created and %d fetched, every one internally synchronised\n", label.c_str(),
+                    g_queueCreates, g_queueFetches);
+    }
+}
+
+// S15.892: with the decode thread on, the image pools a size change replaces are freed during playback,
+// and none outlives the pipeline -- attributed by playback position, not by call.
+void runThreadedPoolChecks(Device& device, const std::string& label, const SizeChangeFixture& fixture) {
+    if (!hardwareDecoderPresent(device, label) || !queuesShared(device, label) || !haveAsset(fixture.file, label)) {
+        return;
+    }
+    resetThreadWatch();
+    resetPools();
+    g_trackedPictures = 0;
+    g_trackPools = true;
+    g_decoderOpen = true;
+    struct Untrack {
+        ~Untrack() {
+            g_trackPools = false;
+            g_decoderOpen = false;
+        }
+    } untrack;
+    auto pipeline = std::make_unique<VideoPipeline>(device, asset(fixture.file), kShaderDir,
+                                                    VideoPipeline::Playback::Once, std::nullopt, watchedHooks());
+    const ThreadWatchEnd end;
+    if (!pipeline->decodeNext()) {
+        std::fprintf(stderr, "FAIL: %s: %s showed no first picture\n", label.c_str(), fixture.file);
+        fail("the fixture's first picture was not decoded");
+        return;
+    }
+    int shown = 1;
+    bool ended = false;
+    for (int i = 0; i < 4000 && !ended; ++i) {
+        const std::optional<VideoPipeline::Decode> answer =
+            takeWhenReady(*pipeline, wallpaperx::PictureSkip::Nothing, label);
+        if (!answer) return;
+        if (*answer == VideoPipeline::Decode::Decoded) {
+            // As the daemon's round does: each picture taken is converted, a submission whose retiring is
+            // what tells an off-thread release that the GPU is done with a pool.
+            pipeline->convert();
+            ++shown;
+        }
+        if (*answer == VideoPipeline::Decode::Exhausted) ended = true;
+    }
+    if (!ended || g_aroundCalls == 0) {
+        std::fprintf(stderr, "FAIL: %s: %s: %s after %d pictures, %d decode(s) on a thread\n", label.c_str(),
+                     fixture.file, ended ? "ended" : "never ended", shown, g_aroundCalls.load());
+        fail("the threaded case did not play the fixture to its end on a decode thread");
+        return;
+    }
+    // The thread has handed on the end, after its last decode; nothing below races it.
+    const int received = g_trackedPictures.load();
+    g_decoderOpen = false;
+    pipeline.reset();
+    // GOAL: S15.892 (image pools) -- with the decode thread on, each pool a size change replaces is freed
+    //       while the pipeline still plays, before its last picture is decoded, and no pool outlives the
+    //       pipeline.
+    // WHY-THIS-SHAPE: attributed by playback position (pictures the decoder had received when the pool was
+    //       freed) and by whether the pipeline still existed, never by call: with the thread on, frees happen
+    //       between calls. Read only after the stream's end was taken, which the thread hands on after its
+    //       last decode, so no free races the read. Each taken picture is converted, as in the daemon: without
+    //       a GPU-thread submission nothing moves the completion watermark an off-thread release reads, and
+    //       every pool then read as freed only at destruction.
+    // CONTROL: via control_batch.sh, 2026-10-19, RTX 3080 Ti, bytes restored: both releaseIdleFramesContexts()
+    //       calls removed from VideoDecoder::decode() (renderer/video/video_decoder.cpp) -> "was not freed during
+    //       playback".
+    // COVERAGE-ASSERT: the fixture must make exactly its listed number of pools, or the replacement was not
+    //       exercised.
+    if (g_pools.size() != fixture.pools) {
+        std::fprintf(stderr, "FAIL: %s: %s made %zu image pool(s), %zu expected\n", label.c_str(), fixture.file,
+                     g_pools.size(), fixture.pools);
+        fail("the size change did not make the pools it should");
+        return;
+    }
+    int alive = 0;
+    for (size_t i = 0; i < g_pools.size(); ++i) {
+        const PoolRecord& pool = g_pools[i];
+        if (!pool.freed) ++alive;
+        if (i + 1 == g_pools.size()) continue;
+        if (!pool.freed || !pool.freedWhileOpen || pool.freedAfterPictures >= received) {
+            std::fprintf(stderr, "FAIL: %s: %s: pool %zu of %zu (%dx%d, %d pictures in it, freed after %d of %d "
+                                 "received, on the %s thread) was not freed during playback: %s\n",
+                         label.c_str(), fixture.file, i + 1, g_pools.size(), pool.width, pool.height, pool.pictures,
+                         pool.freedAfterPictures, received, pool.freedOnMainThread ? "main" : "decode",
+                         !pool.freed            ? "never freed"
+                         : !pool.freedWhileOpen ? "freed only when the pipeline was destroyed"
+                                                : "freed only after the last picture was decoded");
+            fail("a replaced image pool was not freed during playback with the decode thread on");
+        }
+    }
+    if (alive != 0) {
+        std::fprintf(stderr, "FAIL: %s: %s: %d image pool(s) alive after the pipeline was destroyed\n",
+                     label.c_str(), fixture.file, alive);
+        fail("an image pool outlived the pipeline");
+    }
+    if (alive == 0) {
+        std::printf("%s: %s: %d pictures, %zu pools, replaced ones freed during playback\n", label.c_str(),
+                    fixture.file, shown, g_pools.size());
+    }
+}
+
+// A threaded playback read back picture by picture, and what the decode thread held when it failed.
+struct ThreadedPlay {
+    std::vector<int> shown;
+    bool firstStartsPass = false;
+    int queued = -1;     // decoded on the thread and not yet taken when the failure was armed
+    bool consumed = false;
+    int hostAfter = 0;   // software pictures the thread received after the failure
+    int threadDecodes = 0;
+};
+
+// Plays `file` (from `startAt`) with the decode thread on, taking each picture as the daemon's round does
+// and reading it back. With `failAt` >= 0, before taking picture `failAt` it waits until the thread holds
+// 2 untaken pictures -- it can decode nothing more until a take -- and arms one hardware failure on it, so
+// the failure meets the thread's next decode with the queue known. `strip` removes the timestamps of every
+// picture the thread decodes before the failure; the thread is held at the gate until that is set.
+std::optional<ThreadedPlay> playThreaded(Device& device, const std::string& label, const std::string& what,
+                                         const std::string& file, std::optional<wallpaperx::StreamPosition> startAt,
+                                         int failAt, bool strip, int total) {
+    resetThreadWatch();
+    g_onThreadReceived = 0;
+    g_onThreadHost = 0;
+    g_countOnThread = true;
+    struct Clear {
+        ~Clear() {
+            g_countOnThread = false;
+            clearFailingCallConditions();
+        }
+    } clear;
+    ThreadedPlay run;
+    std::string failure;
+    try {
+        OffscreenTargetManager targets(device);
+        const OffscreenTarget& target = targets.create(1, kTargetWidth, kTargetHeight);
+        VideoPipeline pipeline(device, file, kShaderDir, VideoPipeline::Playback::Loop, startAt, watchedHooks());
+        const ThreadWatchEnd end;
+        g_watchParks = true;
+        const auto readBack = [&] {
+            pipeline.draw(targets, target, wallpaperx::Placement{});
+            run.shown.push_back(wallpaperx::testing::counterFromBgra(
+                wallpaperx::testing::reclaimAndReadback(device, targets, target), target.width, target.height));
+        };
+        setGate(true);
+        if (!pipeline.decodeNext()) {
+            failure = "showed no first picture";
+        } else {
+            run.firstStartsPass = pipeline.timing().startsPass;
+            if (strip) {
+                g_inFailingCall = true;
+                g_stripTimestamps = true;
+            }
+            setGate(false);
+            readBack();
+            int taken = 0;  // pictures taken from the thread
+            int hostBefore = 0;
+            for (int i = 1; i < total && failure.empty(); ++i) {
+                if (i == failAt) {
+                    if (!waitThread(label, "the decode thread never filled its queue before the failure was armed",
+                                    [&taken] { return g_onThreadReceived.load() - taken >= 2; })) {
+                        return std::nullopt;
+                    }
+                    run.queued = g_onThreadReceived.load() - taken;
+                    g_stripTimestamps = false;
+                    hostBefore = g_onThreadHost.load();
+                    g_threadExternal = 1;
+                }
+                const std::optional<VideoPipeline::Decode> answer =
+                    takeWhenReady(pipeline, wallpaperx::PictureSkip::Nothing, label);
+                if (!answer) return std::nullopt;
+                if (*answer != VideoPipeline::Decode::Decoded) {
+                    failure = "the stream ended after " + std::to_string(run.shown.size()) + " pictures";
+                    break;
+                }
+                ++taken;
+                readBack();
+            }
+            run.consumed = failAt >= 0 && g_threadExternal.load() == 0;
+            run.hostAfter = g_onThreadHost.load() - hostBefore;
+            run.threadDecodes = g_aroundCalls.load();
+        }
+    } catch (const std::exception& e) {
+        failure = std::string("threw: ") + e.what();
+    }
+    if (failure.empty()) return run;
+    std::fprintf(stderr, "FAIL: %s: %s: %s (showed %s)\n", label.c_str(), what.c_str(), failure.c_str(),
+                 joinIds(run.shown).c_str());
+    fail("a threaded playback did not play the pictures it was asked for");
+    return std::nullopt;
+}
+
+void runThreadedResumeChecks(Device& device, const std::string& label) {
+    if (!hardwareDecoderPresent(device, label) || !queuesShared(device, label)) return;
+    const std::optional<CounterReference> full = counterReference(label, "counter_long.mp4");
+    const std::optional<CounterReference> cut = counterReference(label, "counter_long_cut.mp4");
+    if (!full || !cut) return;
+    const std::vector<int>& ids = full->ids;
+    constexpr size_t kAfter = 5;
+    int graded = 0;
+
+    // GOAL: S15.892 (hardware failure, decode thread on) -- a failure injected on the decode thread reaches the
+    //       decoder, and the pictures shown across it are exactly the 2 the thread had decoded and queued at
+    //       the failure, then the resume: for a stream with timestamps, the picture after the last queued, each
+    //       once, in order; for a start at 150 whose pictures lost their timestamps (S15.172), the start's own
+    //       picture. False if a queued picture is lost or repeated, or anything else precedes the resume.
+    // WHY-THIS-SHAPE: the failure is armed only once the thread holds 2 untaken pictures, counted at the
+    //       decoder on that thread, so which decode meets it is known rather than raced, and the expected order
+    //       is built from that measured count. Grading only "the sequence is the stream's" (gradeSequence)
+    //       would call the stripped case's 171 172 150 a defect, and a check of the resume alone would miss a
+    //       lost queued picture.
+    // CONTROL: via control_batch.sh, 2026-10-19, RTX 3080 Ti, bytes restored, each alone: DecodeAhead::ask()
+    //       discarding the queued pictures (renderer/video/decode_ahead.cpp) -> "failing after 10 pictures:
+    //       showed 0 1 ... 10 12 13 ... where 0 1 ... 10 11 12 ... was due (2 queued at the failure)";
+    //       VideoDecoder::admit()'s DropThrough test `<=` made `<` (renderer/video/video_decoder.cpp) -> "showed
+    //       ... 10 11 11 12 ..."; seekToResume()'s re-run from the start's position made `if (false)` (same
+    //       file) -> "... 171 172 23 24 25 ... where ... 171 172 150 151 ...".
+    // COVERAGE-ASSERT: the failure was consumed, software decoded the pictures after it on the thread, the
+    //       queue held 2 when it was armed, and both cases were graded.
+    struct Case {
+        const char* what;
+        size_t start;
+        bool strip;
+        int failAt;
+    };
+    for (const Case& c : {Case{"counter_long.mp4, failing after 10 pictures", 0, false, 10},
+                          Case{"counter_long.mp4 opened at picture 150, its pictures losing their timestamps, failing "
+                               "after 21",
+                               150, true, 21}}) {
+        const size_t failAt = static_cast<size_t>(c.failAt);
+        if (c.start + failAt + 2 + kAfter > ids.size()) {
+            fail("counter_long.mp4 is too short for the threaded failure case");
+            continue;
+        }
+        std::optional<wallpaperx::StreamPosition> position;
+        if (c.start != 0) {
+            position = positionAt(device, label, "counter_long.mp4", c.start, ids[c.start]);
+            if (!position) continue;
+        }
+        const int total = c.failAt + 2 + static_cast<int>(kAfter);
+        const std::optional<ThreadedPlay> run =
+            playThreaded(device, label, c.what, asset("counter_long.mp4"), position, c.failAt, c.strip, total);
+        if (!run) continue;
+        if (!run->consumed || run->hostAfter == 0 || run->queued != 2) {
+            std::fprintf(stderr, "FAIL: %s: %s: failure %s, %d software picture(s) after it on the thread, %d queued "
+                                 "when it was armed\n",
+                         label.c_str(), c.what, run->consumed ? "consumed" : "never reached", run->hostAfter,
+                         run->queued);
+            fail("the hardware failure on the decode thread was not exercised with a full queue");
+            continue;
+        }
+        ++graded;
+        const size_t queued = static_cast<size_t>(run->queued);
+        std::vector<int> due(ids.begin() + static_cast<long>(c.start),
+                             ids.begin() + static_cast<long>(c.start + failAt + queued));
+        const size_t resume = c.strip ? c.start : c.start + failAt + queued;
+        due.insert(due.end(), ids.begin() + static_cast<long>(resume),
+                   ids.begin() + static_cast<long>(resume + kAfter));
+        if (run->shown != due) {
+            std::fprintf(stderr, "FAIL: %s: %s: showed %s where %s was due (%zu queued at the failure)\n",
+                         label.c_str(), c.what, joinIds(run->shown).c_str(), joinIds(due).c_str(), queued);
+            fail("the pictures shown across a hardware failure on the decode thread are not the queued ones and then "
+                 "the resume");
+        } else {
+            std::printf("%s: %s: showed %s; %zu queued at the failure, %d software pictures after it\n",
+                        label.c_str(), c.what, joinIds(run->shown).c_str(), queued, run->hostAfter);
+        }
+    }
+
+    // GOAL: S15.892 / S15.173 with the decode thread on -- a position past the end of the file (picture 300 of
+    //       counter_long.mp4 applied to its 100-picture cut) starts at the file's first picture, as a new pass,
+    //       and the pictures the thread decodes after it follow in order.
+    // WHY-THIS-SHAPE: 30 pictures, not start-at-device's 5, so most are the thread's; the thread having
+    //       decoded is required, or the case is the inline one start-at-device already grades.
+    // CONTROL: via control_batch.sh, 2026-10-19, RTX 3080 Ti, bytes restored: in renderer/video/video_decoder.cpp
+    //       next(), `if (m_startedAfter && m_returned.count == 0) { restart(); continue; }` deleted -> "counter_long_cut.mp4 opened at
+    //       picture 300 of counter_long.mp4: showed no first picture".
+    constexpr int kPastEnd = 30;
+    const std::optional<wallpaperx::StreamPosition> past = positionAt(device, label, "counter_long.mp4", 300, ids[300]);
+    if (past && cut->ids.size() >= static_cast<size_t>(kPastEnd) && cut->ids.size() < 300) {
+        const std::string what = "counter_long_cut.mp4 opened at picture 300 of counter_long.mp4";
+        const std::optional<ThreadedPlay> run =
+            playThreaded(device, label, what, asset("counter_long_cut.mp4"), past, -1, false, kPastEnd);
+        if (run) {
+            const std::vector<int> due(cut->ids.begin(), cut->ids.begin() + kPastEnd);
+            if (run->threadDecodes == 0) {
+                std::fprintf(stderr, "FAIL: %s: %s: no picture was decoded on a decode thread\n", label.c_str(),
+                             what.c_str());
+                fail("the past-the-end start was not played on a decode thread");
+            } else if (run->shown != due || !run->firstStartsPass) {
+                std::fprintf(stderr, "FAIL: %s: %s: showed %s (first marked %s) where %s was due\n", label.c_str(),
+                             what.c_str(), joinIds(run->shown).c_str(), run->firstStartsPass ? "yes" : "no",
+                             joinIds(due).c_str());
+                fail("a position past the end of the file starts at its first picture, as a new pass, with the "
+                     "decode thread on");
+            } else {
+                ++graded;
+                std::printf("%s: %s: %d pictures in order from the first, %d decodes on the thread\n", label.c_str(),
+                            what.c_str(), kPastEnd, run->threadDecodes);
+            }
+        }
+    } else if (past) {
+        fail("counter_long_cut.mp4 does not fit the past-the-end case");
+    }
+    check(graded == 3, "every threaded resume case was graded");
+}
+
+void runDecodeStartShortageChecks(Device& device, const std::string& label, int failure);
+
 }  // namespace
 
 // ------------------------------------------------------------------------- //
@@ -5770,6 +6928,25 @@ extern "C" VkResult vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physic
                                                          uint32_t* count, VkExtensionProperties* properties) {
     static const auto real =
         realSymbol<wallpaperx::testing::EnumerateDeviceExtensionsFn>("vkEnumerateDeviceExtensionProperties");
+    if (g_hideSynchronizedQueues && layerName == nullptr) {
+        uint32_t all = 0;
+        if (const VkResult r = real(physicalDevice, nullptr, &all, nullptr); r != VK_SUCCESS) return r;
+        std::vector<VkExtensionProperties> kept(all);
+        if (const VkResult r = real(physicalDevice, nullptr, &all, kept.data()); r < 0) return r;
+        kept.resize(all);
+        std::erase_if(kept, [](const VkExtensionProperties& e) {
+            return std::strcmp(e.extensionName, VK_KHR_INTERNALLY_SYNCHRONIZED_QUEUES_EXTENSION_NAME) == 0 ||
+                   (g_hideVideoExtensions && std::strncmp(e.extensionName, "VK_KHR_video", 12) == 0);
+        });
+        if (properties == nullptr) {
+            *count = static_cast<uint32_t>(kept.size());
+            return VK_SUCCESS;
+        }
+        const uint32_t n = std::min<uint32_t>(*count, static_cast<uint32_t>(kept.size()));
+        std::copy_n(kept.begin(), n, properties);
+        *count = n;
+        return n < kept.size() ? VK_INCOMPLETE : VK_SUCCESS;
+    }
     if (!g_hideVideoExtensions) return real(physicalDevice, layerName, count, properties);
     return wallpaperx::testing::enumerateWithoutVideoExtensions(real, physicalDevice, layerName, count, properties);
 }
@@ -5875,6 +7052,53 @@ extern "C" void vkDestroyDevice(VkDevice device, const VkAllocationCallbacks* al
     real(device, allocator);
 }
 
+extern "C" VkResult vkCreateDevice(VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
+                               const VkAllocationCallbacks* allocator, VkDevice* device) {
+    static const auto real =
+        realSymbol<VkResult (*)(VkPhysicalDevice, const VkDeviceCreateInfo*, const VkAllocationCallbacks*, VkDevice*)>(
+            "vkCreateDevice");
+    if (g_recordQueues) {
+        g_createdSynchronized = false;
+        for (uint32_t i = 0; i < info->enabledExtensionCount; ++i) {
+            if (std::strcmp(info->ppEnabledExtensionNames[i], VK_KHR_INTERNALLY_SYNCHRONIZED_QUEUES_EXTENSION_NAME) == 0) {
+                g_createdSynchronized = true;
+            }
+        }
+        for (uint32_t i = 0; i < info->queueCreateInfoCount; ++i) {
+            ++g_queueCreates;
+            const VkDeviceQueueCreateInfo& queue = info->pQueueCreateInfos[i];
+            if (g_createdSynchronized && (queue.flags & VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR) == 0) {
+                ++g_unflaggedQueues;
+                std::fprintf(stderr, "FAIL: queue family %u was created without the internally-synchronized flag\n",
+                             queue.queueFamilyIndex);
+                fail("a queue was created without the internally-synchronized flag");
+            }
+        }
+    }
+    return real(physical, info, allocator, device);
+}
+
+extern "C" void vkGetDeviceQueue2(VkDevice device, const VkDeviceQueueInfo2* info, VkQueue* queue) {
+    static const auto real =
+        realSymbol<void (*)(VkDevice, const VkDeviceQueueInfo2*, VkQueue*)>("vkGetDeviceQueue2");
+    if (g_recordQueues) {
+        ++g_queueFetches;
+        if (g_createdSynchronized && (info->flags & VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR) == 0) {
+            ++g_unflaggedQueues;
+            std::fprintf(stderr, "FAIL: queue family %u was fetched without the internally-synchronized flag\n",
+                         info->queueFamilyIndex);
+            fail("a queue was fetched without the internally-synchronized flag");
+        }
+    }
+    real(device, info, queue);
+}
+
+extern "C" void vkGetDeviceQueue(VkDevice device, uint32_t family, uint32_t index, VkQueue* queue) {
+    static const auto real = realSymbol<void (*)(VkDevice, uint32_t, uint32_t, VkQueue*)>("vkGetDeviceQueue");
+    if (g_recordQueues) ++g_plainFetches;
+    real(device, family, index, queue);
+}
+
 extern "C" int av_hwframe_ctx_init(AVBufferRef* ref) {
     static const auto real = realSymbol<int (*)(AVBufferRef*)>("av_hwframe_ctx_init");
     auto* frames = reinterpret_cast<AVHWFramesContext*>(ref->data);
@@ -5893,6 +7117,29 @@ extern "C" int av_hwframe_ctx_init(AVBufferRef* ref) {
 extern "C" int avcodec_receive_frame(AVCodecContext* context, AVFrame* frame) {
     static const auto real = realSymbol<int (*)(AVCodecContext*, AVFrame*)>("avcodec_receive_frame");
     const bool decoders = isDecodersContext(context);
+    if (decoders && g_holdInFfmpeg.load() && gettid() == g_decodeTid.load()) {
+        std::unique_lock<std::mutex> lock(g_threadMutex);
+        g_heldInFfmpeg = true;
+        g_threadChanged.notify_all();
+        g_threadChanged.wait(lock, [] { return !g_holdInFfmpeg.load(); });
+    }
+    if (decoders && g_threadExternal.load() > 0 && gettid() == g_decodeTid.load()) {
+        int left = g_threadExternal.load();
+        while (left > 0 && !g_threadExternal.compare_exchange_weak(left, left - 1)) {
+        }
+        if (left > 0) return AVERROR_EXTERNAL;
+    }
+    if (decoders && g_countThreaded.load()) {
+        const int err = real(context, frame);
+        if (err != 0) return err;
+        if (gettid() != g_gpuTid.load()) ++g_receivedOffGpuThread;
+        if (frame->format != AV_PIX_FMT_VULKAN) ++g_threadHostReceived;
+        const int untaken = ++g_threadReceived - g_taken.load();
+        int most = g_maxUntaken.load();
+        while (untaken > most && !g_maxUntaken.compare_exchange_weak(most, untaken)) {
+        }
+        return err;
+    }
     if (decoders && g_receiveExternalRemaining > 0) {
         --g_receiveExternalRemaining;
         return AVERROR_EXTERNAL;
@@ -5913,6 +7160,7 @@ extern "C" int avcodec_receive_frame(AVCodecContext* context, AVFrame* frame) {
     if (err == 0 && decoders && g_logPictures) {
         g_pictureLog.push_back(LoggedPicture{frame->width, frame->format == AV_PIX_FMT_VULKAN});
     }
+    if (err == 0 && decoders && g_trackPools) ++g_trackedPictures;
     if (err == 0 && decoders && g_trackPools && frame->format == AV_PIX_FMT_VULKAN && frame->hw_frames_ctx != nullptr) {
         if (PoolRecord* pool = poolRecord(reinterpret_cast<const AVHWFramesContext*>(frame->hw_frames_ctx->data))) {
             ++pool->pictures;
@@ -5924,6 +7172,10 @@ extern "C" int avcodec_receive_frame(AVCodecContext* context, AVFrame* frame) {
             TrafficEntry{frame->best_effort_timestamp, g_failingSeeks.size(), frame->format == AV_PIX_FMT_VULKAN});
     }
     if (err == 0 && decoders && g_inFailingCall && g_stripTimestamps) frame->best_effort_timestamp = AV_NOPTS_VALUE;
+    if (err == 0 && decoders && g_countOnThread.load() && gettid() == g_decodeTid.load()) {
+        ++g_onThreadReceived;
+        if (frame->format != AV_PIX_FMT_VULKAN) ++g_onThreadHost;
+    }
     if (err == 0 && decoders && g_recordPictures) {
         ++(frame->format == AV_PIX_FMT_VULKAN ? g_devicePictures : g_hostPictures);
         if (g_inFailingCall) ++g_failingPictures;
@@ -6047,7 +7299,189 @@ extern "C" int avformat_open_input(AVFormatContext** context, const char* url, c
     return real(context, url, format, options);
 }
 
+// A wait on a condition from the decode thread outside a decode call is its queue-full wait: run() has no
+// other, and ask() runs inside one.
+extern "C" int pthread_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex) {
+    using Fn = int (*)(pthread_cond_t*, pthread_mutex_t*);
+    static std::atomic<Fn> real{nullptr};
+    Fn fn = real.load();
+    if (fn == nullptr) {
+        fn = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "pthread_cond_wait"));
+        if (fn == nullptr) std::abort();
+        real = fn;
+    }
+#if defined(__SANITIZE_THREAD__)
+    // A wait called straight from a library tsan.supp names `called_from_lib` (ffmpeg, the Vulkan loader,
+    // Lavapipe) goes to libc, as the sanitizer itself treats it: forwarded to its interceptor, the wait's
+    // relock is seen while the library's own locking is ignored, which reads as lock-order cycles
+    // between two of that library's mutexes.
+    if (wallpaperx::testing::ignored_caller::fromIgnoredLibrary(__builtin_return_address(0))) {
+        static const Fn libcWait = [] {
+            const Fn found = wallpaperx::testing::ignored_caller::libcSymbol<Fn>("pthread_cond_wait");
+            if (found == nullptr) std::abort();
+            return found;
+        }();
+        fn = libcWait;
+    }
+#endif
+    if (g_watchParks.load() && gettid() == g_decodeTid.load() && !g_inAround.load()) {
+        {
+            std::lock_guard<std::mutex> lock(g_threadMutex);
+            ++g_parks;
+        }
+        g_threadChanged.notify_all();
+    }
+    return fn(cond, mutex);
+}
+
+// operator new replaced so one allocation inside DecodeAhead::start() can fail (S15.888), recognised by
+// the functions on its stack -- the target exports its symbols for dladdr(). Not under AddressSanitizer
+// or ThreadSanitizer, which own operator new; that mode then reports itself not answerable.
+#if !defined(__SANITIZE_ADDRESS__) && !defined(__SANITIZE_THREAD__)
+#define WALLPAPERX_PROBE_REPLACES_NEW 1
 namespace {
+thread_local bool t_checkingStack = false;
+
+bool allocationInStart(bool hook) {
+    void* frames[48];
+    const int depth = backtrace(frames, 48);
+    bool start = false;
+    bool installing = false;
+    for (int i = 0; i < depth; ++i) {
+        Dl_info info{};
+        if (dladdr(frames[i], &info) == 0 || info.dli_sname == nullptr) continue;
+        if (std::strstr(info.dli_sname, "11DecodeAhead5start") != nullptr) start = true;
+        if (std::strstr(info.dli_sname, "13PictureSource16askDeviceThrough") != nullptr) installing = true;
+    }
+    return start && installing == hook;
+}
+
+void* allocate(std::size_t size) {
+    const int failure = g_failNew.load();
+    if (failure != 0 && !t_checkingStack && gettid() == g_gpuTid.load()) {
+        t_checkingStack = true;
+        const bool hit = allocationInStart(failure == 2);
+        t_checkingStack = false;
+        if (hit && g_failNew.exchange(0) == failure) {
+            ++g_newFailures;
+            throw std::bad_alloc();
+        }
+    }
+    for (;;) {
+        if (void* p = std::malloc(size == 0 ? 1 : size)) return p;
+        std::new_handler handler = std::get_new_handler();
+        if (handler == nullptr) throw std::bad_alloc();
+        handler();
+    }
+}
+}  // namespace
+
+void* operator new(std::size_t size) { return allocate(size); }
+void* operator new[](std::size_t size) { return allocate(size); }
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
+    try {
+        return allocate(size);
+    } catch (...) {
+        return nullptr;
+    }
+}
+void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
+    try {
+        return allocate(size);
+    } catch (...) {
+        return nullptr;
+    }
+}
+namespace {
+void release(void* p) noexcept {
+    if (p != nullptr && p == g_watchedDevice.load()) g_watchedDeviceFreed = true;
+    std::free(p);
+}
+}  // namespace
+void operator delete(void* p) noexcept { release(p); }
+void operator delete[](void* p) noexcept { release(p); }
+void operator delete(void* p, std::size_t) noexcept { release(p); }
+void operator delete[](void* p, std::size_t) noexcept { release(p); }
+void operator delete(void* p, const std::nothrow_t&) noexcept { release(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { release(p); }
+// libstdc++'s aligned operator new takes its memory from aligned_alloc, which free() releases.
+void operator delete(void* p, std::align_val_t) noexcept { release(p); }
+void operator delete(void* p, std::size_t, std::align_val_t) noexcept { release(p); }
+#endif
+
+namespace {
+
+void runDecodeStartShortageChecks(Device& device, const std::string& label, int failure) {
+#ifndef WALLPAPERX_PROBE_REPLACES_NEW
+    std::printf("%s: a sanitizer owns operator new in this build, so no allocation can be failed -- not answerable\n",
+                label.c_str());
+    g_notVerified = true;
+    static_cast<void>(device);
+    static_cast<void>(failure);
+#else
+    if (!hardwareDecoderPresent(device, label) || !queuesShared(device, label) || !haveAsset(kThreadFixture, label)) {
+        return;
+    }
+    resetThreadWatch();
+    VideoPipeline pipeline(device, asset(kThreadFixture), kShaderDir, VideoPipeline::Playback::Once, std::nullopt,
+                           watchedHooks());
+    const ThreadWatchEnd end;
+    g_countThreaded = true;
+    // GOAL: S15.888 -- running out of memory inside DecodeAhead::start() (the hook's installation, or its
+    //       first allocation) leaves the decoded picture returned, the pipeline's source intact and the thread
+    //       started on a later picture.
+    // WHY-THIS-SHAPE: the failure is placed by the functions on the allocating stack, not by an allocation
+    //       count, which validation layers and the driver make vary. A lost source is a null dereference on
+    //       the next decode, so the case runs in a forked child and a crash is graded, not suffered.
+    // CONTROL: via control_batch.sh, 2026-10-19, RTX 3080 Ti, bytes restored: each in renderer/video: the hook installed before
+    //       the `try` in DecodeAhead::start() (decode_ahead.cpp, the pre-E8 code) -> hook case "the child died by
+    //       signal 11 (Segmentation fault)"; decodeAheadIfSafe()'s bad_alloc catch removed (video_pipeline.cpp)
+    //       -> "was reported failed: std::bad_alloc"; decodeAheadIfSafe() called after the first picture only
+    //       (video_pipeline.cpp) -> "8 pictures after the shortage, 0 decoded on a thread", both cases.
+    // COVERAGE-ASSERT: the failure must fire exactly once and no decode thread may run after that call,
+    //       or start() did not meet it.
+    g_failNew = failure;
+    bool first = false;
+    try {
+        first = pipeline.decodeNext();
+    } catch (const std::exception& e) {
+        g_failNew = 0;
+        std::fprintf(stderr, "FAIL: %s: the picture decoded while the thread's start ran out of memory was reported "
+                             "failed: %s\n",
+                     label.c_str(), e.what());
+        fail("a memory shortage starting the decode thread failed a decoded picture");
+        return;
+    }
+    g_failNew = 0;
+    if (g_newFailures != 1 || g_aroundCalls != 0) {
+        std::fprintf(stderr, "FAIL: %s: the allocation failure fired %d time(s) in DecodeAhead::start(), and %d "
+                             "decode(s) ran on a thread after it\n",
+                     label.c_str(), g_newFailures.load(), g_aroundCalls.load());
+        fail("the harness did not fail start() as planned");
+        return;
+    }
+    if (!first) {
+        std::fprintf(stderr, "FAIL: %s: decodeNext() answered no picture\n", label.c_str());
+        fail("a memory shortage starting the decode thread lost the decoded picture");
+        return;
+    }
+    for (int i = 0; i < 8; ++i) {
+        if (!pipeline.decodeNext()) {
+            std::fprintf(stderr, "FAIL: %s: picture %d after the shortage never came\n", label.c_str(), i + 2);
+            fail("the pipeline stopped decoding after a memory shortage starting the decode thread");
+            return;
+        }
+    }
+    if (g_aroundCalls == 0 || g_receivedOffGpuThread == 0) {
+        std::fprintf(stderr, "FAIL: %s: 8 pictures after the shortage, %d decoded on a thread\n", label.c_str(),
+                     g_receivedOffGpuThread.load());
+        fail("no decode thread started on a later picture after a memory shortage");
+        return;
+    }
+    std::printf("%s: picture kept, %d later pictures decoded on the thread started afterwards\n", label.c_str(),
+                g_receivedOffGpuThread.load());
+#endif
+}
 
 // One validated Device for `body`, and the exit code its checks earn: the whole process for most
 // modes, the whole child for a forked case.
@@ -6067,6 +7501,20 @@ int runGraded(const std::string& label, bool hideVideoExtensions, const std::fun
                 g_hideVideoExtensions = false;
                 oracle.attach(*device, grade);
                 std::printf("%s: on %s\n", label.c_str(), device->info().gpuName.c_str());
+                // GOAL: the modes that count or inject inside the caller's call really decode on that call's
+                //       thread; with a decode thread, counts and injections land between calls instead.
+                // WHY-THIS-SHAPE: asserted on the Device, not inferred from the checks passing, so an
+                //       extension renamed or enabled another way fails here by name instead of as nine
+                //       entries' unrelated counting failures.
+                // CONTROL: test-side, 2026-10-19, RTX 3080 Ti: the strip skipped (interposer branch
+                //       disabled) -> "FAIL: ... the Device still shares its queues with a decode thread".
+                if (g_hideSynchronizedQueues && device->queuesInternallySynchronized()) {
+                    std::fprintf(stderr, "FAIL: %s: the Device still shares its queues with a decode thread, so "
+                                         "this mode's per-call counts would land outside the call\n",
+                                 label.c_str());
+                    fail("internally synchronised queues were not hidden from the Device");
+                    throw std::runtime_error("cannot grade per-call counts with a decode thread running");
+                }
                 body(*device);
                 device->waitForSubmissions();
             } catch (const std::exception& e) {
@@ -6210,7 +7658,10 @@ int main(int argc, char** argv) {
         "halves-device",     "halves-host",   "timing-device",     "timing-host",       "start-at-device",
         "start-at-device-ts", "start-at-host", "start-at-device-open-gop", "start-at-device-open-gop-hevc",
         "start-at-device-open-gop-mp4", "start-at-host-open-gop", "start-at-device-budget", "start-at-device-av1",
-        "bounded-decode-device", "bounded-decode-host"};
+        "bounded-decode-device", "bounded-decode-host", "decode-thread-depth", "decode-thread-pending",
+        "decode-thread-failure", "decode-thread-catch-up", "decode-thread-hidden", "decode-thread-software",
+        "decode-thread-alloc", "decode-thread-left-running", "decode-thread-pools", "decode-thread-resume", "device-completed-off-thread",
+        "device-queue-flags"};
     if (std::find(modes.begin(), modes.end(), mode) == modes.end()) {
         std::fprintf(stderr, "usage: %s <mode>, one of:", argv[0]);
         for (const std::string& m : modes) std::fprintf(stderr, " %s", m.c_str());
@@ -6218,8 +7669,42 @@ int main(int argc, char** argv) {
         return 1;
     }
     const std::string label = "video_pipeline_probe (" + mode + ")";
+    // backtrace() loads its unwinder on first use, which allocates: never first inside operator new.
+    {
+        void* frames[2];
+        static_cast<void>(backtrace(frames, 2));
+    }
+    // GOAL: S13.83/S13.86 and the resume, loop and start-at goals these modes hold are about the decoding
+    //       PictureSource does, which is the same code on either thread; these modes attribute every count,
+    //       injected failure and pool free to the caller's call, which only holds when decoding is inline.
+    // WHY-THIS-SHAPE: hiding the extension needs no production seam. Leaving the thread on made every
+    //       injection and free land between calls (13x "the injected hardware failure never reached the
+    //       decoder", 7x "a replaced image pool was not freed during playback"), testing the probe's
+    //       timing, not the decoder. The same properties with the thread on are not covered here.
+    // CONTROL: test-side, 2026-10-19, RTX 3080 Ti: run without this assignment -> all nine entries red as
+    //       listed above; with it, all nine green. Production controls re-run under it: both
+    //       releaseIdleFramesContexts() calls removed (renderer/video/video_decoder.cpp) -> shape_device "pool 1
+    //       of 2 (320x240) was freed only when the pipeline was destroyed"; held via control_batch.sh.
+    g_hideSynchronizedQueues = mode == "resume-late-seek" || mode == "resume-end" || mode == "resume-seek-failure" ||
+                               mode == "resume-drop-count" || mode == "shape-device" || mode == "loop-device" ||
+                               mode == "loop-cost-device" || mode == "loop-resume" || mode == "start-at-device" ||
+                               mode == "decode-thread-hidden";
 
-    if (mode == "shape-device" || mode == "loop-device" || mode == "release-device" || mode == "retire-device") {
+    g_recordQueues = mode == "device-queue-flags";
+    if (mode == "decode-thread-left-running") {
+        superviseChild(label, [&label] { return runLeftRunningCase(label); });
+        const int failures = wallpaperx::testing::reportFailures("video_pipeline_probe");
+        if (failures > 0) return 1;
+        if (g_notVerified) {
+            std::printf("%s: NOT VERIFIED here -- reported to ctest as a skip, not a pass\n", label.c_str());
+            return kNotVerifiedExitCode;
+        }
+        std::printf("%s: passed in its own child\n", label.c_str());
+        return 0;
+    }
+    if (mode == "shape-device" || mode == "loop-device" || mode == "release-device" || mode == "retire-device" ||
+        mode == "decode-thread-hidden" || mode == "decode-thread-software" || mode == "decode-thread-alloc" ||
+        mode == "decode-thread-pools") {
         std::vector<std::pair<std::string, std::function<void(Device&)>>> cases;
         if (mode == "shape-device") {
             for (const SizeChangeFixture& fixture : kSizeChangeFixtures) {
@@ -6248,6 +7733,23 @@ int main(int argc, char** argv) {
                                [label](Device& device) { runRefusedTeardownChecks(device, label); });
             cases.emplace_back("counter_resize.h264, device not answering at teardown",
                                [label](Device& device) { runUnansweredProbeTeardownChecks(device, label); });
+        } else if (mode == "decode-thread-hidden" || mode == "decode-thread-software") {
+            const bool software = mode == "decode-thread-software";
+            cases.emplace_back(software ? "a stream decoded in software" : "queues not shared",
+                               [label, software](Device& device) { runNoDecodeThreadChecks(device, label, software); });
+        } else if (mode == "decode-thread-pools") {
+            for (const SizeChangeFixture& fixture : kSizeChangeFixtures) {
+                const std::string file = fixture.file;
+                if (file != "counter_resize.h264" && file != "counter_shrink_grow.h264") continue;
+                cases.emplace_back(file, [&fixture, label](Device& device) {
+                    runThreadedPoolChecks(device, label, fixture);
+                });
+            }
+        } else if (mode == "decode-thread-alloc") {
+            cases.emplace_back("first allocation in DecodeAhead::start",
+                               [label](Device& device) { runDecodeStartShortageChecks(device, label, 1); });
+            cases.emplace_back("the device-question hook's allocation",
+                               [label](Device& device) { runDecodeStartShortageChecks(device, label, 2); });
         } else if (mode == "loop-device") {
             cases.emplace_back("every loop fixture", [label](Device& device) {
                 runLoopChecks(device, label, /*onDevice=*/true);
@@ -6275,6 +7777,13 @@ int main(int argc, char** argv) {
                                 mode == "start-at-host" || mode == "start-at-host-open-gop" ||
                                 mode == "bounded-decode-host",
                      [&](Device& device) {
+                         if (mode == "decode-thread-depth") runDecodeDepthChecks(device, label);
+                         if (mode == "decode-thread-pending") runDecodePendingChecks(device, label);
+                         if (mode == "decode-thread-failure") runDecodeFailureChecks(device, label);
+                         if (mode == "decode-thread-catch-up") runDecodeCatchUpChecks(device, label);
+                         if (mode == "decode-thread-resume") runThreadedResumeChecks(device, label);
+                         if (mode == "device-completed-off-thread") runCompletedOffThreadChecks(device, label);
+                         if (mode == "device-queue-flags") runQueueFlagChecks(device, label);
                          if (mode == "bounded-decode-device") runBoundedDecodeChecks(device, label, /*onDevice=*/true);
                          if (mode == "bounded-decode-host") runBoundedDecodeChecks(device, label, /*onDevice=*/false);
                          if (mode == "sequence-device") runSequenceChecks(device, label, /*onDevice=*/true);

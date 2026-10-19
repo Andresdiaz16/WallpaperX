@@ -6,6 +6,7 @@
 #include "http_server.h"
 #include "log_pump.h"
 #include "wallpaper_manager.h"
+#include "vulkan/device.h"
 
 #include <sdbus-c++/sdbus-c++.h>
 
@@ -73,6 +74,13 @@ int failureStatus() {
 void flushBeforeExit(std::string_view line = {}) noexcept {
     wallpaperx::logpump::flush(wallpaperx::logpump::kExitFlush);
     if (!line.empty()) wallpaperx::logpump::writeErrNow(line.data(), line.size());
+}
+
+// A thread this process gave up on -- a config read blocked in the kernel, a video decode inside
+// the driver -- would run library code already torn down if it woke during static destruction, so
+// the process then ends without running static destructors.
+bool threadLeftRunning() {
+    return wallpaperx::configLoadAbandoned() || wallpaperx::Device::threadLeftRunning();
 }
 
 [[noreturn]] void exitNow(int status, std::string_view line = {}) noexcept {
@@ -444,7 +452,7 @@ int serve(int argc, char** argv) {
         std::fprintf(stderr, "wallpaperx-daemon: fatal: %s\n", e.what());
         // The same hazard as the clean path below, and more likely here: a start that
         // failed is a start whose config read may still be outstanding.
-        if (wallpaperx::configLoadAbandoned()) {
+        if (threadLeftRunning()) {
             flushLogs();
             std::_Exit(status);
         }
@@ -459,10 +467,8 @@ int serve(int argc, char** argv) {
         std::printf("wallpaperx-daemon: stopped after losing the GPU device, exit status %d\n", exitStatus);
     }
 
-    // An abandoned config read left a thread blocked in the kernel, and waking during static
-    // destruction would run library code already torn down. Everything with observable effects
-    // is destroyed by here.
-    if (wallpaperx::configLoadAbandoned()) {
+    // Everything with observable effects is destroyed by here.
+    if (threadLeftRunning()) {
         flushLogs();
         std::_Exit(exitStatus);
     }

@@ -21,6 +21,8 @@
 
 #include "tests/alloc_fail_control.h"
 
+#include "support/sanitizer_ignored_caller.h"
+
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <fcntl.h>
@@ -128,6 +130,22 @@ Fn nextPthread(const char* symbol) {
     return reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, symbol));
 }
 
+// Where a condition wait goes. Under ThreadSanitizer, dlvsym above never matches the runtime's
+// unversioned interceptor, so it is libc's own wait: the sanitizer would never see the mutex released
+// and retaken inside it, and every access the daemon makes under that mutex reads as a race. So the
+// daemon's waits go to the interceptor (dlsym finds it; it calls the current version), and only a wait
+// from a library the sanitizer ignores keeps libc's, as the sanitizer itself would treat it.
+template <class Fn>
+Fn waitFor(Fn libc, Fn sanitizer, const void* caller) {
+#if defined(__SANITIZE_THREAD__)
+    if (sanitizer != nullptr && !wallpaperx::testing::ignored_caller::fromIgnoredLibrary(caller)) return sanitizer;
+#else
+    (void)sanitizer;
+    (void)caller;
+#endif
+    return libc;
+}
+
 }  // namespace
 
 extern "C" int sd_bus_message_append_basic(sd_bus_message* message, char type, const void* value) {
@@ -142,24 +160,33 @@ extern "C" int sd_bus_message_append_basic(sd_bus_message* message, char type, c
 
 extern "C" int pthread_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex) {
     using Fn = int (*)(pthread_cond_t*, pthread_mutex_t*);
-    static const Fn real = nextPthread<Fn>("pthread_cond_wait");
+    static const Fn libc = nextPthread<Fn>("pthread_cond_wait");
+    static const Fn sanitizer = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "pthread_cond_wait"));
     noteWait();
-    return real(cond, mutex);
+    return waitFor(libc, sanitizer, __builtin_return_address(0))(cond, mutex);
 }
 
 extern "C" int pthread_cond_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex, const struct timespec* at) {
     using Fn = int (*)(pthread_cond_t*, pthread_mutex_t*, const struct timespec*);
-    static const Fn real = nextPthread<Fn>("pthread_cond_timedwait");
+    static const Fn libc = nextPthread<Fn>("pthread_cond_timedwait");
+    static const Fn sanitizer = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "pthread_cond_timedwait"));
     noteWait();
-    return real(cond, mutex, at);
+    return waitFor(libc, sanitizer, __builtin_return_address(0))(cond, mutex, at);
 }
 
 extern "C" int pthread_cond_clockwait(pthread_cond_t* cond, pthread_mutex_t* mutex, clockid_t clock,
                                       const struct timespec* at) {
     using Fn = int (*)(pthread_cond_t*, pthread_mutex_t*, clockid_t, const struct timespec*);
-    static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "pthread_cond_clockwait"));
+    static const Fn sanitizer = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "pthread_cond_clockwait"));
+    static const Fn libc = [] {
+#if defined(__SANITIZE_THREAD__)
+        return wallpaperx::testing::ignored_caller::libcSymbol<Fn>("pthread_cond_clockwait");
+#else
+        return sanitizer;
+#endif
+    }();
     noteWait();
-    return real(cond, mutex, clock, at);
+    return waitFor(libc != nullptr ? libc : sanitizer, sanitizer, __builtin_return_address(0))(cond, mutex, clock, at);
 }
 
 // Only the two forms libstdc++ does not route through these itself: its operator new[] and the

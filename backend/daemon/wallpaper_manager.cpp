@@ -15,6 +15,7 @@
 #include "vulkan/tier_selection.h"
 
 #include <algorithm>
+#include <bitset>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -108,7 +109,6 @@ std::string resolveShaderDir(const std::string& configured) {
 }
 
 using SteadyTime = std::chrono::steady_clock::time_point;
-using PictureTiming = VideoPipeline::PictureTiming;
 
 // Bounds on the time between two pictures. The floor is a budget, not a display fact: 120 pictures
 // a second per monitor on the one thread that also answers every monitor's frame request. It is
@@ -179,10 +179,11 @@ constexpr std::chrono::milliseconds kHandOverLead{100};
 // away is never mistaken for one handed on early or a catch-up hold off its own pass.
 constexpr std::chrono::milliseconds kShortestHandedPass = 2 * (kHandOverLead + kCatchUpHold);
 
-// The pipeline's next picture, dropping one picture at a time on the way until `until`, and at least one.
+// The pipeline's next picture, dropping one picture at a time on the way until `until`, and at least one;
+// never waiting for its decode thread.
 VideoPipeline::Decode decodeUntil(VideoPipeline& pipeline, SteadyTime until, PictureSkip skip) {
     for (;;) {
-        const VideoPipeline::Decode step = pipeline.decodeWithin(1, skip);
+        const VideoPipeline::Decode step = pipeline.takeReady(skip);
         if (step != VideoPipeline::Decode::Dropping || std::chrono::steady_clock::now() >= until) return step;
     }
 }
@@ -222,17 +223,14 @@ WallpaperManager::WallpaperManager(Config config)
           [](const std::string& line) {
               std::fprintf(stderr, "wallpaperx-daemon: %s\n", sanitizeForLog(line, 1024, LogFraming::Bare).c_str());
           },
-          // A track's tag is its session's blame line, so a death in its sound counts against the
-          // video as one in its pictures does.
+          // A track's tag is the blame line of the screen it is heard on, so a death in its sound
+          // counts against the video as one in its pictures does.
           [](const std::string& blame, const std::function<void()>& work) {
               const PlayingBlame decoding(blame);
               work();
           },
           // A parked session's lifetime rests on its sound being there, which only a round reads.
-          [this] {
-              std::lock_guard<std::mutex> lock(m_clockWakeMutex);
-              if (m_clockWake) m_clockWake();
-          })) {
+          [this] { wakeClock(); })) {
     if (!m_store.enabled()) {
         // Ok, not Fail: this feeds a worst-wins aggregate, so Fail would make every daemon
         // that never opted in report itself broken.
@@ -485,10 +483,10 @@ void WallpaperManager::ensureGpu() {
     // would leave a half-initialised manager if the target manager throws: m_device set,
     // m_targets null, and every later call taking the "already initialised" early return
     // straight into a null dereference.
-    std::unique_ptr<Device> device;
+    OwnedDevice device;
     std::unique_ptr<OffscreenTargetManager> targets;
     try {
-        device = std::make_unique<Device>(m_config.enableValidation, m_config.onDeviceLost);
+        device.reset(new Device(m_config.enableValidation, m_config.onDeviceLost));
         targets = std::make_unique<OffscreenTargetManager>(*device);
     } catch (const std::exception& e) {
         recordHealth(&DaemonHealth::gpu, HealthStatus::Fail, e.what());
@@ -2074,49 +2072,209 @@ std::vector<int> WallpaperManager::restoreSaved() {
     return monitorIds;
 }
 
-void WallpaperManager::closeVideoSessionLocked(int monitorId) {
-    m_videoSessions.erase(monitorId);
+std::optional<WallpaperManager::FileIdentity> WallpaperManager::fileIdentityOf(const std::string& path) {
+    struct stat st {};
+    if (::stat(path.c_str(), &st) != 0) return std::nullopt;
+    return FileIdentity{static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino),
+                        static_cast<int64_t>(st.st_size),
+                        static_cast<int64_t>(st.st_mtim.tv_sec) * 1'000'000'000 + st.st_mtim.tv_nsec};
 }
 
-void WallpaperManager::releaseVideoSessionLocked(int monitorId) {
-    const auto session = m_videoSessions.find(monitorId);
+void WallpaperManager::blameFirstMember(VideoSession& session) noexcept {
+    if (session.members.empty() || session.members.front().monitorId == session.blamed) return;
+    // Losing the new line to a failed allocation leaves the old one, which still names the file.
+    try {
+        const int monitorId = session.members.front().monitorId;
+        session.blame->line.store(std::make_shared<const std::string>(playingBlameLine(monitorId, session.path)));
+        session.blamed = monitorId;
+    } catch (const std::bad_alloc&) {
+    }
+}
+
+bool WallpaperManager::speedSettledLocked(const VideoSession& session) const {
+    return std::all_of(session.members.begin(), session.members.end(), [&](const VideoSession::Member& member) {
+        const auto it = m_monitors.find(member.monitorId);
+        // One showing something else asks for nothing: the round drops it before choosing the speed.
+        if (it == m_monitors.end() || it->second.wallpaperSeq != member.wallpaperSeq ||
+            drawableType(it->second.type) != Drawable::Clip) {
+            return true;
+        }
+        return playbackSpeed(it->second.properties) == session.speed;
+    });
+}
+
+WallpaperManager::VideoSessionRef WallpaperManager::videoSessionOfLocked(int monitorId) {
+    for (auto& [id, session] : m_videoSessions) {
+        for (const VideoSession::Member& member : session.members) {
+            if (member.monitorId == monitorId) return {id, &session};
+        }
+    }
+    return {};
+}
+
+void WallpaperManager::closeVideoSessionLocked(uint64_t sessionId) {
+    m_videoSessions.erase(sessionId);
+}
+
+void WallpaperManager::releaseVideoSessionLocked(uint64_t sessionId) {
+    const auto session = m_videoSessions.find(sessionId);
     if (session == m_videoSessions.end()) return;
     {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
-        const auto it = m_monitors.find(monitorId);
-        if (it != m_monitors.end()) {
+        for (const VideoSession::Member& member : session->second.members) {
+            const auto it = m_monitors.find(member.monitorId);
+            if (it == m_monitors.end()) continue;
             MonitorState& state = it->second;
-            const VideoSession& released = session->second;
-            const bool drewNothing = std::holds_alternative<VideoSession::Undrawn>(released.clock) ||
-                                     std::holds_alternative<VideoSession::CatchingUp>(released.clock);
-            const std::optional<StreamPosition> shown =
-                drewNothing ? released.openedAt : released.pipeline->shownPosition();
             state.releasedAt.reset();
-            if (shown && state.wallpaperSeq == released.wallpaperSeq) {
-                state.releasedAt = MonitorState::ReleasedAt{state.wallpaperSeq, *shown};
+            if (member.shown && state.wallpaperSeq == member.wallpaperSeq) {
+                state.releasedAt = MonitorState::ReleasedAt{state.wallpaperSeq, *member.shown};
             }
         }
     }
-    closeVideoSessionLocked(monitorId);
+    closeVideoSessionLocked(sessionId);
 }
 
-void WallpaperManager::closeFailedVideoSessionLocked(int monitorId, Fault failure) {
-    auto it = m_videoSessions.find(monitorId);
-    if (it == m_videoSessions.end()) return;
+std::vector<WallpaperManager::VideoSessionMember> WallpaperManager::closeFailedVideoSessionLocked(
+    uint64_t sessionId, const RenderFailure& failure, const std::bitset<kMaxMonitors>& failing,
+    const std::string* blame) {
+    auto it = m_videoSessions.find(sessionId);
+    if (it == m_videoSessions.end()) return {};
 
     VideoSession session = std::move(it->second);
     m_videoSessions.erase(it);
-    if (failure != Fault::File) return;
-    const PlayingBlame freeing(*session.blame);
-    session.pipeline.reset();
+    {
+        const std::shared_ptr<const std::string> line = session.blame->line.load();
+        std::optional<PlayingBlame> freeing;
+        if (failure.fault() == Fault::File) freeing.emplace(blame != nullptr ? *blame : *line);
+        session.pipeline.reset();
+    }
+
+    const bool atPosition = std::holds_alternative<VideoSession::CatchingUp>(session.clock);
+    std::bitset<kMaxMonitors> lost;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        for (const VideoSession::Member& member : session.members) {
+            if (failing.test(static_cast<size_t>(member.monitorId))) continue;
+            const auto state = m_monitors.find(member.monitorId);
+            if (state == m_monitors.end() || state->second.wallpaperSeq != member.wallpaperSeq) continue;
+            if (failure.gpuFault) {
+                recordFailureLocked(state->second, failure.error, failure.fault());
+                lost.set(static_cast<size_t>(member.monitorId));
+                continue;
+            }
+            state->second.releasedAt.reset();
+            if (member.shown && !atPosition) {
+                state->second.releasedAt = MonitorState::ReleasedAt{member.wallpaperSeq, *member.shown};
+            }
+        }
+    }
+    for (const VideoSession::Member& member : session.members) {
+        if (!lost.test(static_cast<size_t>(member.monitorId))) continue;
+        std::fprintf(stderr, "wallpaperx-daemon: monitor %d stopped playing: %s\n", member.monitorId,
+                     sanitizeForLog(failure.error, 1024).c_str());
+        releaseTarget(member.monitorId);
+    }
+    return std::move(session.members);
+}
+
+void WallpaperManager::leaveVideoSessionLocked(int monitorId, bool keepPosition) {
+    const VideoSessionRef ref = videoSessionOfLocked(monitorId);
+    if (ref.session == nullptr) return;
+    std::vector<VideoSession::Member>& members = ref.session->members;
+    const auto member = std::find_if(members.begin(), members.end(),
+                                     [monitorId](const VideoSession::Member& m) { return m.monitorId == monitorId; });
+    const VideoSession::Member left = *member;
+    members.erase(member);
+    if (keepPosition) {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        const auto it = m_monitors.find(monitorId);
+        if (it != m_monitors.end()) {
+            it->second.releasedAt.reset();
+            if (left.shown && it->second.wallpaperSeq == left.wallpaperSeq) {
+                it->second.releasedAt = MonitorState::ReleasedAt{left.wallpaperSeq, *left.shown};
+            }
+        }
+    }
+    if (members.empty()) {
+        closeVideoSessionLocked(ref.id);
+    } else {
+        blameFirstMember(*ref.session);
+    }
 }
 
 void WallpaperManager::dropStaleVideoSessionLocked(int monitorId, std::optional<Drawable> kind,
                                                    uint64_t wallpaperSeq) {
-    const auto it = m_videoSessions.find(monitorId);
-    if (it == m_videoSessions.end()) return;
-    if (kind == Drawable::Clip && it->second.wallpaperSeq == wallpaperSeq) return;
-    closeVideoSessionLocked(monitorId);
+    const VideoSessionRef ref = videoSessionOfLocked(monitorId);
+    if (ref.session == nullptr) return;
+    for (const VideoSession::Member& member : ref.session->members) {
+        if (member.monitorId == monitorId && kind == Drawable::Clip && member.wallpaperSeq == wallpaperSeq) return;
+    }
+    leaveVideoSessionLocked(monitorId, false);
+}
+
+void WallpaperManager::mergeSharedSessionsLocked() {
+    // Which session absorbs the other: one a screen moves in, so a playing screen never jumps to a
+    // stopped one's picture; then one holding a picture over one still catching up to its position,
+    // then the one more screens are playing from, then the larger, then the older.
+    struct Standing {
+        bool moves = false;
+        bool holdsPicture = false;
+        size_t playing = 0;
+        size_t members = 0;
+        auto operator<=>(const Standing&) const = default;
+    };
+    for (bool merged = true; merged;) {
+        merged = false;
+        std::vector<std::pair<uint64_t, Standing>> standing;
+        {
+            std::lock_guard<std::mutex> stateLock(m_stateMutex);
+            for (const auto& [id, session] : m_videoSessions) {
+                if (!speedSettledLocked(session)) continue;
+                Standing s{false, !std::holds_alternative<VideoSession::CatchingUp>(session.clock), 0,
+                           session.members.size()};
+                for (const VideoSession::Member& member : session.members) {
+                    const Motion motion = motionLocked(member.monitorId, member.wallpaperSeq);
+                    s.moves = s.moves || motion != Motion::Stopped;
+                    if (motion == Motion::Playing) ++s.playing;
+                }
+                standing.emplace_back(id, s);
+            }
+        }
+        for (size_t a = 0; a < standing.size() && !merged; ++a) {
+            for (size_t b = a + 1; b < standing.size() && !merged; ++b) {
+                VideoSession& first = m_videoSessions.at(standing[a].first);
+                VideoSession& second = m_videoSessions.at(standing[b].first);
+                if (first.speed != second.speed || first.path != second.path || !first.file ||
+                    first.file != second.file) {
+                    continue;
+                }
+                // Where no screen moves, each keeps the picture it has: the join's rule.
+                if (!standing[a].second.moves && !standing[b].second.moves) continue;
+                // Ids grow with age, so on equal standing the older -- `first` -- stays.
+                const bool keepFirst = standing[a].second >= standing[b].second;
+                const uint64_t absorbed = keepFirst ? standing[b].first : standing[a].first;
+                VideoSession& into = keepFirst ? first : second;
+                VideoSession& from = keepFirst ? second : first;
+                std::vector<int> moved;
+                for (VideoSession::Member& member : from.members) moved.push_back(member.monitorId);
+                into.members.insert(into.members.end(), std::make_move_iterator(from.members.begin()),
+                                    std::make_move_iterator(from.members.end()));
+                from.members.clear();
+                into.lastUsed = std::max(into.lastUsed, from.lastUsed);
+                {
+                    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+                    for (const int monitorId : moved) {
+                        if (const auto it = m_monitors.find(monitorId); it != m_monitors.end()) {
+                            it->second.served.clear();
+                            it->second.cleanPlay.lastShown.reset();
+                        }
+                    }
+                }
+                closeVideoSessionLocked(absorbed);
+                merged = true;
+            }
+        }
+    }
 }
 
 static_assert(WallpaperManager::kMaxVideoSessions > 0, "the monitor being drawn needs a session of its own");
@@ -2234,7 +2392,7 @@ bool WallpaperManager::recordDeliveredLocked(int monitorId, const std::string& c
         it->second.uncollectedSince.reset();
         // Recorded per consumer rather than derived from the holds: a consumer that gives its image
         // back before asking for the next one holds none at this moment and is reading all the same.
-        if (m_videoSessions.count(monitorId) == 0) return false;
+        if (videoSessionOfLocked(monitorId).session == nullptr) return false;
         return !reportConsumer(it->second.served, client, Repeat::Once, std::chrono::steady_clock::now(),
                                m_config.refusalLogInterval);
     } catch (...) {
@@ -2254,18 +2412,21 @@ bool WallpaperManager::handoverDelivered(int monitorId, const std::string& clien
 
 bool WallpaperManager::evictIdleVideoSessionLocked() {
     const VideoSession* victim = nullptr;
-    int victimId = 0;
+    uint64_t victimId = 0;
     {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
-        for (const auto& [monitorId, session] : m_videoSessions) {
+        for (const auto& [id, session] : m_videoSessions) {
             // Not the clock's own test: a screen showing a current picture never loses its decoder
             // for another screen's sake, and nobody having fetched for a couple of seconds is a
             // guess about the consumer, not evidence that the screen is gone. A screen that has
             // said it is not being drawn is evidence, and is taken at once.
-            if (currentSeqLocked(monitorId, session.wallpaperSeq) && screenDrawnLocked(monitorId)) continue;
+            const bool showing = std::any_of(session.members.begin(), session.members.end(), [this](const auto& m) {
+                return currentSeqLocked(m.monitorId, m.wallpaperSeq) && screenDrawnLocked(m.monitorId);
+            });
+            if (showing) continue;
             if (victim != nullptr && victim->lastUsed <= session.lastUsed) continue;
             victim = &session;
-            victimId = monitorId;
+            victimId = id;
         }
     }
     if (victim == nullptr) return false;
@@ -2328,10 +2489,50 @@ void WallpaperManager::releaseExpiredStillsLocked(SteadyTime now, ClockRound& ro
 }
 
 WallpaperManager::VideoSession& WallpaperManager::videoSessionLocked(int monitorId, const std::string& path,
-                                                                    uint64_t wallpaperSeq) {
-    if (const auto it = m_videoSessions.find(monitorId); it != m_videoSessions.end()) {
-        it->second.lastUsed = ++m_videoSessionUse;
-        return it->second;
+                                                                    uint64_t wallpaperSeq, bool keepsPicture) {
+    if (const VideoSessionRef ref = videoSessionOfLocked(monitorId); ref.session != nullptr) {
+        ref.session->lastUsed = ++m_videoSessionUse;
+        return *ref.session;
+    }
+
+    // Spent by this attempt whether or not it opens, so a failure never repeats at the same position.
+    std::optional<StreamPosition> startAt;
+    double speed = 1.0;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        const auto it = m_monitors.find(monitorId);
+        if (it != m_monitors.end()) {
+            if (it->second.releasedAt && it->second.releasedAt->forSeq == wallpaperSeq) {
+                startAt = it->second.releasedAt->shown;
+            }
+            it->second.releasedAt.reset();
+            speed = playbackSpeed(it->second.properties);
+        }
+    }
+
+    // A screen joins whatever has this file open at its speed, except that one with a picture of its
+    // own to keep joins only where another screen plays, and takes that session's picture.
+    const std::optional<FileIdentity> file = fileIdentityOf(path);
+    if (file) {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        for (auto& [id, session] : m_videoSessions) {
+            if (session.path != path || session.file != file) continue;
+            if (keepsPicture && startAt &&
+                std::none_of(session.members.begin(), session.members.end(), [&](const VideoSession::Member& m) {
+                    return motionLocked(m.monitorId, m.wallpaperSeq) != Motion::Stopped;
+                })) {
+                continue;
+            }
+            if (session.speed != speed || !speedSettledLocked(session)) continue;
+            session.members.push_back(VideoSession::Member{monitorId, wallpaperSeq, startAt});
+            session.lastUsed = ++m_videoSessionUse;
+            // Its readers are new to this session, and its play starts afresh.
+            if (const auto it = m_monitors.find(monitorId); it != m_monitors.end()) {
+                it->second.served.clear();
+                it->second.cleanPlay.lastShown.reset();
+            }
+            return session;
+        }
     }
 
     while (m_videoSessions.size() >= kMaxVideoSessions) {
@@ -2344,20 +2545,17 @@ WallpaperManager::VideoSession& WallpaperManager::videoSessionLocked(int monitor
 
     // What the card can hold is settled by trying: a decoder's images are ffmpeg's to size, so
     // nothing here can predict them.
-    // Spent by this attempt whether or not it opens, so a failure never repeats at the same position.
-    std::optional<StreamPosition> startAt;
-    {
-        std::lock_guard<std::mutex> stateLock(m_stateMutex);
-        const auto it = m_monitors.find(monitorId);
-        if (it != m_monitors.end()) {
-            if (it->second.releasedAt && it->second.releasedAt->forSeq == wallpaperSeq) {
-                startAt = it->second.releasedAt->shown;
-            }
-            it->second.releasedAt.reset();
-        }
-    }
 
-    auto blame = std::make_unique<const std::string>(playingBlameLine(monitorId, path));
+    auto blame = std::make_unique<VideoSession::BlameLine>();
+    blame->line.store(std::make_shared<const std::string>(playingBlameLine(monitorId, path)));
+    // The decode thread names the session's line as it stands at each picture it decodes.
+    VideoPipeline::DecodeHooks hooks;
+    hooks.around = [named = blame.get()](const std::function<void()>& step) {
+        const std::shared_ptr<const std::string> line = named->line.load();
+        const PlayingBlame decoding(*line);
+        step();
+    };
+    hooks.ready = [this] { wakeClock(); };
     std::unique_ptr<VideoPipeline> pipeline;
     // A first open runs under the crash record, across the open and the first decode: the spans in which
     // the file's content is what runs. An open at `startAt` resumes a file this run has played, so a death
@@ -2367,15 +2565,16 @@ WallpaperManager::VideoSession& WallpaperManager::videoSessionLocked(int monitor
     // withdrawn before an eviction frees another file's decoder.
     const auto open = [&] {
         retryOnShortageLocked(Relief::KeptStillsThenIdleVideo, [&] {
+            const std::shared_ptr<const std::string> line = blame->line.load();
             std::optional<ApplyingRecord> applying;
             std::optional<PlayingBlame> resuming;
             if (startAt) {
-                resuming.emplace(*blame);
+                resuming.emplace(*line);
             } else {
                 applying.emplace(m_config.stateDir, monitorId, "video", path);
             }
             auto opened = std::make_unique<VideoPipeline>(*m_device, path, m_resolvedShaderDir,
-                                                          VideoPipeline::Playback::Loop, startAt);
+                                                          VideoPipeline::Playback::Loop, startAt, hooks);
             // A file with no picture cannot be drawn at a later pass either, so this fails now.
             if (!startAt && !opened->decodeNext()) {
                 throw WallpaperContentError(describeRejection("VideoPipeline", "no picture could be decoded", path));
@@ -2393,15 +2592,21 @@ WallpaperManager::VideoSession& WallpaperManager::videoSessionLocked(int monitor
     }
 
     using Clock = decltype(VideoSession::clock);
-    const Clock clock = startAt ? Clock(VideoSession::CatchingUp{}) : Clock(VideoSession::Undrawn{});
-    const auto entry = m_videoSessions
-                           .insert_or_assign(monitorId, VideoSession{wallpaperSeq, ++m_videoSessionUse, path,
-                                                                     std::move(blame), std::move(pipeline), startAt,
-                                                                     clock})
-                           .first;
+    VideoSession opened;
+    opened.members.push_back(VideoSession::Member{monitorId, wallpaperSeq, startAt});
+    opened.speed = speed;
+    opened.lastUsed = ++m_videoSessionUse;
+    opened.path = path;
+    opened.file = file;
+    opened.blame = std::move(blame);
+    opened.blamed = monitorId;
+    opened.pipeline = std::move(pipeline);
+    opened.openedAtPosition = startAt.has_value();
+    opened.clock = startAt ? Clock(VideoSession::CatchingUp{}) : Clock(VideoSession::Undrawn{});
+    const auto entry = m_videoSessions.emplace(++m_lastVideoSessionId, std::move(opened)).first;
     {
-        // A new session's readers are all new to it, and its play starts afresh. This is the only
-        // place a session is made, so the only reset any of these needs.
+        // A new session's readers are all new to it, and its play starts afresh, as they do for a
+        // screen joining one.
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
         if (const auto it = m_monitors.find(monitorId); it != m_monitors.end()) {
             it->second.served.clear();
@@ -2413,9 +2618,10 @@ WallpaperManager::VideoSession& WallpaperManager::videoSessionLocked(int monitor
 
 WallpaperManager::VideoSession& WallpaperManager::caughtUpSessionLocked(int monitorId, VideoSession& session,
                                                                       const std::string& path,
-                                                                      uint64_t wallpaperSeq) {
+                                                                      uint64_t wallpaperSeq, bool keepsPicture,
+                                                                      const std::string& blame) {
     try {
-        const PlayingBlame working(*session.blame);
+        const PlayingBlame working(blame);
         if (!session.pipeline->decodeNext()) {
             throw WallpaperContentError(describeRejection("VideoPipeline", "no picture could be decoded", path));
         }
@@ -2423,10 +2629,12 @@ WallpaperManager::VideoSession& WallpaperManager::caughtUpSessionLocked(int moni
         return session;
     } catch (const std::exception&) {
         const RenderFailure failure = classifyFailure();
-        closeFailedVideoSessionLocked(monitorId, failure.fault());
+        std::bitset<kMaxMonitors> self;
+        self.set(static_cast<size_t>(monitorId));
+        closeFailedVideoSessionLocked(videoSessionOfLocked(monitorId).id, failure, self, &blame);
         if (!givesUpPosition(monitorId, failure)) throw;
     }
-    return videoSessionLocked(monitorId, path, wallpaperSeq);
+    return videoSessionLocked(monitorId, path, wallpaperSeq, keepsPicture);
 }
 
 bool WallpaperManager::givesUpPosition(int monitorId, const RenderFailure& failure) {
@@ -2558,6 +2766,12 @@ AudioTrack* WallpaperManager::heardTrackLocked(int monitorId, VideoSession& sess
         if (session.audio) session.audio->stop();
         return nullptr;
     }
+    // A stream is named for its screen, so another screen of the session being heard gets its own,
+    // as it would have with a session of its own. The old one's clock readings name its requests.
+    if (session.audio && session.audioScreen != monitorId) {
+        session.audio.reset();
+        session.heard.reset();
+    }
     if (!session.audio) {
         // What the sound server lists the stream as: the screen, which outlasts any one file.
         std::string screen = "monitor " + std::to_string(monitorId);
@@ -2567,7 +2781,8 @@ AudioTrack* WallpaperManager::heardTrackLocked(int monitorId, VideoSession& sess
                 if (boundId == monitorId) screen = name;
             }
         }
-        session.audio = m_audio->track(session.path, *session.blame, "Wallpaper on " + screen);
+        session.audio = m_audio->track(session.path, playingBlameLine(monitorId, session.path), "Wallpaper on " + screen);
+        session.audioScreen = monitorId;
     }
     // Cubed, as desktop mixers do, so the slider's middle sounds like the middle.
     session.audio->setVolume(wanted.volume * wanted.volume * wanted.volume);
@@ -2830,9 +3045,14 @@ void WallpaperManager::recordFailureLocked(MonitorState& state, const std::strin
 }
 
 void WallpaperManager::setClockWake(std::function<void()> wake) {
-    // Under the lock the output's thread calls it under, so once this returns the old one is not running.
+    // Under the lock wakeClock() calls it under, so once this returns the old one is not running.
     std::lock_guard<std::mutex> lock(m_clockWakeMutex);
     m_clockWake = std::move(wake);
+}
+
+void WallpaperManager::wakeClock() {
+    std::lock_guard<std::mutex> lock(m_clockWakeMutex);
+    if (m_clockWake) m_clockWake();
 }
 
 ClockRound WallpaperManager::advanceVideo(SteadyTime now) {
@@ -2840,23 +3060,26 @@ ClockRound WallpaperManager::advanceVideo(SteadyTime now) {
     ClockRound round;
     // Reserved before anything is shown, so no allocation can fail between a commit and its
     // announcement, or between a failure and the render it leaves owed.
-    round.shown.reserve(m_videoSessions.size());
-    round.retry.reserve(m_videoSessions.size() + kMaxMonitors);
+    // A monitor is in at most one session, so it is shown at most once a round.
+    round.shown.reserve(kMaxMonitors);
+    round.retry.reserve(2 * kMaxMonitors);
     const size_t sessionsBefore = m_videoSessions.size();
+    mergeSharedSessionsLocked();
     const SteadyTime catchUpUntil = std::chrono::steady_clock::now() + kCatchUpSlice;
     for (auto it = m_videoSessions.begin(); it != m_videoSessions.end();) {
         // Advanced first: a failing session erases its own entry, and only its own.
-        const int monitorId = (it++)->first;
+        const uint64_t sessionId = it->first;
+        const int named = (it++)->second.members.front().monitorId;
         std::optional<SteadyTime> due;
         try {
-            due = advanceSessionLocked(monitorId, now, catchUpUntil, round);
+            due = advanceSessionLocked(sessionId, now, catchUpUntil, round);
         } catch (const std::exception& e) {
             // Only reporting a failure can reach here, and a session whose failure could not be
             // reported still must not be advanced again: its pipeline threw. The failure to report
-            // is the daemon's.
-            closeFailedVideoSessionLocked(monitorId, Fault::Daemon);
+            // is the daemon's, and no screen's to answer for.
+            closeFailedVideoSessionLocked(sessionId, RenderFailure{{}, true}, {});
             std::fprintf(stderr, "wallpaperx-daemon: monitor %d stopped playing, and why could not be recorded: %s\n",
-                         monitorId, sanitizeForLog(e.what(), 1024).c_str());
+                         named, sanitizeForLog(e.what(), 1024).c_str());
         }
         if (due && (!round.nextDue || *due < *round.nextDue)) round.nextDue = due;
     }
@@ -2891,7 +3114,7 @@ void WallpaperManager::reopenVideosLocked(SteadyTime now, bool freedSession, Clo
         // Ahead of the tests below, so a monitor that cannot be posted does not spend the reopen
         // budget one of them takes.
         if (free == 0) break;
-        if (drawableType(state.type) != Drawable::Clip || m_videoSessions.count(monitorId) != 0) continue;
+        if (drawableType(state.type) != Drawable::Clip || videoSessionOfLocked(monitorId).session != nullptr) continue;
 
         // A video that would be playing and has nothing to play with: its session was freed while
         // nobody was looking, and only a render opens the file again. Self-limiting -- the render
@@ -2933,37 +3156,100 @@ void WallpaperManager::reopenVideosLocked(SteadyTime now, bool freedSession, Clo
     }
 }
 
-std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, SteadyTime now,
+std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(uint64_t sessionId, SteadyTime now,
                                                                  SteadyTime catchUpUntil, ClockRound& round) {
     using Session = VideoSession;
     using Decode = VideoPipeline::Decode;
-    Session& session = m_videoSessions.at(monitorId);
-    const uint64_t wallpaperSeq = session.wallpaperSeq;
+    Session& session = m_videoSessions.at(sessionId);
     const bool resuming = std::holds_alternative<Session::CatchingUp>(session.clock);
 
-    Motion motion = Motion::Stopped;
-    std::optional<uint64_t> playing;
+    // What each screen lets the session do. For the whole round: a change arriving meanwhile wakes
+    // the worker for another.
+    struct Screen {
+        int monitorId = 0;
+        uint64_t wallpaperSeq = 0;
+        Motion motion = Motion::Stopped;
+        std::optional<uint64_t> playing;
+    };
+    std::vector<Screen> screens;
+    screens.reserve(session.members.size());
     bool paused = false;
-    // For the whole round: a change arriving meanwhile wakes the worker for another.
     double speed = 1.0;
     SoundWanted sound;
+    // The screen whose sound is heard; while none is, no track is made and this names none.
+    int heardOn = -1;
     // Sound that plays with no pictures has no picture deadline to bring the round that stops it.
     std::optional<SteadyTime> unwatchedAt;
     {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
-        motion = motionLocked(monitorId, wallpaperSeq);
-        playing = playingSeqLocked(monitorId, wallpaperSeq);
-        paused = pausedLocked(monitorId);
-        sound.heard = soundHeardLocked(monitorId);
-        if (const auto it = m_monitors.find(monitorId); it != m_monitors.end()) {
-            unwatchedAt = unwatchedAtLocked(it->second);
-            speed = playbackSpeed(it->second.properties);
-            sound.volume = wallpaperVolume(it->second.properties);
+        const auto stateOf = [this](const Session::Member& member) -> MonitorState* {
+            const auto it = m_monitors.find(member.monitorId);
+            if (it == m_monitors.end() || it->second.wallpaperSeq != member.wallpaperSeq ||
+                drawableType(it->second.type) != Drawable::Clip) {
+                return nullptr;
+            }
+            return &it->second;
+        };
+        // A screen given another wallpaper leaves; its own render would drop it too, but only once it runs.
+        std::erase_if(session.members, [&](const Session::Member& member) { return stateOf(member) == nullptr; });
+        // The session plays at one speed. A screen set to another leaves keeping its picture, and plays
+        // from a session of its own once reopenVideosLocked() posts it. Which speed stays: the session's
+        // while a screen still asks for it, else a playing screen's, else the first screen's -- so only
+        // the screens whose speed changed leave.
+        if (!session.members.empty()) {
+            const auto speedOf = [&](const Session::Member& member) { return playbackSpeed(stateOf(member)->properties); };
+            if (std::none_of(session.members.begin(), session.members.end(),
+                             [&](const Session::Member& m) { return speedOf(m) == session.speed; })) {
+                const auto mover = std::find_if(session.members.begin(), session.members.end(), [&](const Session::Member& m) {
+                    return motionLocked(m.monitorId, m.wallpaperSeq) == Motion::Playing;
+                });
+                session.speed = speedOf(mover != session.members.end() ? *mover : session.members.front());
+            }
+            speed = session.speed;
+            std::erase_if(session.members, [&](const Session::Member& member) {
+                if (speedOf(member) == speed) return false;
+                MonitorState& state = *stateOf(member);
+                state.releasedAt.reset();
+                if (member.shown) state.releasedAt = MonitorState::ReleasedAt{member.wallpaperSeq, *member.shown};
+                state.cleanPlay.lastShown.reset();
+                return true;
+            });
+        }
+        for (const Session::Member& member : session.members) {
+            MonitorState& state = *stateOf(member);
+            Screen screen{member.monitorId, member.wallpaperSeq, motionLocked(member.monitorId, member.wallpaperSeq),
+                          playingSeqLocked(member.monitorId, member.wallpaperSeq)};
+            paused = paused || pausedLocked(member.monitorId);
+            if (const std::optional<SteadyTime> at = unwatchedAtLocked(state); at && (!unwatchedAt || *at < *unwatchedAt)) {
+                unwatchedAt = at;
+            }
             // Stopped play ends the stretch the next picture's time is counted from.
-            if (!playing) it->second.cleanPlay.lastShown.reset();
+            if (!screen.playing) state.cleanPlay.lastShown.reset();
+            // One screen holds the focus, so at most one is heard; its sound goes on only while its
+            // own picture moves, or a render owed redraws it.
+            if (!sound.heard && screen.motion != Motion::Stopped && soundHeardLocked(member.monitorId)) {
+                sound.heard = true;
+                sound.volume = wallpaperVolume(state.properties);
+                heardOn = member.monitorId;
+            }
+            screens.push_back(screen);
         }
         sound.speed = speed;
     }
+    if (session.members.empty()) {
+        closeVideoSessionLocked(sessionId);
+        return std::nullopt;
+    }
+    blameFirstMember(session);
+
+    const auto anyIn = [&](Motion motion) {
+        return std::any_of(screens.begin(), screens.end(), [motion](const Screen& s) { return s.motion == motion; });
+    };
+    const bool playing = anyIn(Motion::Playing);
+    const Motion motion = playing                    ? Motion::Playing
+                          : anyIn(Motion::Parked)     ? Motion::Parked
+                          : anyIn(Motion::RenderOwed) ? Motion::RenderOwed
+                                                      : Motion::Stopped;
     // A parked session opened at the picture on screen holds no picture yet, and its sound starts
     // from that picture's time, so it is decoded first, as a playing one would be.
     const bool parkedCatchingUp = motion == Motion::Parked && resuming && sound.audible();
@@ -2973,7 +3259,7 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
         // Anything else stops the sound with the pictures; it starts again with the next one shown.
         if (motion == Motion::Parked) {
             using Content = AudioTrack::Content;
-            const AudioTrack* track = loopParkedSoundLocked(monitorId, session, sound, now);
+            const AudioTrack* track = loopParkedSoundLocked(heardOn, session, sound, now);
             // Null while wanted is a track that could not be made; null otherwise, a sound not to be heard.
             const Content content = track != nullptr ? track->content()
                                     : sound.audible() ? Content::Failed
@@ -2983,19 +3269,23 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
                 session.idleSince.reset();
                 return unwatchedAt;
             }
+            // Recorded for the screen whose sound was wanted: another's was never tried.
             if (sound.audible()) {
                 using Why = MonitorState::NoSound::Why;
                 std::lock_guard<std::mutex> stateLock(m_stateMutex);
-                const auto it = m_monitors.find(monitorId);
-                if (it != m_monitors.end() && it->second.wallpaperSeq == wallpaperSeq) {
-                    it->second.noSound = {wallpaperSeq, content == Content::Failed ? Why::Failed : Why::Silent};
+                for (const Screen& screen : screens) {
+                    if (screen.monitorId != heardOn) continue;
+                    const auto it = m_monitors.find(screen.monitorId);
+                    if (it != m_monitors.end() && it->second.wallpaperSeq == screen.wallpaperSeq) {
+                        it->second.noSound = {screen.wallpaperSeq, content == Content::Failed ? Why::Failed : Why::Silent};
+                    }
                 }
             }
         }
         const bool soundPlays = motion == Motion::RenderOwed && sound.audible() && session.audio;
         if (!soundPlays && session.audio) session.audio->stop();
         // Stopped, for whatever reason: paused, nobody can see it, a render is owed, its file held
-        // one picture. The picture on screen stays where it is -- nothing here touches the frame --
+        // one picture. The pictures on screen stay where they are -- nothing here touches a frame --
         // and all this decides is how long the decoder and its picture pool are kept against playing
         // starting again. The session that replaces a released one seeks back to that picture.
         // Outside the state lock, because freeing them re-enters ffmpeg and the driver and every
@@ -3006,35 +3296,42 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
         const SteadyTime releaseAt =
             *session.idleSince + (paused ? m_config.pausedSessionRelease : m_config.idleSessionRelease);
         if (now < releaseAt) return soundPlays && unwatchedAt ? std::min(releaseAt, *unwatchedAt) : releaseAt;
-        releaseVideoSessionLocked(monitorId);
+        releaseVideoSessionLocked(sessionId);
         return std::nullopt;
     }
     session.idleSince.reset();
-    // One decode's sample, against the time on screen at this round's speed. None for a picture that
-    // starts a pass while nothing is skipped: its decode holds the loop's seek and key picture, paid once
-    // a pass. Skipping, it may be the pass's only picture, and the level could never come down without
-    // it. Returns when the decode ended, which is what the round's `now` becomes: a slow decode's
-    // picture is judged, and shown, after it.
-    const auto measureDecode = [&](SteadyTime started, const PictureTiming& before, const PictureTiming& after,
+    // One decode's sample: the decoder's own time for the picture, on whichever thread it ran, against
+    // the time on screen at this round's speed. None for a picture that starts a pass while nothing is
+    // skipped: its decode holds the loop's seek and key picture, paid once a pass. Skipping, it may be
+    // the pass's only picture, and the level could never come down without it. Returns now, which is
+    // what the round's `now` becomes: a slow decode's picture is judged, and shown, after it.
+    const auto measureDecode = [&](const PictureTiming& before, const PictureTiming& after,
                                    std::chrono::nanoseconds gap) {
         const SteadyTime ended = std::chrono::steady_clock::now();
         session.decodeLoad.saw(after.skip, after.keptThrough);
         if (!after.startsPass || after.skip != PictureSkip::Nothing) {
-            session.decodeLoad.add(ended - started, intervalAtSpeed(after, speed),
+            session.decodeLoad.add(after.decodeTime, intervalAtSpeed(after, speed),
                                    std::max(atSpeed(gap, speed), kMinPictureInterval), before.skip, after.skip,
                                    session.pipeline->deepestSkip(), after.readSince);
         }
         return ended;
     };
 
+    // Whose picture a failure costs: the screen being drawn when one is, else every moving screen not
+    // already shown this round's picture.
+    std::optional<int> drawing;
+    std::bitset<kMaxMonitors> shownNow;
     try {
         // Inside the try, so it is withdrawn before the failure path frees the session it names.
-        const PlayingBlame working(*session.blame);
+        const std::shared_ptr<const std::string> line = session.blame->line.load();
+        const PlayingBlame working(*line);
         // A decode that is still dropping pictures on the way to its own gets the next round: the picture
         // on screen stays, and the rounds between let every other screen and request have the GPU.
         if (resuming) {
             const Decode step = decodeUntil(*session.pipeline, catchUpUntil, session.decodeLoad.skip());
             if (step == Decode::Dropping) return now;
+            // The pipeline's ready hook asks for the round that takes it.
+            if (step == Decode::Pending) return std::nullopt;
             if (step == Decode::Exhausted) {
                 throw WallpaperContentError(describeRejection("VideoPipeline", "no picture could be decoded", session.path));
             }
@@ -3051,9 +3348,9 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
             // single slot cannot name every playing file at once. The guard above names it instead.
             const Session::OnScreen shown = *onScreen;
             const PictureTiming before = session.pipeline->timing();
-            const SteadyTime decodeStarted = std::chrono::steady_clock::now();
             const Decode step = decodeUntil(*session.pipeline, catchUpUntil, session.decodeLoad.skip());
             if (step == Decode::Dropping) return now;
+            if (step == Decode::Pending) return std::nullopt;
             if (step == Decode::Exhausted) {
                 throw WallpaperContentError(
                     describeRejection("VideoPipeline", "no picture could be decoded when it started again", session.path));
@@ -3064,7 +3361,7 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
                 // The pass that just ended held one picture with nothing skipped, so the file does: it is already on
                 // screen and there is nothing to show after it. Asking again would decode that
                 // same picture for ever and announce it as a new frame each time. Recorded on the
-                // monitor, where it outlives the session: the session itself is kept like any other
+                // monitors, where it outlives the session: the session itself is kept like any other
                 // that has stopped, because a resize still redraws that picture from it rather than
                 // reopening the file, and the idle release frees it on the same terms.
                 //
@@ -3073,16 +3370,18 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
                 // for the life of the daemon. The round this asks for takes the stopped branch
                 // above, which owns that countdown.
                 std::lock_guard<std::mutex> stateLock(m_stateMutex);
-                const auto it = m_monitors.find(monitorId);
-                if (it != m_monitors.end() && it->second.wallpaperSeq == wallpaperSeq) {
-                    it->second.parkedWallpaperSeq = wallpaperSeq;
+                for (const Screen& screen : screens) {
+                    const auto it = m_monitors.find(screen.monitorId);
+                    if (it != m_monitors.end() && it->second.wallpaperSeq == screen.wallpaperSeq) {
+                        it->second.parkedWallpaperSeq = screen.wallpaperSeq;
+                    }
                 }
                 return now;
             }
             const std::chrono::nanoseconds gap = gapBetween(before, after);
             std::optional<std::chrono::nanoseconds> reaches;
             if (before.presentation) reaches = *before.presentation + gap;
-            now = measureDecode(decodeStarted, before, after, gap);
+            now = measureDecode(before, after, gap);
             session.clock = Session::Waiting{shown, shown.timeline, gap, speed, reaches};
         }
         // Every draw below passes here first, so what it reads is timed at this round's speed.
@@ -3090,7 +3389,7 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
         std::optional<SteadyTime> waitUntil;
         if (auto* waiting = std::get_if<Session::Waiting>(&session.clock)) {
             waiting->retime(now, speed);
-            pace = steerSoundLocked(monitorId, session, *waiting, sound, now, CatchUp::Chasing);
+            pace = steerSoundLocked(heardOn, session, *waiting, sound, now, CatchUp::Chasing);
             // A picture whose time the sound has already played through is dropped, not drawn: at least
             // one a round, then while the round's catch-up slice lasts. One still behind when the slice
             // runs out is held for the next round rather than drawn, until kCatchUpHold, so a file slow
@@ -3105,7 +3404,7 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
                 }
                 const SteadyTime checked = std::chrono::steady_clock::now();
                 if (waiting->catchingUpSince && checked - *waiting->catchingUpSince >= kCatchUpHold) {
-                    pace = steerSoundLocked(monitorId, session, *waiting, sound, now, CatchUp::HoldRunOut);
+                    pace = steerSoundLocked(heardOn, session, *waiting, sound, now, CatchUp::HoldRunOut);
                     break;
                 }
                 // One drop a round whatever the slice holds, as the screens before this one may have
@@ -3116,15 +3415,20 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
                 }
                 const Decode step = decodeUntil(*session.pipeline, catchUpUntil, session.decodeLoad.skip());
                 if (step == Decode::Dropping) return now;
+                // Held as when the slice runs out, until the next picture is decoded or the hold ends.
+                if (step == Decode::Pending) {
+                    if (!waiting->catchingUpSince) waiting->catchingUpSince = checked;
+                    return *waiting->catchingUpSince + kCatchUpHold;
+                }
                 if (step == Decode::Exhausted) {
                     throw WallpaperContentError(describeRejection("VideoPipeline", "no picture could be decoded", session.path));
                 }
                 const PictureTiming after = session.pipeline->timing();
                 const std::chrono::nanoseconds gap = gapBetween(held, after);
-                now = measureDecode(checked, held, after, gap);
+                now = measureDecode(held, after, gap);
                 waiting->left += gap;
                 waiting->reaches = held.presentation ? std::optional(*held.presentation + gap) : std::nullopt;
-                pace = steerSoundLocked(monitorId, session, *waiting, sound, now, CatchUp::Chasing);
+                pace = steerSoundLocked(heardOn, session, *waiting, sound, now, CatchUp::Chasing);
             }
             if (const SteadyTime due = waiting->planned().due; due > now) waitUntil = std::min(due, pace.roundAt.value_or(due));
         }
@@ -3135,57 +3439,75 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
         // Drawn, and recorded as shown, after whatever this round has decoded and converted.
         now = std::chrono::steady_clock::now();
 
-        const OffscreenTarget* target = nullptr;
-        {
-            std::lock_guard<std::mutex> stateLock(m_stateMutex);
-            target = m_targets->nextUnheld(monitorId, heldBuffersLocked(monitorId));
+        // Drawn more than an interval past its time, it was held up by a stop nothing reported, or
+        // by a hold or a decode too slow to play: none is clean play. Never more than the file's own
+        // interval: slowing playback does not make a stop clean.
+        const auto* waiting = std::get_if<Session::Waiting>(&session.clock);
+        const PictureTiming timing = session.pipeline->timing();
+        const bool onTime = waiting != nullptr && now - waiting->planned().due <=
+                                                      std::min(intervalAtSpeed(timing, speed), ownInterval(timing));
+        // The first picture of a session opened at a position delivers the render that opened it,
+        // which kept the frame and left the drawing to this round, so it clears a GPU failure as
+        // that render's commit would. Built before the draws: nothing between a draw and its
+        // commit may throw, or a submitted picture is thrown away as a playback failure.
+        std::optional<HealthCheck> delivered;
+        if (std::holds_alternative<Session::Undrawn>(session.clock) && session.openedAtPosition) {
+            delivered = healthCheck(HealthStatus::Ok, m_gpuStatus.name + " (" + m_gpuStatus.descriptorTier + ")");
         }
-        // The reserve exportCurrentFrame() keeps makes this unreachable; if it is reached, the
-        // picture waits one interval rather than being drawn under a reader. Nothing is counted or
-        // logged: deferredRenders counts renders owed, and this monitor owes none -- the render
-        // path reports the same broken reserve the moment anything posts this monitor.
-        if (target == nullptr) return now + intervalAtSpeed(session.pipeline->timing(), speed);
-
-        uint64_t generation = 0;
-        bool playedClean = false;
-        {
+        std::vector<int> playedClean;
+        playedClean.reserve(screens.size());
+        bool anyTarget = false;
+        bool drew = false;
+        for (const Screen& screen : screens) {
+            if (!screen.playing) continue;
+            drawing = screen.monitorId;
+            const OffscreenTarget* target = nullptr;
+            {
+                std::lock_guard<std::mutex> stateLock(m_stateMutex);
+                target = m_targets->nextUnheld(screen.monitorId, heldBuffersLocked(screen.monitorId));
+            }
+            // The reserve exportCurrentFrame() keeps makes this unreachable; if it is reached, that
+            // screen skips this picture rather than have it drawn under a reader. Nothing is counted or
+            // logged: deferredRenders counts renders owed, and this monitor owes none -- the render
+            // path reports the same broken reserve the moment anything posts this monitor.
+            if (target == nullptr) continue;
+            anyTarget = true;
             // Checked and drawn under one acquisition, as a render's commit is: a request landing
             // in between must not see this wallpaper's picture published after it.
             std::lock_guard<std::mutex> stateLock(m_stateMutex);
-            const auto it = m_monitors.find(monitorId);
+            const auto it = m_monitors.find(screen.monitorId);
             // Asked again with a fresh reading, since the decode above may have crossed the moment
-            // this monitor stopped being watched. `now`, not nothing, for the park branch's reason:
-            // a session that stops here has nothing else scheduled to start its idle countdown.
-            if (it == m_monitors.end() || playingSeqLocked(monitorId, wallpaperSeq) != playing) {
+            // this monitor stopped being watched.
+            if (it == m_monitors.end() || playingSeqLocked(screen.monitorId, screen.wallpaperSeq) != screen.playing) {
                 if (it != m_monitors.end()) it->second.cleanPlay.lastShown.reset();
-                return now;
-            }
-            // Drawn more than an interval past its time, it was held up by a stop nothing reported, or
-            // by a hold or a decode too slow to play: none is clean play. Never more than the file's own
-            // interval: slowing playback does not make a stop clean.
-            const auto* waiting = std::get_if<Session::Waiting>(&session.clock);
-            const PictureTiming timing = session.pipeline->timing();
-            const bool onTime = waiting != nullptr && now - waiting->planned().due <=
-                                                          std::min(intervalAtSpeed(timing, speed), ownInterval(timing));
-            // The first picture of a session opened at a position delivers the render that opened it,
-            // which kept the frame and left the drawing to this round, so it clears a GPU failure as
-            // that render's commit would. Built before the draw: nothing between a draw and its
-            // commit may throw, or a submitted picture is thrown away as a playback failure.
-            std::optional<HealthCheck> delivered;
-            if (std::holds_alternative<Session::Undrawn>(session.clock) && session.openedAt) {
-                delivered = healthCheck(HealthStatus::Ok, m_gpuStatus.name + " (" + m_gpuStatus.descriptorTier + ")");
+                continue;
             }
             const Placement drawnWith = placement(it->second.properties);
             session.pipeline->draw(*m_targets, *target, drawnWith);
-            generation = commitFrameLocked(it->second, *target, drawnWith);
-            if (delivered) m_health.gpu = std::move(*delivered);
+            const uint64_t generation = commitFrameLocked(it->second, *target, drawnWith);
+            if (delivered) {
+                m_health.gpu = std::move(*delivered);
+                delivered.reset();
+            }
             // A picture shown is playback working, so the reopens start again from here: what the
             // budget bounds is failures with nothing shown between them.
             playbackBudgetLocked(it->second) = {it->second.wallpaperSeq};
-            playedClean = creditCleanPlayLocked(it->second, now, onTime);
+            if (creditCleanPlayLocked(it->second, now, onTime)) playedClean.push_back(screen.monitorId);
+            for (Session::Member& member : session.members) {
+                if (member.monitorId == screen.monitorId) member.shown = session.pipeline->shownPosition();
+            }
+            round.shown.push_back(ClockRound::Shown{screen.monitorId, generation});
+            shownNow.set(static_cast<size_t>(screen.monitorId));
+            drew = true;
         }
+        drawing.reset();
+        // No screen had a free image: the picture waits one interval. `now`, not nothing, when every
+        // screen stopped playing meanwhile: a session that stops here has nothing else scheduled to
+        // start its idle countdown.
+        if (!anyTarget) return now + intervalAtSpeed(timing, speed);
+        if (!drew) return now;
         // Outside the state lock: it writes to the state directory.
-        if (playedClean) m_playing.clear(monitorId);
+        for (const int monitorId : playedClean) m_playing.clear(monitorId);
         if (pace.playAtDraw && pace.playAtDraw->restart) {
             session.clock = Session::OnScreen{now, now};
         } else {
@@ -3195,55 +3517,76 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
             const SteadyTime shownAt = std::get<Session::OnScreen>(session.clock).timeline;
             session.audio->play({pace.playAtDraw->from, shownAt + pace.playAtDraw->after});
         }
-        round.shown.push_back(ClockRound::Shown{monitorId, generation});
         // The next picture is decoded at once, so its time is known before it is due.
         return now;
     } catch (const std::exception&) {
         const RenderFailure failure = classifyFailure();
         const bool atPosition = std::holds_alternative<Session::CatchingUp>(session.clock);
+        // A failed device is every screen's.
+        std::bitset<kMaxMonitors> failing;
+        for (const Screen& screen : screens) {
+            const bool hit = failure.gpuFault ? true
+                             : drawing        ? screen.monitorId == *drawing
+                                              : screen.motion != Motion::Stopped &&
+                                                    !shownNow.test(static_cast<size_t>(screen.monitorId));
+            if (hit) failing.set(static_cast<size_t>(screen.monitorId));
+        }
 
         // The session goes before anything that can throw: a pipeline that threw is not usable, and
         // a failure this cannot finish reporting must not leave one to be drawn with again.
-        closeFailedVideoSessionLocked(monitorId, failure.fault());
+        const std::vector<Session::Member> members = closeFailedVideoSessionLocked(sessionId, failure, failing);
+        const auto named = std::find_if(members.begin(), members.end(), [&](const Session::Member& m) {
+            return failing.test(static_cast<size_t>(m.monitorId));
+        });
 
-        // The picture on screen stays, nothing is recorded, and the render reopens the file.
-        if (atPosition && givesUpPosition(monitorId, failure)) {
+        // The pictures on screen stay, nothing is recorded, and the render reopens the file.
+        if (atPosition && named != members.end() && givesUpPosition(named->monitorId, failure)) {
             std::lock_guard<std::mutex> stateLock(m_stateMutex);
-            const auto it = m_monitors.find(monitorId);
-            if (it != m_monitors.end() && it->second.wallpaperSeq == wallpaperSeq) {
-                round.retry.push_back(monitorId);
-                ++it->second.requestSeq;
+            for (const Session::Member& member : members) {
+                if (!failing.test(static_cast<size_t>(member.monitorId))) continue;
+                const auto it = m_monitors.find(member.monitorId);
+                if (it != m_monitors.end() && it->second.wallpaperSeq == member.wallpaperSeq) {
+                    round.retry.push_back(member.monitorId);
+                    ++it->second.requestSeq;
+                }
             }
             return std::nullopt;
         }
 
         if (failure.gpuFault) recordHealth(&DaemonHealth::gpu, HealthStatus::Fail, failure.error);
-        std::fprintf(stderr, "wallpaperx-daemon: monitor %d stopped playing: %s\n", monitorId,
-                     sanitizeForLog(failure.error, 1024).c_str());
 
-        // Recorded whenever the monitor still holds this wallpaper, whether or not a render is
-        // owed, and the monitor is left owing one while the budget lasts: nothing else would ever
-        // open the file again, and a frame dropped with no render owed is a screen blank until the
-        // user acts. The render starts the file from the beginning -- a pipeline that threw cannot
-        // go on -- so a file that always fails at the same picture would reopen for ever without
-        // the budget. Spent, the error stands as the monitor's answer.
+        // Recorded whenever a failing monitor still holds this wallpaper, whether or not a render is
+        // owed, and the monitor is left owing one while the budget lasts: nothing else would ever open
+        // the file again, and a frame dropped with no render owed is a screen blank until the user
+        // acts. The render starts the file from the beginning -- a pipeline that threw cannot go on --
+        // so a file that always fails at the same picture would reopen for ever without the budget.
+        // Spent, the error stands as the monitor's answer.
         //
         // Never after a GPU fault: rendering again on a device that has just stopped answering is
         // worse than stopping, and the recorded gpu health is what says so.
-        bool failed = false;
+        std::bitset<kMaxMonitors> failed;
         {
             std::lock_guard<std::mutex> stateLock(m_stateMutex);
-            const auto it = m_monitors.find(monitorId);
-            if (it != m_monitors.end() && it->second.wallpaperSeq == wallpaperSeq) {
+            for (const Session::Member& member : members) {
+                if (!failing.test(static_cast<size_t>(member.monitorId))) continue;
+                const auto it = m_monitors.find(member.monitorId);
+                if (it == m_monitors.end() || it->second.wallpaperSeq != member.wallpaperSeq) continue;
                 recordFailureLocked(it->second, failure.error, failure.fault());
-                failed = true;
+                failed.set(static_cast<size_t>(member.monitorId));
                 if (!failure.gpuFault && playbackBudgetLocked(it->second).spend(failure.fault())) {
                     ++it->second.requestSeq;
-                    round.retry.push_back(monitorId);
+                    round.retry.push_back(member.monitorId);
                 }
             }
         }
-        if (failed) releaseTarget(monitorId);
+        // A picture this round committed and a GPU fault then took is not announced. Allocates nothing.
+        std::erase_if(round.shown, [&](const ClockRound::Shown& s) { return failed.test(static_cast<size_t>(s.monitorId)); });
+        for (const Session::Member& member : members) {
+            if (!failed.test(static_cast<size_t>(member.monitorId))) continue;
+            std::fprintf(stderr, "wallpaperx-daemon: monitor %d stopped playing: %s\n", member.monitorId,
+                         sanitizeForLog(failure.error, 1024).c_str());
+            releaseTarget(member.monitorId);
+        }
         return std::nullopt;
     }
 }
@@ -3329,13 +3672,15 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
     // Everything expensive happens here, outside m_stateMutex: decoding the image,
     // uploading the texture, building the pipeline, creating the target. None of it
     // touches the offscreen image's contents.
-    std::string error;
-    Fault fault = Fault::File;
+    std::optional<RenderFailure> failure;
     bool deferred = false;
+    // What names this pass's video to the fatal-signal handler when the work it does on a session
+    // is not covered by `applying`: this monitor and the path, whichever screen the session is first for.
+    std::string passBlame;
     // On disk while a still's renderer is built, and from the choice of target through the submit
     // and the teardowns after it -- the spans in which the file's content is what runs -- so a
     // start after a fatal signal in any of them refuses this wallpaper. A video's open carries
-    // videoSessionLocked()'s own, and a catch-up the session's blame. Not around ensureGpu() or the
+    // videoSessionLocked()'s own, and a catch-up `passBlame`. Not around ensureGpu() or the
     // images: a driver that dies creating those would be blamed on whichever picture happened to be
     // first, so a pass failing there frees its renderer with no record on disk.
     //
@@ -3346,6 +3691,9 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
     // outlives the pass, and this only points at the one m_videoSessions holds.
     std::optional<StaticRenderer> still;
     VideoSession* clip = nullptr;
+    // The clip's pipeline threw, so the session is unusable for every screen in it; any other
+    // failure of this pass costs this screen its place in the session and no more.
+    bool clipBroken = false;
     // The clip is catching up to the picture this monitor already shows, in images this pass keeps:
     // there is nothing to draw, and the clock shows the picture once it is reached.
     bool keepsFrame = false;
@@ -3396,21 +3744,40 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
                 } catch (const std::bad_alloc&) {
                 }
             } else {
-                clip = &videoSessionLocked(monitorId, path, wallpaperSeq);
-                if (std::holds_alternative<VideoSession::Waiting>(clip->clock) && clip->pipeline->shownPosition()) {
-                    // The pipeline holds the picture after the one on screen. Playing, it is due soon
-                    // and is drawn early; stopped, it is reopened at the one on screen, as a released
-                    // session would be, and the catch-up below decodes that picture again.
-                    bool playsOn = false;
+                bool playsOn = false;
+                {
+                    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+                    const auto it = m_monitors.find(monitorId);
+                    playsOn = it != m_monitors.end() && !pausedLocked(monitorId) && watchedLocked(monitorId, it->second);
+                }
+                passBlame = playingBlameLine(monitorId, path);
+                clip = &videoSessionLocked(monitorId, path, wallpaperSeq, !playsOn);
+                // The pipeline holds a picture other than the one on this screen: the one after it,
+                // or one another screen has moved on to. It is drawn -- early, when it is this screen's
+                // next -- unless this screen is stopped and so is every other: then it leaves for a
+                // session reopened at its own picture, as a released session would be, and the
+                // catch-up below decodes that picture again. A stopped screen beside a playing one
+                // jumps to the others' picture instead: reopening would stall them for the catch-up.
+                // A screen that left is folded back into the others' session once one of them moves.
+                const auto own = std::find_if(clip->members.begin(), clip->members.end(),
+                                              [monitorId](const VideoSession::Member& m) { return m.monitorId == monitorId; });
+                const bool elsewhere =
+                    own->shown && (std::holds_alternative<VideoSession::Waiting>(clip->clock) ||
+                                   (std::holds_alternative<VideoSession::OnScreen>(clip->clock) &&
+                                    clip->pipeline->shownPosition() != own->shown));
+                if (elsewhere && !playsOn) {
+                    bool othersPlay = false;
                     {
                         std::lock_guard<std::mutex> stateLock(m_stateMutex);
-                        const auto it = m_monitors.find(monitorId);
-                        playsOn = it != m_monitors.end() && !pausedLocked(monitorId) &&
-                                  watchedLocked(monitorId, it->second);
+                        othersPlay = std::any_of(clip->members.begin(), clip->members.end(),
+                                                 [&](const VideoSession::Member& m) {
+                                                     return m.monitorId != monitorId &&
+                                                            motionLocked(m.monitorId, m.wallpaperSeq) != Motion::Stopped;
+                                                 });
                     }
-                    if (!playsOn) {
-                        releaseVideoSessionLocked(monitorId);
-                        clip = &videoSessionLocked(monitorId, path, wallpaperSeq);
+                    if (!othersPlay) {
+                        leaveVideoSessionLocked(monitorId, true);
+                        clip = &videoSessionLocked(monitorId, path, wallpaperSeq, true);
                     }
                 }
                 if (std::holds_alternative<VideoSession::CatchingUp>(clip->clock)) {
@@ -3423,7 +3790,9 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
                                      it->second.wallpaperSeq == wallpaperSeq &&
                                      it->second.shownPlacement == placement(it->second.properties);
                     }
-                    if (!keepsFrame) clip = &caughtUpSessionLocked(monitorId, *clip, path, wallpaperSeq);
+                    if (!keepsFrame) {
+                        clip = &caughtUpSessionLocked(monitorId, *clip, path, wallpaperSeq, !playsOn, passBlame);
+                    }
                 }
             }
 
@@ -3442,17 +3811,47 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
                 deferred = target == nullptr;
                 if (!deferred) {
                     applying.emplace(m_config.stateDir, monitorId, type, path);
-                    // A picture the clock decoded and has not converted, so the draw below is a blit.
-                    if (clip != nullptr) retryOnShortageLocked(Relief::KeptStills, [&] { clip->pipeline->convert(); });
+                    // A picture the clock decoded and has not converted, so the draw below is a blit. A
+                    // shortage leaves the pipeline as it was -- retryOnShortageLocked() relies on that --
+                    // so it costs this screen alone.
+                    if (clip != nullptr) {
+                        try {
+                            retryOnShortageLocked(Relief::KeptStills, [&] { clip->pipeline->convert(); });
+                        } catch (const ResourceExhausted&) {
+                            throw;
+                        } catch (...) {
+                            clipBroken = true;
+                            throw;
+                        }
+                    }
                 }
             }
         }
     } catch (const std::exception&) {
-        const RenderFailure failure = classifyFailure();
-        error = failure.error;
-        fault = failure.fault();
-        if (failure.gpuFault) recordHealth(&DaemonHealth::gpu, HealthStatus::Fail, error);
+        failure = classifyFailure();
+        clipBroken = clipBroken || failure->gpuFault;
+        if (failure->gpuFault) recordHealth(&DaemonHealth::gpu, HealthStatus::Fail, failure->error);
     }
+
+    // A failed pass takes its screen out of the session; a broken pipeline closes it for every screen.
+    const auto dropFailedClip = [&] {
+        if (clipBroken) {
+            std::bitset<kMaxMonitors> self;
+            self.set(static_cast<size_t>(monitorId));
+            closeFailedVideoSessionLocked(videoSessionOfLocked(monitorId).id, *failure, self, &passBlame);
+        } else {
+            leaveVideoSessionLocked(monitorId, false);
+        }
+    };
+    // Under this pass's record only when the file is what failed, for closeFailedVideoSessionLocked()'s
+    // reason. The kept image goes first, so it is freed with the renderer. Runs before the commit for
+    // a failure found there, and again after it, where only a draw's failure leaves anything to do.
+    const auto tearDownFailed = [&] {
+        if (failure->fault() != Fault::File) applying.reset();
+        m_keptStills.erase(monitorId);
+        still.reset();
+        dropFailedClip();
+    };
 
     if (deferred) {
         // Every image on this monitor is in a consumer's hands, which exportCurrentFrame()'s
@@ -3482,12 +3881,8 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
     }
 
     // Here, not only after the commit block, which an overtaken pass returns from inside: the newer
-    // pass must not draw on a device this failure may have lost, nor reuse what it kept. `still`
-    // holds the kept image until its own teardown.
-    if (!error.empty()) {
-        m_keptStills.erase(monitorId);
-        closeFailedVideoSessionLocked(monitorId, fault);
-    }
+    // pass must not draw on a device this failure may have lost, nor reuse what it kept.
+    if (failure) tearDownFailed();
 
     bool committed = false;
     uint64_t generation = 0;
@@ -3506,7 +3901,7 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
         // the newest one, and a dragged position control is not left discarding every pass.
         const bool current = it != m_monitors.end() &&
                              (it->second.requestSeq == seq ||
-                              (error.empty() && !keepsFrame && relaidOnlySince(it->second, seq)));
+                              (!failure && !keepsFrame && relaidOnlySince(it->second, seq)));
         if (!current) {
             // Superseded. Nothing has been submitted, so kept images still hold exactly what the
             // consumer was last told about; replaced ones hold nothing, and renderPending() draws
@@ -3516,23 +3911,30 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
         }
 
         const Placement drawnWith = placement(it->second.properties);
-        if (error.empty() && !keepsFrame) {
+        if (!failure && !keepsFrame) {
             try {
                 // One of the two is always set here: every path that leaves both unset sets
-                // `error`, which the guard above excludes.
+                // `failure`, which the guard above excludes.
                 if (*kind == Drawable::Still) {
                     still->place(drawnWith);
                     m_targets->render(*still, *target);
                 } else {
+                    clipBroken = true;
                     clip->pipeline->draw(*m_targets, *target, drawnWith);
-                    markShown(*clip, std::chrono::steady_clock::now(), playbackSpeed(it->second.properties));
+                    clipBroken = false;
+                    // The others in a shared session see this picture when their schedule reaches it.
+                    if (clip->members.size() == 1) {
+                        markShown(*clip, std::chrono::steady_clock::now(), playbackSpeed(it->second.properties));
+                    }
+                    for (VideoSession::Member& member : clip->members) {
+                        if (member.monitorId == monitorId) member.shown = clip->pipeline->shownPosition();
+                    }
                 }
             } catch (const std::exception&) {
                 // m_stateMutex is held here, so the locked recorder: the same sorting, one lock in.
-                const RenderFailure failure = classifyFailure();
-                error = failure.error;
-                fault = failure.fault();
-                if (failure.gpuFault) recordHealthLocked(&DaemonHealth::gpu, HealthStatus::Fail, error);
+                failure = classifyFailure();
+                clipBroken = clipBroken || failure->gpuFault;
+                if (failure->gpuFault) recordHealthLocked(&DaemonHealth::gpu, HealthStatus::Fail, failure->error);
             }
         }
 
@@ -3541,8 +3943,8 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
         // decoded again for every spurious post.
         it->second.servicedSeq = it->second.requestSeq;
 
-        if (!error.empty()) {
-            recordFailureLocked(it->second, error, fault);
+        if (failure) {
+            recordFailureLocked(it->second, failure->error, failure->fault());
         } else if (!keepsFrame) {
             committed = true;
             generation = commitFrameLocked(it->second, *target, drawnWith);
@@ -3554,18 +3956,14 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
                                m_gpuStatus.name + " (" + m_gpuStatus.descriptorTier + ")");
         }
     }
-    // Both outside the state lock: freeing a texture waits for the GPU, and an unlink on a stalled
-    // filesystem must not hold up GetStatus. Both teardowns run under this pass's own record only
-    // when the file is what failed, for closeFailedVideoSessionLocked()'s reason.
-    if (!error.empty() && fault != Fault::File) applying.reset();
-    // A failed pass keeps nothing. Erased first, so the image goes with the renderer, under the same record.
-    if (!error.empty()) m_keptStills.erase(monitorId);
+    // Outside the state lock: freeing a texture waits for the GPU, and an unlink on a stalled
+    // filesystem must not hold up GetStatus. A failed pass keeps nothing, and a draw that threw
+    // leaves its pipeline unusable.
+    if (failure) tearDownFailed();
     still.reset();
-    // A draw that threw leaves its pipeline unusable.
-    if (!error.empty()) closeFailedVideoSessionLocked(monitorId, fault);
     applying.reset();
 
-    if (!error.empty()) {
+    if (failure) {
         // Outside the state lock: destroying a target waits for device idle, which has
         // no business blocking GetStatus. A monitor whose render failed keeps no frame,
         // so its target has no reader, and freeing it means a retry starts clean.

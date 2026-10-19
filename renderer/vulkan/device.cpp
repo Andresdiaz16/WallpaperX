@@ -5,6 +5,7 @@
 #include "descriptor_buffer.h"
 #include "descriptor_classic.h"
 #include "descriptor_heap.h"
+#include "owned_device.h"
 
 #include <algorithm>
 #include <array>
@@ -42,6 +43,9 @@ constexpr uint64_t kSubmitTimeoutNs = std::chrono::nanoseconds(kSubmitTimeout).c
 // Ceiling on batches submitted but not yet known complete. Not a tuning knob: it is what
 // bounds the pending list, and reaching it makes the next submit wait for the oldest batch.
 constexpr size_t kMaxSubmissionsInFlight = 16;
+
+// Set by Device::recordThreadLeftRunning(); never cleared, as the thread is never joined.
+std::atomic<bool> g_threadLeftRunning{false};
 
 // Each codec's decode extension and the operation bit a queue family advertises for it. One
 // table, so the extension enabled and the capability reported cannot name different codecs.
@@ -576,6 +580,18 @@ void Device::createLogicalDevice() {
         deviceExtensions.push_back(VK_KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME);
         deviceExtensions.insert(deviceExtensions.end(), codecExtensions.begin(), codecExtensions.end());
     }
+    // The decoder library submits to the decode queues and to the graphics queue this Device
+    // submits to; with every queue internally synchronised it may do that off the GPU thread.
+    bool synchronizedQueues = false;
+    if (enableDecode && hasExtension(available, VK_KHR_INTERNALLY_SYNCHRONIZED_QUEUES_EXTENSION_NAME)) {
+        VkPhysicalDeviceInternallySynchronizedQueuesFeaturesKHR queues{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INTERNALLY_SYNCHRONIZED_QUEUES_FEATURES_KHR};
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        query.pNext = &queues;
+        vkGetPhysicalDeviceFeatures2(m_physicalDevice, &query);
+        synchronizedQueues = queues.internallySynchronizedQueues == VK_TRUE;
+        if (synchronizedQueues) deviceExtensions.push_back(VK_KHR_INTERNALLY_SYNCHRONIZED_QUEUES_EXTENSION_NAME);
+    }
 
     // The chain, in the order the header states. A tier's structs are linked and their flags
     // set together, so a struct that is out of the chain reads VK_FALSE.
@@ -596,6 +612,23 @@ void Device::createLogicalDevice() {
         m_features.descriptorBuffer.descriptorBuffer = VK_TRUE;
         m_features.descriptorBuffer.pNext = nullptr;
     }
+    if (synchronizedQueues) {
+        auto* tail = reinterpret_cast<VkBaseOutStructure*>(&m_features.features2);
+        while (tail->pNext != nullptr) tail = tail->pNext;
+        tail->pNext = reinterpret_cast<VkBaseOutStructure*>(&m_features.internallySynchronizedQueues);
+        m_features.internallySynchronizedQueues.internallySynchronizedQueues = VK_TRUE;
+        m_features.internallySynchronizedQueues.pNext = nullptr;
+    }
+    // Every queue is created, and fetched, with the same flags.
+    const VkDeviceQueueCreateFlags queueFlags =
+        synchronizedQueues ? VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR : 0;
+    const auto fetchQueue = [&](uint32_t family, VkQueue& queue) {
+        VkDeviceQueueInfo2 info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2};
+        info.flags = queueFlags;
+        info.queueFamilyIndex = family;
+        info.queueIndex = 0;
+        vkGetDeviceQueue2(m_device, &info, &queue);
+    };
 
     // One queue per family. A decode family that is the graphics family shares its queue: a
     // second create info for the same family is invalid, and one queue is all a single decoder
@@ -607,6 +640,7 @@ void Device::createLogicalDevice() {
             if (existing.queueFamilyIndex == family) return;
         }
         VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+        queueInfo.flags = queueFlags;
         queueInfo.queueFamilyIndex = family;
         queueInfo.queueCount = 1;
         queueInfo.pQueuePriorities = &queuePriority;
@@ -628,7 +662,7 @@ void Device::createLogicalDevice() {
         throwVkFailure("Device: vkCreateDevice", r);
     }
 
-    vkGetDeviceQueue(m_device, m_graphicsQueueFamily, 0, &m_graphicsQueue);
+    fetchQueue(m_graphicsQueueFamily, m_graphicsQueue);
 
     // Read back off the extension list the device was just created with, so the codecs named
     // are exactly those whose extension is enabled. A family left with no enabled codec is
@@ -644,7 +678,7 @@ void Device::createLogicalDevice() {
     for (const auto& [family, ops] : m_decodeFamilyOps) {
         VideoDecodeFamily decode{family, ops & enabledOps, VK_NULL_HANDLE};
         if (decode.ops == 0) continue;
-        vkGetDeviceQueue(m_device, family, 0, &decode.queue);
+        fetchQueue(family, decode.queue);
         m_videoDecodeFamilies.push_back(decode);
         m_info.videoDecodeOps |= decode.ops;
     }
@@ -686,7 +720,7 @@ void Device::createCommandPool() {
 }
 
 void Device::assertGpuThread(const char* what) const {
-    if (std::this_thread::get_id() == m_gpuThread) return;
+    if (std::this_thread::get_id() == m_gpuThread.load(std::memory_order_relaxed)) return;
 
     std::fprintf(stderr,
                  "[vulkan] FATAL: %s was made from a thread other than the one that created the Device. Vulkan "
@@ -805,8 +839,10 @@ Device::SubmitTicket Device::submit(const std::function<void(VkCommandBuffer)>& 
     // lose the only record of a command buffer and fence that are in use. The reserve in
     // createCommandPool() plus the cap above are what make this a plain move of two handles.
     discard.device = nullptr;
-    m_pending.push_back(Pending{cmd, fence, m_nextSerial});
-    return SubmitTicket{m_nextSerial++};
+    const uint64_t serial = m_nextSerial.load(std::memory_order_relaxed);
+    m_pending.push_back(Pending{cmd, fence, serial});
+    m_nextSerial.store(serial + 1, std::memory_order_release);
+    return SubmitTicket{serial};
 }
 
 void Device::wait(SubmitTicket ticket) {
@@ -906,6 +942,21 @@ void Device::recordLeak(const char* whatIsLeaked) noexcept {
     std::fprintf(stderr, "Device: %s is leaked rather than freed\n", whatIsLeaked);
 }
 
+void Device::recordThreadLeftRunning(const char* whatIsLeaked) noexcept {
+    g_threadLeftRunning.store(true, std::memory_order_release);
+    recordLeak(whatIsLeaked);
+}
+
+bool Device::threadLeftRunning() noexcept { return g_threadLeftRunning.load(std::memory_order_acquire); }
+
+void DeviceDeleter::operator()(Device* device) const noexcept {
+    if (Device::threadLeftRunning()) {
+        std::fprintf(stderr, "Device: a thread left running may still use the device, so it is not torn down\n");
+        return;
+    }
+    delete device;
+}
+
 bool Device::lost() const {
     assertGpuThread("Device::lost");
     return m_lost;
@@ -924,13 +975,14 @@ VkResult Device::observe(VkResult result) noexcept {
 }
 
 Device::SubmitTicket Device::lastSubmission() const {
-    assertGpuThread("Device::lastSubmission");
     // m_nextSerial starts at 1, so this is the null ticket until something is submitted.
-    return SubmitTicket{m_nextSerial - 1};
+    return SubmitTicket{m_nextSerial.load(std::memory_order_acquire) - 1};
 }
 
 bool Device::hasCompleted(SubmitTicket ticket) {
-    assertGpuThread("Device::hasCompleted");
+    if (ticket.m_serial <= m_completedThrough.load(std::memory_order_acquire)) return true;
+    // The pending list is the GPU thread's alone.
+    if (std::this_thread::get_id() != m_gpuThread.load(std::memory_order_relaxed)) return false;
     // Checked before retiring, so a ticket old enough to have been forgotten costs no driver
     // call at all -- which is the common case for a caller polling one repeatedly.
     if (!isPending(ticket.m_serial)) return true;
@@ -1009,6 +1061,10 @@ void Device::retireCompleted() noexcept {
         m_freeCommandBuffers.push_back(batch.cmd);
     }
     m_pending.resize(kept);
+    // Oldest first, so everything before the first batch still pending has completed.
+    const uint64_t through = m_pending.empty() ? m_nextSerial.load(std::memory_order_relaxed) - 1
+                                               : m_pending.front().serial - 1;
+    m_completedThrough.store(through, std::memory_order_release);
 }
 
 VkCommandBuffer Device::takeCommandBuffer() {

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// Step 13 Stages E1, E2 and E3: the daemon draws a `video` wallpaper's first picture, keeps one
-// decode session per monitor rather than building one inside every render pass, and plays it.
+// Step 13 Stages E1, E2 and E3: the daemon draws a `video` wallpaper's first picture, keeps a decode
+// session for it rather than building one inside every render pass -- one per file and speed, shared
+// by the screens showing it -- and plays it.
 //
 // Each phase has a manager of its own, because they need the manager in three different shapes --
 // with a bus, with a render worker and no bus, and with neither -- and the Device pins itself to
@@ -83,6 +84,7 @@
 #include "support/cover_expectation.h"
 #include "support/decoder_message_id.h"
 #include "support/exported_frame_map.h"
+#include "support/loaded_range.h"
 #include "support/picture_counter.h"
 #include "support/test_image.h"
 #include "support/validation_grade.h"
@@ -175,6 +177,10 @@ CallGate g_imageGate;            // an image created at the armed extent ("40x30
 // difference is the whole of "a GPU fault never retries", so the two cannot share a gate.
 std::atomic<int> g_submitDeviceLost{0};
 
+// Armed at N >= 0: N queue submissions go through, the next fails as VK_ERROR_OUT_OF_DEVICE_MEMORY,
+// and it disarms itself (-1). What fails a clock round's second draw and not its first.
+std::atomic<int> g_submitFailAfter{-1};
+
 // Image creations to be failed as VK_ERROR_OUT_OF_DEVICE_MEMORY. Only the daemon's own: ffmpeg
 // reaches Vulkan through a function table it fetched from the loader, which no definition here can
 // interpose, so an armed count is spent on the picture converter's image inside the decode that
@@ -190,6 +196,12 @@ std::atomic<int> g_extentCreates{0};
 // before the images were rebuilt" an observation rather than an inference.
 std::atomic<int> g_decodeCalls{0};
 std::atomic<int> g_codecFrees{0};
+// The same packets, counted only when sent on g_countedThread (a render worker's thread): what a
+// render pass decodes itself, apart from a session's decode thread filling its queue meanwhile.
+std::atomic<pid_t> g_countedThread{0};
+std::atomic<int> g_countedThreadDecodes{0};
+// Pictures the wallpaper's decoder delivered since the last reset, on any thread.
+std::atomic<int> g_pictureDeliveries{0};
 
 // The wallpaper files the daemon has open, keyed by the descriptor it reads each through, and how
 // often each path was opened and closed since the last reset.
@@ -610,8 +622,18 @@ void armCrash(CrashOn on, const std::string& path) {
     g_crashOn.store(on);
 }
 
+// Where a staged Decode death writes which thread it died on, before faulting; empty in the parent.
+std::string g_deathNotePath;
+// Set once a decoder packet is sent off both the render worker's thread and the main one: the
+// device runs a decode thread. Lavapipe's does not, and decodes on the render thread.
+std::atomic<bool> g_decodeThreadSeen{false};
+
+// A Decode death is accepted on any thread but the child's main one: with the decode thread on, the
+// clock's packets are sent from the session's own thread, not the render worker's. Teardown frees,
+// the reason for the thread rule, are Free's concern and run on the main thread.
 bool crashDueFor(CrashOn on, const AVCodecContext* context) {
-    if (g_crashOn.load() != on || ::gettid() != g_crashThread.load()) return false;
+    if (g_crashOn.load() != on) return false;
+    if (on == CrashOn::Decode ? ::gettid() == ::getpid() : ::gettid() != g_crashThread.load()) return false;
     std::string target;
     {
         std::lock_guard<std::mutex> lock(g_crashPathMutex);
@@ -686,8 +708,24 @@ extern "C" VkResult vkQueueSubmit(VkQueue queue, uint32_t count, const VkSubmitI
     for (int armed = g_submitDeviceLost.load(); armed > 0;) {
         if (g_submitDeviceLost.compare_exchange_weak(armed, armed - 1)) return VK_ERROR_DEVICE_LOST;
     }
+    for (int left = g_submitFailAfter.load(); left >= 0;) {
+        if (g_submitFailAfter.compare_exchange_weak(left, left - 1)) {
+            if (left == 0) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            break;
+        }
+    }
     return real(queue, count, infos, fence);
 }
+
+#if defined(__SANITIZE_THREAD__)
+// ThreadSanitizer's in-process symboliser opens and closes files while it holds the sanitizer's report
+// lock. The ledger and the gates below take mutexes, which re-enter the sanitizer and deadlock it, so
+// a call from the sanitizer's own runtime goes straight through. Nothing in it opens a wallpaper.
+static const wallpaperx::testing::LoadedRange g_sanitizerRuntime{"libtsan.so"};
+static bool calledFromSanitizer(const void* returnAddress) { return g_sanitizerRuntime.contains(returnAddress); }
+#else
+static constexpr bool calledFromSanitizer(const void*) { return false; }
+#endif
 
 // The daemon opens a wallpaper file itself, through openWallpaperFile(), and closes that
 // descriptor as the last step of a session's teardown. These two hooks are where the ledger and
@@ -708,6 +746,7 @@ extern "C" int open(const char* path, int flags, ...) {
         mode = static_cast<mode_t>(va_arg(args, unsigned int));
         va_end(args);
     }
+    if (calledFromSanitizer(__builtin_return_address(0))) return real(path, flags, mode);
     if (const int error = g_openFailure.failureFor(path); error != 0) {
         errno = error;
         return -1;
@@ -730,6 +769,7 @@ extern "C" int close(int fd) {
     using Fn = int (*)(int);
     static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "close"));
     if (real == nullptr) return -1;
+    if (calledFromSanitizer(__builtin_return_address(0))) return real(fd);
     // The gate is entered only for a wallpaper file: every descriptor in the process passes
     // through here, and a gate armed on a path would otherwise be asked about each of them.
     if (const std::string path = g_files.closing(fd); !path.empty()) g_closeFileGate.enter(path.c_str());
@@ -745,11 +785,28 @@ extern "C" int avcodec_send_packet(AVCodecContext* context, const AVPacket* pack
             std::lock_guard<std::mutex> lock(g_contextFilesMutex);
             g_contextFiles.try_emplace(context, t_lastWallpaperOpened);
         }
-        if (crashDueFor(CrashOn::Decode, context) && g_playbackFailure.hasDelivered(context)) faultNow();
+        if (g_crashThread.load() != 0 && ::gettid() != g_crashThread.load() && ::gettid() != ::getpid()) {
+            g_decodeThreadSeen.store(true);
+        }
+        if (crashDueFor(CrashOn::Decode, context) && g_playbackFailure.hasDelivered(context)) {
+            if (!g_deathNotePath.empty()) {
+                char note[128];
+                const int n = std::snprintf(note, sizeof(note), "%d %d %d %d\n", static_cast<int>(::gettid()),
+                                            static_cast<int>(g_crashThread.load()), static_cast<int>(::getpid()),
+                                            g_decodeThreadSeen.load() ? 1 : 0);
+                const int fd = ::open(g_deathNotePath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+                if (fd >= 0) {
+                    if (n > 0 && ::write(fd, note, static_cast<size_t>(n)) != n) ::unlink(g_deathNotePath.c_str());
+                    ::close(fd);
+                }
+            }
+            faultNow();
+        }
         if (crashDueFor(CrashOn::CatchUp, context)) faultNow();
         if (packet != nullptr) g_recordWatch.packet();
         if (packet != nullptr) g_farRead.sent();
         g_decodeCalls.fetch_add(1, std::memory_order_relaxed);
+        if (::gettid() == g_countedThread.load()) g_countedThreadDecodes.fetch_add(1, std::memory_order_relaxed);
         if (const int delay = g_sendDelayMs.load(std::memory_order_relaxed); delay > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(delay));
         }
@@ -786,7 +843,10 @@ extern "C" int avcodec_receive_frame(AVCodecContext* context, AVFrame* frame) {
         if (const int failure = g_playbackFailure.failureFor(context); failure != 0) return failure;
     }
     const int result = real(context, frame);
-    if (result == 0 && isDecodersContext(context)) g_playbackFailure.delivered(context);
+    if (result == 0 && isDecodersContext(context)) {
+        g_playbackFailure.delivered(context);
+        g_pictureDeliveries.fetch_add(1, std::memory_order_relaxed);
+    }
     return result;
 }
 
@@ -929,6 +989,15 @@ bool drainWorker(RenderWorker& worker) {
     std::future<void> future = done->get_future();
     worker.postTask([done](RenderWorker::TaskState) { done->set_value(); });
     return future.wait_for(std::chrono::seconds(60)) == std::future_status::ready;
+}
+
+// The worker's thread id, asked on the worker; nothing if it does not answer.
+std::optional<pid_t> workerThreadId(RenderWorker& worker) {
+    auto answer = std::make_shared<std::promise<pid_t>>();
+    std::future<pid_t> future = answer->get_future();
+    worker.postTask([answer](RenderWorker::TaskState) { answer->set_value(::gettid()); });
+    if (future.wait_for(std::chrono::seconds(60)) != std::future_status::ready) return std::nullopt;
+    return future.get();
 }
 
 std::optional<wallpaperx::MonitorStatus> monitorStatus(const WallpaperManager& manager, int monitorId) {
@@ -1500,31 +1569,42 @@ void runResizeChecks(const WallpaperManager::Config& config, const std::string& 
     //       non-zero count no longer says the pass did it. A file whose session parks leaves the pass
     //       as the only possible opener or decoder, and firstFrame() above waits for the round that
     //       parks it.
+    //       DECODES ARE COUNTED ON THE RENDER THREAD ONLY: the parked session's decode thread keeps
+    //       refilling its two-picture queue (kDepth) inside this window, which is the session's own work
+    //       and not the pass's. A pass that rebuilt the session still shows, as an open.
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, dropStaleVideoSessionLocked()'s keep-it
     //       `return` disabled (`&& false`), so every pass reopens its file -> "FAIL: a resize of a
-    //       monitor with a resident session opens and decodes nothing", printing "1 open(s), 1
-    //       packet(s) by the rebuild; 1 open(s), 1 packet(s) by the commit". Observed 2026-09-18.
-    //       Reverted.
+    //       monitor with a resident session opens and decodes nothing", printing "1 open(s), 1 packet(s)
+    //       on the render thread by the rebuild; 1 open(s), 1 by the commit (7 on any thread)".
+    //       control_batch.sh, --phase '^resize$', 2026-10-19 (T5c), NVIDIA. Reverted.
     // COVERAGE-ASSERT: the gate is asserted to have fired, so "nothing was decoded" is never
-    //       concluded from a rebuild that never happened.
+    //       concluded from a rebuild that never happened; the render thread's id is asserted known.
+    const std::optional<pid_t> renderThread = workerThreadId(worker);
+    check(renderThread.has_value(), "the render worker says which thread it is");
+    if (!renderThread) return;
+    g_countedThread.store(*renderThread);
     g_decodeCalls.store(0);
+    g_countedThreadDecodes.store(0);
     resetCountsAfterOpenOf(clip, "the resize phase");
     g_framebufferGate.arm(CallGate::Mode::Hold, extentOf(kResizedWidth, kResizedHeight));
     resize("DP-ORDER", kResizedWidth, kResizedHeight);
     const bool rebuilding = g_framebufferGate.waitFired(kGateLimit);
     check(rebuilding, "a new size makes the render thread rebuild the video monitor's images");
     const int opensAtRebuild = g_files.totalOpens();
-    const int decodesAtRebuild = g_decodeCalls.load();
+    const int decodesAtRebuild = g_countedThreadDecodes.load();
     g_framebufferGate.release();
     const bool resizedCommit = signals.wait(kMonitorOrder, 2);
     check(resizedCommit, "and the redraw commits once the rebuild is let go");
     if (rebuilding && resizedCommit) {
         const bool nothing = opensAtRebuild == 0 && decodesAtRebuild == 0 && g_files.totalOpens() == 0 &&
-                             g_decodeCalls.load() == 0;
+                             g_countedThreadDecodes.load() == 0;
         check(nothing, "a resize of a monitor with a resident session opens and decodes nothing");
         if (!nothing) {
-            std::fprintf(stderr, "  %d open(s), %d packet(s) by the rebuild; %d open(s), %d packet(s) by the commit\n",
-                         opensAtRebuild, decodesAtRebuild, g_files.totalOpens(), g_decodeCalls.load());
+            std::fprintf(stderr,
+                         "  %d open(s), %d packet(s) on the render thread by the rebuild; %d open(s), %d by the commit "
+                         "(%d on any thread)\n",
+                         opensAtRebuild, decodesAtRebuild, g_files.totalOpens(), g_countedThreadDecodes.load(),
+                         g_decodeCalls.load());
         }
     }
 
@@ -1536,10 +1616,11 @@ void runResizeChecks(const WallpaperManager::Config& config, const std::string& 
     //       new size, since the frame converter builds its own framebuffer during the first decode and
     //       an unfiltered gate stops there instead; and the packet counter takes only the decoder's own
     //       context, since ffmpeg's probing packets precede the rebuild in either order.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, `clip = &videoSessionLocked(...)` moved below
-    //       `if (ensureTargets(monitorId, size)) rebuilt = true;` -> "FAIL: a new video wallpaper is
-    //       decoded before the monitor's images are rebuilt", printing "no packet had been decoded when
-    //       the image rebuild was reached". Observed 2026-09-16 on both driver entries. Reverted.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp's renderPassLocked(), an
+    //       `if (ensureTargets(monitorId, size)) rebuilt = true;` put just above
+    //       `clip = &videoSessionLocked(...)` -> "FAIL: a new video wallpaper is decoded before the
+    //       monitor's images are rebuilt". Via control_batch.sh, --phase '^resize$', 2026-10-18,
+    //       NVIDIA. Reverted.
     // COVERAGE-ASSERT: the gate is asserted to have fired, as above.
     g_decodeCalls.store(0);
     g_framebufferGate.arm(CallGate::Mode::Hold, extentOf(kResizedAgainWidth, kResizedAgainHeight));
@@ -1577,6 +1658,7 @@ void runResizeChecks(const WallpaperManager::Config& config, const std::string& 
         return;
     }
     g_decodeCalls.store(0);
+    g_countedThreadDecodes.store(0);
     g_files.resetCounts();
     g_framebufferGate.arm(CallGate::Mode::Hold, extentOf(kResizedWidth, kResizedHeight));
     resize("DP-RACE", kResizedWidth, kResizedHeight);
@@ -1600,19 +1682,25 @@ void runResizeChecks(const WallpaperManager::Config& config, const std::string& 
         //       renderPending() call can commit -- the newer size's own post finds its request
         //       serviced -- so the counters cover exactly the overtaken pass and its retry. The
         //       one-picture fixture again: a playing session would decode on this thread inside the
-        //       same window and no counter could say which of the two did it.
+        //       same window and no counter could say which of the two did it. Packets counted on the
+        //       render thread only, as above: the session's decode thread refills its queue meanwhile.
         // CONTROL: in backend/daemon/wallpaper_manager.cpp, `m_videoSessions.erase(monitorId);` added
         //       before the superseded `return RenderPass{{}, true};` in the commit block -> "FAIL: the
-        //       retry after an overtaken rebuild opens and decodes nothing", printing "1 open(s), 3
-        //       packet(s) across the overtaken pass and its retry". Observed 2026-09-18. Reverted.
+        //       retry after an overtaken rebuild opens and decodes nothing", printing "1 open(s), 1
+        //       packet(s) on the render thread across the overtaken pass and its retry (7 on any thread)".
+        //       The session is keyed by id now, so the break is `m_videoSessions.erase(ref.id)` of
+        //       videoSessionOfLocked(monitorId). control_batch.sh, --phase '^resize$', 2026-10-19 (T5c),
+        //       NVIDIA. Reverted.
         const bool retried = signals.wait(kMonitorRace, 2);
         check(retried, "the retry after the overtaken rebuild commits");
         if (retried) {
-            const bool nothing = g_files.totalOpens() == 0 && g_decodeCalls.load() == 0;
+            const bool nothing = g_files.totalOpens() == 0 && g_countedThreadDecodes.load() == 0;
             check(nothing, "the retry after an overtaken rebuild opens and decodes nothing");
             if (!nothing) {
-                std::fprintf(stderr, "  %d open(s), %d packet(s) across the overtaken pass and its retry\n",
-                             g_files.totalOpens(), g_decodeCalls.load());
+                std::fprintf(stderr,
+                             "  %d open(s), %d packet(s) on the render thread across the overtaken pass and its retry "
+                             "(%d on any thread)\n",
+                             g_files.totalOpens(), g_countedThreadDecodes.load(), g_decodeCalls.load());
             }
         }
     }
@@ -1664,11 +1752,12 @@ void runCrashRecordSpanChecks(const WallpaperManager::Config& base, const std::s
     //       after the pass cannot see the span; the record is removed by the end of the pass, so
     //       "it was there afterwards" is not available as evidence. The record's contents are read
     //       too, not just its existence: a record naming the wrong type would refuse nothing.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `const ApplyingRecord applying(...)` line
-    //       deleted from videoSessionLocked()'s attempt -> "FAIL: a crash record is on disk while the
-    //       video is being decoded", and the eviction phase's positive reading ("and a record naming
-    //       the new file IS on disk ..."), nothing else. Observed 2026-09-21 on the NVIDIA entry.
-    //       Reverted.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, videoSessionLocked()'s attempt left without
+    //       its ApplyingRecord (`applying.emplace(...)` made a no-op) -> "FAIL: a crash record is on
+    //       disk while the video is being decoded", and the eviction phase's positive reading ("and a
+    //       record naming the new file IS on disk ..."), nothing else. Observed 2026-09-21 on the
+    //       NVIDIA entry; this phase re-run via control_batch.sh, --phase '^crashRecordSpan$',
+    //       2026-10-18, NVIDIA. Reverted.
     g_decodeGate.arm(CallGate::Mode::Hold);
     wallpaperx::testing::nameScreen(manager, kMonitorRecord, "DP-REC");
     manager.requestWallpaper("video", clip, kMonitorRecord);
@@ -1748,7 +1837,8 @@ void runCrashRecordSpanChecks(const WallpaperManager::Config& base, const std::s
 }
 
 // --------------------------------------------------------------------------- //
-// Stage E2: one decode session per monitor
+// Stage E2: decode sessions kept between passes (one per file and speed; these checks give each monitor
+// its own copy of the file, so here a session is also one monitor's)
 // --------------------------------------------------------------------------- //
 
 std::string screenOf(int monitorId) { return "DP-S" + std::to_string(monitorId); }
@@ -1956,9 +2046,9 @@ void runSessionChecks(const WallpaperManager::Config& config, const std::vector<
         }
     }
 
-    // GOAL: S13.124 -- giving a monitor the same video path again opens a new session and closes the
-    //       old one, leaving one. False for a daemon that keys the session on the path, which would
-    //       keep decoding a file rewritten in place from bytes that are gone.
+    // GOAL: S13.124 -- giving a monitor alone on a file the same video path again opens a new session
+    //       and closes the old one, leaving one. (A screen re-set to a file another screen plays joins
+    //       that session instead: S15.820.)
     // CONTROL: `++state.wallpaperSeq;` deleted from requestWallpaper() in
     //       backend/daemon/wallpaper_manager.cpp, after its save is queued -> "FAIL: the same video path
     //       given again opens a new session and closes the old one", printing "committed, 0 open(s), 0
@@ -1969,7 +2059,7 @@ void runSessionChecks(const WallpaperManager::Config& config, const std::vector<
     check(again.outcome.rendered, "the same video given again commits");
     reportUnless(again.opens == 1 && again.closes == 1 && again.decodes > 0,
                  "the same video path given again opens a new session and closes the old one", describe(again));
-    reportUnless(g_files.live().count(clips[0]) == 1, "and one session for that monitor remains",
+    reportUnless(g_files.live().count(clips[0]) == 1, "and one session holds that file",
                  "open: " + describeFiles(g_files.live()));
 
     // GOAL: S13.126, restated for the clock -- eight sessions is the ceiling, and a ninth video
@@ -1984,12 +2074,11 @@ void runSessionChecks(const WallpaperManager::Config& config, const std::vector<
     //       for the ninth on a daemon with a worker running, cannot establish "no playing session is
     //       taken": which session is least recently used would then depend on which clock rounds had
     //       run.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the "skip a session whose monitor is
-    //       showing its own current picture" line deleted from evictIdleVideoSessionLocked() --
-    //       Stage E4 spells it `if (currentSeqLocked(...) && screenDrawnLocked(monitorId))
-    //       continue;`, where Stage E2 had no skip at all -> "FAIL: a ninth video wallpaper asked
-    //       for while all eight play opens nothing and commits nothing", and eleven more across
-    //       this phase and the eviction-narrowing one. Observed 2026-09-20. Raising
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, evictIdleVideoSessionLocked()'s skip of a
+    //       session one of whose screens shows its current picture (`if (showing) continue;`) made
+    //       a no-op -> "FAIL: a ninth video wallpaper asked for while all eight play opens nothing
+    //       and commits nothing" and five more in this phase. Via control_batch.sh, --phase session,
+    //       2026-10-18, NVIDIA. Raising
     //       kMaxVideoSessions cannot be used as the control: the static_assert above stops the
     //       build, which is the point of tying the monitor count to the constant. Reverted.
     // COVERAGE-ASSERT: each of the eight opens is asserted to have happened, so "eight are resident"
@@ -2022,10 +2111,12 @@ void runSessionChecks(const WallpaperManager::Config& config, const std::vector<
         // GOAL: the refusal is the daemon's, and it says what the limit is. False for a refusal
         //       reported as the file's fault, which sends the user to replace a file that is fine,
         //       and false for one whose message does not name the limit that caused it.
-        // CONTROL: in classifyFailure() (backend/daemon/wallpaper_manager.cpp), the ResourceExhausted
-        //       arm's `daemonFault` set to false -> "FAIL: the refusal is recorded as the daemon's
-        //       fault, not the file's". Changing the thrown text in videoSessionLocked() to drop the
-        //       count reddens the naming clause instead. Observed 2026-09-18. Reverted.
+        // CONTROL: in classifyFailure() (backend/daemon/wallpaper_manager.cpp), the ResourceExhausted arm
+        //       returning `RenderFailure{e.what(), false, false, false}` -- the file's fault -> "FAIL: the
+        //       refusal is recorded as the daemon's fault, not the file's", 2026-10-18 (T2), control_batch.sh,
+        //       NVIDIA. Clearing `daemonFault` alone cannot redden it: `exhausted` makes fault() Shortage,
+        //       which GetStatus also reports as the daemon's. Changing the thrown text in videoSessionLocked()
+        //       to drop the count reddens the naming clause instead (2026-09-18). Reverted.
         const std::optional<wallpaperx::MonitorStatus> status = monitorStatus(manager, refused);
         const std::string error = status ? status->lastError : std::string();
         reportUnless(error.find("at most " + std::to_string(WallpaperManager::kMaxVideoSessions) + " videos") !=
@@ -2259,13 +2350,12 @@ void runFailedPassChecks(const WallpaperManager::Config& base, const std::vector
     //       and a start is built from the state copied at that instant -- the consequence, not just
     //       the file. The draw-fault section below builds the same copy while a record IS on disk and
     //       requires it to refuse, so this "not refused" cannot be the copy failing to refuse anything.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, closeFailedVideoSessionLocked() made to free
-    //       a non-file failure's pipeline inside a scoped `ApplyingRecord` naming the session's file
-    //       -- a record-writing close, which the Stage E2 review found here -> "FAIL: no crash record
-    //       is on disk while a session is torn down for a fault that is not the file's", printing the
-    //       record naming video_parked_0.mp4, and "FAIL: a start after dying in that teardown applies
-    //       the video instead of refusing it", beside the restated S13.129 pair below (the same close).
-    //       Observed 2026-09-21 on the NVIDIA entry. Reverted.
+    // CONTROL: control_batch.sh 2026-10-18, phase failedPass, NVIDIA, reverted, backend/daemon/wallpaper_manager.cpp:
+    //       leaveVideoSessionLocked() closing the last member's session inside an `ApplyingRecord` naming the
+    //       file -> "FAIL: no crash record is on disk while a session is torn down for a fault that is not
+    //       the file's" and "FAIL: a start after dying in that teardown applies the video ...". This failure
+    //       (an image shortage) leaves the session through leaveVideoSessionLocked(), not
+    //       closeFailedVideoSessionLocked(): the same record added there reddens only the S13.129 pair below.
     // COVERAGE-ASSERT: the injected failure is asserted to have fired, so the teardown seen is the
     //       one that failure caused.
     g_framebufferFailGate.arm(CallGate::Mode::Fail, extentOf(kResizedWidth, kResizedHeight));
@@ -2314,11 +2404,10 @@ void runFailedPassChecks(const WallpaperManager::Config& base, const std::vector
     //       that order, with no timing involved. The open count is reset AFTER requestWallpaper():
     //       the request opens the file itself to check it can be read (S13.195), and that open,
     //       counted, would make "the pass opened its session" read two where the pass opened one.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, renderPassLocked()'s first
-    //       `closeFailedVideoSessionLocked(monitorId, fault);` -- in the `if (!error.empty())` block
-    //       before the commit block -- deleted -> "FAIL: a failed, overtaken pass leaves no session: the
-    //       newer pass opens its own", printing "0 open(s), 0 close(s) after the failure", alone.
-    //       Observed 2026-10-18 via control_batch.sh on NVIDIA and Lavapipe. Reverted.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, renderPassLocked()'s first `if (failure)
+    //       tearDownFailed();` -- before the commit block, whose `dropFailedClip()` frees the session --
+    //       deleted -> "FAIL: a failed, overtaken pass leaves no session: the newer pass opens its own".
+    //       Re-run 2026-10-18 (T2) via control_batch.sh on NVIDIA and Lavapipe. Reverted.
     // COVERAGE-ASSERT: the held pass is asserted to have opened the session, and the injected
     //       failure to have fired.
     if (!show(kMonitorOvertaken, clips[0])) {
@@ -2402,13 +2491,11 @@ void runFailedPassChecks(const WallpaperManager::Config& base, const std::vector
     //       -- and a start is built from the state copied at that instant, for S13.127's reason. The
     //       record reading just above, in the same directory for the same monitor, is what makes
     //       this absence evidence.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, renderPassLocked()'s
-    //       `if (!error.empty() && fault != Fault::File) applying.reset();` deleted, so the pass's
-    //       record stays on disk through the teardown -> "FAIL: no record naming the video is on disk
-    //       while a session whose draw failed for the daemon's reason is torn down", printing the
-    //       record naming video_parked_2.mp4, and "FAIL: a start after dying in that teardown applies
-    //       the video", printing the "killed while applying" refusal; nothing else. Observed 2026-09-21
-    //       on the NVIDIA entry. Reverted.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, renderPassLocked()'s `tearDownFailed` lambda's
+    //       `if (failure->fault() != Fault::File) applying.reset();` deleted, so the pass's record stays on
+    //       disk through the teardown -> "FAIL: no record naming the video is on disk while a session whose
+    //       draw failed for the daemon's reason is torn down". Re-run 2026-10-18 (T2) via control_batch.sh,
+    //       NVIDIA. Reverted.
     g_submitFailGate.arm(CallGate::Mode::Fail);
     g_closeFileGate.arm(CallGate::Mode::Hold, clips[2]);
     repostWithoutRebuild();
@@ -2561,7 +2648,9 @@ void runEvictionRecordCheck(const WallpaperManager::Config& base, const std::vec
     //       decode are running". Each observed 2026-09-21 on the NVIDIA entry, (a) together with the
     //       applying-record control in runPlaybackBlameChecks. (a) re-run via control_batch.sh, --phase
     //       '^evictionRecord$', 2026-09-30, now that an eviction frees through releaseVideoSessionLocked():
-    //       the same line, printing the record naming video_parked_0.mp4. Reverted.
+    //       the same line, printing the record naming video_parked_0.mp4. Reverted. (a) and (b) re-run
+    //       2026-10-18 (T2) via control_batch.sh, NVIDIA: (a) as an ApplyingRecord naming the first member
+    //       around the pipeline's reset in closeVideoSessionLocked(). Reverted.
     g_closeFileGate.arm(CallGate::Mode::Hold, clips[0]);
     const size_t ninth = std::size(kEvictionMonitors) - 1;
     post(ninth);
@@ -3085,7 +3174,8 @@ void runClockChecks(const WallpaperManager::Config& config, const std::string& c
         //       VideoPipeline::Playback::Once -> "FAIL: and starts it again without reopening the
         //       file", printing 2 opens since the first frame; the picture COUNT stays above ten even
         //       then, because the failure at the file's end posts a render that reopens and goes on,
-        //       which is why the reopen count is asserted beside it. Observed 2026-09-18. Reverted.
+        //       which is why the reopen count is asserted beside it. Observed 2026-09-18; re-run via
+        //       control_batch.sh, --phase '^clock$', 2026-10-18, NVIDIA. Reverted.
         reportUnless(shown.size() > kClipPictures,
                      "the video plays past the last picture in the file instead of stopping at it",
                      std::to_string(shown.size()) + " picture(s) from a file holding " +
@@ -3210,13 +3300,25 @@ void runOnePictureChecks(const WallpaperManager::Config& config, const std::stri
     //       second, and "FAIL: and its one picture is announced once, not once per round", printing
     //       10 further announcements, with the overtaken-rebuild count in the resize phase red
     //       beside them. Rewritten for Stage E4, which moved the fact from a clock variant onto the
-    //       monitor; observed 2026-09-20. Reverted.
+    //       monitor; observed 2026-09-20. Re-run against the bound below via control_batch.sh, --phase
+    //       '^onePicture$', 2026-10-19 (T5c), NVIDIA: "7 picture(s) delivered, 14 packet(s)" and "7
+    //       further announcement(s)". Reverted.
+    //       BOUNDED BY THE DECODE QUEUE, NOT ZERO: the session's decode thread keeps up to kDepth (2,
+    //       renderer/video/decode_ahead.cpp) pictures ready, and with this file each is the one picture
+    //       again after a restart. After the park nothing takes from that queue, so the thread can
+    //       deliver at most kDepth more pictures whatever the interleaving, and then waits; a clock that
+    //       kept asking takes a picture every round and the thread delivers one per round after it.
+    //       Packets are not bounded this way (a restart's flush sends more than one per picture).
+    constexpr int kQueueDepth = 2;
     g_decodeCalls.store(0);
+    g_pictureDeliveries.store(0);
     resetCountsAfterOpenOf(onePicture, "the one-picture phase");
     const size_t announced = signals.countFor(kMonitorParked);
     std::this_thread::sleep_for(config.idleSessionRelease / 2);
-    reportUnless(g_decodeCalls.load() == 0, "a video file holding one picture is never decoded again",
-                 std::to_string(g_decodeCalls.load()) + " packet(s) in a quiet window");
+    reportUnless(g_pictureDeliveries.load() <= kQueueDepth, "a video file holding one picture is never decoded again",
+                 std::to_string(g_pictureDeliveries.load()) + " picture(s) delivered, " +
+                     std::to_string(g_decodeCalls.load()) + " packet(s), in a quiet window; at most " +
+                     std::to_string(kQueueDepth) + " refill the decode queue");
     reportUnless(signals.countFor(kMonitorParked) == announced,
                  "and its one picture is announced once, not once per round",
                  std::to_string(signals.countFor(kMonitorParked) - announced) + " further announcement(s)");
@@ -3268,7 +3370,8 @@ void runOnePictureChecks(const WallpaperManager::Config& config, const std::stri
     //       delay choice and the releaseVideoSessionLocked() call gone -- so nothing is ever freed ->
     //       "FAIL: a parked one-picture video's decoder and file are released once it has been idle",
     //       printing wallpaper_one_picture.mp4 still open after the wait. Re-run via control_batch.sh,
-    //       --phase '^onePicture$', 2026-09-30. Reverted.
+    //       --phase '^onePicture$', 2026-10-18, NVIDIA, as the stopped branch's
+    //       releaseVideoSessionLocked() call made a no-op. Reverted.
     //       NOT graded here: whether the park branch SCHEDULES that release. Making it return
     //       nothing leaves this check green, because the resize above posts a job and the round
     //       that follows any job starts the countdown anyway. runParkedReleaseChecks below is the
@@ -3417,7 +3520,8 @@ void runOffSwitchChecks(const WallpaperManager::Config& config, const std::strin
     //       still holds its file open just after stopping", printing "open files: none" -- and a dozen
     //       other checks in this file with it, since a session freed the moment it stops breaks every
     //       reuse and resize property Stage E2 established. Both re-run via control_batch.sh, --phase
-    //       '^offSwitch$', 2026-09-30. Reverted.
+    //       '^offSwitch$', 2026-09-30; the first again 2026-10-18, NVIDIA, as the stopped branch's
+    //       releaseVideoSessionLocked() call made a no-op, with the same two lines red. Reverted.
     {
         const std::multiset<std::string> openNow = g_files.live();
         reportUnless(openNow.count(clip) == 1, "the stopped video still holds its file open just after stopping",
@@ -4072,7 +4176,9 @@ void runSpeedChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const std:
     //       (backend/daemon/wallpaper_manager.cpp) replaced by `speed = 1.0;`, via control_run.sh,
     //       2026-09-29 -> "FAIL: a video set with speed 2 shows its pictures twice as fast as its file's
     //       own rate", with the speed-0.01 check below. Reverted. Re-run via control_batch.sh, --phase
-    //       '^speed$', 2026-10-14 -> the same line, with the speed-0.5 check below.
+    //       '^speed$', 2026-10-14 -> the same line, with the speed-0.5 check below. That line is now
+    //       `speed = session.speed;`; re-run 2026-10-18 via control_batch.sh, --phase '^speed$', NVIDIA, as
+    //       `speed = 1.0;` after the round's speed-change block -> the same line and the speed-0.5 one.
     // CONTROL: gapBetween() (backend/daemon/wallpaper_manager.cpp) made to return kMinPictureInterval
     //       always, a clock free-running at the cap -> the same line, by the lower bound: "20 pictures
     //       took 0.166630 s". Reverted.
@@ -5262,6 +5368,8 @@ void runIntervalClampChecks(const WallpaperManager::Config& config, const std::s
     //       other picture is thrown away -- which is what a rate cap implemented by thinning would do ->
     //       "FAIL: and it plays every picture rather than thinning the file out to keep up", 248 packets
     //       for 125 pictures, while the rate check stayed green at 120.0. That is why both oracles are here.
+    //       Re-run 2026-10-19 (T7), RTX: (2) rewritten for the round's takeReady(), decodeUntil() first taking a
+    //       picture and throwing it away -> held, the same line. (1) re-run 2026-10-19 (T7b), RTX: held.
     // COVERAGE-ASSERT: the packet count is asserted to be non-zero, so a run in which the decode
     //       hook saw nothing -- which would make "it decoded no more than it showed" trivially true
     //       -- fails instead of reading as the rate having been established.
@@ -5987,12 +6095,12 @@ void runEvictionWatchChecks(const WallpaperManager::Config& config, const std::v
     //       run where the interval had not elapsed and nothing was stale at all. The two
     //       directions are then driven from the same eight sessions, so the only thing that differs
     //       between "refused" and "evicted" is the screen report.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, evictIdleVideoSessionLocked()'s
-    //       `if (currentSeqLocked(...) && screenDrawnLocked(monitorId)) continue;` changed back to
-    //       `if (playingSeqLocked(monitorId, session.wallpaperSeq)) continue;` -- the clock's own
-    //       test -> "FAIL: a ninth video is refused while every screen is showing a current
-    //       picture", because a stale-but-drawn session is evicted instead. Observed 2026-09-20.
-    //       Reverted.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, evictIdleVideoSessionLocked()'s per-screen
+    //       test `currentSeqLocked(...) && screenDrawnLocked(...)` changed to
+    //       `playingSeqLocked(...).has_value()` -- the clock's own test -> "FAIL: a ninth video is
+    //       refused while every screen is showing a current picture", because a stale-but-drawn
+    //       session is evicted instead. Re-run via control_batch.sh, --phase '^evictionWatch$',
+    //       2026-10-18, NVIDIA. Reverted.
     // COVERAGE-ASSERT: every one of the eight is required to read as unwatched before the ninth is
     //       asked for, so a run that had not gone stale cannot report the refusal as evidence that
     //       eviction ignores staleness.
@@ -6031,10 +6139,11 @@ void runEvictionWatchChecks(const WallpaperManager::Config& config, const std::v
 
     // The other direction, from the same eight sessions: one screen says it is not being drawn, and
     // that one is taken at once.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `&& screenDrawnLocked(monitorId)` term
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `&& screenDrawnLocked(m.monitorId)` term
     //       deleted from evictIdleVideoSessionLocked() -> "FAIL: a screen that says it is not being
     //       drawn gives its session up for the ninth video", because nothing is then evictable and
-    //       the ninth is refused again. Observed 2026-09-20. Reverted.
+    //       the ninth is refused again. Re-run via control_batch.sh, --phase '^evictionWatch$',
+    //       2026-10-18, NVIDIA. Reverted.
     manager.setOutputVisible(screenOf(kEvictionWatchMonitors[2]), false);
     // Asked for again, not merely re-rendered: a pass that failed marks the request serviced, so
     // renderPending() on its own would answer "nothing to do" and this check would read a no-op.
@@ -6720,10 +6829,10 @@ void runKeptStillChecks(const WallpaperManager::Config& base, const std::vector<
     // GOAL: S15.746 -- a pass that fails keeps nothing: the redraw after it decodes the unchanged file again.
     // WHY-THIS-SHAPE: the redraw is a resize; a new request would make a new wallpaperSeq, whose stale-image
     //       drop decodes afresh whether the failure kept anything or not.
-    // CONTROL: control_batch.sh 2026-10-18, phase keptStill, NVIDIA and Lavapipe, reverted: the `if
-    //       (!error.empty()) m_keptStills.erase(monitorId);` after the commit block deleted (backend/daemon/
-    //       wallpaper_manager.cpp) -> this line alone, "committed, 0 decode(s)" (a failed submission is inside
-    //       the commit block, which the earlier erase misses).
+    // CONTROL: control_batch.sh 2026-10-18 (T2), phase keptStill, NVIDIA and Lavapipe, reverted: the erase is
+    //       one line inside renderPassLocked()'s `tearDownFailed` (backend/daemon/wallpaper_manager.cpp), called
+    //       before and after the commit block; the call AFTER it deleted -> this line (a failed submission is
+    //       inside the commit block, which the earlier call misses). S15.802 is the earlier call's.
     owed.clear();
     manager.setOutputSize(screenOf(kA), kResizedAgainWidth, kResizedAgainHeight, owed);
     const StillPass afterFailure = drawCounted(manager, kA);
@@ -7131,9 +7240,10 @@ void runLayoutDragChecks(const WallpaperManager::Config& config) {
     // WHY-THIS-SHAPE: held inside the image rebuild of a resize (after the kept image is back in the map),
     //       overtaken there by a layout change, then failed as a lost device: a shortage would have its relief
     //       drop every kept still anyway. The decode count is of images at the still's own 40x30 size.
-    // CONTROL: control_batch.sh 2026-10-18, phase layoutDrag, NVIDIA and Lavapipe, reverted: in renderPassLocked
-    //       (backend/daemon/wallpaper_manager.cpp) the `m_keptStills.erase(monitorId);` before the commit block
-    //       deleted -> this line alone, "generation 5 -> 6, 0 decode(s)".
+    // CONTROL: control_batch.sh 2026-10-18 (T2), phase layoutDrag, NVIDIA and Lavapipe, reverted: in
+    //       renderPassLocked (backend/daemon/wallpaper_manager.cpp) the `if (failure) tearDownFailed();` BEFORE
+    //       the commit block deleted (the erase is one line in that lambda; S15.746 is the later call's) -> this
+    //       line. The same break reddens S13.128 in failedPass, whose session that call also frees.
     // COVERAGE-ASSERT: the hold and the injected failure are asserted to have fired.
     if (!settle()) {
         check(false, "the screen settles before the overtaken-failure case");
@@ -7227,10 +7337,10 @@ void runPlaybackRetryChecks(const WallpaperManager::Config& config, const std::v
     //       not held. The same settled state -- no frame, the error standing, a frame request
     //       answering RenderFailed -- is what is read below.
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, both `state.hasFrame = false;` in
-    //       recordFailureLocked() and `if (failed) releaseTarget(monitorId);` in advanceSessionLocked()
-    //       deleted, so a failed video keeps its last picture -> "FAIL: a video whose playback keeps
-    //       failing stops on its own ...", S13.142's "and the monitor is left with no frame", and the
-    //       shortage phase's settle checks. Observed 2026-09-21 on the NVIDIA entry. Reverted.
+    //       recordFailureLocked() and the `releaseTarget(member.monitorId);` of advanceSessionLocked()'s
+    //       failure path deleted, so a failed video keeps its last picture -> "FAIL: a video whose playback
+    //       keeps failing stops on its own ...". Re-run via control_batch.sh, --phase '^playbackRetry$',
+    //       2026-10-18, NVIDIA, reverted (S13.142's and the shortage phase's lines were not re-run).
     // COVERAGE-ASSERT: the number of failures actually injected is asserted to be at least one per
     //       reopen plus the one that spent the budget, so a run where the injection stopped landing
     //       fails instead of grading a daemon that simply never failed.
@@ -7429,7 +7539,7 @@ void runGpuFaultChecks(const WallpaperManager::Config& config, const std::vector
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `!failure.gpuFault` term deleted from
     //       advanceSessionLocked()'s retry condition -> "FAIL: a GPU fault during playback never
     //       reopens the file", printing "1 reopen(s) after the fault", with the two clauses after it.
-    //       Observed 2026-09-18. Reverted.
+    //       Re-run via control_batch.sh, --phase '^gpuFault$', 2026-10-18, NVIDIA: the same three lines. Reverted.
     // COVERAGE-ASSERT: the injected fault is asserted to have been spent before anything is read, so
     //       "no reopen" cannot be read off an injection that never fired.
     resetCountsAfterOpenOf(clips[0], "the GPU-fault phase");
@@ -7482,6 +7592,8 @@ void writeConfig(const std::filesystem::path& file, const std::vector<std::tuple
 //   resume-seek   in the seek back of <path>'s resume: played 40 pictures, hidden until its session
 //                 is released, then shown again
 //   resume-catch-up  the same, in the first packet the resume's catch-up sends
+//   shared-catch-up  <path> on <monitor> and <extra monitor>, both paused until released; the first
+//                 reopens catching up, and the death is in the second's render pass decoding that catch-up
 constexpr const char* kBlameChildFlag = "--blame-child";
 constexpr uint64_t kBlameResumeAfterPictures = 40;
 constexpr int kBlameChildNeverDied = 3;
@@ -7510,8 +7622,10 @@ constexpr int kBlameChildSetupFailed = 4;
         config.idleSessionRelease = std::chrono::milliseconds(300);
     }
     if (resume) config.idleSessionRelease = std::chrono::milliseconds(300);
+    if (scenario == "shared-catch-up") config.pausedSessionRelease = std::chrono::milliseconds(300);
     g_files.watch(path);
     if (!extra.empty()) g_files.watch(extra);
+    if (scenario == "decode") g_deathNotePath = (std::filesystem::path(argv[3]).parent_path() / "death-thread").string();
     try {
         WallpaperManager manager(config);
         const std::vector<int> restored = manager.restoreSaved();
@@ -7528,6 +7642,41 @@ constexpr int kBlameChildSetupFailed = 4;
             if (recorded.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
                 std::_Exit(kBlameChildSetupFailed);
             }
+        }
+        if (scenario == "shared-catch-up") {
+            // Driven on this thread with the worker idle, so no clock round runs between the two passes.
+            g_crashThread.store(::gettid());
+            std::vector<int> owed;
+            wallpaperx::testing::nameScreen(manager, monitorId, "DP-BLAME");
+            wallpaperx::testing::nameScreen(manager, extraMonitor, "DP-SECOND");
+            for (const int id : restored) manager.renderPending(id);
+            if (g_files.live().size() != 1) std::_Exit(kBlameChildSetupFailed);
+            uint64_t shown = 0;
+            for (const Clock::time_point until = Clock::now() + std::chrono::seconds(20); shown < kBlameResumeAfterPictures;) {
+                if (Clock::now() > until) std::_Exit(kBlameChildSetupFailed);
+                for (const auto& s : manager.advanceVideo(std::chrono::steady_clock::now()).shown) shown += s.monitorId == monitorId;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            manager.setMonitorPause(monitorId, "always_paused");
+            manager.setMonitorPause(extraMonitor, "always_paused");
+            const auto now = std::chrono::steady_clock::now();
+            manager.advanceVideo(now);
+            manager.advanceVideo(now + std::chrono::seconds(2));
+            if (!g_files.live().empty()) std::_Exit(kBlameChildSetupFailed);
+            // The first screen reopens at its picture, keeping its frame, so its session is left catching up.
+            manager.setMonitorPause(monitorId, "play");
+            const wallpaperx::ClockRound round = manager.advanceVideo(std::chrono::steady_clock::now());
+            if (std::find(round.retry.begin(), round.retry.end(), monitorId) == round.retry.end()) {
+                std::_Exit(kBlameChildSetupFailed);
+            }
+            manager.renderPending(monitorId);
+            if (g_files.live().size() != 1) std::_Exit(kBlameChildSetupFailed);
+            // The second joins it at a new size, so its own pass decodes the catch-up.
+            manager.setMonitorPause(extraMonitor, "play");
+            manager.setOutputSize("DP-SECOND", kResizedWidth, kResizedHeight, owed);
+            armCrash(CrashOn::CatchUp, path);
+            manager.renderPending(extraMonitor);
+            std::_Exit(kBlameChildNeverDied);
         }
         for (const int id : restored) worker.post(id);
         if (scenario == "decode") {
@@ -7640,11 +7789,15 @@ void runPlaybackBlameChecks(const WallpaperManager::Config& base, const std::vec
     //       covers). Two videos play, so a record naming the wrong one is told apart from the right.
     //       The fault fires only on the render worker's thread: without that, a child unwinding after
     //       a failed setup died in ~WallpaperManager's teardown and was graded as the staged death.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, `const PlayingBlame working(*session.blame);`
-    //       deleted from advanceSessionLocked() -> "FAIL: a death in the clock's decode of one video
-    //       names that video", printing "the record names no video", "FAIL: after two deaths in its
-    //       playback, the next start refuses that video, saying so" and "FAIL: and the refused file
-    //       is never opened". Observed 2026-09-21 on the NVIDIA entry. Reverted.
+    //       With a decode thread the packet is sent on it, so a Decode death is staged on any thread
+    //       but the child's main one (see crashDueFor), and the check below says which thread died.
+    // CONTROL: backend/daemon/wallpaper_manager.cpp, via control_batch.sh, --phase '^playbackBlame$',
+    //       2026-10-19 (T5c), NVIDIA, reverted: `const PlayingBlame decoding(*line);` deleted from the
+    //       decode thread's hooks.around -> "FAIL: a death in the clock's decode of one video names that
+    //       video", "FAIL: after two deaths in its playback, the next start refuses that video, saying
+    //       so" and "FAIL: and the refused file is never opened". `const PlayingBlame working(*line);`
+    //       deleted from advanceSessionLocked() instead stays green on NVIDIA: the death is on the
+    //       decode thread, which that guard never covers.
     {
         const std::filesystem::path configFile = scratch.path() / "decode" / "config.json";
         const std::filesystem::path stateDir = scratch.path() / "decode" / "state";
@@ -7655,6 +7808,35 @@ void runPlaybackBlameChecks(const WallpaperManager::Config& base, const std::vec
         const bool named = first.playing && first.playing->died && first.playing->died->monitorId == kMonitorBlamed &&
                            first.playing->died->path == blamed && first.playing->signal == SIGSEGV;
         reportUnless(named, "a death in the clock's decode of one video names that video", describeDeath(first));
+
+        // GOAL: S13.184's decode-thread clause -- the death graded above happened on the session's own
+        //       decode thread, not the render worker's or the child's main thread. False if the staging
+        //       fired somewhere else, which would leave the decode thread's blame ungraded.
+        // WHY-THIS-SHAPE: the child writes the dying thread's id, the render worker's, its own pid and
+        //       whether any packet was sent off those two threads (a decode thread exists) to a file just
+        //       before faulting; the only other thread that sends this file's packets is the session's
+        //       decode thread. A device with no decode thread (Lavapipe) decodes on the render thread, so
+        //       there only "not the main thread" is graded, and that is printed.
+        // CONTROL: test-side only, by hand, 2026-10-19 (T5c), NVIDIA, restored by hash: the note made to
+        //       give the render worker's id as the dying thread -> this line, "died on thread N, render
+        //       worker N, ..., a decode thread running". It controls the comparison, not a production
+        //       break: no small change to production moves this death onto the render thread.
+        {
+            std::ifstream note(scratch.path() / "decode" / "death-thread");
+            long dying = 0, render = 0, mainThread = 0;
+            int threaded = 0;
+            const bool read = static_cast<bool>(note >> dying >> render >> mainThread >> threaded);
+            const std::string where = read ? "died on thread " + std::to_string(dying) + ", render worker " +
+                                                 std::to_string(render) + ", main " + std::to_string(mainThread) +
+                                                 (threaded != 0 ? ", a decode thread running" : ", no decode thread")
+                                           : std::string("the child left no note of the dying thread");
+            reportUnless(read && dying != mainThread && (threaded == 0 || dying != render),
+                         "the death in the clock's decode was on the session's decode thread", where);
+            if (read && threaded == 0) {
+                std::printf("video_wallpaper_test: this device runs no decode thread, so the death was graded as off "
+                            "the main thread only (%s)\n", where.c_str());
+            }
+        }
 
         // GOAL: S13.185 end to end -- after a second such death the next start refuses that video with
         //       the reason and leaves the other one playing: it is drawn, and it goes on to show more
@@ -7704,7 +7886,7 @@ void runPlaybackBlameChecks(const WallpaperManager::Config& base, const std::vec
     //       ways. The positive reading that makes each absence evidence is the file-failure case
     //       below, the same death in the same free, which IS named.
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, closeVideoSessionLocked() made to free the
-    //       pipeline under `const PlayingBlame freeing(*session.blame);`, as closeFailedVideoSessionLocked()
+    //       pipeline under a PlayingBlame naming `*session.blame->line.load()`, as closeFailedVideoSessionLocked()
     //       does for the file's own failure -> "FAIL: a death freeing a video's decoder when its
     //       monitor is given another video names nothing" and the same for a still, the idle release
     //       and an eviction, each printing the record naming video_session_0.mp4. The applying-record
@@ -7714,6 +7896,9 @@ void runPlaybackBlameChecks(const WallpaperManager::Config& base, const std::vec
     //       '^playbackBlame$', 2026-09-30, NVIDIA, now that the idle release and an eviction reach
     //       closeVideoSessionLocked() through releaseVideoSessionLocked(): the same four lines each.
     //       Reverted.
+    //       The naming half re-run 2026-10-19 (T7), RTX, against the shared blame line: held, the same lines.
+    //       The applying-record half re-run 2026-10-19 (T7b), RTX: held, the "-- and leaves no applying record
+    //       either" lines.
     struct Teardown {
         const char* scenario;
         const char* what;
@@ -7752,9 +7937,10 @@ void runPlaybackBlameChecks(const WallpaperManager::Config& base, const std::vec
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, closeFailedVideoSessionLocked(): (a)
     //       `const PlayingBlame freeing(*session.blame);` deleted -> "FAIL: a death freeing a video's
     //       decoder after its own picture failed names that video", printing "the record names no
-    //       video"; (b) `if (failure != Fault::File) return;` deleted -> "FAIL: a death freeing a
-    //       video's decoder after the device was lost names nothing", printing the record naming
-    //       video_session_0.mp4. Each alone; observed 2026-09-21 on the NVIDIA entry. Reverted.
+    //       video"; (b) the condition of `if (failure.fault() == Fault::File) freeing.emplace(...)` dropped, so the
+    //       guard is taken for every failure -> "FAIL: a death freeing a video's decoder after the device was
+    //       lost names nothing". Each alone; (a) observed 2026-09-21, (b) re-run 2026-10-18 (T2) via
+    //       control_batch.sh, NVIDIA. Reverted.
     {
         const std::filesystem::path dir = scratch.path() / "file-failure";
         writeConfig(dir / "config.json", {{kMonitorBlamed, "video", blamed}});
@@ -7799,17 +7985,16 @@ constexpr int kMonitorClean = 0;
 //       reading a clear as a defect. The three-second case is the one this suite could not fail
 //       before: under the old rule that hide was credited as play, measured on unmodified production
 //       at the time.
-// CONTROL: via control_batch.sh, each hide length alone, 2026-09-30, NVIDIA, in
-//       backend/daemon/wallpaper_manager.cpp, reverted. The three `cleanPlay.lastShown.reset()` drops this
-//       drive crosses deleted -- setOutputVisible()'s, videoSessionLocked()'s (the session is released and
-//       reopened at its stopping picture inside both hides) and advanceSessionLocked()'s stopped branch ->
-//       "FAIL: a 3 s hide is not counted as play" and "FAIL: a 6 s hide is not counted as play", each
-//       printing "the count is 0". The same three deleted AND creditCleanPlayLocked()'s `onTime` term
-//       replaced by the rule before the fix, `now - *play.lastShown <= kMaxPictureInterval` -> the 3 s run
-//       red, "the count is 0", and the 6 s run GREEN, which is exactly the defect the short hide was added
-//       for. Measured and NOT usable as controls: the `onTime` replacement alone leaves both runs green (the
-//       drops above defend them), and setOutputVisible()'s drop alone leaves both green, 2026-10-01 (the
-//       clock's stopped branch drops the anchor a moment later).
+// CONTROL: control_batch.sh 2026-10-18 (T3), NVIDIA, each hide length alone, reverted, all in
+//       backend/daemon/wallpaper_manager.cpp. The three `cleanPlay.lastShown.reset()` drops this drive
+//       crosses -- setOutputVisible()'s, videoSessionLocked()'s new-session one, advanceSessionLocked()'s
+//       stopped branch -- deleted AND creditCleanPlayLocked()'s `onTime` replaced by the rule before the
+//       fix, `now - *play.lastShown <= kMaxPictureInterval` -> "FAIL: a 3 s hide is not counted as play",
+//       the 6 s run GREEN: the defect the short hide exists for. The same drops with advanceSessionLocked's
+//       `onTime` forced true -> "FAIL: a 6 s hide is not counted as play"; the 3 s run stayed GREEN, not
+//       understood. The drops alone, or `onTime` forced true alone, leave both green: the reopened session's
+//       first picture is drawn from a catch-up, never a Waiting clock, so it is never on time and the gap
+//       before it is never credited.
 // COVERAGE-ASSERT: the session is required to have been released during the hide, so the "released"
 //       part of the goal is exercised rather than assumed, and the count is read once before the
 //       hide so the run is known to have started carrying one.
@@ -9120,7 +9305,7 @@ std::optional<int> servedCounter(WallpaperManager& manager, int monitorId, std::
 // out again: each its own manager, the counter fixture on a 4:3 screen so every layout here reads whole.
 void runStoppedRelayoutChecks(const WallpaperManager::Config& base) {
     using wallpaperx::PositionMode;
-    const char* kGoals = "S15.803-S15.804 (a stopped video laid out again shows the picture on screen)";
+    const char* kGoals = "S15.803-S15.804 (a stopped video laid out again, alone on its file, shows the picture on screen)";
     const std::string counterClip = counterClipPath();
     if (!std::filesystem::exists(counterClip)) {
         notVerified(kGoals, "the counter fixture " + counterClip + " was not built");
@@ -9183,8 +9368,9 @@ void runStoppedRelayoutChecks(const WallpaperManager::Config& base) {
         if (!v.pause) std::this_thread::sleep_for(config.unwatchedAfter + std::chrono::milliseconds(200));
 
         // GOAL: S15.803 -- a layout change on a video that will not play on, with its next picture already
-        //       decoded, shows the picture that was on screen, not the one decoded ahead; S15.804 -- only the
-        //       first change may reopen the file, every later one is a plain redraw with no open.
+        //       decoded and no other screen on the same file playing, shows the picture that was on screen,
+        //       not the one decoded ahead; S15.804 -- only the first change may reopen the file, every later
+        //       one is a plain redraw with no open. (Beside a playing screen it takes theirs: S15.862.)
         // WHY-THIS-SHAPE: read from the served frame after every change, each change owed and drawn. The first
         //       change's open count is printed and bounded (at most one), not required to be one: reopening is
         //       how the daemon gets back to the on-screen picture today, not the property.
@@ -9456,7 +9642,7 @@ void runResumeChecks(const WallpaperManager::Config& base, const std::string& co
     //       resumes on the picture it stopped on, then its successor", printing "stopped on 13 (generation
     //       14), then showed 0 and 1", the hidden and hand-over halves below red the same way, and the three
     //       S15.155 lines (a fresh open seeks nothing); releaseVideoSessionLocked() never recording
-    //       `releasedAt` -> the same six lines.
+    //       `releasedAt` -> the same six lines (that one re-run 2026-10-18, NVIDIA).
     // GOAL: S15.155 -- a resume runs under no crash record: at the seek back and at the packets its
     //       catch-up decodes after it, no record for this monitor is on disk, so a death there is not
     //       a quarantine at the next start (resumeBlame grades that it is counted as a playing death).
@@ -9570,7 +9756,7 @@ void runResumeChecks(const WallpaperManager::Config& base, const std::string& co
     // WHY-THIS-SHAPE: the still opens no session, so nothing between spends the recorded position; only the
     //       wallpaper it was recorded for decides whether it is used. Read while the screen is hidden, from
     //       the render the new wallpaper owes, which no clock round has moved on.
-    // CONTROL: via control_batch.sh, --phase '^resume$', re-run 2026-10-16, NVIDIA at half speed, the
+    // CONTROL: via control_batch.sh, --phase '^resume$', re-run 2026-10-18, NVIDIA, the
     //       `releasedAt->forSeq == wallpaperSeq` term dropped from videoSessionLocked()
     //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a video set again after a still starts at its first
     //       picture, not where the old one stood", printing "stopped on 28; the video set again showed 28",
@@ -9664,7 +9850,7 @@ void runResumeEvictionChecks(const WallpaperManager::Config& base, const std::st
     //       free the hidden monitor's session -- the only one not on a drawn screen. The close is asserted
     //       before the resume. A reopen never evicts -- it waits for a free slot -- so another monitor is
     //       then given a still, whose render frees that monitor's session and runs the round that reopens.
-    // CONTROL: via control_batch.sh, --phase '^resumeEviction$', re-run 2026-10-16 on NVIDIA at half speed, closeVideoSessionLocked() in
+    // CONTROL: via control_batch.sh, --phase '^resumeEviction$', re-run 2026-10-18 on NVIDIA, closeVideoSessionLocked() in
     //       place of releaseVideoSessionLocked() in evictIdleVideoSessionLocked()
     //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a video whose session was evicted resumes on the
     //       picture it stopped on, then its successor", printing "stopped on 7 (generation 8), then showed 0
@@ -9675,7 +9861,7 @@ void runResumeEvictionChecks(const WallpaperManager::Config& base, const std::st
         setWallpaper(proxy, "video", clips[static_cast<size_t>(id - 1)], id);
     }
     const bool evicted = settlesWithin(std::chrono::seconds(60), [&] { return g_files.closes(counterClip) >= 1; });
-    // CONTROL: via control_batch.sh, 2026-10-16, NVIDIA: evictIdleVideoSessionLocked()
+    // CONTROL: via control_batch.sh, re-run 2026-10-18, NVIDIA: evictIdleVideoSessionLocked()
     //       (backend/daemon/wallpaper_manager.cpp) never choosing a victim -> this line red. Reverted.
     check(evicted, "the hidden video's session is evicted for the eighth other video (the premise)");
     if (!evicted) return;
@@ -9802,7 +9988,8 @@ void runResumeFallbackChecks(const WallpaperManager::Config& base, const std::st
     //       again would make the recorded position another wallpaper's and prove nothing.
     // CONTROL: via control_run.sh, --phase '^resumeFallback$', re-run 2026-10-08 on NVIDIA, reverted: in
     //       videoSessionLocked() (backend/daemon/wallpaper_manager.cpp) `it->second.releasedAt.reset();` moved to
-    //       after a successful open -> both lines red, "then showed 40 and 41" -- the old position, where 0 was
+    //       after a successful open -> both lines red (re-run 2026-10-18, T2, with the reset deleted outright:
+    //       the seek-no-more line red), "then showed 40 and 41" -- the old position, where 0 was
     //       due -- and "1 far seek(s) at the re-render". Reverted.
     // COVERAGE-ASSERT: both opens were failed and the screen went blank before the re-render.
     frozen = playThenRelease();
@@ -9854,9 +10041,9 @@ void runResumeFallbackChecks(const WallpaperManager::Config& base, const std::st
     //       failing that read is the S15.175 open fallback above, not this. The status is read while the render
     //       thread is held in the reopen's first decode: polled instead, the failure path's dropped frame and
     //       recorded error were cleared by that reopen before any poll landed on Lavapipe.
-    // CONTROL: via control_run.sh, --phase '^resumeFallback$', re-run 2026-10-09 through the shared failedCatchUp
-    //       on video_wallpaper_lavapipe, reverted: advanceSessionLocked()'s `if (atPosition && givesUpPosition(monitorId, failure))` made
-    //       `atPosition && false` (backend/daemon/wallpaper_manager.cpp), so the ordinary playback-failure path
+    // CONTROL: via control_batch.sh, --phase '^resumeFallback$', re-run 2026-10-18 on video_wallpaper_lavapipe,
+    //       reverted: advanceSessionLocked()'s `if (atPosition && named != members.end() && givesUpPosition(...))`
+    //       given `false &&` after `atPosition` (backend/daemon/wallpaper_manager.cpp), so the ordinary playback-failure path
     //       runs -> "FAIL: a catch-up that fails as the file's fault keeps the frame and records no failure",
     //       "has_frame was false; last_error: VideoDecoder: cannot read the wallpaper (Input/output error)", with
     //       S15.425's line below. The pictures after it were 0 and 1 even so: the budgeted reopen hides the
@@ -9940,10 +10127,10 @@ void runResumeFallbackChecks(const WallpaperManager::Config& base, const std::st
     //       a size no image fits: it cannot keep the frame and catches up itself (caughtUpSessionLocked), and no
     //       clock round can reach the catch-up first. The shortage is read after a packet was sent, so it lands in
     //       that catch-up's decode and not in the open, on either driver.
-    // CONTROL: via control_run.sh, --phase '^resumeFallback$', 2026-10-09, Lavapipe, reverted: caughtUpSessionLocked()
+    // CONTROL: via control_batch.sh, --phase '^resumeFallback$', re-run 2026-10-18, Lavapipe, reverted: caughtUpSessionLocked()
     //       (backend/daemon/wallpaper_manager.cpp) rethrowing every failure, so the render pass records the shortage
     //       -> "FAIL: a render that must catch up and runs short of memory draws the file from its first picture",
-    //       "0 new picture(s) within 20 s".
+    //       with "and records no failure".
     // COVERAGE-ASSERT: the injected shortage was spent.
     frozen = playThenRelease();
     if (!frozen) return;
@@ -10159,6 +10346,9 @@ void runResumeHoldChecks(const WallpaperManager::Config& base, const std::string
     //       "the longest wait was 918 ms of a 909 ms catch-up" on NVIDIA (unbroken: 17-24 ms of about 910 ms),
     //       and 1458 ms of 1444 ms on Lavapipe with the slowed decode. decodeUntil() ignoring its deadline ->
     //       the same line, 890 ms of 885 ms, NVIDIA.
+    //       Re-run 2026-10-19 (T7), RTX, decodeUntil() now on takeReady(): held, this line and the premise line
+    //       ("asked for at least five times during its catch-up"), the catch-up running in one go.
+    //       The `keepsFrame` break re-run 2026-10-19 (T7b), RTX: held, this line.
     // COVERAGE-ASSERT: the catch-up sent at least 100 packets -- a resume near the keyframe would prove
     //       nothing -- and a request overlapped it. Not "many requests": a lock held throughout leaves room
     //       for only one or two. The graded catch-up lasted kMeasurable or more; see resumeOnce's caller.
@@ -10274,9 +10464,9 @@ void runResumeCatchUpChecks(const WallpaperManager::Config& base, const std::str
         const std::optional<ReadPicture> frozen = playThenRelease();
         if (!frozen) return;
         g_files.resetCounts();
-        // CONTROL: via control_batch.sh, --phase '^resumeCatchUp$', 2026-10-16, NVIDIA: reopenVideosLocked()
-        //       (backend/daemon/wallpaper_manager.cpp) never owing a render to a playing video with no session -> only this
-        //       line red. Reverted.
+        // CONTROL: via control_batch.sh, --phase '^resumeCatchUp$', 2026-10-16, re-run 2026-10-18 (T2), NVIDIA:
+        //       reopenVideosLocked() (backend/daemon/wallpaper_manager.cpp) never owing a render to a playing video
+        //       with no session (`bool owed = false;`) -> this line red. Reverted.
         if (!resumeSlowly()) {
             check(false, "a hidden counter video shown again sends its decoder a packet (the premise)");
             return;
@@ -10285,9 +10475,9 @@ void runResumeCatchUpChecks(const WallpaperManager::Config& base, const std::str
         const bool released = settlesWithin(std::chrono::seconds(20), [&] { return g_files.closes(counterClip) >= 1; });
         g_sendDelayMs.store(0);
         const uint64_t latest = latestGeneration(rig.pictures, kMonitorResume);
-        // CONTROL: via control_batch.sh, --phase '^resumeCatchUp$', 2026-10-16, NVIDIA: advanceSessionLocked()
-        //       (backend/daemon/wallpaper_manager.cpp) returning before releaseVideoSessionLocked() for a CatchingUp session
-        //       -> only this line red. Reverted.
+        // CONTROL: via control_batch.sh, --phase '^resumeCatchUp$', 2026-10-16, graded mechanically 2026-10-18 (T2),
+        //       NVIDIA: advanceSessionLocked() (backend/daemon/wallpaper_manager.cpp) returning before
+        //       releaseVideoSessionLocked() for a CatchingUp session -> this line red. Reverted.
         check(released, "a video hidden again while it catches up is released (the premise)");
         if (!released) return;
         if (latest != frozen->generation) {
@@ -10632,7 +10822,8 @@ void runResumeBlameChecks(const std::string& counterClip) {
     //       advanceSessionLocked() -> the same for "a death in a resume's catch-up decode". The `open` lambda
     //       emplacing `applying` for an open at a position too -> "FAIL: a death in a resume's seek back leaves no
     //       crash record, ...", "a crash record names '.../counter_long.mp4'"; an ApplyingRecord around the
-    //       CatchingUp decode -> the same for the catch-up decode.
+    //       CatchingUp decode -> the same for the catch-up decode. The last three re-run 2026-10-18 (T2) via
+    //       control_batch.sh, NVIDIA, against the current advanceSessionLocked()/videoSessionLocked().
     // COVERAGE-ASSERT: a staged death that never came is reported by stageDeath() as not verified, never
     //       passed; how many of the two were reached is printed.
     int graded = 0;
@@ -10653,6 +10844,26 @@ void runResumeBlameChecks(const std::string& counterClip) {
                      record ? "a crash record names '" + record->path + "'" : std::string());
     }
     std::printf("video_wallpaper_test: %d of 2 staged resume deaths were reached\n", graded);
+
+    // GOAL: S15.874 -- a death in a render pass's catch-up decode on a shared session is blamed on that
+    //       pass's monitor, not on the session's first screen.
+    // WHY-THIS-SHAPE: the child drives every pass and round on one thread, so the second screen's pass is
+    //       the first thing to decode the session's catch-up: the first screen reopened keeping its frame and
+    //       no round ran between. The first screen opened the session, so a guard on the session's line names it.
+    // CONTROL: control_batch.sh 2026-10-18, phase resumeBlame, reverted: caughtUpSessionLocked()'s
+    //       `const PlayingBlame working(blame);` (backend/daemon/wallpaper_manager.cpp) made
+    //       `working(*session.blame)` -> this line on both entries, "the record names monitor 0".
+    const std::filesystem::path dir = scratch.path() / "shared-catch-up";
+    writeConfig(dir / "config.json", {{kMonitorBlamed, "video", counterClip}, {kMonitorBystander, "video", counterClip}});
+    const StagedDeath shared = stageDeath("S15.874", dir / "config.json", dir / "state",
+                                          {"shared-catch-up", std::to_string(kMonitorBlamed), counterClip, "",
+                                           std::to_string(kMonitorBystander)});
+    if (shared.died) {
+        reportUnless(shared.playing && shared.playing->died && shared.playing->died->monitorId == kMonitorBystander &&
+                         shared.playing->died->path == counterClip,
+                     "a death in a render pass's catch-up on a shared decoder names that pass's screen",
+                     describeDeath(shared));
+    }
 }
 
 // S15.157: time paused is not clean play. Manager-level, like runCleanPlayHideChecks: the playing record
@@ -10754,6 +10965,1161 @@ void runCleanPlayPauseChecks(const WallpaperManager::Config& base, const std::st
 }
 
 }  // namespace
+
+// Clock rounds at the real time until `done` holds of one round's shown screens, or 5 s pass (false).
+// Monitors 0..monitors-1 left owing a render are rendered here, as the worker would.
+bool clockRoundsUntil(WallpaperManager& manager, int monitors, const std::function<bool(const std::set<int>&)>& done) {
+    for (const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+         std::chrono::steady_clock::now() < deadline;) {
+        std::set<int> shown;
+        const wallpaperx::ClockRound round = manager.advanceVideo(std::chrono::steady_clock::now());
+        for (const wallpaperx::ClockRound::Shown& s : round.shown) shown.insert(s.monitorId);
+        for (int id = 0; id < monitors; ++id) {
+            if (owesRender(manager, id)) manager.renderPending(id);
+        }
+        if (done(shown)) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return false;
+}
+
+int liveCount(const std::string& path) { return static_cast<int>(g_files.live().count(path)); }
+
+std::string watchedCopy(const std::string& from, const char* name) {
+    const std::string path = testAssetDir() + "/" + name;
+    std::filesystem::copy_file(from, path, std::filesystem::copy_options::overwrite_existing);
+    g_files.watch(path);
+    return path;
+}
+
+// S15.823's render half and S15.824: a shared decoder outlives one screen's failed pass, and is released
+// on the session's terms, not one screen's. Clock rounds past the release delays are run at made-up
+// times, which is what the release reads; nothing here sleeps them out.
+void runSharedReleaseChecks(const WallpaperManager::Config& base, const std::string& clip) {
+    const char* kGoals = "S15.823-S15.824 (a shared decoder's render failures and releases)";
+    PhaseGrade grade("the shared-release phase");
+    WallpaperManager::Config config = base;
+    config.unwatchedAfter = std::chrono::hours(1);
+    config.idleSessionRelease = std::chrono::seconds(2);
+    config.pausedSessionRelease = std::chrono::seconds(6);
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    const std::string broken = watchedCopy(clip, "shared_release_broken.mp4");
+    const std::string released = watchedCopy(clip, "shared_release_released.mp4");
+    static constexpr int kKeep = 0, kBroken = 1, kPlays = 2, kHidden = 3, kMonitors = 4;
+    for (int id = 0; id < kMonitors; ++id) wallpaperx::testing::nameScreen(manager, id, screenOf(id));
+    const auto rounds = [&manager](const std::function<bool(const std::set<int>&)>& done) {
+        return clockRoundsUntil(manager, kMonitors, done);
+    };
+    const auto share = [&](const std::string& path, int a, int b) {
+        manager.requestWallpaper("video", path, a);
+        const PassCost first = renderCounted(manager, a);
+        manager.requestWallpaper("video", path, b);
+        const PassCost second = renderCounted(manager, b);
+        const bool both = rounds([&](const std::set<int>& s) { return s.count(a) && s.count(b); });
+        if (first.outcome.rendered && second.outcome.rendered && first.opens == 1 && second.opens == 0 && both) return true;
+        std::fprintf(stderr, "  %s; %s; %s\n", describe(first).c_str(), describe(second).c_str(),
+                     both ? "both shown" : "not both shown within 5 s");
+        return false;
+    };
+
+    manager.requestWallpaper("video", broken, kKeep);
+    if (!renderCounted(manager, kKeep).outcome.rendered) {
+        grade.expectNoDevice();
+        notVerified(kGoals, "the first video render on this host produced no frame");
+        return;
+    }
+
+    // GOAL: S15.823's render half -- a pass that fails for one screen's own reason (its images failing to
+    //       build) takes only that screen out: the shared decoder stays open and the other screen plays on.
+    // CONTROL: control_batch.sh 2026-10-18, phase sharedRelease, both entries, reverted: renderPassLocked's
+    //       dropFailedClip (backend/daemon/wallpaper_manager.cpp) `if (clipBroken)` made `if (true)` ->
+    //       "...leaves the shared decoder open".
+    if (!share(broken, kKeep, kBroken)) {
+        check(false, "two screens share a decoder before one screen's pass fails");
+    } else {
+        std::vector<int> owed;
+        manager.setOutputSize(screenOf(kBroken), kResizedWidth, kResizedHeight, owed);
+        g_framebufferFailGate.arm(CallGate::Mode::Fail, extentOf(kResizedWidth, kResizedHeight));
+        const PassCost failed = renderCounted(manager, kBroken);
+        check(!failed.outcome.rendered, "the screen whose images fail to build is not drawn (the premise)");
+        reportUnless(liveCount(broken) == 1 && failed.closes == 0,
+                     "a render failure that is not the decoder's leaves the shared decoder open",
+                     describe(failed) + "; open: " + describeFiles(g_files.live()));
+        reportUnless(rounds([](const std::set<int>& s) { return s.count(kKeep) > 0; }),
+                     "and the other screen goes on being drawn from it", "no picture within 5 s");
+    }
+
+    // GOAL: S15.824 -- a shared decoder is not released while any of its screens plays, however long
+    //       another has been stopped; with none playing and one paused, the paused delay applies, not the
+    //       idle one; and the release records a position for every screen, not only the first.
+    // WHY-THIS-SHAPE: the rounds run at made-up times far past both delays, since that time is what the
+    //       release compares; the record is read as the seek the hidden screen's reopen makes, because a
+    //       screen with no position recorded reopens at the file's start and seeks nothing.
+    // CONTROL: control_batch.sh 2026-10-18, phase sharedRelease, both entries, each alone, reverted
+    //       (backend/daemon/wallpaper_manager.cpp): advanceSessionLocked's `playing` made
+    //       `anyIn(Playing) && !anyIn(Stopped)` -> "...not released while one of its screens plays";
+    //       `paused = paused || pausedLocked(...)` made `paused = pausedLocked(...)` -> "...kept past the idle
+    //       delay"; releaseVideoSessionLocked() recording only the first member -> "...every screen".
+    if (!share(released, kPlays, kHidden)) {
+        check(false, "two screens share a decoder before the release checks");
+        return;
+    }
+    manager.setOutputVisible(screenOf(kHidden), false);
+    g_files.resetCounts();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 4; ++i) manager.advanceVideo(t0 + i * std::chrono::seconds(5));
+    reportUnless(g_files.closes(released) == 0 && liveCount(released) == 1,
+                 "a shared decoder is not released while one of its screens plays, however long another is stopped",
+                 std::to_string(g_files.closes(released)) + " close(s)");
+
+    manager.setMonitorPause(kPlays, "always_paused");
+    const auto t1 = std::chrono::steady_clock::now();
+    manager.advanceVideo(t1);
+    manager.advanceVideo(t1 + config.idleSessionRelease + std::chrono::milliseconds(500));
+    const int closesPastIdle = g_files.closes(released);
+    manager.advanceVideo(t1 + config.pausedSessionRelease + std::chrono::milliseconds(500));
+    const int closesPastPaused = g_files.closes(released);
+    reportUnless(closesPastIdle == 0,
+                 "with one screen paused and none playing, the shared decoder is kept past the idle delay",
+                 std::to_string(closesPastIdle) + " close(s)");
+    reportUnless(closesPastPaused == 1, "and it is released once the paused delay passes",
+                 std::to_string(closesPastPaused) + " close(s)");
+    if (closesPastPaused != 1) return;
+
+    g_farRead.arm(0.0, 0, false);
+    manager.setOutputVisible(screenOf(kHidden), true);
+    const bool reopened = rounds([&](const std::set<int>&) { return liveCount(released) == 1; });
+    const int seeks = g_farRead.farSeeks();
+    g_farRead.disarm();
+    check(reopened, "the screen shown again reopens the released file within 5 s");
+    if (reopened) {
+        reportUnless(seeks >= 1, "a release records the position of every screen of the shared decoder, not only the first",
+                     "the second screen's reopen made no seek, so it had no position recorded");
+    }
+}
+
+// S15.825: under the session ceiling, a shared session one of whose screens still shows its current
+// picture is never the one closed for room, whatever its other screens do.
+void runSharedEvictionChecks(const WallpaperManager::Config& base, const std::vector<std::string>& clips) {
+    const char* kGoals = "S15.825 (eviction of a shared decoder)";
+    PhaseGrade grade("the shared-eviction phase");
+    WallpaperManager::Config config = base;
+    config.unwatchedAfter = std::chrono::hours(1);
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    static_assert(WallpaperManager::kMaxVideoSessions == 8, "the monitor plan below fills exactly eight sessions");
+    constexpr int kHiddenFirst = 0, kShowing = 1, kNinth = 9;
+    for (int id = 0; id <= kNinth; ++id) wallpaperx::testing::nameScreen(manager, id, screenOf(id));
+
+    manager.requestWallpaper("video", clips[0], kHiddenFirst);
+    const PassCost first = renderCounted(manager, kHiddenFirst);
+    if (!first.outcome.rendered) {
+        grade.expectNoDevice();
+        notVerified(kGoals, "the first video render on this host produced no frame");
+        return;
+    }
+    manager.requestWallpaper("video", clips[0], kShowing);
+    const PassCost joined = renderCounted(manager, kShowing);
+    if (!joined.outcome.rendered || joined.opens != 0) {
+        check(false, ("a second screen joins the first file's decoder (the premise) -- " + describe(joined)).c_str());
+        return;
+    }
+    // GOAL: S13.126 restated -- the ceiling counts files, not screens: nine screens on eight files all
+    //       open and draw, closing nothing.
+    // CONTROL: control_batch.sh 2026-10-18, phase sharedEviction, both entries, reverted: videoSessionLocked()'s
+    //       ceiling test (backend/daemon/wallpaper_manager.cpp) adding the first session's extra screens to
+    //       m_videoSessions.size() -> this line.
+    int opened = 0;
+    int closed = 0;
+    for (int i = 1; i <= 7; ++i) {
+        manager.requestWallpaper("video", clips[static_cast<size_t>(i)], i + 1);
+        const PassCost cost = renderCounted(manager, i + 1);
+        if (cost.outcome.rendered && cost.opens == 1) ++opened;
+        closed += cost.closes;
+    }
+    reportUnless(opened == 7 && closed == 0 && g_files.live().size() == 8,
+                 "nine screens on eight files all draw under the eight-session ceiling, closing nothing",
+                 std::to_string(opened) + " of 7 opened, " + std::to_string(closed) + " closed; open: " +
+                     describeFiles(g_files.live()));
+    if (opened != 7 || g_files.live().size() != 8) return;
+
+    // GOAL: S15.825 -- with the oldest session shared by a hidden screen and one still showing its
+    //       picture, and a younger session whose screen owes a render, room for a ninth file is made by
+    //       closing the younger one.
+    // WHY-THIS-SHAPE: the shared session is the least recently used and its FIRST screen is the hidden
+    //       one, so a daemon that judged a session by one screen would pick it.
+    // CONTROL: control_batch.sh 2026-10-18, phase sharedEviction, both entries, reverted:
+    //       evictIdleVideoSessionLocked()'s any_of (backend/daemon/wallpaper_manager.cpp) over the first
+    //       member only -> "...not the shared one with a screen still showing".
+    manager.setOutputVisible(screenOf(kHiddenFirst), false);
+    std::vector<int> owed;
+    manager.setOutputSize(screenOf(2), kResizedWidth, kResizedHeight, owed);
+    manager.requestWallpaper("video", clips[8], kNinth);
+    const PassCost ninth = renderCounted(manager, kNinth);
+    reportUnless(ninth.outcome.rendered && liveCount(clips[0]) == 1 && liveCount(clips[1]) == 0,
+                 "room for a ninth file closes the session with no screen showing, not the shared one with a screen "
+                 "still showing",
+                 describe(ninth) + "; open: " + describeFiles(g_files.live()));
+}
+
+// S15.860-S15.868: a paused screen on a decoder another screen plays from, read by the counter
+// fixture's frame numbers. Every pass and clock round runs on this thread with no worker.
+void runPauseRejoinChecks(const WallpaperManager::Config& base) {
+    using wallpaperx::PositionMode;
+    const char* kGoals = "S15.860-S15.868 (a paused screen on a shared decoder)";
+    const std::string counterClip = counterClipPath();
+    if (!std::filesystem::exists(counterClip)) {
+        notVerified(kGoals, "the counter fixture " + counterClip + " was not built");
+        return;
+    }
+    const std::optional<CounterOrder> order = counterOrder(counterClip, kGoals);
+    if (!order) return;
+    g_files.watch(counterClip);
+    PhaseGrade grade("the pause-rejoin phase");
+    WallpaperManager::Config config = base;
+    config.unwatchedAfter = std::chrono::hours(1);
+    config.idleSessionRelease = std::chrono::seconds(2);
+    config.pausedSessionRelease = std::chrono::seconds(6);
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    static constexpr int kPlays = 0, kPaused = 1, kMonitors = 2;
+    std::vector<int> owed;
+    for (int id = 0; id < kMonitors; ++id) {
+        wallpaperx::testing::nameScreen(manager, id, screenOf(id));
+        manager.setOutputSize(screenOf(id), 160, 120, owed);
+    }
+    std::string reason;
+    const auto counterOn = [&](int id) { return servedCounter(manager, id, reason); };
+    const auto text = [](std::optional<int> n) { return n ? std::to_string(*n) : std::string("unreadable"); };
+    // `a` is `b`'s picture or the one after it: a redraw takes the picture the decoder holds, which
+    // while it waits to be shown is the playing screen's next.
+    const auto withinOne = [&](std::optional<int> a, std::optional<int> b) {
+        return a && b && (*a == *b || order->after(*b) == *a);
+    };
+
+    // kPlays' frame number after every round that shows it; each must be the picture after the last.
+    std::optional<int> lastPlays;
+    int compared = 0;
+    std::string jumps;
+    const auto takeJumps = [&] {
+        std::string j = jumps.empty() ? "none" : jumps;
+        jumps.clear();
+        return j;
+    };
+    const auto rounds = [&](const std::function<bool(const std::set<int>&)>& done) {
+        return clockRoundsUntil(manager, kMonitors, [&](const std::set<int>& shown) {
+            if (shown.count(kPlays)) {
+                const std::optional<int> now = counterOn(kPlays);
+                if (lastPlays && now) {
+                    ++compared;
+                    if (order->after(*lastPlays) != *now) {
+                        jumps += (jumps.empty() ? "" : ", ") + std::to_string(*lastPlays) + " -> " + std::to_string(*now);
+                    }
+                }
+                lastPlays = now;
+            }
+            return done(shown);
+        });
+    };
+    const auto showsOf = [&](int id, int count) {
+        int seen = 0;
+        return rounds([&, id, count](const std::set<int>& s) { return (seen += static_cast<int>(s.count(id))) >= count; });
+    };
+
+    manager.requestWallpaper("video", counterClip, kPlays, {{"position", PositionMode::Stretch}});
+    if (!renderCounted(manager, kPlays).outcome.rendered) {
+        grade.expectNoDevice();
+        notVerified(kGoals, "the first video render on this host produced no frame");
+        return;
+    }
+    manager.requestWallpaper("video", counterClip, kPaused, {{"position", PositionMode::Stretch}});
+    const PassCost joined = renderCounted(manager, kPaused);
+    int bothShown = 0;
+    const bool together = rounds([&](const std::set<int>& s) { return (bothShown += s.count(kPlays) && s.count(kPaused)) >= 3; });
+    if (!joined.outcome.rendered || joined.opens != 0 || !together || !lastPlays) {
+        check(false, "two screens on the counter file share its decoder and are drawn together (the premise)");
+        std::fprintf(stderr, "  %s; %s\n", describe(joined).c_str(), together ? "drawn together" : "not drawn together within 5 s");
+        return;
+    }
+
+    // GOAL: S15.860 -- a paused screen sharing a decoder keeps its picture while the other screen plays on.
+    // CONTROL: control_batch.sh 2026-10-18, phase pauseRejoin, both entries, reverted: motionLocked()
+    //       (backend/daemon/wallpaper_manager.cpp) not counting a pause as stopped -> this line.
+    manager.setMonitorPause(kPaused, "always_paused");
+    const std::optional<int> frozen = counterOn(kPaused);
+    bool pausedDrawn = false;
+    int playsShown = 0;
+    const bool ranOn = rounds([&](const std::set<int>& s) {
+        pausedDrawn = pausedDrawn || s.count(kPaused) > 0;
+        return (playsShown += static_cast<int>(s.count(kPlays))) >= 10;
+    });
+    const std::optional<int> held = counterOn(kPaused);
+    if (!ranOn || !frozen) {
+        check(false, "the other screen shows ten pictures while one is paused, and the paused one is read (the premise)");
+        return;
+    }
+    reportUnless(held == frozen && !pausedDrawn, "a paused screen on a shared decoder keeps its picture while the other plays on",
+                 "paused on " + text(frozen) + ", read " + text(held) + ", the other at " + text(lastPlays) +
+                     (pausedDrawn ? "; the clock drew the paused screen" : ""));
+
+    // GOAL: S15.862-S15.864 -- a paused screen resized or laid out again beside a playing one shows the
+    //       shared picture (the playing screen's, or the one after it), opens no decoder, and the playing
+    //       screen goes on showing every picture in turn.
+    // WHY-THIS-SHAPE: "keeps its rate" is read as no picture skipped on the playing screen, by frame number
+    //       after every round that shows it; a count of pictures a second would grade the scheduler.
+    // CONTROL: control_batch.sh 2026-10-18, phase pauseRejoin, both entries, each alone, reverted
+    //       (backend/daemon/wallpaper_manager.cpp): both halves of the rule undone -- renderPassLocked's
+    //       `if (!othersPlay)` made `if (true)` and videoSessionLocked()'s join refused to any screen with a
+    //       picture to keep -> "...shows the playing screen's picture" (3 beside 13) and "...opens no decoder"
+    //       (1 open per change); either half alone stays green here, the other half covers it. Each alone has
+    //       its own check at the end of this phase: S15.866 (the join) and the speed-change redraw (the stay). Two extra decodes
+    //       of the shared pipeline where the paused screen stays -> "...shows every picture in turn".
+    // COVERAGE-ASSERT: the playing screen's 24 pictures after the redraws (six each) are all compared.
+    struct Change {
+        const char* what;
+        std::function<void()> apply;
+    };
+    const Change changes[] = {
+        {"resized", [&] { manager.setOutputSize(screenOf(kPaused), 200, 150, owed); }},
+        {"resized back", [&] { manager.setOutputSize(screenOf(kPaused), 160, 120, owed); }},
+        {"laid out freely", [&] { manager.setWallpaperProperties(kPaused, {{"position", PositionMode::Free}}); }},
+        {"stretched again", [&] { manager.setWallpaperProperties(kPaused, {{"position", PositionMode::Stretch}}); }},
+    };
+    int redrawn = 0;
+    std::string pictures, opened;
+    bool allShared = true, noneOpened = true;
+    compared = 0;
+    takeJumps();
+    for (const Change& c : changes) {
+        c.apply();
+        const bool wasOwed = owesRender(manager, kPaused);
+        const int opensBefore = g_files.opens(counterClip);
+        const bool drawn = manager.renderPending(kPaused).rendered;
+        const int opens = g_files.opens(counterClip) - opensBefore;
+        const std::optional<int> paused = counterOn(kPaused);
+        const std::optional<int> plays = counterOn(kPlays);
+        if (wasOwed && drawn) ++redrawn;
+        allShared = allShared && withinOne(paused, plays);
+        noneOpened = noneOpened && opens == 0 && liveCount(counterClip) == 1;
+        pictures += std::string(pictures.empty() ? "" : "; ") + c.what + ": " + text(paused) + " beside " + text(plays);
+        opened += std::string(opened.empty() ? "" : ", ") + std::to_string(opens);
+        if (!showsOf(kPlays, 6)) {
+            check(false, "the playing screen goes on being drawn after the paused one is redrawn (within 5 s)");
+            return;
+        }
+    }
+    check(redrawn == 4, "every change to the paused screen is owed and drawn");
+    reportUnless(allShared, "a paused screen redrawn beside a playing one shows the playing screen's picture", pictures);
+    reportUnless(noneOpened, "a paused screen redrawn beside a playing one opens no decoder",
+                 "opens per change: " + opened + "; open: " + describeFiles(g_files.live()));
+    const bool inTurn = jumps.empty();
+    reportUnless(compared >= 24 && inTurn,
+                 "the playing screen shows every picture in turn while the paused one is redrawn beside it",
+                 std::to_string(compared) + " compared; skipped: " + takeJumps());
+    std::printf("paused screen redrawn beside a playing one: %s\n", pictures.c_str());
+
+    // GOAL: S15.861 -- on resume the paused screen rejoins where the other is: the first round that draws
+    //       both draws the same picture on both, with no decoder opened.
+    // CONTROL: control_batch.sh 2026-10-18, phase pauseRejoin, both entries, reverted
+    //       (backend/daemon/wallpaper_manager.cpp): advanceSessionLocked's split sending a paused member away
+    //       keeping its picture, and videoSessionLocked() never joining a screen with a recorded position ->
+    //       this line, "38 beside 38; 1 open(s)". The first alone stays green: the resume joins back.
+    g_files.resetCounts();
+    manager.setMonitorPause(kPaused, "play");
+    std::optional<int> rejoinedAt;
+    const bool rejoined = rounds([&](const std::set<int>& s) {
+        if (s.count(kPlays) && s.count(kPaused)) rejoinedAt = counterOn(kPaused);
+        return rejoinedAt.has_value();
+    });
+    reportUnless(rejoined && rejoinedAt == lastPlays && g_files.opens(counterClip) == 0,
+                 "a paused screen resumed beside a playing one rejoins at the other's picture",
+                 (rejoined ? "drawn together: " + text(rejoinedAt) + " beside " + text(lastPlays) : std::string("not drawn together within 5 s")) +
+                     "; " + std::to_string(g_files.opens(counterClip)) + " open(s)");
+
+    // GOAL: S15.867 -- a screen split off by its speed and folded back when the speeds match jumps to the
+    //       other screen's picture, and the other screen's playback goes on without a jump.
+    // WHY-THIS-SHAPE: the split screen runs at twice the speed long enough to be well ahead, so a fold
+    //       into its session would show as a jump on the other screen.
+    // CONTROL: control_batch.sh 2026-10-18, phase pauseRejoin, both entries, reverted: mergeSharedSessionsLocked()'s
+    //       `keepFirst` (backend/daemon/wallpaper_manager.cpp) given `<` for `>=` -> "...without a jump".
+    manager.setWallpaperProperties(kPaused, {{"speed", 2.0}});
+    const bool split = rounds([&](const std::set<int>&) { return liveCount(counterClip) == 2; }) && showsOf(kPaused, 20);
+    const std::optional<int> ahead = counterOn(kPaused);
+    const std::optional<int> behind = lastPlays;
+    if (!split || !ahead || ahead == behind) {
+        check(false, "a screen set to twice the speed splits off and runs ahead of the other (the premise)");
+        std::fprintf(stderr, "  %s; %s against %s\n", split ? "split" : "not split within 5 s", text(ahead).c_str(),
+                     text(behind).c_str());
+        return;
+    }
+    takeJumps();
+    manager.setWallpaperProperties(kPaused, {{"speed", 1.0}});
+    std::optional<int> foldedAt;
+    const bool folded = rounds([&](const std::set<int>& s) {
+        if (liveCount(counterClip) == 1 && s.count(kPlays) && s.count(kPaused)) foldedAt = counterOn(kPaused);
+        return foldedAt.has_value();
+    });
+    reportUnless(folded && foldedAt == lastPlays, "a screen folded back after a speed change jumps to the other screen's picture",
+                 "ran ahead at " + text(ahead) + " against " + text(behind) + "; " +
+                     (folded ? "then " + text(foldedAt) + " beside " + text(lastPlays) : std::string("not folded within 5 s")));
+    std::printf("speed split and fold: ran ahead at %s against %s, folded at %s beside %s; the other's jumps: %s\n",
+                text(ahead).c_str(), text(behind).c_str(), text(foldedAt).c_str(), text(lastPlays).c_str(), jumps.c_str());
+    const bool noJump = jumps.empty();
+    reportUnless(folded && noJump, "and the other screen plays on through the fold without a jump",
+                 "skipped: " + takeJumps());
+
+    // GOAL: S15.865 -- with every screen on the file paused, a redraw keeps the screen's own picture.
+    // CONTROL: control_batch.sh 2026-10-18, phase pauseRejoin, both entries, reverted: renderPassLocked's
+    //       `if (!othersPlay)` (backend/daemon/wallpaper_manager.cpp) made `if (false)` -> this line.
+    manager.setMonitorPause(kPaused, "always_paused");
+    const std::optional<int> ownPicture = counterOn(kPaused);
+    const bool movedOn = showsOf(kPlays, 10);
+    manager.setMonitorPause(kPlays, "always_paused");
+    const std::optional<int> otherPicture = counterOn(kPlays);
+    lastPlays.reset();
+    if (!movedOn || !ownPicture || !otherPicture || ownPicture == otherPicture) {
+        check(false, "the other screen plays ten pictures on and is paused too (the premise)");
+        return;
+    }
+    manager.setOutputSize(screenOf(kPaused), 200, 150, owed);
+    const bool allPausedDrawn = owesRender(manager, kPaused) && manager.renderPending(kPaused).rendered;
+    const std::optional<int> kept = counterOn(kPaused);
+    reportUnless(allPausedDrawn && kept == ownPicture,
+                 "with every screen on the file paused, a redraw keeps the screen's own picture",
+                 "own " + text(ownPicture) + ", the other on " + text(otherPicture) + ", read " + text(kept) +
+                     (allPausedDrawn ? "" : "; not drawn"));
+
+    // GOAL: S15.868 -- a release records each screen's own picture: the screen resumed first reopens on
+    //       its own picture, not the other screen's. S15.866 -- the other, still paused and released, joins
+    //       the resumed screen's decoder when it is redrawn: no decoder opened, the resumed one's picture.
+    // WHY-THIS-SHAPE: the screen read for S15.868 is not the session's first, so a release that recorded
+    //       the first screen's picture for all would reopen it ten pictures off.
+    // CONTROL: control_batch.sh 2026-10-18, phase pauseRejoin, both entries, each alone, reverted
+    //       (backend/daemon/wallpaper_manager.cpp): releaseVideoSessionLocked() recording the first member's
+    //       picture for every member -> "...reopens on its own picture"; videoSessionLocked()'s join exception
+    //       for a screen with a picture of its own reduced to `keepsPicture && startAt` -> "...joins the
+    //       resumed screen's decoder".
+    const auto t1 = std::chrono::steady_clock::now();
+    manager.advanceVideo(t1);
+    manager.advanceVideo(t1 + config.pausedSessionRelease + std::chrono::milliseconds(500));
+    if (liveCount(counterClip) != 0) {
+        check(false, "both paused screens' decoder is released once the paused delay passes (the premise)");
+        return;
+    }
+    g_files.resetCounts();
+    manager.setMonitorPause(kPaused, "play");
+    // The first picture drawn after the resume, by a render pass or a clock round, whichever comes first.
+    std::optional<int> reopenedAt;
+    const bool reopenDrawn = clockRoundsUntil(manager, 0, [&](const std::set<int>& shown) {
+        if (owesRender(manager, kPaused) && manager.renderPending(kPaused).rendered) {
+            reopenedAt = counterOn(kPaused);
+            return true;
+        }
+        if (shown.count(kPaused)) reopenedAt = counterOn(kPaused);
+        return shown.count(kPaused) > 0;
+    });
+    reportUnless(reopenedAt && withinOne(reopenedAt, ownPicture) && g_files.opens(counterClip) == 1,
+                 "a screen resumed after its shared decoder's release reopens on its own picture",
+                 "own " + text(ownPicture) + ", the other's " + text(otherPicture) + "; reopened on " +
+                     (reopenedAt ? text(reopenedAt) : reopenDrawn ? "nothing readable (" + reason + ")" : std::string("nothing within 5 s")) +
+                     ", " + std::to_string(g_files.opens(counterClip)) + " open(s)");
+    if (!reopenedAt || !showsOf(kPaused, 3)) {
+        check(false, "the resumed screen plays on from its reopened decoder (the premise)");
+        return;
+    }
+    const int opensBefore = g_files.opens(counterClip);
+    manager.setOutputSize(screenOf(kPlays), 200, 150, owed);
+    const bool joinDrawn = owesRender(manager, kPlays) && manager.renderPending(kPlays).rendered;
+    const int joinOpens = g_files.opens(counterClip) - opensBefore;
+    const std::optional<int> joinedAt = counterOn(kPlays);
+    const std::optional<int> resumedAt = counterOn(kPaused);
+    reportUnless(joinDrawn && joinOpens == 0 && liveCount(counterClip) == 1 && withinOne(joinedAt, resumedAt),
+                 "a paused screen whose decoder was released joins the resumed screen's decoder when redrawn",
+                 std::string(joinDrawn ? "drawn" : "not drawn") + ", " + std::to_string(joinOpens) + " open(s), showing " +
+                     text(joinedAt) + " beside " + text(resumedAt) + "; open: " + describeFiles(g_files.live()));
+
+    // Every render the manager says is owed, for both screens, as the worker would post and run it.
+    std::string owedRun;
+    const auto runOwed = [&] {
+        for (int id = 0; id < kMonitors; ++id) {
+            if (!owesRender(manager, id)) continue;
+            manager.renderPending(id);
+            owedRun += (owedRun.empty() ? "" : ", ") + std::to_string(id);
+        }
+    };
+    if (!joinDrawn || joinOpens != 0 || !showsOf(kPaused, 3)) {
+        check(false, "kPlays, paused, shares the playing screen's decoder before the speed-change cases (the premise)");
+        return;
+    }
+
+    // GOAL: S15.880 -- a paused screen sharing a decoder whose speed is changed opens no decoder over the
+    //       following clock rounds while it stays paused, and keeps its picture.
+    // WHY-THIS-SHAPE: driven as the daemon runs: after the change and after every round, every render the
+    //       manager reports owed for either screen is run, so a redraw the change or the split posts is not
+    //       skipped by a test that renders only the playing screen. Ten rounds showing the playing screen. The
+    //       layout is passed again with the speed: properties are replaced whole, and a dropped layout owes a
+    //       redraw by design (which takes the playing screen's picture, S15.862).
+    // CONTROL: control_batch.sh 2026-10-18, phase pauseRejoin, both entries, reverted: reopenVideosLocked()
+    //       (backend/daemon/wallpaper_manager.cpp) owing a render to every video screen with no session
+    //       (`bool owed = playingSeqLocked(...).has_value();` made `bool owed = true;`) -> this line.
+    {
+        const std::optional<int> pausedOn = counterOn(kPlays);
+        g_files.resetCounts();
+        owedRun.clear();
+        manager.setWallpaperProperties(kPlays, {{"position", PositionMode::Stretch}, {"speed", 2.0}});
+        runOwed();
+        int playsShown = 0;
+        const bool ranOn = rounds([&](const std::set<int>& s) {
+            runOwed();
+            return (playsShown += static_cast<int>(s.count(kPaused))) >= 10;
+        });
+        const std::optional<int> after = counterOn(kPlays);
+        if (!ranOn || !pausedOn) {
+            check(false, "the playing screen shows ten pictures after the paused one's speed change (the premise)");
+            return;
+        }
+        reportUnless(g_files.opens(counterClip) == 0 && after == pausedOn,
+                     "a paused screen whose shared decoder's speed is changed opens no decoder and keeps its picture",
+                     std::to_string(g_files.opens(counterClip)) + " open(s); paused on " + text(pausedOn) + ", read " +
+                         text(after) + "; renders run for: " + (owedRun.empty() ? "none" : owedRun));
+    }
+
+    // GOAL: S15.862 under a pending speed change -- a paused screen redrawn beside a playing one, after its
+    //       speed was changed and before any clock round split it off, opens no decoder.
+    // WHY-THIS-SHAPE: the one case where renderPassLocked()'s "stay in the session" branch is alone: leaving and
+    //       rejoining (the join exception for a screen with a picture to keep) cannot rejoin a session at
+    //       another speed, so only staying avoids the open. S15.862's own redraws are at one speed, where the
+    //       rejoin covers a broken stay; S15.866's line above is the join exception's own.
+    // CONTROL: control_batch.sh 2026-10-18, phase pauseRejoin, both entries, reverted: renderPassLocked()'s
+    //       `if (!othersPlay)` (backend/daemon/wallpaper_manager.cpp) made `if (true)`, alone -> this line.
+    {
+        manager.setWallpaperProperties(kPlays, {{"position", PositionMode::Stretch}, {"speed", 1.0}});
+        manager.setOutputSize(screenOf(kPlays), 160, 120, owed);
+        const bool rejoinedDrawn = owesRender(manager, kPlays) && manager.renderPending(kPlays).rendered;
+        if (!rejoinedDrawn || liveCount(counterClip) != 1 || !showsOf(kPaused, 3)) {
+            check(false, "the paused screen at speed 1 rejoins the playing one's decoder when redrawn (the premise)");
+            return;
+        }
+        const int before = g_files.opens(counterClip);
+        manager.setWallpaperProperties(kPlays, {{"position", PositionMode::Stretch}, {"speed", 2.0}});
+        manager.setOutputSize(screenOf(kPlays), 200, 150, owed);
+        const bool drawn = owesRender(manager, kPlays) && manager.renderPending(kPlays).rendered;
+        const int opens = g_files.opens(counterClip) - before;
+        reportUnless(drawn && opens == 0,
+                     "a paused screen redrawn beside a playing one after a speed change opens no decoder",
+                     std::string(drawn ? "drawn" : "not drawn") + ", " + std::to_string(opens) + " open(s); open: " +
+                         describeFiles(g_files.live()));
+    }
+}
+
+// S15.820-S15.824: screens showing one file at one speed share one decoder. Every pass and clock round
+// runs on this thread with no worker, so the file ledger counts only what this function drove.
+void runDecodeOnceChecks(const WallpaperManager::Config& base, const std::string& clip, const std::string& onePicture) {
+    using wallpaperx::PositionMode;
+    const char* kGoals = "S15.820-S15.824 (screens on one file share one decoder)";
+    PhaseGrade grade("the decode-once phase");
+    WallpaperManager::Config config = base;
+    config.unwatchedAfter = std::chrono::hours(1);  // plays with no consumer for the whole phase
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    const auto copyOf = [](const std::string& from, const char* name) {
+        const std::string path = testAssetDir() + "/" + name;
+        std::filesystem::copy_file(from, path, std::filesystem::copy_options::overwrite_existing);
+        g_files.watch(path);
+        return path;
+    };
+    const std::string shared = copyOf(clip, "decode_once_shared.mp4");
+    const std::string speeds = copyOf(clip, "decode_once_speeds.mp4");
+    const std::string failing = copyOf(clip, "decode_once_failing.mp4");
+    const std::string rewritten = copyOf(clip, "decode_once_rewritten.mp4");
+    static constexpr int kCover = 0, kFit = 1, kThird = 2, kSlow = 3, kFast = 4, kFailA = 5, kFailB = 6, kOld = 7, kNew = 8;
+    for (int id = kCover; id <= kNew; ++id) wallpaperx::testing::nameScreen(manager, id, screenOf(id));
+
+    const auto roundsUntil = [&manager](const std::function<bool(const std::set<int>&)>& done) {
+        return clockRoundsUntil(manager, kNew + 1, done);
+    };
+    const auto live = [](const std::string& path) { return liveCount(path); };
+
+    manager.requestWallpaper("video", shared, kCover);
+    const PassCost first = renderCounted(manager, kCover);
+    if (!first.outcome.rendered) {
+        grade.expectNoDevice();
+        notVerified(kGoals, "the first video render on this host produced no frame");
+        return;
+    }
+    reportUnless(first.opens == 1 && first.decodes > 0,
+                 "a first screen on a file opens it and decodes a picture (the counters work)", describe(first));
+
+    // GOAL: S15.820 -- a second and a third screen given the same unchanged file at the same speed open no
+    //       file: one decoder serves all three, and each screen is drawn with its own placement.
+    // WHY-THIS-SHAPE: opens are counted per pass on the only thread running passes, so a join cannot be
+    //       confused with a decoder a clock round opened. Placement is read after a round that drew all
+    //       three, so it grades the shared clock's per-screen blit, not the render pass's own draw.
+    // CONTROL: control_batch.sh 2026-10-18, phase decodeOnce, both entries, reverted: videoSessionLocked()'s join
+    //       loop (backend/daemon/wallpaper_manager.cpp) given `continue` for every session -> "...open nothing:
+    //       they join its decoder"; advanceSessionLocked's `placement(it->second.properties)` made the first
+    //       member's placement -> "...the Fit screen's picture from the shared decoder is fitted".
+    manager.requestWallpaper("video", shared, kFit, {{"position", PositionMode::Fit}});
+    const PassCost fit = renderCounted(manager, kFit);
+    manager.requestWallpaper("video", shared, kThird);
+    const PassCost third = renderCounted(manager, kThird);
+    reportUnless(fit.outcome.rendered && third.outcome.rendered && fit.opens == 0 && third.opens == 0,
+                 "a second and a third screen on the same file open nothing: they join its decoder",
+                 describe(fit) + "; " + describe(third));
+    reportUnless(live(shared) == 1, "three screens on one file hold one open decoder",
+                 "open: " + describeFiles(g_files.live()));
+    const bool allThree = roundsUntil([](const std::set<int>& s) { return s.count(kCover) && s.count(kFit) && s.count(kThird); });
+    check(allThree, "one clock round draws the shared picture on all three screens within 5 s");
+    if (allThree) {
+        std::string reason;
+        const std::optional<bool> coverBlack = leftEdgeBlack(manager, kCover, reason);
+        const std::optional<bool> fitBlack = leftEdgeBlack(manager, kFit, reason);
+        reportUnless(coverBlack.has_value() && !*coverBlack,
+                     "the Cover screen's picture from the shared decoder is cover-cropped (no black edge)",
+                     coverBlack ? "the left edge is black" : "unreadable: " + reason);
+        reportUnless(fitBlack.value_or(false), "the Fit screen's picture from the shared decoder is fitted (black edge)",
+                     fitBlack ? "the left edge is not black" : "unreadable: " + reason);
+        reportUnless(g_files.opens(shared) == 0, "and the shared clock opened no second decoder for them",
+                     std::to_string(g_files.opens(shared)) + " open(s)");
+    }
+
+    // GOAL: S15.822 -- one screen set to another speed is split onto a decoder of its own, and when the
+    //       speeds match again the two fold back into one decoder showing one picture on both screens.
+    // WHY-THIS-SHAPE: both waits have a deadline that fails the check; the fold is read off the open
+    //       set and a round drawing both screens, since the position a fold jumps to has no reader here.
+    // CONTROL: control_batch.sh 2026-10-18, phase decodeOnce, both entries, reverted (backend/daemon/wallpaper_manager.cpp):
+    //       advanceSessionLocked's split `if (speedOf(member) == speed) return false;` made `return false;`
+    //       -> "...split onto a decoder of its own"; mergeSharedSessionsLocked() clearing `standing` before
+    //       its pairing loop -> "...fold back into one decoder" (re-run 2026-10-18, T2, both entries).
+    manager.requestWallpaper("video", speeds, kSlow);
+    const PassCost slow = renderCounted(manager, kSlow);
+    manager.requestWallpaper("video", speeds, kFast);
+    const PassCost fast = renderCounted(manager, kFast);
+    if (!slow.outcome.rendered || !fast.outcome.rendered || slow.opens != 1 || fast.opens != 0) {
+        check(false, ("two screens on a second file share its decoder before a speed change -- " + describe(slow) +
+                      "; " + describe(fast)).c_str());
+    } else {
+        g_files.resetCounts();
+        manager.setWallpaperProperties(kFast, {{"speed", 2.0}});
+        const bool split = roundsUntil([&](const std::set<int>& s) { return live(speeds) == 2 && s.count(kFast); });
+        reportUnless(split, "a screen set to another speed is split onto a decoder of its own and drawn from it",
+                     "open: " + describeFiles(g_files.live()));
+        if (split) {
+            manager.setWallpaperProperties(kFast, {{"speed", 1.0}});
+            const bool folded = roundsUntil(
+                [&](const std::set<int>& s) { return live(speeds) == 1 && s.count(kSlow) && s.count(kFast); });
+            reportUnless(folded, "when the speeds match again they fold back into one decoder drawing both screens",
+                         "open: " + describeFiles(g_files.live()));
+        }
+    }
+
+    // GOAL: S15.823 -- a decoder failure in a shared session closes it and is recorded on every screen
+    //       playing from it, not only the screen it is blamed on.
+    // CONTROL: control_batch.sh 2026-10-18 (T3), phase decodeOnce, both entries, reverted: advanceSessionLocked's
+    //       `failing` set (backend/daemon/wallpaper_manager.cpp) taking only the first screen hit, `if (hit &&
+    //       failing.none())` -> "FAIL: a shared decoder's failure is recorded on every screen showing it".
+    manager.requestWallpaper("video", failing, kFailA);
+    const PassCost failA = renderCounted(manager, kFailA);
+    manager.requestWallpaper("video", failing, kFailB);
+    const PassCost failB = renderCounted(manager, kFailB);
+    if (!failA.outcome.rendered || !failB.outcome.rendered || failB.opens != 0) {
+        check(false, ("two screens on a third file share its decoder before it fails -- " + describe(failA) + "; " +
+                      describe(failB)).c_str());
+    } else {
+        const auto errorOf = [&manager](int id) {
+            const std::optional<wallpaperx::MonitorStatus> status = monitorStatus(manager, id);
+            return status ? status->lastError : std::string();
+        };
+        g_playbackFailure.arm();
+        const bool failed = roundsUntil([&](const std::set<int>&) { return !errorOf(kFailA).empty() || !errorOf(kFailB).empty(); });
+        g_playbackFailure.disarm();
+        check(failed, "a failure injected into the shared decoder is recorded within 5 s");
+        if (failed) {
+            reportUnless(!errorOf(kFailA).empty() && !errorOf(kFailB).empty(),
+                         "a shared decoder's failure is recorded on every screen showing it",
+                         "first: '" + errorOf(kFailA).substr(0, 80) + "', second: '" + errorOf(kFailB).substr(0, 80) + "'");
+        }
+    }
+
+    // GOAL: S15.821 -- a screen given a path whose file was rewritten in place after another screen
+    //       opened it is not joined to that decoder: it opens its own.
+    // WHY-THIS-SHAPE: last in the phase, since the first screen's decoder now reads bytes that changed
+    //       under it and no round may run it again.
+    // CONTROL: control_batch.sh 2026-10-18, phase decodeOnce, both entries, reverted: `|| session.file != file`
+    //       deleted from videoSessionLocked()'s join test (backend/daemon/wallpaper_manager.cpp) ->
+    //       "...rewritten in place ... opens a decoder of its own".
+    manager.requestWallpaper("video", rewritten, kOld);
+    const PassCost old = renderCounted(manager, kOld);
+    if (!old.outcome.rendered || old.opens != 1) {
+        check(false, ("a screen opens the file that is then rewritten -- " + describe(old)).c_str());
+        return;
+    }
+    std::filesystem::copy_file(onePicture, rewritten, std::filesystem::copy_options::overwrite_existing);
+    manager.requestWallpaper("video", rewritten, kNew);
+    const PassCost fresh = renderCounted(manager, kNew);
+    reportUnless(fresh.outcome.rendered && fresh.opens == 1 && live(rewritten) == 2,
+                 "a screen given a file rewritten in place since another screen opened it opens a decoder of its own",
+                 describe(fresh) + "; open: " + describeFiles(g_files.live()));
+}
+
+// Two screens on one copy of the counter file, sharing its decoder, each manager its own. Every pass
+// and clock round runs on this thread with no worker. Monitor 0 opens the file, so it is the
+// session's first screen.
+class SharedCounterRig {
+public:
+    static constexpr int kFirst = 0, kSecond = 1, kMonitors = 2;
+
+    SharedCounterRig(const WallpaperManager::Config& config, const std::string& path, const CounterOrder& order)
+        : manager(config), path(path), m_order(order) {
+        std::vector<int> owed;
+        for (int id = 0; id < kMonitors; ++id) {
+            wallpaperx::testing::nameScreen(manager, id, screenOf(id));
+            manager.setOutputSize(screenOf(id), 160, 120, owed);
+        }
+    }
+
+    // False, having said why, unless the second screen joined the first's decoder and both are drawn.
+    bool share(const char* what) {
+        using wallpaperx::PositionMode;
+        manager.requestWallpaper("video", path, kFirst, {{"position", PositionMode::Stretch}});
+        const PassCost first = renderCounted(manager, kFirst);
+        manager.requestWallpaper("video", path, kSecond, {{"position", PositionMode::Stretch}});
+        const PassCost second = renderCounted(manager, kSecond);
+        int together = 0;
+        const bool drawn = rounds([&](const std::set<int>& s) { return (together += s.count(kFirst) && s.count(kSecond)) >= 3; });
+        if (first.outcome.rendered && first.opens == 1 && second.outcome.rendered && second.opens == 0 && drawn) return true;
+        check(false, (std::string(what) + ": two screens on the counter file share its decoder and are drawn together "
+                                          "(the premise) -- " + describe(first) + "; " + describe(second) +
+                      (drawn ? "" : "; not drawn together within 5 s")).c_str());
+        return false;
+    }
+
+    std::optional<int> counter(int id) { return servedCounter(manager, id, m_reason); }
+    std::string error(int id) const {
+        const std::optional<wallpaperx::MonitorStatus> status = monitorStatus(manager, id);
+        return status ? status->lastError : std::string();
+    }
+    bool rounds(const std::function<bool(const std::set<int>&)>& done) { return clockRoundsUntil(manager, kMonitors, done); }
+    bool showsOf(int id, int count) {
+        int seen = 0;
+        return rounds([&](const std::set<int>& s) { return (seen += static_cast<int>(s.count(id))) >= count; });
+    }
+    // The first picture `id` is drawn with by the rounds from here, its render passes included.
+    std::optional<int> firstShown(int id) {
+        std::optional<int> first;
+        rounds([&](const std::set<int>& s) {
+            if (s.count(id)) first = counter(id);
+            return s.count(id) > 0;
+        });
+        return first;
+    }
+    // `a` is `b` or the picture after it.
+    bool withinOne(std::optional<int> a, std::optional<int> b) const { return a && b && (*a == *b || m_order.after(*b) == *a); }
+    static std::string text(std::optional<int> n) { return n ? std::to_string(*n) : std::string("unreadable"); }
+
+    WallpaperManager manager;
+    const std::string path;
+
+private:
+    const CounterOrder& m_order;
+    std::string m_reason;
+};
+
+// S15.869-S15.871: a failure that breaks a shared decoder costs only the screens it is about.
+void runSharedFailureChecks(const WallpaperManager::Config& base, const std::string& still) {
+    using wallpaperx::PositionMode;
+    const char* kGoals = "S15.869-S15.871 (a shared decoder's failure costs only the screens it is about)";
+    const std::string counterClip = counterClipPath();
+    if (!std::filesystem::exists(counterClip)) {
+        notVerified(kGoals, "the counter fixture " + counterClip + " was not built");
+        return;
+    }
+    const std::optional<CounterOrder> order = counterOrder(counterClip, kGoals);
+    if (!order) return;
+    WallpaperManager::Config config = base;
+    config.unwatchedAfter = std::chrono::hours(1);
+    config.idleSessionRelease = std::chrono::seconds(60);
+    config.pausedSessionRelease = std::chrono::seconds(60);
+    constexpr int kA = SharedCounterRig::kFirst, kB = SharedCounterRig::kSecond;
+
+    // GOAL: S15.869 -- a render pass on a paused screen whose draw fails for a reason that is not a GPU
+    //       fault breaks the shared decoder; the playing screen keeps its picture, records no error, and
+    //       resumes from its OWN picture, not the failing screen's (ten pictures back) nor the start.
+    // WHY-THIS-SHAPE: the failing screen is paused so the two positions differ; a failure on two screens
+    //       at one picture could not tell "its own" from "the failing screen's". The failure is the draw's
+    //       submit, so the session is closed for everyone (the premise reads no file left open).
+    // CONTROL: control_batch.sh 2026-10-18, phase sharedFailure, both entries, each reverted, in
+    //       closeFailedVideoSessionLocked() (backend/daemon/wallpaper_manager.cpp): the others' `releasedAt`
+    //       not recorded -> "...the playing screen resumes from its own picture"; `if (failure.gpuFault)` made
+    //       `if (true)` -> "...leaves the playing screen its picture and no error".
+    {
+        PhaseGrade grade("the shared-failure phase (a failed render pass)");
+        SharedCounterRig rig(config, watchedCopy(counterClip, "shared_failure_pass.mp4"), *order);
+        CaptureGradeOnExit captureGrade{grade, rig.manager};
+        if (!rig.share("S15.869")) {
+            if (!rig.counter(kA)) grade.expectNoDevice();
+            return;
+        }
+        rig.manager.setMonitorPause(kB, "always_paused");
+        const std::optional<int> frozen = rig.counter(kB);
+        const bool ranOn = rig.showsOf(kA, 10);
+        const std::optional<int> lastA = rig.counter(kA);
+        g_submitFailGate.arm(CallGate::Mode::Fail);
+        rig.manager.setWallpaperProperties(kB, {{"position", PositionMode::Fit}});
+        const bool owed = owesRender(rig.manager, kB);
+        const bool drawn = rig.manager.renderPending(kB).rendered;
+        const bool fired = g_submitFailGate.waitFired(std::chrono::seconds(0));
+        g_submitFailGate.release();
+        if (!ranOn || !frozen || !lastA || frozen == lastA || !owed || drawn || !fired || liveCount(rig.path) != 0) {
+            check(false, ("S15.869: the paused screen's pass fails at its draw and closes the shared decoder (the premise) "
+                          "-- paused on " + SharedCounterRig::text(frozen) + ", the other on " + SharedCounterRig::text(lastA) +
+                          (owed ? "" : "; not owed") + (drawn ? "; drawn" : "") + (fired ? "" : "; the failure never fired") +
+                          "; open: " + describeFiles(g_files.live())).c_str());
+        } else {
+            const std::string errorA = rig.error(kA);
+            const std::optional<int> keptA = rig.counter(kA);
+            reportUnless(errorA.empty() && keptA == lastA,
+                         "another screen's failed render pass leaves the playing screen its picture and no error",
+                         "error '" + errorA.substr(0, 80) + "', showing " + SharedCounterRig::text(keptA) + " where it had " +
+                             SharedCounterRig::text(lastA));
+            g_files.resetCounts();
+            const std::optional<int> resumedA = rig.firstShown(kA);
+            reportUnless(rig.withinOne(resumedA, lastA),
+                         "after another screen's failed render pass, the playing screen resumes from its own picture",
+                         "its own " + SharedCounterRig::text(lastA) + ", the failing screen's " + SharedCounterRig::text(frozen) +
+                             ", resumed on " + SharedCounterRig::text(resumedA) + ", " +
+                             std::to_string(g_files.opens(rig.path)) + " open(s)");
+        }
+    }
+
+    // GOAL: S15.870 -- a decode failure in the clock round fails the playing screen only: the paused
+    //       screen sharing the decoder keeps its picture, records no error, and resumes from its own.
+    // WHY-THIS-SHAPE: the rounds that meet the failure are bare advanceVideo() calls, so no render pass
+    //       reopens anything before the paused screen is read; the playing screen is then given a still,
+    //       so the resumed one has no decoder to join and opens at whatever position was recorded for it.
+    // CONTROL: control_batch.sh 2026-10-18, phase sharedFailure, both entries, each reverted
+    //       (backend/daemon/wallpaper_manager.cpp): advanceSessionLocked()'s `hit` made true for every screen
+    //       -> "...the paused screen keeps its picture and records no error"; closeFailedVideoSessionLocked()
+    //       not recording the others' `releasedAt` -> "...plays on from its own picture".
+    {
+        PhaseGrade grade("the shared-failure phase (a paused screen through a decode failure)");
+        SharedCounterRig rig(config, watchedCopy(counterClip, "shared_failure_paused.mp4"), *order);
+        CaptureGradeOnExit captureGrade{grade, rig.manager};
+        if (!rig.share("S15.870")) return;
+        rig.manager.setMonitorPause(kB, "always_paused");
+        const std::optional<int> frozen = rig.counter(kB);
+        const bool ranOn = rig.showsOf(kA, 10);
+        const int injectedBefore = g_playbackFailure.injected();
+        g_playbackFailure.arm(std::numeric_limits<int>::max(), 1);
+        bool failed = false;
+        for (const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+             !failed && std::chrono::steady_clock::now() < deadline;) {
+            rig.manager.advanceVideo(std::chrono::steady_clock::now());
+            failed = !rig.error(kA).empty();
+            if (!failed) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        g_playbackFailure.disarm();
+        if (!ranOn || !frozen || !failed || g_playbackFailure.injected() != injectedBefore + 1) {
+            check(false, ("S15.870: one injected decode failure fails the playing screen within 5 s (the premise) -- "
+                          "paused on " + SharedCounterRig::text(frozen) + (failed ? "" : "; no failure recorded")).c_str());
+        } else {
+            const std::string errorB = rig.error(kB);
+            const std::optional<int> keptB = rig.counter(kB);
+            reportUnless(errorB.empty() && keptB == frozen,
+                         "after a shared decoder fails in the clock round, the paused screen keeps its picture and records "
+                         "no error",
+                         "error '" + errorB.substr(0, 80) + "', showing " + SharedCounterRig::text(keptB) + " where it had " +
+                             SharedCounterRig::text(frozen));
+            rig.manager.requestWallpaper("static", still, kA);
+            const bool stillDrawn = rig.manager.renderPending(kA).rendered;
+            rig.manager.setMonitorPause(kB, "play");
+            g_files.resetCounts();
+            const std::optional<int> resumedB = rig.firstShown(kB);
+            check(stillDrawn, "S15.870: the failed screen draws the still it is given");
+            reportUnless(rig.withinOne(resumedB, frozen) && g_files.opens(rig.path) == 1,
+                         "the paused screen resumed after the shared decoder failed plays on from its own picture",
+                         "paused on " + SharedCounterRig::text(frozen) + ", resumed on " + SharedCounterRig::text(resumedB) +
+                             ", " + std::to_string(g_files.opens(rig.path)) + " open(s)");
+        }
+    }
+
+    // GOAL: S15.871 -- a clock round whose second screen's draw fails (not a GPU fault) leaves the first
+    //       screen, already drawn that round, with that round's picture and no error, and it resumes from it.
+    // WHY-THIS-SHAPE: the failing round must be one that draws and decodes nothing else, so that the one
+    //       submission let through is the first screen's draw: rounds run until one decodes and converts the
+    //       next picture without drawing it, and the next is run when that picture is due. The premise reads
+    //       only the second screen failed; the first being announced is part of what is graded.
+    // CONTROL: control_batch.sh 2026-10-18, phase sharedFailure, both entries, each reverted
+    //       (backend/daemon/wallpaper_manager.cpp): advanceSessionLocked()'s `drawing ? screen.monitorId ==
+    //       *drawing` made `drawing ? true` -> "...the screen drawn before it keeps that round's picture and no
+    //       error"; closeFailedVideoSessionLocked() not recording the others' `releasedAt` -> "and it resumes
+    //       from that round's picture".
+    {
+        PhaseGrade grade("the shared-failure phase (a later screen's draw)");
+        SharedCounterRig rig(config, watchedCopy(counterClip, "shared_failure_draw.mp4"), *order);
+        CaptureGradeOnExit captureGrade{grade, rig.manager};
+        if (!rig.share("S15.871")) return;
+        std::optional<std::chrono::steady_clock::time_point> due;
+        for (const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+             !due && std::chrono::steady_clock::now() < deadline;) {
+            const auto now = std::chrono::steady_clock::now();
+            const wallpaperx::ClockRound round = rig.manager.advanceVideo(now);
+            if (round.shown.empty() && round.nextDue && *round.nextDue > now) {
+                due = round.nextDue;
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
+        const std::optional<int> before = rig.counter(kA);
+        std::set<int> shown;
+        if (due) {
+            std::this_thread::sleep_until(*due);
+            g_submitFailAfter.store(1);
+            for (const auto& s : rig.manager.advanceVideo(std::chrono::steady_clock::now()).shown) shown.insert(s.monitorId);
+        }
+        const bool fired = g_submitFailAfter.exchange(-1) == -1;
+        // Whether the first screen's picture was announced is graded below, not here: a round that fails
+        // every screen withdraws it, which is the defect, not a premise gone wrong.
+        if (!due || !before || !fired || shown.count(kB) || rig.error(kB).empty()) {
+            check(false, ("S15.871: a round fails the second screen's draw (the premise) -- " +
+                          std::string(due ? "" : "no waiting round within 5 s; ") + (fired ? "" : "the failure never fired; ") +
+                          "second " + (shown.count(kB) ? "shown" : "not shown") +
+                          (rig.error(kB).empty() ? ", no error on it" : "")).c_str());
+        } else {
+            const std::string errorA = rig.error(kA);
+            const std::optional<int> drawnA = rig.counter(kA);
+            reportUnless(errorA.empty() && shown.count(kA) && drawnA && *drawnA == order->after(*before),
+                         "when a later screen's draw fails in a clock round, the screen drawn before it keeps that round's "
+                         "picture and no error",
+                         "error '" + errorA.substr(0, 80) + "', " + (shown.count(kA) ? "announced" : "not announced") +
+                             ", showing " + SharedCounterRig::text(drawnA) + " after " + SharedCounterRig::text(before));
+            const std::optional<int> resumedA = rig.firstShown(kA);
+            reportUnless(rig.withinOne(resumedA, drawnA), "and it resumes from that round's picture",
+                         "drawn " + SharedCounterRig::text(drawnA) + ", resumed on " + SharedCounterRig::text(resumedA));
+        }
+    }
+}
+
+// S15.872, S15.873, S15.878, S15.879: which screens share a decoder around a speed change, and when two
+// sessions on one file fold together.
+void runSharedSpeedChecks(const WallpaperManager::Config& base) {
+    const char* kGoals = "S15.872-S15.879 (sharing a decoder around stopped screens and speed changes)";
+    const std::string counterClip = counterClipPath();
+    if (!std::filesystem::exists(counterClip)) {
+        notVerified(kGoals, "the counter fixture " + counterClip + " was not built");
+        return;
+    }
+    const std::optional<CounterOrder> order = counterOrder(counterClip, kGoals);
+    if (!order) return;
+    WallpaperManager::Config config = base;
+    config.unwatchedAfter = std::chrono::hours(1);
+    config.idleSessionRelease = std::chrono::seconds(60);
+    config.pausedSessionRelease = std::chrono::seconds(60);
+    constexpr int kA = SharedCounterRig::kFirst, kB = SharedCounterRig::kSecond;
+
+    {
+        PhaseGrade grade("the shared-speed phase (stopped sessions, then a speed change)");
+        SharedCounterRig rig(config, watchedCopy(counterClip, "shared_speed_stopped.mp4"), *order);
+        CaptureGradeOnExit captureGrade{grade, rig.manager};
+        if (!rig.share("S15.872")) {
+            if (!rig.counter(kA)) grade.expectNoDevice();
+            return;
+        }
+        rig.manager.setMonitorPause(kB, "always_paused");
+        const bool ranOn = rig.showsOf(kA, 10);
+        rig.manager.setMonitorPause(kA, "always_paused");
+        std::vector<int> owed;
+        rig.manager.setOutputSize(screenOf(kB), 200, 150, owed);
+        const PassCost apart = renderCounted(rig.manager, kB);
+        if (!ranOn || !apart.outcome.rendered || apart.opens != 1 || liveCount(rig.path) != 2) {
+            check(false, ("S15.872: with both screens paused, the one redrawn reopens at its own picture, so two "
+                          "sessions hold the file (the premise) -- " + describe(apart) + "; open: " +
+                          describeFiles(g_files.live())).c_str());
+            return;
+        }
+
+        // GOAL: S15.872 -- two sessions on one file whose screens are all stopped are not folded into one.
+        // CONTROL: control_batch.sh 2026-10-18, phase sharedSpeed, both entries, reverted:
+        //       mergeSharedSessionsLocked()'s `if (!standing[a].second.moves && !standing[b].second.moves)
+        //       continue;` (backend/daemon/wallpaper_manager.cpp) deleted -> this line.
+        g_files.resetCounts();
+        size_t fewest = 2;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 5; ++i) {
+            rig.manager.advanceVideo(t0 + i * std::chrono::milliseconds(200));
+            fewest = std::min(fewest, static_cast<size_t>(liveCount(rig.path)));
+        }
+        reportUnless(fewest == 2 && g_files.closes(rig.path) == 0,
+                     "two sessions on one file whose screens are all stopped are not merged",
+                     "fewest open across five rounds: " + std::to_string(fewest) + ", " +
+                         std::to_string(g_files.closes(rig.path)) + " close(s)");
+
+        // GOAL: S15.879 -- a session whose screen now asks for another speed is not folded into a session
+        //       at its cached speed before its own round retimes it: the changed screen plays on in its own
+        //       session, never sent out and reopened.
+        // WHY-THIS-SHAPE: the speed is changed and play resumed with no round between, so the next round's
+        //       merge, which runs before any session's own round, sees the cached speed (1) equal to the
+        //       other session's while the live one (2) differs.
+        // CONTROL: control_batch.sh 2026-10-18, phase sharedSpeed, both entries, reverted:
+        //       mergeSharedSessionsLocked()'s `if (!speedSettledLocked(session)) continue;`
+        //       (backend/daemon/wallpaper_manager.cpp) deleted -> this line.
+        g_files.resetCounts();
+        rig.manager.setWallpaperProperties(kA, {{"speed", 2.0}});
+        rig.manager.setMonitorPause(kA, "play");
+        fewest = 2;
+        int shownA = 0;
+        const bool played = rig.rounds([&](const std::set<int>& s) {
+            fewest = std::min(fewest, static_cast<size_t>(liveCount(rig.path)));
+            return (shownA += static_cast<int>(s.count(kA))) >= 10;
+        });
+        reportUnless(played && fewest == 2 && g_files.opens(rig.path) == 0,
+                     "a session whose screen just changed speed is not merged before its own round retimes it, and that "
+                     "screen plays on without a reopen",
+                     std::string(played ? "" : "not shown ten times within 5 s; ") + "fewest open " +
+                         std::to_string(fewest) + ", " + std::to_string(g_files.opens(rig.path)) + " open(s)");
+    }
+
+    // GOAL: S15.873 -- a speed change on the paused FIRST screen of a shared session sends only that screen
+    //       out: the other plays on in the same session, no file opened.
+    // WHY-THIS-SHAPE: the changed screen is the session's first, so a session that took its speed from its
+    //       first screen would retime and send the playing one out to reopen. Only the playing screen's
+    //       renders are run, so every open counted is one that screen made.
+    // CONTROL: control_batch.sh 2026-10-18, phase sharedSpeed, both entries, reverted: advanceSessionLocked()'s
+    //       speed choice (backend/daemon/wallpaper_manager.cpp) replaced by `session.speed =
+    //       speedOf(session.members.front());` -> this line.
+    {
+        PhaseGrade grade("the shared-speed phase (a paused first screen's speed)");
+        SharedCounterRig rig(config, watchedCopy(counterClip, "shared_speed_paused_first.mp4"), *order);
+        CaptureGradeOnExit captureGrade{grade, rig.manager};
+        if (!rig.share("S15.873")) return;
+        rig.manager.setMonitorPause(kA, "always_paused");
+        rig.manager.setWallpaperProperties(kA, {{"speed", 2.0}});
+        g_files.resetCounts();
+        // Only the playing screen's renders run: the changed one may owe a redraw, which would reopen it
+        // at its own picture -- an open that is not the one this check is about.
+        int shownB = 0;
+        bool playsOn = false;
+        for (const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+             !playsOn && std::chrono::steady_clock::now() < deadline;) {
+            for (const auto& s : rig.manager.advanceVideo(std::chrono::steady_clock::now()).shown) shownB += s.monitorId == kB;
+            if (owesRender(rig.manager, kB)) rig.manager.renderPending(kB);
+            playsOn = shownB >= 10;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        reportUnless(playsOn && g_files.opens(rig.path) == 0 && liveCount(rig.path) == 1,
+                     "a speed change on a paused first screen sends only it out; the other plays on without a reopen",
+                     std::string(playsOn ? "" : "not shown ten times within 5 s; ") +
+                         std::to_string(g_files.opens(rig.path)) + " open(s); open: " + describeFiles(g_files.live()));
+    }
+
+    // GOAL: S15.878 -- a screen at the old speed does not join a session whose screen just asked for a new
+    //       one before that session's round: it opens its own, and the changed screen is neither sent out
+    //       nor reopened.
+    // CONTROL: control_batch.sh 2026-10-18, phase sharedSpeed, both entries, reverted: `|| !speedSettledLocked(session)`
+    //       deleted from videoSessionLocked()'s join (backend/daemon/wallpaper_manager.cpp) -> "...opens its
+    //       own" and "...neither sent out nor reopened".
+    {
+        using wallpaperx::PositionMode;
+        PhaseGrade grade("the shared-speed phase (a join against a stale speed)");
+        SharedCounterRig rig(config, watchedCopy(counterClip, "shared_speed_join.mp4"), *order);
+        CaptureGradeOnExit captureGrade{grade, rig.manager};
+        rig.manager.requestWallpaper("video", rig.path, kA, {{"position", PositionMode::Stretch}});
+        const PassCost first = renderCounted(rig.manager, kA);
+        if (!first.outcome.rendered || !rig.showsOf(kA, 3)) {
+            check(false, ("S15.878: one screen opens and plays the file (the premise) -- " + describe(first)).c_str());
+            return;
+        }
+        rig.manager.setWallpaperProperties(kA, {{"speed", 2.0}});
+        rig.manager.requestWallpaper("video", rig.path, kB, {{"position", PositionMode::Stretch}});
+        const PassCost joined = renderCounted(rig.manager, kB);
+        reportUnless(joined.outcome.rendered && joined.opens == 1,
+                     "a screen at the old speed does not join a session whose screen just asked for another: it opens its own",
+                     describe(joined));
+        g_files.resetCounts();
+        const bool playsOn = rig.showsOf(kA, 10);
+        reportUnless(playsOn && g_files.opens(rig.path) == 0 && liveCount(rig.path) == 2,
+                     "and the screen whose speed changed is neither sent out nor reopened",
+                     std::string(playsOn ? "" : "not shown ten times within 5 s; ") +
+                         std::to_string(g_files.opens(rig.path)) + " open(s); open: " + describeFiles(g_files.live()));
+    }
+}
+
+// S15.876, on the render worker so a teardown can be held.
+void runSharedGpuFaultChecks(const WallpaperManager::Config& base, const std::string& onePicture) {
+    const char* kGoals = "S15.876 (a GPU fault in a shared pass's conversion)";
+    const wallpaperx::testing::ScratchDir scratch("videosharedgpu");
+    if (!scratch.ok()) {
+        notVerified(kGoals, "no scratch directory could be created for the state and config");
+        return;
+    }
+    WallpaperManager::Config config = base;
+    config.stateDir = scratch.path() / "state";
+    config.configFile = scratch.path() / "config.json";
+    const std::string path = watchedCopy(onePicture, "shared_gpu_fault.mp4");
+    constexpr int kOther = 30, kFaulted = 31;
+
+    PhaseGrade grade("the shared GPU-fault phase");
+    FrameReadyLog signals;
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    RenderWorker worker(manager, [&signals](int monitorId, uint64_t generation) { signals.record(monitorId, generation); });
+    WorkerUnblock unblock{worker};
+    const auto show = [&](int id) {
+        wallpaperx::testing::nameScreen(manager, id, screenOf(id));
+        manager.requestWallpaper("video", path, id);
+        worker.post(id);
+        return signals.wait(id, 1) && drainWorker(worker);
+    };
+    if (!show(kOther)) {
+        grade.expectNoDevice();
+        notVerified(kGoals, "the first video render on this host produced no frame");
+        return;
+    }
+    if (!show(kFaulted) || liveCount(path) != 1) {
+        check(false, ("S15.876: a second screen joins the one-picture file's decoder (the premise) -- open: " +
+                      describeFiles(g_files.live())).c_str());
+        return;
+    }
+
+    // GOAL: S15.876 -- a GPU fault in a render pass's conversion, on a decoder shared with another screen,
+    //       frees the session and the other screen's images with no crash record naming the file on disk,
+    //       so a start after a death in that teardown still applies the file.
+    // WHY-THIS-SHAPE: a one-picture file, because its clock round decodes the picture again and parks
+    //       without converting it, so the re-posted pass's convert is the one with work to submit; the
+    //       re-post changes size and back, so it rebuilds nothing and that submit is its first. The
+    //       thread is held as the file is closed, the end of the teardown, and a start built from the state
+    //       copied then (runFailedPassChecks shows that copy refusing while a record is on disk).
+    // CONTROL: control_batch.sh 2026-10-18, phase sharedGpuFault, both entries, reverted: renderPassLocked()'s pre-commit
+    //       `if (failure) tearDownFailed();` (backend/daemon/wallpaper_manager.cpp) given the teardown
+    //       without `applying.reset()` -> "...no crash record naming the file is on disk" and "...still
+    //       applies the file".
+    g_submitDeviceLost.store(1);
+    g_closeFileGate.arm(CallGate::Mode::Hold, path);
+    std::vector<int> notPosted;
+    manager.setOutputSize(screenOf(kFaulted), kResizedWidth, kResizedHeight, notPosted);
+    manager.setOutputSize(screenOf(kFaulted), kTargetWidth, kTargetHeight, notPosted);
+    worker.post(kFaulted);
+    const bool closing = g_closeFileGate.waitFired(kGateLimit);
+    check(closing, "S15.876: a GPU fault in a shared pass tears the shared session down (the premise)");
+    if (closing) {
+        const std::optional<wallpaperx::CrashRecord> record = wallpaperx::readCrashRecord(config.stateDir, kFaulted);
+        reportUnless(!record.has_value(),
+                     "while a GPU fault in a shared pass's conversion frees the session, no crash record naming the file "
+                     "is on disk",
+                     "the record on disk: " + describeRecord(record));
+        const RestartVerdict restart = startAfterDeathNow(config, kFaulted);
+        if (restartGraded(restart)) {
+            reportUnless(!restart.refused, "a start after dying in that teardown still applies the file",
+                         "the start refused it: " + restart.lastError);
+        }
+    }
+    g_closeFileGate.release();
+    check(drainWorker(worker), "S15.876: the faulted pass finishes once its teardown is let go");
+    const std::optional<wallpaperx::MonitorStatus> other = monitorStatus(manager, kOther);
+    check(g_submitDeviceLost.load() == 0 && other && !other->lastError.empty(),
+          "S15.876: the injected device loss was spent and recorded on the other screen too (the premise)");
+}
 
 int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], kBlameChildFlag) == 0) runBlameChild(argc, argv);
@@ -11058,6 +12424,13 @@ int main(int argc, char** argv) {
         phase("renderPathRetime", [&] { onSlowFile("S15.119", runRenderPathRetimeChecks); });
         phase("dueSlowdown", [&] { onSlowFile("S15.120", runDueSlowdownChecks); });
         phase("playbackBlame", [&] { runPlaybackBlameChecks(config, clips, still, onePicture); });
+        phase("decodeOnce", [&] { runDecodeOnceChecks(config, clip, onePicture); });
+        phase("sharedRelease", [&] { runSharedReleaseChecks(config, clip); });
+        phase("sharedEviction", [&] { runSharedEvictionChecks(config, clips); });
+        phase("pauseRejoin", [&] { runPauseRejoinChecks(config); });
+        phase("sharedFailure", [&] { runSharedFailureChecks(config, still); });
+        phase("sharedSpeed", [&] { runSharedSpeedChecks(config); });
+        phase("sharedGpuFault", [&] { runSharedGpuFaultChecks(config, onePicture); });
     } catch (const std::exception& e) {
         // Without this an escaping sdbus::Error -- what a host with no session bus produces --
         // would abort the process, so ctest would report an opaque SIGABRT instead of the named

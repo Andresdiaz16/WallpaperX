@@ -40,7 +40,9 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <cstdarg>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -50,13 +52,16 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <system_error>
 #include <thread>
 #include <vector>
 
+#include <dlfcn.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <sys/inotify.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -71,6 +76,91 @@ using wallpaperx::testing::exportDelivered;
 using wallpaperx::testing::harnessFailure;
 using wallpaperx::testing::notVerified;
 using wallpaperx::testing::ScratchDir;
+
+
+// Opens of one traced path, each with the thread that made it: an inotify watch counts every
+// thread's opens, and a playing session's decode thread is not the render pass under test.
+namespace {
+std::atomic<bool> g_tracing{false};
+std::mutex g_traceMutex;
+std::string g_tracePath;
+std::vector<std::pair<pid_t, std::string>> g_traceOpens;  // thread id, thread name
+}  // namespace
+
+extern "C" int open(const char* path, int flags, ...) {
+    using Fn = int (*)(const char*, int, mode_t);
+    static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "open"));
+    if (real == nullptr) return -1;
+    mode_t mode = 0;
+    if ((flags & (O_CREAT | O_TMPFILE)) != 0) {
+        va_list args;
+        va_start(args, flags);
+        mode = static_cast<mode_t>(va_arg(args, unsigned int));
+        va_end(args);
+    }
+    const int fd = real(path, flags, mode);
+    if (fd >= 0 && path != nullptr && g_tracing.load()) {
+        char name[32] = "";
+        ::pthread_getname_np(::pthread_self(), name, sizeof(name));
+        std::lock_guard<std::mutex> lock(g_traceMutex);
+        if (g_tracePath == path) g_traceOpens.emplace_back(::gettid(), name);
+    }
+    return fd;
+}
+
+// The shared children's aim: once armed, the first PlayingBlame production raises on the armed thread
+// for a line naming the armed file is followed at once by SIGSEGV to that thread, so the death lands
+// inside that turn with production's own line live. Linked with --wrap of the constructor; the
+// daemon's code is unchanged.
+namespace aim {
+std::atomic<bool> g_armed{false};
+std::atomic<bool> g_fired{false};
+pthread_t g_thread{};
+std::string g_file;  // written before g_armed is set, read only after
+}  // namespace aim
+
+#define WPX_PLAYING_BLAME _ZN10wallpaperx12PlayingBlameC1ERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE
+#define WPX_CAT2(a, b) a##b
+#define WPX_CAT(a, b) WPX_CAT2(a, b)
+
+extern "C" void WPX_CAT(__real_, WPX_PLAYING_BLAME)(wallpaperx::PlayingBlame* self, const std::string& line);
+extern "C" void WPX_CAT(__wrap_, WPX_PLAYING_BLAME)(wallpaperx::PlayingBlame* self, const std::string& line) {
+    WPX_CAT(__real_, WPX_PLAYING_BLAME)(self, line);
+    if (!aim::g_armed.load() || !::pthread_equal(::pthread_self(), aim::g_thread)) return;
+    if (line.find(aim::g_file) == std::string::npos || aim::g_fired.exchange(true)) return;
+    ::pthread_kill(::pthread_self(), SIGSEGV);
+}
+
+namespace {
+
+// The traced opens made while `work` ran: on the calling thread, and a description of the others.
+struct TracedOpens {
+    int here = 0;
+    std::string others;
+};
+template <typename Work>
+TracedOpens tracedOpens(const std::string& path, Work&& work) {
+    {
+        std::lock_guard<std::mutex> lock(g_traceMutex);
+        g_tracePath = path;
+        g_traceOpens.clear();
+    }
+    g_tracing.store(true);
+    work();
+    g_tracing.store(false);
+    TracedOpens out;
+    std::lock_guard<std::mutex> lock(g_traceMutex);
+    for (const auto& [tid, name] : g_traceOpens) {
+        if (tid == ::gettid()) {
+            ++out.here;
+        } else {
+            out.others += " thread " + std::to_string(tid) + " '" + name + "'";
+        }
+    }
+    return out;
+}
+
+}  // namespace
 
 namespace {
 
@@ -223,6 +313,91 @@ constexpr int kPlayingChildSetupFailed = 121;
     _exit(kPlayingChildSetupFailed);
 }
 
+// Exits of a shared child that are not the death it was run for.
+constexpr int kSharedChildNotShared = 122;
+constexpr int kSharedChildNoFrame = 123;
+constexpr int kSharedChildNoTurn = 124;
+
+// The shared children: kBadVideoMonitor opens the real video and kSameFileMonitor joins its session;
+// `still` set on kBadVideoMonitor first when given, so it leaves. Then the clock runs, a picture due
+// every round, and the aim sends this thread SIGSEGV inside its first turn under a line naming the file:
+// whatever that line names is what the death names.
+[[noreturn]] void runSharedChild(WallpaperManager::Config config, const std::string& video, const std::string& still,
+                                 int attempt) {
+    config.width = kWidth;
+    config.height = kHeight;
+    config.unwatchedAfter = std::chrono::hours(1);
+    // The clock is handed a picture's time per round, far ahead of the wall clock; credited as play, that
+    // would clear the very count under test.
+    config.cleanPlayAfter = std::chrono::hours(24);
+    try {
+        WallpaperManager manager(config);
+        manager.restoreSaved();
+        manager.recordStartingVideos();
+        // After the restore: a bind saves the config, which before it holds no rows.
+        std::vector<int> redraw;
+        manager.setMonitorOutput(kBadVideoMonitor, "DP-1", redraw);
+        manager.setMonitorOutput(kSameFileMonitor, "DP-2", redraw);
+        // The premise counts opens made by the second screen's render, on this thread. The first screen's
+        // own open, traced the same way, proves the trace sees one.
+        const TracedOpens opener = tracedOpens(video, [&] { manager.renderPending(kBadVideoMonitor); });
+        if (opener.here < 1) {
+            const auto first = monitor(manager.snapshot(), kBadVideoMonitor);
+            std::fprintf(stderr,
+                         "crash_quarantine_test shared child: the first screen's render opened the file on no thread "
+                         "(others:%s); its status: %s, '%s'\n",
+                         opener.others.c_str(), first ? (first->hasFrame ? "a frame" : "no frame") : "not restored",
+                         first ? first->lastError.c_str() : "");
+            _exit(kPlayingChildSetupFailed);
+        }
+        {
+            OpenWatch watch(video);
+            const TracedOpens joiner = tracedOpens(video, [&] { manager.renderPending(kSameFileMonitor); });
+            const int anyThread = watch.ok() ? watch.drain() : -1;
+            if (joiner.here != 0) {
+                std::fprintf(stderr,
+                             "crash_quarantine_test shared child: the second screen's render opened the file %d time(s); "
+                             "%d open(s) on any thread;%s\n",
+                             joiner.here, anyThread, joiner.others.c_str());
+                _exit(kSharedChildNotShared);
+            }
+            if (anyThread != 0) {
+                std::printf("crash_quarantine_test shared child: %d open(s) of the file on other threads meanwhile:%s\n",
+                            anyThread, joiner.others.c_str());
+            }
+        }
+        const WallpaperManager::Snapshot snap = manager.snapshot();
+        const auto bad = monitor(snap, kBadVideoMonitor);
+        const auto same = monitor(snap, kSameFileMonitor);
+        if (!bad || !bad->hasFrame || !same || !same->hasFrame) {
+            std::fprintf(stderr, "crash_quarantine_test shared child: no picture: '%s' / '%s'\n",
+                         bad ? bad->lastError.c_str() : "not restored", same ? same->lastError.c_str() : "not restored");
+            _exit(kSharedChildNoFrame);
+        }
+        if (!still.empty()) {
+            manager.requestWallpaper("static", still, kBadVideoMonitor);
+            manager.renderPending(kBadVideoMonitor);
+        }
+        static_cast<void>(attempt);
+        aim::g_file = video;
+        aim::g_thread = ::pthread_self();
+        aim::g_armed.store(true);
+        // Without a turn under a line naming the file the aim never fires; that is reported, not waited on.
+        std::thread([] {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            if (!aim::g_fired.load()) _exit(kSharedChildNoTurn);
+        }).detach();
+        auto at = std::chrono::steady_clock::now();
+        for (;;) {
+            at += std::chrono::milliseconds(34);
+            manager.advanceVideo(at);
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "crash_quarantine_test shared child: %s\n", e.what());
+    }
+    _exit(kPlayingChildSetupFailed);
+}
+
 [[noreturn]] void runPlayingChild(int argc, char** argv) {
     wallpaperx::testing::suppressCoreDump();
     wallpaperx::installFatalSignalHandlers();
@@ -231,6 +406,10 @@ constexpr int kPlayingChildSetupFailed = 121;
     WallpaperManager::Config config;
     config.configFile = argv[2];
     config.stateDir = argv[3];
+    if (action == "shared") {
+        if (argc < 8) _exit(kPlayingChildSetupFailed);
+        runSharedChild(config, argv[5], argv[6], std::atoi(argv[7]));
+    }
     try {
         auto manager = std::make_unique<WallpaperManager>(config);
         manager->restoreSaved();
@@ -556,6 +735,160 @@ void runPlaybackDeathChecks(const std::filesystem::path& root) {
                                   describeStatus(v.bad) + ")");
     }
     (void)kGoals;
+}
+
+// ---------------------------------------------------------------------------- //
+// Deaths while two screens share one decode of a file
+// ---------------------------------------------------------------------------- //
+
+// A real fixture, from the build tree this binary sits in; empty when it is not there.
+std::filesystem::path videoAsset(const char* name) {
+    std::error_code ec;
+    const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (ec) return {};
+    const std::filesystem::path file = exe.parent_path() / "video_assets" / name;
+    return std::filesystem::exists(file, ec) ? file : std::filesystem::path{};
+}
+
+struct NamedDeath {
+    int monitorId = -1;
+    std::string path;
+};
+
+// Runs one shared child and returns what its death names. Nothing, having said why, when the premise
+// fails or the harness does.
+//
+// The config is written afresh each time: a child given `still` saves that still on the first screen,
+// and a later child that started from it would find the first screen showing the still and the second
+// opening the video alone.
+//
+// GOAL: S15.842/S15.843's premise -- the render thread's turn on the shared video runs under a blame
+//       line naming that file, so a death inside the turn names a screen at all.
+// WHY-THIS-SHAPE: the death is aimed (the PlayingBlame wrap above) rather than timed. A timed signal
+//       mostly fell between rounds once decoding moved to its own thread -- 5 of 8 runs graded nothing --
+//       and a retry-until-named loop would turn "the turn has no blame" into a skip.
+// CONTROL: control_batch.sh 2026-10-19 (T6d), NVIDIA, reverted: `const PlayingBlame working(*line);` removed
+//       from advanceSessionLocked (backend/daemon/wallpaper_manager.cpp) -> "FAIL: the render thread takes a
+//       turn on the shared video under a blame line naming it (none in 10 s of rounds)".
+std::optional<NamedDeath> sharedDeath(const std::filesystem::path& configFile, const std::string& rows,
+                                      const std::filesystem::path& stateDir, const std::string& video,
+                                      const std::string& still, const char* goals) {
+    writeText(configFile, rows);
+    const wallpaperx::testing::SelfExecResult r = wallpaperx::testing::runSelf(
+        {kPlayingChildFlag, configFile.string(), stateDir.string(), "shared", video, still, "0"},
+        std::chrono::seconds(30));
+    if (r.exitedWith(kSharedChildNotShared)) {
+        check(false, "the second screen on the same file joins the first's decode, opening nothing (the premise)");
+        return std::nullopt;
+    }
+    if (r.exitedWith(kSharedChildNoFrame)) {
+        notVerified(goals, "the shared screens drew no picture on this host");
+        return std::nullopt;
+    }
+    if (r.exitedWith(kSharedChildNoTurn)) {
+        check(false, "the render thread takes a turn on the shared video under a blame line naming it (none in 10 s "
+                     "of rounds)");
+        return std::nullopt;
+    }
+    if (!r.fault.empty() || !r.diedOf(SIGSEGV)) {
+        harnessFailure("a shared child did not die of the SIGSEGV it was sent (" + (r.fault.empty() ? r.how() : r.fault) +
+                       "), so what it left grades nothing");
+        return std::nullopt;
+    }
+    const std::optional<wallpaperx::PlayingHistory> h = wallpaperx::readPlayingRecord(stateDir);
+    if (h && h->died) return NamedDeath{h->died->monitorId, h->died->path};
+    check(false, "a death aimed inside a turn on the shared video, under a line naming it, names a screen");
+    return std::nullopt;
+}
+
+void runSharedDeathChecks(const std::filesystem::path& root) {
+    const char* kGoals = "S15.842-S15.843 (a death while two screens share one decode)";
+    const std::filesystem::path video = videoAsset("wallpaper_tone.mp4");
+    if (video.empty()) {
+        notVerified(kGoals, "the build tree's video_assets/wallpaper_tone.mp4 is not there");
+        return;
+    }
+    const std::string goodVideo = (root / "shared-other.mp4").string();
+    writeText(goodVideo, "not a video");
+    std::string still;
+    try {
+        still = wallpaperx::testing::writeGradientPng((root / "shared-still.png").string(), 16, 16);
+    } catch (const std::exception& e) {
+        harnessFailure(std::string("the still for the shared checks could not be written: ") + e.what());
+        return;
+    }
+    const std::string rows = configJson({
+        {kBadVideoMonitor, "video", video.string()},
+        {kGoodVideoMonitor, "video", goodVideo},
+        {kSameFileMonitor, "video", video.string()},
+    });
+    const auto describe = [](const NamedDeath& d) {
+        return "named monitor " + std::to_string(d.monitorId) + ", " + d.path;
+    };
+
+    // GOAL: S15.842 -- a death while two screens play one file from one shared decode counts against the
+    //       screen the blame names, the session's first (the one that opened it), and only that screen: the
+    //       next start carries one death for it and none for the other, and a second such death refuses the
+    //       file on the first screen while the other screen still plays it (S13.185's "the same file on
+    //       another monitor carries no count", shared).
+    // WHY-THIS-SHAPE: a real fatal signal, aimed at the render thread inside its turn on the shared video
+    //       (sharedDeath), rather than a planted record: the blame line is whatever production's own guard holds
+    //       then. Graded on every run: 8 of 8 on NVIDIA and on Lavapipe (T6d), against 3 of 8 when timed.
+    // CONTROL: control_batch.sh 2026-10-18, re-run 2026-10-19 (T6d) with the aim, reverted, backend/daemon/wallpaper_manager.cpp: blameFirstMember
+    //       naming `members.back()`, in its early-return test too (re-run in T2: `back()` in the naming line
+    //       alone stays green, since the early return on `session.blamed` is taken before it while the opener
+    //       is still first) -> "FAIL: a death while two screens share one decode names the session's
+    //       first screen" (named monitor 12), "... counts against the screen it names and no other (0 and 1)" and
+    //       "... refuses the file on the first screen only"; restoreSaved's `played->died->monitorId == monitorId &&`
+    //       deleted -> "(1 and 1)" and "refuses the file on the first screen only", beside S13.185's own line.
+    // COVERAGE-ASSERT: each child proves the second screen joined: no open of the file on the thread running
+    //       its render (other threads' opens are printed, not counted), after the first screen's render was
+    //       seen opening it the same way. Join disabled in videoSessionLocked() (`if (session.speed != speed ||
+    //       !speedSettledLocked(session)) continue;` made `continue;`, backend/daemon/wallpaper_manager.cpp) ->
+    //       "FAIL: the second screen on the same file joins the first's decode, opening nothing (the premise)",
+    //       "opened the file 1 time(s)"; control_batch.sh 2026-10-19 (T5c), NVIDIA, reverted.
+    {
+        const std::filesystem::path configFile = root / "shared-config" / "config.json";
+        const std::filesystem::path stateDir = root / "shared-state";
+        writeText(configFile, rows);
+        const std::optional<NamedDeath> first = sharedDeath(configFile, rows, stateDir, video.string(), "", kGoals);
+        if (!first) return;
+        std::printf("crash_quarantine_test: S15.842 graded: the aimed shared death %s\n", describe(*first).c_str());
+        check(first->monitorId == kBadVideoMonitor && first->path == video.string(),
+              "a death while two screens share one decode names the session's first screen (" + describe(*first) + ")");
+        if (!runStart(configFile, stateDir, [](WallpaperManager&) {})) return;
+        const int bad = countFor(stateDir, kBadVideoMonitor);
+        const int same = countFor(stateDir, kSameFileMonitor);
+        check(bad == 1 && same == 0, "the shared death counts against the screen it names and no other (" +
+                                         std::to_string(bad) + " and " + std::to_string(same) + ")");
+        const std::optional<NamedDeath> second = sharedDeath(configFile, rows, stateDir, video.string(), "", kGoals);
+        if (!second) return;
+        const StartVerdict v = startNow(configFile, stateDir);
+        if (!v.graded) return;
+        check(refused(v.bad) && applied(v.sameFile),
+              "a second shared death refuses the file on the first screen only (" + describeStatus(v.bad) + "; " +
+                  describeStatus(v.sameFile) + ")");
+    }
+
+    // GOAL: S15.843 -- when the session's first screen leaves it, the blame is re-pointed: a death while the
+    //       remaining screen plays names that screen, so it counts against a screen still showing the file.
+    //       False if the line still names the screen that left, whose row no longer holds the file.
+    // WHY-THIS-SHAPE: the first screen leaves by being set to a still, which draws once and never decodes on
+    //       the clock, so every death the clock causes afterwards is the shared file's.
+    // CONTROL: control_batch.sh 2026-10-18 (re-run in T2, and T6d with the aim), reverted: blameFirstMember (backend/daemon/wallpaper_manager.cpp)
+    //       made to return at once -> "FAIL: after the first screen leaves, a shared death names the screen
+    //       still playing"; the sharing checks above stay green, the opener's line being right for them.
+    {
+        const std::filesystem::path configFile = root / "shared-left-config" / "config.json";
+        const std::filesystem::path stateDir = root / "shared-left-state";
+        writeText(configFile, rows);
+        const std::optional<NamedDeath> death = sharedDeath(configFile, rows, stateDir, video.string(), still, kGoals);
+        if (!death) return;
+        std::printf("crash_quarantine_test: S15.843 graded: the aimed death after the first screen left %s\n",
+                    describe(*death).c_str());
+        check(death->monitorId == kSameFileMonitor && death->path == video.string(),
+              "after the first screen leaves, a shared death names the screen still playing (" + describe(*death) + ")");
+    }
 }
 
 }  // namespace
@@ -1009,6 +1342,11 @@ int main(int argc, char** argv) {
         runPlaybackDeathChecks(root);
     } catch (const std::exception& e) {
         harnessFailure(std::string("the playback-death checks ended in an unhandled exception: ") + e.what());
+    }
+    try {
+        runSharedDeathChecks(root);
+    } catch (const std::exception& e) {
+        harnessFailure(std::string("the shared-death checks ended in an unhandled exception: ") + e.what());
     }
 
     return finish();

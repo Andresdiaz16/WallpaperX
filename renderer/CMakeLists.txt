@@ -95,6 +95,8 @@ add_library(wallpaperx-renderer STATIC
     video/video_decoder.cpp
     video/reset_point.cpp
     video/frame_converter.cpp
+    video/picture_source.cpp
+    video/decode_ahead.cpp
     video/video_pipeline.cpp
     audio/audio_decoder.cpp
     audio/audio_output.cpp
@@ -661,8 +663,9 @@ endif()
 # VideoPipeline, and VideoDecoder's resume after a mid-stream hardware failure, graded by the frame
 # number each counter fixture draws into its pictures. Interposes ffmpeg's decode, seek and open
 # entry points to inject the failure and count what the resume costs, and Vulkan's create and wait
-# entry points to count what a steady picture costs; no allocator replacement, so no
-# WALLPAPERX_SANITIZE opt-out.
+# entry points to count what a steady picture costs. It replaces operator new only outside
+# AddressSanitizer and ThreadSanitizer builds, where its decode-thread-alloc mode reports itself not
+# answerable; it exports its symbols so that mode can name the functions on an allocating stack.
 set(WALLPAPERX_CATCH_UP_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/catch_up_budget.h)
 add_custom_command(
     OUTPUT ${WALLPAPERX_CATCH_UP_HEADER}
@@ -675,6 +678,7 @@ add_custom_command(
 add_executable(wallpaperx-video-pipeline-probe tests/video_pipeline_probe.cpp ${WALLPAPERX_CATCH_UP_HEADER})
 target_include_directories(wallpaperx-video-pipeline-probe PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(wallpaperx-video-pipeline-probe PRIVATE wallpaperx-renderer)
+set_target_properties(wallpaperx-video-pipeline-probe PROPERTIES ENABLE_EXPORTS ON)
 target_compile_definitions(wallpaperx-video-pipeline-probe PRIVATE
     WALLPAPERX_VIDEO_ASSET_DIR="${WALLPAPERX_VIDEO_ASSET_DIR}"
     WALLPAPERX_SHADER_DIR="${SHADER_OUTPUT_DIR}")
@@ -877,7 +881,10 @@ set(WALLPAPERX_PIPELINE_MODES sequence-device sequence-host resume-timestamps re
     steady-host loop-device loop-host loop-cost-device loop-cost-host loop-resume release-device retire-device
     halves-device halves-host timing-device timing-host start-at-device start-at-device-ts start-at-host
     start-at-device-open-gop start-at-device-open-gop-hevc start-at-device-open-gop-mp4 start-at-host-open-gop
-    start-at-device-budget start-at-device-av1 bounded-decode-device bounded-decode-host)
+    start-at-device-budget start-at-device-av1 bounded-decode-device bounded-decode-host
+    decode-thread-depth decode-thread-pending decode-thread-failure decode-thread-catch-up decode-thread-hidden
+    decode-thread-software decode-thread-alloc decode-thread-left-running decode-thread-pools decode-thread-resume
+    device-completed-off-thread device-queue-flags)
 foreach(MODE ${WALLPAPERX_PIPELINE_MODES})
     string(REPLACE "-" "_" MODE_NAME "${MODE}")
     wallpaperx_add_test(NAME video_pipeline_${MODE_NAME} COMMAND wallpaperx-video-pipeline-probe ${MODE})

@@ -294,7 +294,7 @@ void runDecodeInvariants(Device& device) {
     VkVideoCodecOperationFlagsKHR union_ = 0;
     for (const Device::VideoDecodeFamily& decode : families) {
         union_ |= decode.ops;
-        // CONTROL: renderer/vulkan/device.cpp, the decode family's vkGetDeviceQueue deleted -> on the RTX
+        // CONTROL: renderer/vulkan/device.cpp, the decode family's fetchQueue() deleted (re-run 2026-10-19, T7: held) -> on the RTX
         //       entry device_video_decode "FAIL: a listed decode family has no queue handle". Reverted.
         check(decode.queue != VK_NULL_HANDLE, "a listed decode family has no queue handle");
         check((decode.ops & reported) == decode.ops,
