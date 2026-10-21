@@ -40,6 +40,7 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/error.h>
+#include <libavutil/mathematics.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
@@ -50,7 +51,9 @@ extern "C" {
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
+#include <map>
 #include <chrono>
 #include <climits>
 #include <condition_variable>
@@ -137,6 +140,29 @@ bool g_recordSends = false;
 std::vector<std::pair<int, bool>> g_sends;
 // Beside each send: whether the packet holds an H.264 IDR slice, read from its length-prefixed NAL units.
 std::vector<bool> g_sendsIdr;
+
+// The thinning tag checks (runThinningTagChecks). While g_recordThinning is set, each packet's first real send
+// records, by its presentation time in ns, the grids' number the test had in force (g_numberInForce) and the
+// packet's `opaque` tag as VideoDecoder::decode() set it (renderer/video/video_decoder.cpp tagSent: bits 0-1 the
+// level, bit 2 thinned, bits 3-10 the grids' number, the packet's number above bit 10).
+bool g_recordThinning = false;
+uint8_t g_numberInForce = 0;
+std::map<int64_t, uint8_t> g_numberAtSend;
+std::vector<uintptr_t> g_thinningTags;
+// Armed: the next send whose tag says thinned is refused with EAGAIN, and inside that same call the decoder is
+// given g_renumberTo, as a caller's change landing between a send and its resend would be. g_refusedTag is what
+// that send carried; g_resendTag what the same packet carried when sent again.
+VideoDecoder* g_thinDecoder = nullptr;
+std::optional<wallpaperx::NumberedGrids> g_renumberTo;
+bool g_eagainOnThinned = false;
+std::optional<uintptr_t> g_refusedTag;
+std::optional<uintptr_t> g_resendTag;
+// Armed: the next send on a hardware codec whose tag says thinned fails with AVERROR_EXTERNAL, the hardware
+// decoder failing on a device that still answers, which reopens the stream in software (runThinnedReopenCheck).
+bool g_externalOnThinned = false;
+bool g_externalFired = false;
+constexpr uintptr_t kTagThinnedBit = 4;
+constexpr unsigned kTagPacketShift = 11;
 
 // What one Device::submit was given, read off the VkSubmitInfo rather than inferred.
 struct RecordedSubmit {
@@ -284,6 +310,7 @@ SkipDecode decodeSkipping(Device& device, const std::string& file, wallpaperx::P
 }
 
 void runSkipLevelChecks(Device& device, const char* label, bool hardware, const SkipDecode& all, const SkipDecode& some);
+void runThinnedReopenCheck(Device& device);
 
 // GOAL: S15.576 -- VideoDecoder::next(PictureSkip::Unreferenced) leaves out the pictures nothing references:
 //       counter_long.mp4 (H.264, three B-frames between references, the middle one referenced) decodes to
@@ -836,6 +863,7 @@ void runHardwareChecks(Device& device) {
                 device.info().gpuName.c_str(), hardwareFrames, waitedAt(firstSubmit).c_str(),
                 waitedAt(secondSubmit).c_str(), waitedAt(afterFailure).c_str());
     runPictureSkipChecks(device, "hardware", true);
+    if (haveAssets({"counter_long.mp4"})) runThinnedReopenCheck(device);
 }
 
 // ------------------------------------------------------------------------- //
@@ -1226,6 +1254,237 @@ void runMultiFileChecks(Device& device, const ScratchDir& scratch) {
     check(graded == kCases, "every multi-file case ran (" + std::to_string(graded) + " of 3)");
 }
 
+// S15.904 and S15.908 -- what each picture says about the thinning it was decoded under. Software, where the
+// deepest level is NonKey, so a tag carrying the grid's added level would read as a level of its own.
+void runThinningTagChecks(Device& device) {
+    using namespace std::chrono_literals;
+    using wallpaperx::NumberedGrids;
+    using wallpaperx::PictureSkip;
+    using wallpaperx::ShowGrids;
+    const std::string label = "content, thinning";
+    const std::string file = asset("counter_long.mp4");  // 30 a second, 321 pictures, three B pictures a run
+    constexpr std::chrono::nanoseconds kSpacing = std::chrono::nanoseconds(2s) / 30;  // one picture in two shown
+    constexpr int kPictures = 321;
+
+    // GOAL: S15.904 -- a picture not thinned reports no number: with no grids at all every picture's
+    //       thinnedUnder() is empty.
+    // CONTROL: control_batch.sh 2026-10-20, reverted, video_decoder_content_lavapipe, renderer/video/video_decoder.cpp: sentThinnedUnder() ignoring the thinned
+    //       bit -> "FAIL: ... none reports a thinning number (321 of 321 did)", and the first-picture line.
+    int unthinnedReported = 0, decodedPlain = 0;
+    {
+        VideoDecoder plain(device, file);
+        while (std::optional<DecodedFrame> frame = plain.next(PictureSkip::Nothing)) {
+            ++decodedPlain;
+            if (frame->thinnedUnder()) ++unthinnedReported;
+        }
+    }
+    check(decodedPlain == kPictures && unthinnedReported == 0,
+          label + ": with no grids every picture is decoded and none reports a thinning number (" +
+              std::to_string(unthinnedReported) + " of " + std::to_string(decodedPlain) + " did)");
+
+    VideoDecoder decoder(device, file);
+    const auto numbered = [&](uint8_t number) {
+        const std::array<std::chrono::nanoseconds, 1> spacings{kSpacing};
+        return NumberedGrids{ShowGrids(decoder.timelineStart(), spacings), number};
+    };
+    struct Stop {
+        ~Stop() {
+            g_recordThinning = false;
+            g_eagainOnThinned = false;
+            g_thinDecoder = nullptr;
+            g_renumberTo.reset();
+        }
+    } stop;
+    g_numberAtSend.clear();
+    g_thinningTags.clear();
+    g_refusedTag.reset();
+    g_resendTag.reset();
+    g_numberInForce = 7;
+    g_thinDecoder = &decoder;
+    g_recordThinning = true;
+    decoder.leaveUnshown(numbered(7));
+
+    struct Returned {
+        std::optional<std::chrono::nanoseconds> at;
+        PictureSkip skip;
+        std::optional<uint8_t> under;
+    };
+    std::vector<Returned> pictures;
+    std::optional<uint8_t> afterRestart;
+    bool restarted = false;
+    while (std::optional<DecodedFrame> frame = decoder.next(PictureSkip::Nothing)) {
+        if (restarted) {
+            afterRestart = frame->thinnedUnder();
+            break;
+        }
+        pictures.push_back({frame->presentationTime(), frame->skip(), frame->thinnedUnder()});
+        if (pictures.size() == 100) {
+            g_renumberTo = numbered(8);
+            g_eagainOnThinned = true;
+        }
+        if (pictures.size() == 200) {
+            decoder.restart();
+            restarted = true;
+        }
+    }
+
+    // GOAL: S15.904 -- the skip tag reports only the level next() was asked for: a stream thinned at level 0
+    //       returns every picture tagged Nothing, though the grid left pictures out at Unreferenced.
+    // WHY-THIS-SHAPE: the stream is shown to be thinned (pictures left out, pictures reporting a number), so a
+    //       tag that never could have carried Unreferenced does not pass by default.
+    // COVERAGE-ASSERT: at least 50 pictures reporting a number, and fewer pictures than an unthinned decode
+    //       by the 200th returned. Not itself observed red: no break here leaves the grid unapplied alone.
+    // CONTROL: control_batch.sh 2026-10-20, reverted, video_decoder_content_lavapipe, renderer/video/video_decoder.cpp: tagSent() given `applied` in place of
+    //       m_skipping -> "FAIL: ... returns every picture tagged Nothing (127 of 200)".
+    size_t taggedNothing = 0, thinned = 0;
+    for (const Returned& r : pictures) {
+        if (r.skip == PictureSkip::Nothing) ++taggedNothing;
+        if (r.under) ++thinned;
+    }
+    const std::optional<std::chrono::nanoseconds> lastAt = pictures.empty() ? std::nullopt : pictures.back().at;
+    const bool leftOut = lastAt && *lastAt - pictures.front().at.value_or(0ns) > 210 * (std::chrono::nanoseconds(1s) / 30);
+    check(taggedNothing == pictures.size(), label + ": a stream thinned at level 0 returns every picture tagged Nothing (" +
+                                                std::to_string(taggedNothing) + " of " + std::to_string(pictures.size()) + ")");
+    check(thinned >= 50 && leftOut, label + ": the grid thinned the stream (" + std::to_string(thinned) +
+                                        " pictures report a number; 200 pictures reach " +
+                                        std::to_string(lastAt ? lastAt->count() / 1'000'000 : -1) + " ms)");
+    check(!pictures.empty() && !pictures.front().under, label + ": the stream's first picture, before the grid applies, reports no number");
+
+    // GOAL: S15.904 -- thinnedUnder() is the number of the grids in force when the picture's packet was first
+    //       sent: pictures already in flight when the number changes keep the old one.
+    // WHY-THIS-SHAPE: the number in force is the test's own, recorded at each packet's first send by the
+    //       interposer and matched by presentation time; a decoder reporting the number at return would
+    //       pass every picture sent after the change and fail only those in flight across it.
+    // COVERAGE-ASSERT: at least one picture returned after the change reports the old number, and one the new.
+    // CONTROL: control_batch.sh 2026-10-20, reverted, video_decoder_content_lavapipe, renderer/video/video_decoder.cpp: a returned picture given the grids' number
+    //       now in force (m_unshown->number) -> "FAIL: ... reports the grids' number in force when its packet was
+    //       sent (17 of 181 did not)" and the coverage line (0 old). Green: 181 compared, 17 old and 83 new.
+    size_t compared = 0, mismatched = 0, oldAfterChange = 0, newAfterChange = 0;
+    for (size_t i = 0; i < pictures.size(); ++i) {
+        const Returned& r = pictures[i];
+        if (!r.under || !r.at) continue;
+        const auto sent = g_numberAtSend.find(r.at->count());
+        if (sent == g_numberAtSend.end()) continue;
+        ++compared;
+        if (*r.under != sent->second) {
+            ++mismatched;
+            if (mismatched <= 5) {
+                std::fprintf(stderr, "  picture %zu at %lld ms reports %d, sent under %d\n", i,
+                             static_cast<long long>(r.at->count() / 1'000'000), *r.under, sent->second);
+            }
+        }
+        if (i >= 100) ++(*r.under == 7 ? oldAfterChange : newAfterChange);
+    }
+    check(mismatched == 0, label + ": every thinned picture reports the grids' number in force when its packet was sent (" +
+                               std::to_string(mismatched) + " of " + std::to_string(compared) + " did not)");
+    check(compared >= 50 && oldAfterChange >= 1 && newAfterChange >= 1,
+          label + ": the number check compared pictures in flight across the change (" + std::to_string(compared) +
+              " compared; after it " + std::to_string(oldAfterChange) + " old, " + std::to_string(newAfterChange) + " new)");
+
+    // GOAL: S15.908 -- a packet ffmpeg refuses with EAGAIN keeps its verdict and number when sent again, even
+    //       when the grids changed in between.
+    // WHY-THIS-SHAPE: the grids are renumbered inside the refused send itself, so a resend judged afresh
+    //       carries 8 where the kept verdict carries 7; without that change a fresh judgement would match.
+    // CONTROL: control_batch.sh 2026-10-20, reverted, video_decoder_content_lavapipe, renderer/video/video_decoder.cpp: judgeGrid() run on every send, not once a
+    //       packet -> "FAIL: ... keeps its verdict and grids' number (tag 60 then 68)". Green: 60 then 60.
+    const bool refusedThinned = g_refusedTag && (*g_refusedTag & kTagThinnedBit) != 0;
+    check(refusedThinned && g_resendTag.has_value(), label + ": a thinned packet was refused with EAGAIN and sent again");
+    if (refusedThinned && g_resendTag) {
+        const uintptr_t low = (uintptr_t{1} << kTagPacketShift) - 1;
+        check((*g_resendTag & low) == (*g_refusedTag & low),
+              label + ": a packet sent again after EAGAIN keeps its verdict and grids' number (tag " +
+                  std::to_string(*g_refusedTag & low) + " then " + std::to_string(*g_resendTag & low) + ")");
+    }
+
+    std::printf("video_decoder_probe (%s): %zu pictures before the restart, %zu thinned, %zu numbers compared (%zu old and "
+                "%zu new after the change); refused tag %lld, resent %lld; after the restart %d\n",
+                label.c_str(), pictures.size(), thinned, compared, oldAfterChange, newAfterChange,
+                g_refusedTag ? static_cast<long long>(*g_refusedTag & 2047) : -1LL,
+                g_resendTag ? static_cast<long long>(*g_resendTag & 2047) : -1LL, afterRestart ? int{*afterRestart} : -1);
+
+    // GOAL: S15.908 -- after a rewind (restart) the packet the rewind leaves held is judged afresh: the first
+    //       picture of the new pass reports no number, though the packet sent before the restart was thinned.
+    // CONTROL: control_batch.sh 2026-10-20, reverted, video_decoder_content_lavapipe, renderer/video/video_decoder.cpp: rewind() putting the held packet's
+    //       verdict back after its read -> "FAIL: ... the first picture after a restart reports no thinning number
+    //       (it reported 8)".
+    check(restarted && pictures.size() == 200 && pictures.back().under.has_value(),
+          label + ": the picture before the restart was thinned");
+    check(restarted && !afterRestart.has_value(),
+          label + ": the first picture after a restart reports no thinning number" +
+              (afterRestart ? " (it reported " + std::to_string(*afterRestart) + ")" : std::string()));
+}
+
+// S15.908 -- the software reopen of a thinned stream: what the packets read for the resume are judged.
+void runThinnedReopenCheck(Device& device) {
+    using namespace std::chrono_literals;
+    const std::string label = "hardware, thinned reopen";
+    const std::string file = asset("counter_long.mp4");  // 30 a second, 321 pictures, three B pictures a run
+    constexpr std::chrono::nanoseconds kSpacing = std::chrono::nanoseconds(2s) / 30;  // one picture in two shown
+    VideoDecoder decoder(device, file);
+    const std::array<std::chrono::nanoseconds, 1> spacings{kSpacing};
+    decoder.leaveUnshown(wallpaperx::NumberedGrids{wallpaperx::ShowGrids(decoder.timelineStart(), spacings), 7});
+    struct Disarm {
+        ~Disarm() {
+            g_externalOnThinned = false;
+            g_externalFired = false;
+        }
+    } disarm;
+
+    // GOAL: S15.908 -- after a software reopen while thinning (the hardware decoder failing mid-stream on a
+    //       device that still answers), the packets read to resume are judged afresh, not thinned while
+    //       resuming: the reopen's first picture reports no thinning number, though the packet that failed
+    //       was thinned; and thinning comes back once resumed.
+    // WHY-THIS-SHAPE: the failure is injected on a thinned packet's send (AVERROR_EXTERNAL, as ffmpeg's Vulkan
+    //       decoder reports one), so a verdict carried over the reopen would be a thinned one. "Thinned again
+    //       later" shows the software decoder still thins, so "no number" is not a stream that stopped thinning.
+    // CONTROL: control_batch.sh 2026-10-20 (F5), reverted, renderer/video/video_decoder.cpp: judgeGrid() without
+    //       its `std::holds_alternative<std::monostate>(m_resume)` condition -> "FAIL: ... the first picture after a
+    //       software reopen reports no thinning number (it reported 7)". The failed packet's verdict kept over the
+    //       reopen stays green: the reopen seeks with no packet held, and the one packet the kept verdict reaches
+    //       decodes a picture before the resume point, which is dropped.
+    // COVERAGE-ASSERT: the failure fired on hardware, the stream reopened in software, and the picture before it
+    //       was thinned.
+    int returned = 0;
+    std::optional<uint8_t> lastBefore, firstAfter;
+    bool sawBefore = false, reopened = false, thinnedAgain = false;
+    VideoDecoder::Path pathBefore = VideoDecoder::Path::SoftwareCodec;
+    while (std::optional<DecodedFrame> frame = decoder.next(wallpaperx::PictureSkip::Nothing)) {
+        ++returned;
+        if (!g_externalFired) {
+            sawBefore = true;
+            lastBefore = frame->thinnedUnder();
+            pathBefore = decoder.path();
+            if (returned == 100) g_externalOnThinned = true;
+            continue;
+        }
+        if (!reopened) {
+            reopened = true;
+            firstAfter = frame->thinnedUnder();
+            continue;
+        }
+        if (frame->thinnedUnder()) {
+            thinnedAgain = true;
+            break;
+        }
+    }
+    if (pathBefore != VideoDecoder::Path::Hardware) {
+        std::printf("video_decoder_probe (%s): %s decodes this file in %s, so a hardware failure cannot be staged -- "
+                    "not answerable here\n",
+                    label.c_str(), device.info().gpuName.c_str(), pathName(pathBefore));
+        g_notVerified = true;
+        return;
+    }
+    check(g_externalFired && reopened && decoder.path() == VideoDecoder::Path::SoftwareRefused,
+          label + ": the staged failure fired on a thinned packet and the stream reopened in software (premise)");
+    check(sawBefore && lastBefore.has_value(), label + ": the picture before the failure was thinned (premise)");
+    check(reopened && !firstAfter.has_value(),
+          label + ": the first picture after a software reopen reports no thinning number" +
+              (firstAfter ? " (it reported " + std::to_string(*firstAfter) + ")" : std::string()));
+    check(thinnedAgain, label + ": the reopened stream is thinned again once resumed");
+    std::printf("video_decoder_probe (%s): %d pictures, reopened after the 100th; first after %d, thinned again %s\n",
+                label.c_str(), returned, firstAfter ? int{*firstAfter} : -1, thinnedAgain ? "yes" : "no");
+}
+
 void runContentChecks(Device& device) {
     if (!haveAssets({"h264_raw.h264", "audio_only.m4a"})) {
         g_notVerified = true;
@@ -1567,6 +1826,7 @@ void runContentChecks(Device& device) {
             g_notVerified = true;
         }
         runPictureSkipChecks(software, "content, software", false);
+        if (haveAssets({"counter_long.mp4"})) runThinningTagChecks(software);
     }
     g_hideVideoExtensions = false;
 }
@@ -1695,6 +1955,30 @@ extern "C" int avcodec_send_packet(AVCodecContext* context, const AVPacket* pack
     if (real == nullptr) {
         std::fprintf(stderr, "video_decoder_probe: cannot resolve the real avcodec_send_packet\n");
         std::abort();
+    }
+    if (g_recordThinning && context != nullptr && packet != nullptr) {
+        const auto tag = reinterpret_cast<uintptr_t>(packet->opaque);
+        if (packet->pts != AV_NOPTS_VALUE && context->pkt_timebase.num > 0) {
+            g_numberAtSend.emplace(av_rescale_q(packet->pts, context->pkt_timebase, AVRational{1, 1'000'000'000}),
+                                   g_numberInForce);
+        }
+        if (g_refusedTag && !g_resendTag && (tag >> kTagPacketShift) == (*g_refusedTag >> kTagPacketShift)) g_resendTag = tag;
+        if (g_eagainOnThinned && (tag & kTagThinnedBit) != 0) {
+            g_eagainOnThinned = false;
+            g_refusedTag = tag;
+            if (g_thinDecoder != nullptr && g_renumberTo) {
+                g_numberInForce = g_renumberTo->number;
+                g_thinDecoder->leaveUnshown(g_renumberTo);
+            }
+            return AVERROR(EAGAIN);
+        }
+        g_thinningTags.push_back(tag);
+    }
+    if (g_externalOnThinned && context != nullptr && packet != nullptr && context->hw_device_ctx != nullptr &&
+        (reinterpret_cast<uintptr_t>(packet->opaque) & kTagThinnedBit) != 0) {
+        g_externalOnThinned = false;
+        g_externalFired = true;
+        return AVERROR_EXTERNAL;
     }
     if (g_recordSends && context != nullptr && packet != nullptr) {
         g_sends.push_back({context->skip_frame, (packet->flags & AV_PKT_FLAG_KEY) != 0});

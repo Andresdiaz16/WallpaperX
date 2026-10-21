@@ -29,6 +29,15 @@ ColumnLayout {
             return pending;
         return root.daemon.screenSound[root.output] !== false;
     }
+    // 0 follows the frame rate on every screen, as does a screen the daemon has no name for; -1 is a
+    // rate a newer WallpaperX set.
+    readonly property int shownFrameRate: {
+        const pending = root.applier.pendingScreenFrameRate;
+        if (pending !== undefined)
+            return pending;
+        const rate = root.daemon.screenFrameRates[root.output];
+        return rate === undefined ? 0 : rate;
+    }
 
     spacing: 4
 
@@ -88,6 +97,43 @@ ColumnLayout {
             Layout.fillWidth: true
         }
     }
+    RowLayout {
+        Layout.fillWidth: true
+
+        Label {
+            textFormat: Text.PlainText
+            text: qsTr("Frame rate on this screen:")
+        }
+        ComboBox {
+            id: frameRate
+
+            Layout.preferredWidth: 220
+            textRole: "text"
+            valueRole: "rate"
+            model: [
+                { rate: 0, text: qsTr("Same as all screens") },
+                { rate: 30, text: qsTr("30 frames a second") },
+                { rate: 60, text: qsTr("60 frames a second") },
+                { rate: 120, text: qsTr("120 frames a second") }
+            ]
+            enabled: root.daemon.state === DaemonClient.Ready && root.applier.screenFrameRateState !== ApplyController.Working
+            currentIndex: frameRate.indexOfValue(root.shownFrameRate)
+            displayText: frameRate.currentIndex < 0 ? qsTr("Set by a newer WallpaperX") : frameRate.currentText
+            onActivated: {
+                root.applier.setScreenFrameRate(frameRate.currentValue);
+                frameRate.currentIndex = Qt.binding(() => frameRate.indexOfValue(root.shownFrameRate));
+            }
+        }
+        BusyIndicator {
+            Layout.preferredHeight: frameRate.implicitHeight
+            Layout.preferredWidth: frameRate.implicitHeight
+            visible: root.applier.screenFrameRateState === ApplyController.Working
+            running: visible
+        }
+        Item {
+            Layout.fillWidth: true
+        }
+    }
     Label {
         Layout.fillWidth: true
         wrapMode: Text.Wrap
@@ -107,6 +153,13 @@ ColumnLayout {
         textFormat: Text.PlainText
         visible: text !== ""
         text: root.applier.screenSoundState === ApplyController.Failed ? root.applier.screenSoundMessage : ""
+    }
+    Label {
+        Layout.fillWidth: true
+        wrapMode: Text.Wrap
+        textFormat: Text.PlainText
+        visible: text !== ""
+        text: root.applier.screenFrameRateState === ApplyController.Failed ? root.applier.screenFrameRateMessage : ""
     }
     Label {
         Layout.fillWidth: true

@@ -2,6 +2,7 @@
 
 #include "daemon/apply_controller.h"
 #include "daemon/daemon_client.h"
+#include "daemon/refresh_rate_reporter.h"
 #include "kde/kscreen_client.h"
 #include "kde/plasma_controller.h"
 #include "library/importer.h"
@@ -140,6 +141,7 @@ int main(int argc, char* argv[])
     wallpaperx::DaemonClient daemon(QDBusConnection::sessionBus());
     wallpaperx::PlasmaController plasma(QDBusConnection::sessionBus());
     wallpaperx::ApplyController applier(kscreen, library, daemon, plasma);
+    wallpaperx::RefreshRateReporter refreshRates(kscreen, daemon);
 
     QQmlApplicationEngine engine;
     engine.addImageProvider(QString::fromLatin1(wallpaperx::kPreviewProviderId), new wallpaperx::PreviewImageProvider);

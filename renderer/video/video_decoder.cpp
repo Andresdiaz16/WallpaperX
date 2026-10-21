@@ -234,14 +234,19 @@ std::optional<std::chrono::nanoseconds> nominalInterval(const AVStream& stream) 
 }
 
 // A packet's `opaque`, which ffmpeg copies to the frames decoded from it: the number
-// VideoDecoder::readVideoPacket() gave it above kLevelBits, 0 for none, and below them the
-// PictureSkip it was sent at.
-constexpr unsigned kLevelBits = 3;
-constexpr uintptr_t kLevelMask = (uintptr_t{1} << kLevelBits) - 1;
+// VideoDecoder::readVideoPacket() gave it above kTagBits, 0 for none, and below them the
+// PictureSkip it was sent at, whether the screens' rates were thinning the stream, and under which
+// NumberedGrids.
+constexpr unsigned kTagBits = 11;
+constexpr uintptr_t kLevelMask = 3;
+constexpr uintptr_t kThinnedBit = 4;
+constexpr unsigned kGridsShift = 3;
 static_assert(static_cast<uintptr_t>(PictureSkip::NonKey) <= kLevelMask);
+static_assert(kThinnedBit < (uintptr_t{1} << kGridsShift) && kGridsShift + 8 == kTagBits);
+static_assert(sizeof(uintptr_t) * 8 - kTagBits >= 48, "packet numbers need the bits above the tag");
 
 std::optional<uint64_t> packetNumber(const AVFrame& frame) {
-    const auto number = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(frame.opaque) >> kLevelBits);
+    const auto number = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(frame.opaque) >> kTagBits);
     return number == 0 ? std::nullopt : std::optional<uint64_t>(number);
 }
 
@@ -249,9 +254,16 @@ PictureSkip sentSkipping(const AVFrame& frame) {
     return static_cast<PictureSkip>(reinterpret_cast<uintptr_t>(frame.opaque) & kLevelMask);
 }
 
-void tagSkipping(AVPacket& packet, PictureSkip skip) {
-    const uintptr_t number = reinterpret_cast<uintptr_t>(packet.opaque) & ~kLevelMask;
-    packet.opaque = reinterpret_cast<void*>(number | static_cast<uintptr_t>(skip));
+std::optional<uint8_t> sentThinnedUnder(const AVFrame& frame) {
+    const auto tag = reinterpret_cast<uintptr_t>(frame.opaque);
+    if ((tag & kThinnedBit) == 0) return std::nullopt;
+    return static_cast<uint8_t>(tag >> kGridsShift);
+}
+
+void tagSent(AVPacket& packet, PictureSkip skip, std::optional<uint8_t> thinnedUnder) {
+    const uintptr_t number = reinterpret_cast<uintptr_t>(packet.opaque) >> kTagBits << kTagBits;
+    const uintptr_t thinned = thinnedUnder ? kThinnedBit | (uintptr_t{*thinnedUnder} << kGridsShift) : 0;
+    packet.opaque = reinterpret_cast<void*>(number | static_cast<uintptr_t>(skip) | thinned);
 }
 
 }  // namespace
@@ -295,6 +307,7 @@ DecodedFrame::DecodedFrame(DecodedFrame&& other) noexcept
       m_duration(other.m_duration),
       m_position(other.m_position),
       m_skip(other.m_skip),
+      m_thinnedUnder(other.m_thinnedUnder),
       m_readSince(other.m_readSince) {}
 
 DecodedFrame& DecodedFrame::operator=(DecodedFrame&& other) noexcept {
@@ -307,6 +320,7 @@ DecodedFrame& DecodedFrame::operator=(DecodedFrame&& other) noexcept {
         m_duration = other.m_duration;
         m_position = other.m_position;
         m_skip = other.m_skip;
+        m_thinnedUnder = other.m_thinnedUnder;
         m_readSince = other.m_readSince;
     }
     return *this;
@@ -823,6 +837,29 @@ int64_t VideoDecoder::streamStart() const {
     return start == AV_NOPTS_VALUE ? 0 : start;
 }
 
+std::chrono::nanoseconds VideoDecoder::timelineStart() const {
+    return inNanoseconds(streamStart(), m_format->streams[m_stream]->time_base).value_or(std::chrono::nanoseconds{});
+}
+
+VideoDecoder::Verdict VideoDecoder::judgeGrid(const AVPacket& packet) {
+    const bool applies = m_unshown && deepestSkip() != PictureSkip::Nothing && m_packetTimesHold && !m_flushed &&
+                         std::holds_alternative<std::monostate>(m_resume) && m_returned.count >= 2 &&
+                         (m_returned.lastTimestamp || m_returned.lastPacket);
+    const AVStream& stream = *m_format->streams[m_stream];
+    std::optional<std::chrono::nanoseconds> length = nominalInterval(stream);
+    if (const auto own = packet.duration > 0 ? inNanoseconds(packet.duration, stream.time_base) : std::nullopt) {
+        length = std::max(length.value_or(*own), *own);
+    }
+    const std::optional<bool> firstFieldLeftOut = std::exchange(m_firstFieldLeftOut, std::nullopt);
+    if (!applies || !length || !m_unshown->grids.mayLeaveOut(*length)) return {};
+    const auto judged = [&](bool leftOut) { return Verdict{leftOut ? Grid::LeavesOut : Grid::Shows, m_unshown->number}; };
+    const std::optional<std::chrono::nanoseconds> at = inNanoseconds(packet.pts, stream.time_base);
+    if (!at) return judged(firstFieldLeftOut.value_or(false));
+    const bool leftOut = !m_unshown->grids.shows(*at, *length);
+    if (m_interlaced) m_firstFieldLeftOut = leftOut;
+    return judged(leftOut);
+}
+
 // Back to the first video packet. A seek shown to reach packet 1 leaves it read and numbered;
 // otherwise the container is opened again.
 void VideoDecoder::rewind() {
@@ -1207,6 +1244,7 @@ bool VideoDecoder::holds(const AVBufferRef& frames, int width, int height) const
 }
 
 int VideoDecoder::readVideoPacket() {
+    m_packetVerdict.reset();
     for (;;) {
         const int err = ffmpeg_file::readPacket(*m_format, m_packet);
         if (err < 0) return err;
@@ -1228,7 +1266,7 @@ int VideoDecoder::readVideoPacket() {
 }
 
 void VideoDecoder::numberPacket() {
-    m_packet->opaque = reinterpret_cast<void*>(static_cast<uintptr_t>(++*m_packetsRead) << kLevelBits);
+    m_packet->opaque = reinterpret_cast<void*>(static_cast<uintptr_t>(++*m_packetsRead) << kTagBits);
     if (*m_packetsRead == 1) m_firstPacket = PacketMark::of(*m_packet);
 }
 
@@ -1285,6 +1323,8 @@ std::variant<std::optional<DecodedFrame>, VideoDecoder::Dropping> VideoDecoder::
             m_awaitingHardwareSetup = false;
             if (m_frame->format == AV_PIX_FMT_VULKAN) m_path = Path::Hardware;
             const int64_t timestamp = m_frame->best_effort_timestamp;
+            if (m_frame->pts == AV_NOPTS_VALUE || m_frame->pts != timestamp) m_packetTimesHold = false;
+            if ((m_frame->flags & AV_FRAME_FLAG_INTERLACED) != 0) m_interlaced = true;
             const std::optional<uint64_t> packet = packetNumber(*m_frame);
             if (!admit(timestamp, packet)) {
                 // The next picture returned is counted on from here, where the last one returned was.
@@ -1302,6 +1342,7 @@ std::variant<std::optional<DecodedFrame>, VideoDecoder::Dropping> VideoDecoder::
             frame.m_duration = out->duration > 0 ? inNanoseconds(out->duration, stream.time_base)
                                                  : nominalInterval(stream);
             frame.m_skip = sentSkipping(*out);
+            frame.m_thinnedUnder = sentThinnedUnder(*out);
             frame.m_readSince = std::max(std::exchange(m_readSinceReturned, 0), 1U);
             recordReturned(timestamp, packet);
             if (m_returned.lastTimestamp) frame.m_position = StreamPosition(*m_returned.lastTimestamp);
@@ -1365,9 +1406,19 @@ std::variant<std::optional<DecodedFrame>, VideoDecoder::Dropping> VideoDecoder::
             (!m_flushed && resetsDecoder(*m_format->streams[m_stream]->codecpar, *m_packet))) {
             m_skipping = wanted;
         }
-        m_codec->skip_frame = discardFor(m_skipping);
-        if (m_skipping != PictureSkip::Nothing) m_returned.skipped = true;
-        if (!m_flushed) tagSkipping(*m_packet, m_skipping);
+        // Once a packet: a field pair's second field is judged by its first.
+        if (!m_packetVerdict) m_packetVerdict = judgeGrid(*m_packet);
+        const Verdict verdict = *m_packetVerdict;
+        // The grid only ever adds Unreferenced, which can be left at any packet, so it needs no level of
+        // its own; the packet is tagged with the asked level alone.
+        const PictureSkip applied = verdict.grid == Grid::LeavesOut
+                                        ? std::min(std::max(m_skipping, PictureSkip::Unreferenced), deepestSkip())
+                                        : m_skipping;
+        m_codec->skip_frame = discardFor(applied);
+        if (applied != PictureSkip::Nothing) m_returned.skipped = true;
+        if (!m_flushed) {
+            tagSent(*m_packet, m_skipping, verdict.grid != Grid::Off ? std::optional(verdict.under) : std::nullopt);
+        }
         err = avcodec_send_packet(m_codec, m_flushed ? nullptr : m_packet);
         // EAGAIN is "read the output first, then send this one again", and ffmpeg promises the
         // receive that follows will not ask for input; a second EAGAIN for the same packet is

@@ -66,6 +66,24 @@ std::optional<int> monitorIdOf(const QString& key)
     return ok && id >= 0 && id < kMonitorIds && key == QString::number(id) ? std::optional<int>(id) : std::nullopt;
 }
 
+// A setting the daemon has just accepted proves it reports frame-rate settings.
+FrameRates& written(std::optional<FrameRates>& rates)
+{
+    return rates ? *rates : rates.emplace();
+}
+
+bool isFrameRateChoice(int rate)
+{
+    return std::ranges::find(kFrameRates, rate) != std::end(kFrameRates);
+}
+
+// Nothing for a rate this app does not know, as a newer daemon may report.
+std::optional<int> frameRateOf(const QJsonValue& value)
+{
+    const int rate = value.toInt(0);
+    return isFrameRateChoice(rate) ? std::optional<int>(rate) : std::nullopt;
+}
+
 std::expected<DaemonStatus, QString> statusOf(const QDBusMessage& reply)
 {
     const QVariantList args = reply.arguments();
@@ -124,6 +142,9 @@ std::expected<DaemonStatus, QString> parseDaemonStatus(const QByteArray& json)
                 return refuse("lists a monitor id out of range");
             }
             status.occupied.insert(*id);
+            if (std::string_view(field) == "wallpapers") {
+                status.wallpapers.insert(*id);
+            }
             if (std::string_view(field) == "pause") {
                 const QString mode = it.value().toObject().value(QStringLiteral("mode")).toString();
                 status.pauseModes.insert(*id, isPauseMode(mode) ? std::optional<QString>(mode) : std::nullopt);
@@ -152,6 +173,37 @@ std::expected<DaemonStatus, QString> parseDaemonStatus(const QByteArray& json)
             }
             status.occupied.insert(*id);
             status.screenSound.insert(*id, it.value().toObject().value(QStringLiteral("enabled")).toBool(true));
+        }
+    }
+
+    const QJsonValue frameRate = root.value(QStringLiteral("frame_rate"));
+    if (!frameRate.isUndefined()) {
+        if (!frameRate.isObject()) {
+            return refuse("has frame-rate settings that are not an object");
+        }
+        const QJsonObject settings = frameRate.toObject();
+        FrameRates& rates = status.frameRates.emplace();
+        rates.rate = frameRateOf(settings.value(QStringLiteral("rate")));
+        // A newer daemon's value is null, and applied as off.
+        rates.keepHigher = settings.value(QStringLiteral("keep_higher")).toBool(false);
+        const QJsonValue monitors = settings.value(QStringLiteral("monitors"));
+        if (!monitors.isUndefined() && !monitors.isObject()) {
+            return refuse("has a list of monitors that is not an object");
+        }
+        const QJsonObject screens = monitors.toObject();
+        for (auto it = screens.begin(); it != screens.end(); ++it) {
+            const auto id = monitorIdOf(it.key());
+            if (!id) {
+                return refuse("lists a monitor id out of range");
+            }
+            status.occupied.insert(*id);
+            const QJsonObject screen = it.value().toObject();
+            if (!screen.value(QStringLiteral("follows_global")).toBool(true)) {
+                rates.screenRates.insert(*id, frameRateOf(screen.value(QStringLiteral("rate"))));
+            }
+            if (const double refresh = screen.value(QStringLiteral("refresh_rate")).toDouble(0); refresh > 0) {
+                rates.refreshRates.insert(*id, refresh);
+            }
         }
     }
 
@@ -214,6 +266,32 @@ QVariantMap DaemonClient::screenSound() const
         sound.insert(it.key(), m_status.screenSound.value(it.value(), true));
     }
     return sound;
+}
+
+int DaemonClient::frameRate() const
+{
+    return m_status.frameRates ? m_status.frameRates->rate.value_or(0) : kDefaultFrameRate;
+}
+
+QVariantMap DaemonClient::screenFrameRates() const
+{
+    QVariantMap rates;
+    for (auto it = m_status.outputs.cbegin(); it != m_status.outputs.cend(); ++it) {
+        int rate = 0;
+        if (m_status.frameRates) {
+            if (const auto own = m_status.frameRates->screenRates.constFind(it.value());
+                own != m_status.frameRates->screenRates.cend()) {
+                rate = own->value_or(-1);
+            }
+        }
+        rates.insert(it.key(), rate);
+    }
+    return rates;
+}
+
+bool DaemonClient::keepHigherFrameRate() const
+{
+    return m_status.frameRates && m_status.frameRates->keepHigher;
 }
 
 QString DaemonClient::persistenceProblem() const
@@ -384,6 +462,54 @@ void DaemonClient::setScreenSound(QObject* context, int monitorId, bool on, Done
     sendSetting(context, message, [this, monitorId, on] {
         m_status.screenSound.insert(monitorId, on);
         m_status.occupied.insert(monitorId);
+    }, std::move(done));
+}
+
+void DaemonClient::setFrameRate(QObject* context, int rate, Done done)
+{
+    QDBusMessage message = method("SetFrameRate");
+    message.setArguments({rate});
+    sendSetting(context, message, [this, rate] { written(m_status.frameRates).rate = rate; }, std::move(done));
+}
+
+void DaemonClient::setScreenFrameRate(QObject* context, int monitorId, int rate, Done done)
+{
+    QDBusMessage message = method("SetMonitorFrameRate");
+    message.setArguments({monitorId, rate});
+    sendSetting(context, message, [this, monitorId, rate] {
+        FrameRates& rates = written(m_status.frameRates);
+        if (rate == 0) {
+            rates.screenRates.remove(monitorId);
+        } else {
+            rates.screenRates.insert(monitorId, rate);
+        }
+        m_status.occupied.insert(monitorId);
+    }, std::move(done));
+}
+
+void DaemonClient::setKeepHigherFrameRate(QObject* context, bool keep, Done done)
+{
+    QDBusMessage message = method("SetKeepHigherFrameRate");
+    message.setArguments({keep});
+    sendSetting(context, message, [this, keep] { written(m_status.frameRates).keepHigher = keep; },
+                std::move(done));
+}
+
+void DaemonClient::setOutputRefreshRate(QObject* context, const QString& connector, double rate, Done done)
+{
+    QDBusMessage message = method("SetOutputRefreshRate");
+    message.setArguments({connector, rate});
+    sendSetting(context, message, [this, connector, rate] {
+        const auto id = m_status.outputs.constFind(connector);
+        if (id == m_status.outputs.cend()) {
+            return;
+        }
+        FrameRates& rates = written(m_status.frameRates);
+        if (rate == 0) {
+            rates.refreshRates.remove(*id);
+        } else {
+            rates.refreshRates.insert(*id, rate);
+        }
     }, std::move(done));
 }
 

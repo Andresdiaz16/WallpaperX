@@ -45,6 +45,9 @@ public:
     // reports neither. A different monitor on the same connector changes it, so a known model
     // name is carried to the next read only while this is unchanged. Not given to QML.
     QString panel;
+    // Refreshes a second of the mode shown now; 0 when KScreen names no current mode, or a rate
+    // below 1 or above 1000, which the daemon would refuse. Not given to QML.
+    double refreshRate = 0;
     // Logical desktop coordinates: KScreen's position with the pixel size divided by the scale.
     QRectF geometry;
     // Pixels on the panel, already swapped for a quarter-turn rotation.

@@ -7,6 +7,11 @@
 //   WALLPAPERX_TEST_ALLOC_FAIL=path   names a file holding an AllocFailControl (alloc_fail_control.h),
 //                                     which the test arms.
 //   WALLPAPERX_TEST_ALLOC_FAIL_TRACE=1  each failure prints its stack on descriptor 2.
+//   WALLPAPERX_TEST_ALLOC_FAIL_ON=handler  aims at the D-Bus handler thread instead (the
+//                                     handlerAllocationFailure phase): the thread is the first to read a
+//                                     double out of a message -- SetOutputRefreshRate's rate, the only
+//                                     double this daemon is sent -- and the countdown is disarmed when
+//                                     that thread sends a reply through sdbus-c++.
 //
 // The thread is learned rather than named: the first to append a Unix descriptor to a D-Bus message
 // is the render worker answering a GetFrame, since nothing else this daemon sends carries one until a
@@ -30,20 +35,25 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <new>
 
+struct sd_bus;
 struct sd_bus_message;
 
 namespace {
 
 wallpaperx::testing::AllocFailControl* g_control = nullptr;
+bool g_onHandler = false;
 
 __attribute__((constructor)) void mapControl() {
     const char* path = std::getenv("WALLPAPERX_TEST_ALLOC_FAIL");
     if (path == nullptr || *path == '\0') return;
+    const char* on = std::getenv("WALLPAPERX_TEST_ALLOC_FAIL_ON");
+    g_onHandler = on != nullptr && std::strcmp(on, "handler") == 0;
     const int fd = ::open(path, O_RDWR | O_CLOEXEC);
     if (fd < 0) return;
     void* mapped = ::mmap(nullptr, sizeof(wallpaperx::testing::AllocFailControl), PROT_READ | PROT_WRITE, MAP_SHARED,
@@ -114,7 +124,7 @@ bool waitedByTheDaemon() {
 // The worker starting to wait on a condition variable of the daemon's own: the end of whatever it was
 // doing. Any other wait on that thread is only counted, for the test to report.
 void noteWait() {
-    if (!onTheWorker()) return;
+    if (g_onHandler || !onTheWorker()) return;
     if (waitedByTheDaemon()) {
         g_control->callsDone.fetch_add(1);
     } else {
@@ -151,11 +161,30 @@ Fn waitFor(Fn libc, Fn sanitizer, const void* caller) {
 extern "C" int sd_bus_message_append_basic(sd_bus_message* message, char type, const void* value) {
     using Fn = int (*)(sd_bus_message*, char, const void*);
     static const auto real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "sd_bus_message_append_basic"));
-    if (type == 'h' && g_control != nullptr) {
+    if (type == 'h' && g_control != nullptr && !g_onHandler) {
         int unset = 0;
         g_control->workerTid.compare_exchange_strong(unset, static_cast<int>(::gettid()));
     }
     return real(message, type, value);
+}
+
+extern "C" int sd_bus_message_read_basic(sd_bus_message* message, char type, void* value) {
+    using Fn = int (*)(sd_bus_message*, char, void*);
+    static const auto real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "sd_bus_message_read_basic"));
+    if (type == 'd' && g_control != nullptr && g_onHandler) {
+        int unset = 0;
+        g_control->workerTid.compare_exchange_strong(unset, static_cast<int>(::gettid()));
+    }
+    return real(message, type, value);
+}
+
+// A reply sdbus-c++ sends is the end of the handler's call: a failure after it would land in sdbus-c++'s
+// loop. An error reply sd-bus sends itself does not pass through here; the test disarms on its answer.
+extern "C" int sd_bus_send(sd_bus* bus, sd_bus_message* message, uint64_t* cookie) {
+    using Fn = int (*)(sd_bus*, sd_bus_message*, uint64_t*);
+    static const auto real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "sd_bus_send"));
+    if (g_onHandler && onTheWorker()) g_control->countdown.store(0);
+    return real(bus, message, cookie);
 }
 
 extern "C" int pthread_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex) {

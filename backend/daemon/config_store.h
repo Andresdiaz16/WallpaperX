@@ -52,9 +52,13 @@ struct PersistedWallpaper {
     // monitor's, like pauseJson.
     std::string soundJson;
 
+    // The monitor's frame-rate setting, the `frame_rate` field as JSON text (frame_rate_setting.h),
+    // empty when the row has none. The monitor's, like pauseJson.
+    std::string frameRateJson;
+
     // Whether the row carries a setting of the monitor, which keeps it worth writing with no
     // wallpaper and no name.
-    bool holdsMonitorSettings() const { return !pauseJson.empty() || !soundJson.empty(); }
+    bool holdsMonitorSettings() const { return !pauseJson.empty() || !soundJson.empty() || !frameRateJson.empty(); }
 };
 
 // The whole file: the settings at its root and one row per monitor.
@@ -63,6 +67,11 @@ struct PersistedConfig {
 
     // The root `sound` field as JSON text, empty when absent (sound_setting.h).
     std::string soundJson;
+
+    // The root `frame_rate` and `keep_higher_frame_rate` fields as JSON text, empty when absent
+    // (frame_rate_setting.h).
+    std::string frameRateJson;
+    std::string keepHigherFrameRateJson;
 };
 
 // Not a fit -- real names run under a dozen bytes -- but a finite bound on a string a
@@ -112,8 +121,10 @@ OutputSize outputSizeFromJson(const std::string& text);
 struct LoadResult {
     std::vector<PersistedWallpaper> entries;
 
-    // The root `sound` field as JSON text, empty when absent.
+    // The root `sound`, `frame_rate` and `keep_higher_frame_rate` fields as JSON text, empty when absent.
     std::string soundJson;
+    std::string frameRateJson;
+    std::string keepHigherFrameRateJson;
 
     // Empty when nothing was wrong, including the ordinary case of no file at all.
     std::string error;

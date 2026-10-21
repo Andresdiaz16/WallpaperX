@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <variant>
 
@@ -44,7 +45,8 @@ struct OffscreenTarget;
 // The first picture is decoded on the calling thread. From the second on, a stream the device
 // decodes is decoded on a thread of its own, a few pictures ahead (DecodeAhead), when the device's
 // queues are internally synchronised and the thread can be had; otherwise every picture is decoded
-// on the calling thread. Only takeReady() and decodeWithin() set what that thread's decodes skip.
+// on the calling thread. Only takeReady(), decodeWithin() and leaveUnshown() set what that thread's
+// decodes skip.
 //
 // GPU thread only, destruction included. Must be destroyed before the Device. Destruction waits
 // for the decode thread to leave the decode call it is in.
@@ -117,6 +119,19 @@ public:
     // As VideoDecoder::deepestSkip(), as of the picture decoded last.
     PictureSkip deepestSkip() const { return m_deepest; }
 
+    // Lets the decoder leave out the pictures nothing references that no display taking one picture every
+    // one of `spacings` of the file's own time would show, from its next decode on, as
+    // VideoDecoder::leaveUnshown() does with ShowGrids laid from the file's start; none leaves none out.
+    // Standing, unlike a PictureSkip, and not a promise: a picture decoded ahead, or one something
+    // references, is still returned. A picture thinned by them reports `number` as
+    // PictureTiming::thinnedUnder. Throws as ShowGrids' constructor does.
+    void leaveUnshown(std::span<const std::chrono::nanoseconds> spacings, uint8_t number);
+
+    // Whether any of those displays would show the picture decoded last; true for one without a time or
+    // a duration, and for no spacing. Throws std::logic_error before the first picture, and as ShowGrids'
+    // constructor does.
+    bool shows(std::span<const std::chrono::nanoseconds> spacings) const;
+
     // Where the picture draw() last showed lies in the file, for a pipeline opened on it later to
     // start there. Empty before the first draw and when the decoder could not find it again.
     std::optional<StreamPosition> shownPosition() const { return m_shownPosition; }
@@ -144,6 +159,8 @@ private:
     // The system had no thread to give, so this thread decodes for good.
     bool m_noDecodeThread = false;
     PictureSkip m_deepest;
+    // Where every ShowGrid for this file is laid from, read before a decode thread owns the decoder.
+    std::chrono::nanoseconds m_origin;
     // Null until the first picture is converted.
     std::unique_ptr<Stage> m_stage;
     // The picture decoded last, while it is not converted yet.

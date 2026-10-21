@@ -85,9 +85,14 @@ public:
     // Where a decoder opened on the same file can start at this picture. Empty when it could not be
     // found again: it has no timestamp, or the pictures returned before it did not rise in time.
     std::optional<StreamPosition> position() const { return m_position; }
-    // What the decoder was leaving out when this picture's packet was sent. With frame threads that
-    // can be a level asked for several pictures before this one was returned.
+    // What the decoder was leaving out, at next()'s asking, when this picture's packet was sent; not
+    // what leaveUnshown() added. With frame threads that can be a level asked for several pictures
+    // before this one was returned.
     PictureSkip skip() const { return m_skip; }
+    // The number of leaveUnshown()'s grids if, when its packet was sent, they applied and could leave out
+    // a picture as long as this one: the first level was returning only the pictures they show. Says so
+    // at any skip(). Empty when not thinned.
+    std::optional<uint8_t> thinnedUnder() const { return m_thinnedUnder; }
     // The highest level that would still decode this picture, judged by its type alone. A B picture
     // is taken as one no other picture references, which in a B pyramid it need not be.
     PictureSkip keptThrough() const;
@@ -149,6 +154,7 @@ private:
     std::optional<std::chrono::nanoseconds> m_duration;
     std::optional<StreamPosition> m_position;
     PictureSkip m_skip = PictureSkip::Nothing;
+    std::optional<uint8_t> m_thinnedUnder;
     uint32_t m_readSince = 1;
 };
 
@@ -311,6 +317,20 @@ public:
     // from deeper at. Nothing for every other codec: AV1 and VP9 ignore a level changed after opening.
     PictureSkip deepestSkip() const;
 
+    // Also leaves out, from the next packet sent, the pictures nothing references that `grids` would not
+    // show; nothing leaves none out. Applied as next()'s Unreferenced is -- so not where deepestSkip() is
+    // Nothing, nor while a start or resume drops its way to a picture -- and not before a pass has
+    // returned two pictures, so a pass returning one means a file of one picture; nor where the count of
+    // pictures returned would be the only place a software resume has, nor once a returned picture's
+    // timestamp is not its packet's. Returned pictures' skip() does not count it: that stays the level
+    // next() was asked for; thinnedUnder() says whether it applied, and under which. Called by the thread
+    // that calls next().
+    void leaveUnshown(std::optional<NumberedGrids> grids) { m_unshown = grids; }
+    std::optional<NumberedGrids> unshown() const { return m_unshown; }
+
+    // The stream's start on the timeline presentationTime() uses: where a ShowGrid for it is laid from.
+    std::chrono::nanoseconds timelineStart() const;
+
 private:
     std::variant<std::optional<DecodedFrame>, Dropping> decode(std::optional<uint32_t> dropLimit, PictureSkip skip);
     // Aborts off the GPU thread unless the device's queues are internally synchronised.
@@ -366,6 +386,18 @@ private:
     bool skipToPacket(const PacketMark& mark);
     bool decodesOnDevice() const;
     int64_t streamStart() const;
+    // What the grid does to the picture `packet` starts or continues: Off where it is not applied or can
+    // leave out no picture this long. A packet is judged over at least the stream's nominal interval, so
+    // a field is judged as its whole picture. One without a timestamp right after one with, once the
+    // decoder has returned an interlaced picture, is taken as that one's second field and judged with it;
+    // any other is shown. Once a packet: it moves the field state on.
+    enum class Grid { Off, Shows, LeavesOut };
+    struct Verdict {
+        Grid grid = Grid::Off;
+        // The grids' number, unless Off.
+        uint8_t under = 0;
+    };
+    Verdict judgeGrid(const AVPacket& packet);
     void rewind();
     bool seekToFirstPacket();
     bool seekLandsOnFirstPacket(int64_t target, int flags);
@@ -439,6 +471,19 @@ private:
     // pictures that can reference skipped ones only at a packet resetsDecoder() accepts. Nothing after a
     // flush: the decoder then holds no picture a later one could miss.
     PictureSkip m_skipping = PictureSkip::Nothing;
+    std::optional<NumberedGrids> m_unshown;
+    // judgeGrid()'s verdict on the packet in m_packet; empty until it is judged, and again once another
+    // is read. A packet a seek or rewind leaves held is a new one: only an EAGAIN resend keeps its verdict.
+    std::optional<Verdict> m_packetVerdict;
+    // Whether the grid left out the packet judged last, when that may be a field pair's first field: it
+    // had a timestamp, and m_interlaced. Taken by the next packet judged.
+    std::optional<bool> m_firstFieldLeftOut;
+    // A picture decoded from this file was interlaced. Not the container's field order, which demuxers
+    // of field-coded H.264 in MPEG-TS often leave unknown.
+    bool m_interlaced = false;
+    // Every picture decoded so far was timestamped as its packet was. Once one is not, packets no
+    // longer place pictures where a caller judging returned ones does, and the grid leaves nothing out.
+    bool m_packetTimesHold = true;
     std::optional<std::chrono::nanoseconds> m_readThrough;
     // Video packets read since a picture was last returned.
     uint32_t m_readSinceReturned = 0;

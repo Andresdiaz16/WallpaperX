@@ -38,6 +38,8 @@ struct PictureTiming {
     // the time spent in its calls, dropped pictures and a loop's restart included, not the time
     // anyone waited for it nor the time it waited for an answer from another thread.
     std::chrono::nanoseconds decodeTime{};
+    // As DecodedFrame::thinnedUnder().
+    std::optional<uint8_t> thinnedUnder;
 };
 
 // One file's VideoDecoder, played through: started again at its end when looping, and each

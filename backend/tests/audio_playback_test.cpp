@@ -169,6 +169,8 @@ struct PictureRecord {
     int64_t at = 0;
     std::string file;
     std::optional<int64_t> presentationNs;
+    // The thread that handed it on.
+    std::thread::id decodedOn;
 };
 std::mutex g_pictureMutex;
 std::vector<PictureRecord> g_pictures;
@@ -182,6 +184,11 @@ std::vector<PictureRecord> g_released;
 // decode thread's queue cannot absorb. Under g_stallFileMutex.
 std::string g_releaseStallFile;
 std::atomic<int> g_releaseStallMs{0};
+// While slow reads are armed, letting go of a g_slowFile picture on a thread other than the one that
+// decoded it costs that thread g_slowReleaseUs: a decode thread takes the read cost off the render
+// thread, and this puts a cost per picture back on it.
+std::atomic<int> g_slowReleaseUs{0};
+std::atomic<int> g_slowReleases{0};
 std::map<const AVPacket*, std::string> g_packetFile;
 std::map<const AVCodecContext*, std::string> g_contextFile;
 thread_local AVCodecContext* t_videoContext = nullptr;
@@ -748,6 +755,7 @@ extern "C" void av_frame_move_ref(AVFrame* dst, AVFrame* src) {
         const AVCodecContext& ctx = *probe::t_videoContext;
         probe::PictureRecord r;
         r.at = probe::nowNs();
+        r.decodedOn = std::this_thread::get_id();
         if (src->best_effort_timestamp != AV_NOPTS_VALUE && ctx.pkt_timebase.num > 0) {
             r.presentationNs = av_rescale_q(src->best_effort_timestamp, ctx.pkt_timebase, AVRational{1, 1'000'000'000});
         }
@@ -762,7 +770,7 @@ extern "C" void av_frame_move_ref(AVFrame* dst, AVFrame* src) {
 extern "C" void av_frame_free(AVFrame** frame) {
     using Fn = void (*)(AVFrame**);
     static const Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "av_frame_free"));
-    int stall = 0;
+    int stall = 0, slow = 0;
     if (frame != nullptr && *frame != nullptr) {
         std::lock_guard<std::mutex> lock(probe::g_pictureMutex);
         if (const auto it = probe::g_handedOn.find(*frame); it != probe::g_handedOn.end()) {
@@ -774,6 +782,11 @@ extern "C" void av_frame_free(AVFrame** frame) {
                 r.file.find(probe::g_releaseStallFile) != std::string::npos) {
                 stall = probe::g_releaseStallMs.exchange(0);
             }
+            if (probe::g_slowReleaseUs.load() > 0 && probe::g_slowPictureReads.load() > 0 && !probe::g_slowFile.empty() &&
+                r.decodedOn != std::this_thread::get_id() && r.file.find(probe::g_slowFile) != std::string::npos) {
+                slow = probe::g_slowReleaseUs.load();
+                probe::g_slowReleases.fetch_add(1);
+            }
             probe::g_released.push_back(std::move(r));
         }
     }
@@ -782,6 +795,7 @@ extern "C" void av_frame_free(AVFrame** frame) {
         std::this_thread::sleep_for(std::chrono::milliseconds(stall));
         probe::g_fileStallEndedAt.store(probe::nowNs());
     }
+    if (slow > 0) std::this_thread::sleep_for(std::chrono::microseconds(slow));
     real(frame);
 }
 
@@ -5408,13 +5422,30 @@ void runStreamNameChecks() {
 //       target under 20 ms (the sound moved into a pass's first 150 ms, which isPassStartSeek() must not take for a
 //       start) -> "FAIL: rate cap rule: a capped file's sound is moved only onto a pass's start" (3 seeks, 3
 //       mid-pass), with the pictures' rate and beep lines.
-void runRateCapChecks() {
+// Run at the frame-rate setting 120 (S15.895) and at the default 60 (S15.896): at 60 the cap is 60 a second,
+// so the same file shows 50 to 62.5 pictures a second, with every other line unchanged.
+// CONTROL: control_batch.sh 2026-10-20 (F1), NVIDIA, reverted: --phase rateCap60, targetRateLocked() returning 120
+//       (backend/daemon/wallpaper_manager.cpp) and ShowGrid::shows()' step doubled (renderer/video/picture_skip.h)
+//       -> "... shows about 60 pictures a second"; AudioTrack::clock() 40 ms ahead -> "... each beep is heard with
+//       the picture at its timestamp". --phase rateCap: targetRateLocked() returning 60 -> "... shows about 120";
+//       the clock break -> the beep line.
+void runRateCapChecks(int frameRate) {
     const char* kGoals = "S15.535 (a video above the picture cap plays at its own rate, its sound with it)";
-    const std::string rule = "rate cap rule";
+    const std::string rule = frameRate >= 120 ? "rate cap rule" : "rate cap rule at 60";
     SoundServer sound(kGoals);
     if (!sound.ready) return;
+    const auto atFrameRate = [&](Daemon& d) {
+        try {
+            d.manager.setFrameRate(frameRate);
+        } catch (const std::exception& e) {
+            check(false, rule + ": the frame rate " + std::to_string(frameRate) + " is accepted", e.what());
+            return false;
+        }
+        return true;
+    };
     {
         Daemon d(smallConfig());
+        if (!atFrameRate(d)) return;
         const std::string file = asset("wallpaper_beeps_rate240.mp4");
         if (!startHeard(d, file, kGoals)) return;
         std::this_thread::sleep_for(1000ms);
@@ -5448,7 +5479,8 @@ void runRateCapChecks() {
         std::printf("audio_playback_test: %s: 240 a second: %.1f pictures shown a second, the line plays %.4f s of the file "
                     "a second; %zu sound seeks (%zu mid-pass) over %zu loops; the server at most %.1f ms between cycles\n",
                     rule.c_str(), perSecond, played, seeks.size(), midPass.size(), loops, serverGap / 1e6);
-        check(perSecond >= 100 && perSecond <= 125, rule + ": a 240-a-second file shows about 120 pictures a second",
+        check(perSecond >= frameRate * 100.0 / 120.0 && perSecond <= frameRate * 125.0 / 120.0,
+              rule + ": a 240-a-second file shows about " + std::to_string(frameRate) + " pictures a second",
               fmt("%.1f", perSecond));
         if (graded >= 0) {
             check(graded >= 8 && passStarts >= 1, rule + ": at least eight beeps were graded, one at a pass start after a loop",
@@ -5465,7 +5497,7 @@ void runRateCapChecks() {
         }
     }
     Daemon d(smallConfig());
-    if (startHeard(d, asset("wallpaper_tone_rate120.mp4"), kGoals)) {
+    if (atFrameRate(d) && startHeard(d, asset("wallpaper_tone_rate120.mp4"), kGoals)) {
         std::printf("audio_playback_test: rate cap rule: the 120-a-second video is heard\n");
     }
 }
@@ -5737,6 +5769,9 @@ Undisturbed runSoundUndisturbed(const char* rule, const char* goals, const std::
 //       commit 43.5 ms late). Green: 2 skipped, the latest commit +10.2 ms against the line. control_batch.sh
 //       2026-10-18, reverted, 180 ms stall, the drop loop disabled as above -> "... closed by dropping" (0 skipped,
 //       2 owed) and "... drawn late" (2 of 39); green: held 113.8 ms, 2 skipped, 0 of 37 late, +13.8 ms.
+//       Re-run 2026-10-20 (T9a), control_batch.sh, phase latePicture, against the drop loop's `!unshown && (...)`
+//       condition: `!pace.timesPicture ||` made `true ||` -> both lines red on both entries (0 skipped, 2 owed);
+//       `if (dropped) break;` at its head -> "... closed by dropping" on NVIDIA only (1 skipped), Lavapipe green.
 void runLatePictureChecks() {
     constexpr int kStallMs = 180;
     // How many pictures a decode thread keeps ready to cover a stall: kDepth in renderer/video/decode_ahead.cpp,
@@ -5821,6 +5856,7 @@ struct StallReset {
         probe::g_slowPictureReads.store(0);
         probe::g_stallFileMs.store(0);
         probe::g_releaseStallMs.store(0);
+        probe::g_slowReleaseUs.store(0);
         probe::g_streamRate.store(0.0);
         probe::g_hideStreamTime.store(false);
         probe::g_costMs.store(0);
@@ -5843,6 +5879,7 @@ struct StallReset {
         }
         std::lock_guard<std::mutex> lock(probe::g_stallFileMutex);
         probe::g_slowFile.clear();
+        probe::g_releaseStallFile.clear();
         probe::g_stallFile.clear();
     }
 };
@@ -6096,20 +6133,26 @@ void runSlowLoopWakeChecks() {
           handedAt ? fmt("the seek came %.1f ms before the new pass", lead) : "no seek to the pass's start was seen");
 }
 
-// GOAL: S15.559 -- catching one screen up to its sound leaves the other screens on time: after an 80 ms
-//       stall of a heard 120-a-second screen whose picture reads cost 3 ms, a second, unheard screen
-//       playing at the 120-a-second cap draws with no gap over 28 ms, the stall's end counted as
-//       an edge. False if the heard screen drops the pictures the sound has passed for as long as that
-//       takes in one round, instead of within the round's 4 ms catch-up slice.
-// WHY-THIS-SHAPE: 3 ms reads make each drop cost about a slice, so dropping the 9 or so pictures an 80 ms
-//       stall leaves behind in one round takes about 40 ms. The other screen at the 120-a-second cap is due
-//       every 8.3 ms, so one long round shows as one long gap; at 30 a second it would mostly hide inside
-//       the interval. 28 ms sits between a correct run's worst gap (about 16 ms) and the about 40 ms the
-//       slice's absence adds. A run whose other screen already went over 20 ms between pictures in the
-//       250 ms before the stall, the slow reads on, is not verified: the machine was too busy to tell.
+// GOAL: S15.559 -- catching one screen up to its sound leaves the other screens on time: after a 60 ms
+//       render-thread stall behind a heard 120-a-second screen each of whose pictures costs the render
+//       thread over a slice, a second, unheard screen playing at the 120-a-second cap draws with no gap over
+//       28 ms, the stall's end counted as an edge. False if the heard screen drops the pictures the sound
+//       has passed for as long as that takes in one round, instead of within the round's 4 ms catch-up slice.
+// WHY-THIS-SHAPE: the frame-rate setting is 120, or the default 60 thins both screens and the other is due
+//       only every 16.7 ms. The stall is on the render thread as it lets go of a heard picture
+//       (g_releaseStallFile): a read stall lands on a hardware decoder's decode thread, which leaves its
+//       queue empty, so pictures arrive one by one and no round ever has a spent slice with a late picture
+//       ready. Each picture costs the render thread 3 ms to read where it decodes, or 4.5 ms to let go of
+//       where a decode thread does (g_slowReleaseUs): over the slice, so one drop spends it, and under the
+//       interval enough to catch 60 ms up inside kCatchUpHold. 28 ms sits between a correct run's worst gap
+//       (18-22 ms) and the 46-56 ms the slice's absence adds. A run whose other screen already went over 20 ms
+//       between pictures in the 250 ms before the stall is not verified: the machine was too busy to tell.
 // COVERAGE-ASSERT: the heard screen drew after the stall and had five or more pictures to drop; at least
 //       twenty of the other screen's gaps graded.
-// CONTROL: control_batch.sh 2026-10-13, reverted, Lavapipe: the slice test in the drop loop made `if (false &&
+// CONTROL: control_batch.sh 2026-10-20 (T9b), on this staging, both entries, reverted: the slice test made
+//       `if (false && dropped && …` (backend/daemon/wallpaper_manager.cpp) -> "FAIL: drop slice rule: the other
+//       screen's pictures stay on time while the heard one catches up", NVIDIA 45.9 ms, Lavapipe 55.8 ms (green
+//       18.4 and 21.6). Before it, on the 80 ms read stall: control_batch.sh 2026-10-13, reverted, Lavapipe: the slice test in the drop loop made `if (false &&
 //       dropped && …`, backend/daemon/wallpaper_manager.cpp -> "FAIL: drop slice rule: the other screen's
 //       pictures stay on time while the heard one catches up" (40.0 ms; 15.3 green, 15.5 on the RTX), and the
 //       held-pictures line below (2 of 55 late). Test-side, by hand: the render thread held 40 ms by one blit in
@@ -6120,6 +6163,12 @@ void runDropSliceChecks() {
     if (!sound.ready) return;
     StallReset reset;
     Daemon d(smallConfig());
+    try {
+        d.manager.setFrameRate(120);
+    } catch (const std::exception& e) {
+        check(false, "drop slice rule: the frame rate 120 is accepted", e.what());
+        return;
+    }
     const std::string heard = asset("wallpaper_tone_rate120.mp4"), other = asset("wallpaper_tone_rate240.mp4");
     if (!startHeard(d, heard, kGoals)) return;
     d.playOther(other);
@@ -6127,9 +6176,9 @@ void runDropSliceChecks() {
     {
         std::lock_guard<std::mutex> lock(probe::g_stallFileMutex);
         probe::g_slowFile = std::filesystem::path(heard).filename().string();
-        probe::g_stallFile = probe::g_slowFile;
     }
     probe::g_slowPictureMs.store(3);
+    probe::g_slowReleaseUs.store(4500);
     probe::g_slowPictureReads.store(1'000'000);
     std::this_thread::sleep_for(300ms);
     const int64_t baselineTo = probe::nowNs();
@@ -6146,7 +6195,12 @@ void runDropSliceChecks() {
     });
     probe::g_fileStallStartedAt.store(0);
     probe::g_fileStallEndedAt.store(0);
-    probe::g_stallFileMs.store(80);
+    probe::g_slowReleases.store(0);
+    {
+        std::lock_guard<std::mutex> lock(probe::g_stallFileMutex);
+        probe::g_releaseStallFile = probe::g_slowFile;
+    }
+    probe::g_releaseStallMs.store(60);
     std::this_thread::sleep_for(1000ms);
     const int64_t seekEnd = probe::nowNs();
     sampler.request_stop();
@@ -6207,29 +6261,39 @@ void runDropSliceChecks() {
                 "(%.2f ms a picture); the other screen drew %d, at most %.1f ms apart (%.1f ms before the stall); %zu sound "
                 "seeks, the server at most %.1f ms between cycles\n",
                 heardAfter, dropped, interval / 1e6, gaps, worst / 1e6, baselineWorst / 1e6, seeks, serverGap / 1e6);
+    std::printf("audio_playback_test: drop slice rule: %d pictures decoded on a decode thread cost the render thread the "
+                "read when let go of (0 when the render thread decodes)\n",
+                probe::g_slowReleases.load());
     check(heardAfter >= 1, "drop slice rule: the heard screen drew again after its stall");
     if (heardAfter == 0) return;
     if (interval == 0) {
         notVerified(kGoals, "no two of the heard screen's commits in a row showed later and later pictures");
         return;
     }
-    // GOAL: S15.557 on a heavy file -- with every picture read of the heard file at 3 ms, the pictures an
-    //       80 ms stall left behind the sound are dropped, not drawn: at least five skipped among the commits
-    //       in the 500 ms after it, and at most one of those commits more than two intervals past the line
-    //       the commits before the stall set. False if a round whose slice is spent draws the late picture
+    // GOAL: S15.557 on a heavy file -- with every heard picture costing the render thread over a slice, the
+    //       pictures a 60 ms stall left behind the sound are dropped, not drawn: at least five skipped among the
+    //       commits in the 500 ms after it, and at most one of those commits more than two intervals past the
+    //       line the commits before the stall set. False if a round whose slice is spent draws the late picture
     //       instead of dropping at least one and holding the rest.
-    // WHY-THIS-SHAPE: the skips are read from presentation times (shownPictures), at the file's interval;
-    //       a 3 ms read alone nearly spends the round's 4 ms slice, so a drop loop bounded only by the slice
-    //       would rarely run. Holding is graded as lateness against the pre-stall line, not commit spacing,
-    //       which at 120 a second cannot tell a held picture from a drawn one. A correct draw comes when its
-    //       picture is under an interval overdue, plus the draw; two intervals (16.7 ms) leave that a margin.
+    // WHY-THIS-SHAPE: the skips are read from presentation times (shownPictures), at the file's interval.
+    //       One drop spends the slice (staging above), so the loop reaches the spent-slice hold with a late
+    //       picture taken on both decode paths. Holding is graded as lateness against the pre-stall line, not
+    //       commit spacing, which at 120 a second cannot tell a held picture from a drawn one. A correct draw
+    //       comes when its picture is under an interval overdue, plus the draw; two intervals (16.7 ms) leave
+    //       that a margin.
     // CONTROL: control_batch.sh 2026-10-13, reverted, backend/daemon/wallpaper_manager.cpp: the hold's `return
     //       now;` in advanceSessionLocked's drop loop made `break;` (a spent slice draws the held picture) -> "FAIL:
     //       drop slice rule: a heavy file's held pictures are not drawn late" (7 of 59 over two intervals, the
     //       latest +70.5 ms; green at most +6.8 ms on Lavapipe, +13.4 on the RTX); steerSoundLocked's move rule made
     //       `(overdue - behind > kSoundDrift)`, without `!chased &&` (the sound moved to the pictures instead) ->
     //       "FAIL: drop slice rule: a heavy file's pictures the stall left behind the sound are dropped" (0 skipped;
-    //       green 16-17).
+    //       green 16-17). Re-run 2026-10-20 (T9a), control_batch.sh, phase dropSlice, the hold's `return now;` made
+    //       `break;` as above -> red on Lavapipe only (4 of 27 over two intervals, +72.6 ms, with "the other
+    //       screen's pictures stay on time"); NVIDIA stayed GREEN under the break (0 of 27, +5.7 ms).
+    //       Re-staged 2026-10-20 (T9b) for that: control_batch.sh, phase dropSlice, the same break, three runs ->
+    //       red on both entries each time, NVIDIA 3 of 56 (+48.8 ms), Lavapipe 4 of 59 (+50.5 ms); green 0 late,
+    //       at most +11.7 and +5.2 ms. The move rule break below on the same staging -> its line on both (0
+    //       skipped). The read stall with only the per-picture cost added stayed green on NVIDIA under the break.
     check(dropped >= 5, "drop slice rule: a heavy file's pictures the stall left behind the sound are dropped",
           fmt("%.0f skipped", dropped));
     std::string why;
@@ -6278,7 +6342,8 @@ void runDropSliceChecks() {
     //       when the server itself went a cycle plus 20 ms between buffers, which earns a seek (as S15.538).
     // CONTROL: control_batch.sh 2026-10-13, reverted: steerSoundLocked's `(!chased && overdue - behind >
     //       kSoundDrift)` made `(overdue - behind > kSoundDrift)`, backend/daemon/wallpaper_manager.cpp ->
-    //       "FAIL: drop slice rule: a heavy file's catch-up does not move the sound" (1 seek).
+    //       "FAIL: drop slice rule: a heavy file's catch-up does not move the sound" (1 seek). Re-run 2026-10-20
+    //       (T9b) on the render-thread stall, both entries -> the same line (1 seek each).
     if (serverGap > kServerLateBound) {
         notVerified("S15.557 (a heavy file's catch-up does not move the sound)",
                     fmt("the sound server went %.1f ms between cycles, so moving the sound would be correct", serverGap / 1e6));
@@ -6678,7 +6743,9 @@ void runCatchUpCapChecks() {
 //       drawn, not dropped" (0.567 s); advanceSessionLocked returning 10 s ahead instead of drawing a waiting pass's
 //       first picture -> "FAIL: first picture rule: the heard screen drew again after the other screen's stall".
 //       control_batch.sh 2026-10-18, on the render-thread stall, `held.startsPass ||` deleted again -> the same
-//       first line (0.567 s); green 0.000 s, 0.1 ms after the stall.
+//       first line (0.567 s); green 0.000 s, 0.1 ms after the stall. Re-run 2026-10-20 (T9a), control_batch.sh,
+//       phase firstPictureKept: the `held.startsPass ||` after `!pace.timesPicture ||` deleted (the `unshown` one
+//       kept) -> the same first line on both entries (0.600 s and 0.567 s).
 void runLoopFirstPictureChecks() {
     const char* kGoals = "S15.560 (a pass's first picture is never dropped)";
     SoundServer sound(kGoals);
@@ -7426,9 +7493,10 @@ void runDropMinimumChecks() {
 //       sound server ran a cycle over 20 ms late in the window (as S15.538).
 // COVERAGE-ASSERT: at least eight beeps graded; at least 20 pictures handed on in the window.
 // CONTROL: control_batch.sh 2026-10-14, reverted, phase skip: DecodeLoad::skip() returning PictureSkip::Nothing,
-//       backend/daemon/wallpaper_manager.h -> "FAIL: skip rule: a file that cannot keep up decodes under half its
-//       pictures" (100 of 100); stepping down removed from DecodeLoad::add (wallpaper_manager.cpp) -> "... skipping
-//       stops within 1.5 s of decoding getting cheap" (never). control_batch.sh 2026-10-15, phase skip:
+//       backend/daemon/decode_load.h -> "FAIL: skip rule: a file that cannot keep up decodes under half its
+//       pictures" (100 of 100); stepping down removed from DecodeLoad::add (backend/daemon/decode_load.cpp) -> "...
+//       skipping stops within 1.5 s of decoding getting cheap" (never). Both re-run at decode_load.{h,cpp},
+//       control_batch.sh 2026-10-20 (F5): held, the same lines. control_batch.sh 2026-10-15, phase skip:
 //       AudioTrack::clock() 40 ms ahead (renderer/audio/audio_output.cpp) -> "FAIL: skip rule: each beep is heard
 //       with the picture at its timestamp" (+39.98 ms each); control_batch.sh 2026-10-18, on the render thread's
 //       release record, 33 ms ahead -> the same line (+32.91 ms each), green -0.07 ms. Marking every level above none unpaced stays green
@@ -8435,8 +8503,9 @@ void runNoClockPastCapChecks() {
 //       whatever the cheap decodes cost; a fourth slow one could make the correct average reach 1.
 //       Silent, so every presentation-time gap is a picture the decoder skipped.
 // COVERAGE-ASSERT: the three slow decodes spent, and at least 40 pictures handed on.
-// CONTROL: control_batch.sh 2026-10-13, reverted, DecodeLoad::add, backend/daemon/wallpaper_manager.cpp:
-//       `everyPicture.samples >= kSettled &&` deleted -> "FAIL: first slow rule: a few slow first decodes do not turn skipping on" (3 skipped; green 0
+// CONTROL: control_batch.sh 2026-10-13, reverted, DecodeLoad::add, backend/daemon/decode_load.cpp (re-run there
+//       2026-10-20 (F5): held, 6 skipped, green 0 of 66):
+//       `m_everyPicture.samples >= kSettled &&` deleted -> "FAIL: first slow rule: a few slow first decodes do not turn skipping on" (3 skipped; green 0
 //       of 64 on both entries). Test-side: no cost -> "FAIL: first slow rule: the slow first decodes were spent,
 //       and the file went on" (0 costed). The first break re-run on the current
 //       DecodeLoad::span() it compares against (control_run.sh 2026-10-15): held (12 skipped).
@@ -8559,7 +8628,9 @@ void runNoClockLeadChecks() {
 //       backend/daemon/wallpaper_manager.cpp: `if (after.startsPass) return;` deleted -> "FAIL: loop
 //       restart rule: a slow restart at each loop does not turn skipping on" (18 skipped; green 0 of 202-203 on
 //       both entries). Test-side: no pass-start hold -> "FAIL: loop restart rule: the file looped and went on
-//       decoding" (0 held).
+//       decoding" (0 held). That gate is now `if (!after.startsPass || after.skip != PictureSkip::Nothing)`;
+//       re-run 2026-10-20 (T9a), control_batch.sh, phase loopRestartLoad, made `if (true)` -> the same line on
+//       both entries (28 and 18 skipped).
 void runLoopRestartLoadChecks() {
     const char* kGoals = "S15.585 (a loop's restart is not decode load)";
     StallReset reset;
@@ -10651,7 +10722,7 @@ void runSoundFaultClosingChecks() {
 // CONTROL: control_run.sh 2026-10-15, reverted, Lavapipe, phase climb: DecodeLoad::add's climb taking one level at a time
 //       (its `while ... ++to` deleted, backend/daemon/wallpaper_manager.cpp) -> "FAIL: climb rule: a file with no B
 //       pictures climbs straight to intra only" (unreferenced at +524 ms, intra at +607 ms; re-run on the current
-//       span(), 2026-10-15: held, +522 / +605 ms); control_batch.sh 2026-10-14:
+//       span(), 2026-10-15: held, +522 / +605 ms; re-run on the optional span(), 2026-10-20: held); control_batch.sh 2026-10-14:
 //       decoderBehind() out of `chased` -> "... a climb moves no sound mid-pass" (4 seeks); PictureSource::next()
 //       not passing the pass end on (renderer/video/picture_source.cpp; re-run there 2026-10-19, T7: held) -> "... handed on once a pass" (1033 ms
 //       apart); DecodeLoad's samples not weighted by the intervals they span -> "... every picture again within
@@ -11916,7 +11987,8 @@ int main(int argc, char** argv) {
         {"lastPicture", &runLastPictureChecks},
         {"reconnect",[] { runReconnect(false); }},
         {"reconnectPlaysOn", [] { runReconnect(true); }},
-        {"rateCap", &runRateCapChecks},
+        {"rateCap", [] { runRateCapChecks(120); }},
+        {"rateCap60", [] { runRateCapChecks(60); }},
         {"resume", &runResumeChecks},
         {"parked", &runParkedChecks},
         {"latePicture", &runLatePictureChecks},

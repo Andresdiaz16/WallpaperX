@@ -5,6 +5,8 @@
 #include "config_store.h"
 #include "config_writer.h"
 #include "crash_record.h"
+#include "decode_load.h"
+#include "frame_rate_setting.h"
 #include "kept_rows.h"
 #include "log_escape.h"
 #include "pause_mode.h"
@@ -32,6 +34,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -193,6 +196,18 @@ struct MonitorSoundStatus {
     // screen has the focus, and no window on it is maximized or fullscreen. Says nothing about
     // whether the wallpaper has sound to play.
     bool heard = false;
+};
+
+// A monitor's frame-rate setting and what it comes to with its screen's refresh rate.
+struct MonitorFrameRateStatus {
+    // The monitor's own setting; nothing when it follows the global one, or holds a value a newer
+    // build wrote, which this one keeps and does not apply.
+    std::optional<int> rate;
+    bool followsGlobal = true;
+    // What its screen last reported; nothing when not known.
+    std::optional<double> refreshRate;
+    // The most pictures a second its video is drawn at now.
+    double target = kDefaultFrameRate;
 };
 
 // True once a config read has been abandoned mid-call. That thread is still blocked in the
@@ -646,6 +661,28 @@ public:
     // every wallpaper change. Throws InvalidRequest for a bad id.
     bool setMonitorSound(int monitorId, bool on);
 
+    // Sets the most pictures a second every screen draws, one of kFrameRates; a monitor's own setting
+    // replaces it there. Throws InvalidRequest for any other value. Persisted, saved and waited on as
+    // setSound() is. The caller wakes the render worker. Returns whether the setting changed.
+    bool setFrameRate(int rate);
+
+    // The same for one monitor, above the global setting; 0 drops the monitor's own so the global one
+    // applies again. Survives every wallpaper change. Throws InvalidRequest for a bad id or a rate that
+    // is neither 0 nor one of kFrameRates.
+    bool setMonitorFrameRate(int monitorId, int rate);
+
+    // Whether a screen is drawn at its frame-rate setting even where its refresh rate is lower, which
+    // otherwise caps it. Persisted as setSound() is.
+    bool setKeepHigherFrameRate(bool keep);
+
+    // Records how many times a second the screen named `outputName` refreshes, 0 for not known. Not
+    // persisted: a rate left from another session would cap a screen that has since changed below what
+    // it shows, where an unknown one only costs pictures it cannot show. Kept by name as a size is.
+    // Throws InvalidRequest for a name the shared validator rejects or a rate refreshRateError()
+    // refuses, and UnknownOutput for a name no monitor answers to. Returns whether the recorded rate
+    // changed, when the caller wakes the render worker.
+    bool setOutputRefreshRate(const std::string& outputName, double rate);
+
     // Records what the consumer named by `client` says it can import, and returns the monitors
     // to re-post so their images are rebuilt against it. GPU-free, like requestWallpaper: the
     // set is applied on the render thread at the next render.
@@ -878,6 +915,14 @@ public:
 
         // Every monitor holding a wallpaper or a sound setting.
         std::map<int, MonitorSoundStatus> monitorSound;
+
+        // The global frame-rate setting and whether a higher one is kept; nothing for a value a newer
+        // build wrote, applied as the default.
+        std::optional<int> frameRate = kDefaultFrameRate;
+        std::optional<bool> keepHigherFrameRate = false;
+
+        // Every monitor holding a wallpaper or a frame-rate setting, or answering to a screen name.
+        std::map<int, MonitorFrameRateStatus> monitorFrameRate;
     };
     Snapshot snapshot() const;
 
@@ -1599,7 +1644,7 @@ private:
 
     // One open video file, looping, and the screens showing it at one speed: the decoder, its
     // picture pool, one converted picture and where that picture stands against the clock. Every
-    // screen playing is drawn each picture with its own placement into its own images; one that is
+    // screen playing is drawn each picture its own rate shows, with its own placement into its own images; one that is
     // not keeps the picture it has. Held so a re-post -- a screen reporting its size, a consumer
     // reporting its layouts -- draws the held picture instead of rebuilding a decode session for
     // it. A resize keeps it: nothing in a session is sized to the target, since the blit that shows
@@ -1717,75 +1762,6 @@ private:
         };
         std::optional<Heard> heard;
 
-        // How long pictures take to decode against the time they are shown for, averaged over several so
-        // that one slow decode -- a key picture, a wait on the GPU queue, a stalled read -- is not taken
-        // for a file that cannot keep up. A sample counts once per picture interval it covers, so the
-        // average spans the same file time at every level: at the key level one picture can settle it.
-        // While the decoder, as it runs, still cannot keep pace over kSettled, or this level is predicted
-        // not to, what it leaves out climbs straight to the lowest higher level predicted to run under
-        // kKeepsUp; it comes down to the lowest level predicted to. The prediction is decoding every
-        // picture's cost over span(): the file time each picture that level returns spans. Entered at 1
-        // and left under kKeepsUp, so a file decoding at about one level's cost does not flip between two
-        // every few pictures. Past the last level is a file that even its key pictures cannot keep up
-        // with: they are shown as they are decoded, and the sound, never moved to them, stops at the file's
-        // end and is silent until the next pass's first picture starts it again. A decoder that applies
-        // fewer levels goes from its deepest straight past the last, still skipping only what it applies.
-        struct DecodeLoad {
-            struct Average {
-                double value = 0;
-                uint32_t samples = 0;  // up to kSettled
-                // Counted as `weight` samples in a row, none past `cap`.
-                void add(double sample, double cap = 2.0, uint32_t weight = 1);
-            };
-            // Against how long each picture is shown: decoding every picture, a skipped one taken to cost
-            // what a decoded one does.
-            Average everyPicture;
-            // Against the time shown since the picture before: the decoder as it runs at the current
-            // level, restarted at each change of it.
-            Average asRun;
-            static constexpr size_t kLevels = static_cast<size_t>(PictureSkip::NonKey) + 1;
-            static constexpr size_t kUnpaced = kLevels;
-            // The pictures' intervals each returned picture at one level spans, kept across visits.
-            struct Span {
-                // One sample a picture, not weighted by its gap: a level's cost is per picture decoded,
-                // so a long gap must not outweigh the short ones beside it.
-                Average perPicture;
-                // Intervals of the file those samples cover, at least one a picture, up to kSettled.
-                uint32_t covered = 0;
-                // `read` is the packets read for the picture: a gap a timestamp jump stretched covers no
-                // more than those.
-                void add(double intervals, uint32_t read);
-            };
-            // The first level is one by definition.
-            std::array<Span, kLevels> spans;
-            // Of the pictures decoded with nothing skipped, how many each level would still decode, by
-            // their type: what a level not yet visited predicts. Index 0 counts them all.
-            std::array<uint64_t, kLevels> kept{};
-            // As seen at `level` once its pictures cover kSettled intervals, else as its pictures' types
-            // predict; 1 with nothing to go on.
-            double span(size_t level) const;
-            // A PictureSkip up to the decoder's deepest, or kUnpaced.
-            size_t level = 0;
-            // What the decoder is asked for; it applies no more than its deepest.
-            PictureSkip skip() const { return static_cast<PictureSkip>(std::min(level, kLevels - 1)); }
-            bool unpaced() const { return level == kUnpaced; }
-            // Skipping, and not yet seen to keep pace at this level: late pictures may be the decoder's.
-            // A level seen not to is left in the add() that sees it.
-            bool decoderBehind() const { return level > 0 && asRun.samples < kSettled; }
-            static constexpr double kKeepsUp = 0.9;
-            // A level whose pictures span no more than this was not seen to leave anything out.
-            static constexpr double kSkipped = 1.05;
-            // One averaging window: the samples an average holds before it moves the level.
-            static constexpr uint32_t kSettled = 8;
-            // `decodedAt` is the level the picture was decoded at, `previousAt` the picture's before it. Only
-            // a picture decoded at the current level, after one that was too, measures it: a decoder's frames
-            // in flight still return the last level's for a while, and `covered` reaches back to that one.
-            // `deepest` is the decoder's own, as VideoPipeline::deepestSkip(); `read` as PictureTiming::readSince.
-            void add(std::chrono::nanoseconds took, std::chrono::nanoseconds shownFor, std::chrono::nanoseconds covered,
-                     PictureSkip previousAt, PictureSkip decodedAt, PictureSkip deepest, uint32_t read);
-            // Every picture returned, sampled or not: a pass's first is often its only key picture.
-            void saw(PictureSkip decodedAt, PictureSkip keptThrough);
-        };
         DecodeLoad decodeLoad;
     };
     // Before the output and the sessions, whose threads call it until they are destroyed.
@@ -1900,6 +1876,23 @@ private:
     // Guarded by m_stateMutex.
     std::string m_sound;
     std::map<int, std::string> m_soundSettings;
+
+    // The global frame-rate setting, whether a higher one is kept, and each monitor's own, as the config
+    // carries them (frame_rate_setting.h): JSON text kept as read for pause's reason, empty or absent for
+    // none. Guarded by m_stateMutex.
+    std::string m_frameRate;
+    std::string m_keepHigherFrameRate;
+    std::map<int, std::string> m_frameRateSettings;
+
+    // Connector name -> how many times a second that screen refreshes, as last reported; absent is not
+    // known. By name, and pruned, as m_outputSizes is. Guarded by m_stateMutex.
+    std::map<std::string, double> m_outputRefreshRates;
+
+    // The refresh rate of the screen bound to this monitor, if reported. Caller must hold m_stateMutex.
+    std::optional<double> refreshRateLocked(int monitorId) const;
+    // The most pictures a second this monitor's video is drawn at: its frame-rate setting, capped at its
+    // screen's refresh rate when that is known and no higher rate is kept. Caller must hold m_stateMutex.
+    double targetRateLocked(int monitorId) const;
 
     // What each screen reported about its windows, by name for m_outputsNotDrawn's reason, and who
     // reported it, so the report dies with its reporter. Only a report of some focus or a maximized

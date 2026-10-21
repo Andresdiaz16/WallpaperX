@@ -32,6 +32,23 @@ constexpr const char* kPauseModes[] = {"play", "always_paused", "paused_while_fo
 // The daemon refuses a longer connector name (config_store.h); the user cannot rename one.
 constexpr qsizetype kMaxOutputNameBytes = 256;
 bool isPauseMode(const QString& mode);
+// The frame rates SetFrameRate and SetMonitorFrameRate take, and the one a daemon plays at unless told.
+constexpr int kFrameRates[] = {30, 60, 120};
+constexpr int kDefaultFrameRate = 60;
+
+// GetStatus's `frame_rate`.
+struct FrameRates {
+    // nullopt for a value a newer daemon wrote, which this one plays at kDefaultFrameRate.
+    std::optional<int> rate = kDefaultFrameRate;
+    // A monitor's own rate; nullopt for a newer daemon's value, under which the daemon applies `rate`.
+    // A monitor with no entry follows `rate`.
+    QHash<int, std::optional<int>> screenRates;
+    bool keepHigher = false;
+    // The refresh rate the daemon was told for the screen each monitor answers to; no entry for none.
+    QHash<int, double> refreshRates;
+
+    friend bool operator==(const FrameRates&, const FrameRates&) = default;
+};
 
 // What GetStatus reports that the app acts on.
 struct DaemonStatus {
@@ -39,12 +56,16 @@ struct DaemonStatus {
     QHash<QString, int> outputs;
     // Ids holding a wallpaper, a pause setting or a sound setting, named or not.
     QSet<int> occupied;
+    // Ids holding a wallpaper.
+    QSet<int> wallpapers;
     // A monitor's pause mode; nullopt for one a newer daemon wrote that this one does not apply.
     // A monitor with no entry plays.
     QHash<int, std::optional<QString>> pauseModes;
     // Sound as the daemon applies it, globally and per monitor; a monitor with no entry is on.
     bool sound = true;
     QHash<int, bool> screenSound;
+    // nullopt from a daemon older than frame-rate settings, which knows no refresh rates either.
+    std::optional<FrameRates> frameRates;
     QString persistenceStatus;
     QString persistenceDetail;
 
@@ -84,6 +105,13 @@ class DaemonClient : public QObject {
     Q_PROPERTY(bool sound READ sound NOTIFY statusChanged)
     // Connector name to whether sound is on there, for every named screen.
     Q_PROPERTY(QVariantMap screenSound READ screenSound NOTIFY statusChanged)
+    // The frame rate on every screen; 0 for a value this app does not know.
+    Q_PROPERTY(int frameRate READ frameRate NOTIFY statusChanged)
+    // Connector name to that screen's own frame rate, for every named screen: 0 when it follows
+    // frameRate, -1 for a value this app does not know.
+    Q_PROPERTY(QVariantMap screenFrameRates READ screenFrameRates NOTIFY statusChanged)
+    // Whether a screen plays at its frame rate even above what it refreshes at.
+    Q_PROPERTY(bool keepHigherFrameRate READ keepHigherFrameRate NOTIFY statusChanged)
     // Why the daemon's settings may not be on disk, or empty.
     Q_PROPERTY(QString persistenceProblem READ persistenceProblem NOTIFY statusChanged)
 
@@ -106,7 +134,12 @@ public:
     QVariantMap pauseModes() const;
     bool sound() const { return m_status.sound; }
     QVariantMap screenSound() const;
+    int frameRate() const;
+    QVariantMap screenFrameRates() const;
+    bool keepHigherFrameRate() const;
     QString persistenceProblem() const;
+    // The last GetStatus answer as shown, empty while not Ready.
+    const DaemonStatus& status() const { return m_status; }
 
 public slots:
     // Reads GetStatus again; a reply to an earlier read is then discarded. Also run on the daemon's
@@ -125,6 +158,12 @@ public:
     void setPause(QObject* context, int monitorId, const QString& mode, Done done);
     void setSound(QObject* context, bool on, Done done);
     void setScreenSound(QObject* context, int monitorId, bool on, Done done);
+    void setFrameRate(QObject* context, int rate, Done done);
+    // `rate` 0 has the monitor follow the frame rate on every screen.
+    void setScreenFrameRate(QObject* context, int monitorId, int rate, Done done);
+    void setKeepHigherFrameRate(QObject* context, bool keep, Done done);
+    // `rate` 0 says it is not known. The daemon refuses a connector no monitor answers to.
+    void setOutputRefreshRate(QObject* context, const QString& connector, double rate, Done done);
 
 signals:
     void statusChanged();

@@ -124,6 +124,7 @@ add_library(wallpaperx-daemon-lib STATIC
     daemon/config_store.cpp
     daemon/config_writer.cpp
     daemon/crash_record.cpp
+    daemon/decode_load.cpp
     daemon/dbus_service.cpp
     daemon/ffmpeg_log.cpp
     daemon/kept_rows.cpp
@@ -480,6 +481,10 @@ endif()
 # with nothing.
 add_executable(wallpaperx-log-escape-test tests/log_escape_test.cpp)
 target_link_libraries(wallpaperx-log-escape-test PRIVATE wallpaperx-daemon-lib)
+
+# S15.905-S15.907: DecodeLoad (daemon/decode_load.cpp) driven with plain values, no bus, GPU or port.
+add_executable(wallpaperx-decode-load-test tests/decode_load_test.cpp)
+target_link_libraries(wallpaperx-decode-load-test PRIVATE wallpaperx-daemon-lib)
 
 # Step 8's persistence layer, and on its own for the reason above: ConfigStore is a file
 # and a parser, and WallpaperManager's save path is GPU-free, so none of it needs a bus, a
@@ -872,6 +877,23 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         COMMENT "Generating video wallpaper fixture wallpaper_rate120_ms.mkv"
         VERBATIM
     )
+    # Four seconds at 120 pictures a second, moving, in each codec the frame-rate setting thins differently:
+    # H.264 and H.265 (each encoder's defaults, so B pictures nothing references) and AV1.
+    foreach(codec "h264@libx264" "hevc@libx265" "av1@libsvtav1")
+        string(REPLACE "@" ";" codec "${codec}")
+        list(GET codec 0 codec_name)
+        list(GET codec 1 codec_encoder)
+        add_custom_command(
+            OUTPUT ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_rate120_${codec_name}.mp4
+            COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error
+                    -f lavfi -i testsrc2=size=320x240:rate=120:duration=4
+                    -vf "format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv"
+                    -c:v ${codec_encoder} -pix_fmt yuv420p
+                    ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_rate120_${codec_name}.mp4
+            COMMENT "Generating video wallpaper fixture wallpaper_rate120_${codec_name}.mp4"
+            VERBATIM
+        )
+    endforeach()
     # 240 pictures a second with regular timestamps, twice the cap at speed 1: the file whose own time
     # trails the capped drawing time by design, which is where the schedule's late test and the lag it
     # banks are graded.
@@ -1098,7 +1120,10 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
                               ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_slow.mp4
                               ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_fast.mp4
                               ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_gap.mp4
-                              ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_rate120_ms.mkv)
+                              ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_rate120_ms.mkv
+                              ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_rate120_h264.mp4
+                              ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_rate120_hevc.mp4
+                              ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_rate120_av1.mp4)
 else()
     message(STATUS "  ffmpeg CLI: not found -- the video wallpaper fixture is not generated, and "
                    "video_wallpaper will report itself to ctest as a skip rather than a pass")
@@ -1291,7 +1316,7 @@ endif()
 if(WALLPAPERX_BUILD_KDE_PLUGIN)
     set_target_properties(wallpaperx-daemon-lib wallpaperx-daemon wallpaperx-dbus-service-test
                           wallpaperx-daemon-system-test wallpaperx-http-server-test
-                          wallpaperx-log-escape-test wallpaperx-config-store-test wallpaperx-request-share-test
+                          wallpaperx-log-escape-test wallpaperx-decode-load-test wallpaperx-config-store-test wallpaperx-request-share-test
                           wallpaperx-kpackage-metadata-test wallpaperx-qml-lint-test
                           wallpaperx-video-wallpaper-test
         PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
@@ -1334,6 +1359,9 @@ set_tests_properties(buffer_claims PROPERTIES LABELS "novulkan"
 # tier to lavapipe-only cannot reach it -- and the documented manual fallback
 # `ctest -L 'lavapipe|novulkan'` needs the label to select it too.
 set_tests_properties(log_escape PROPERTIES LABELS "novulkan")
+# Outside the guard and `novulkan` for log_escape's reasons: plain values, nothing opened.
+wallpaperx_add_test(NAME decode_load COMMAND $<TARGET_FILE:wallpaperx-decode-load-test>)
+set_tests_properties(decode_load PROPERTIES LABELS "novulkan")
 
 # Also outside the guard: it talks to no bus either, and every check it makes is
 # deterministic, so it needs no RESOURCE_LOCK. `novulkan` for the same reason log_escape
@@ -1688,7 +1716,7 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
     # RUN_SERIAL, not a lock, for the phases that count pictures a second against a 120 a second
     # cap: any neighbour's load moves that (measured at -j8: 104.7-119.0 a second, alone 119.99),
     # and a lock would only keep out entries holding the same lock.
-    set(_wx_video_serial capBudget highRate)
+    set(_wx_video_serial capBudget capBudget60 highRate highRate60 thinRate60 thinRate120 thinShared thinSlice)
     wallpaperx_add_phase_tests(BASE video_wallpaper TARGET wallpaperx-video-wallpaper-test
         SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/tests/video_wallpaper_test.cpp
         ENVIRONMENT "WALLPAPERX_FORCE_TIER="
@@ -1711,7 +1739,7 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
     # rateCap RUN_SERIAL on the graphics card: at -j8 it once heard a capped file's sound moved
     # mid-pass (1 of 3 seeks), and passed four times alone. cleanCredit likewise: its slowed run
     # needs 1500 ms of drawing, and drew 1221 ms at -j24 against 2665 ms alone.
-    set(_wx_audio_serial rateCap cleanCredit)
+    set(_wx_audio_serial rateCap rateCap60 cleanCredit)
     wallpaperx_add_phase_tests(BASE audio_playback TARGET wallpaperx-audio-playback-test
         SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/tests/audio_playback_test.cpp
         ENVIRONMENT "WALLPAPERX_FORCE_TIER="

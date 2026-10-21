@@ -4,8 +4,8 @@
 // and app/kde/plasma_controller.cpp, driven against stand-ins for the daemon and for plasmashell on
 // the private bus (fake_wallpaperx.h), with a real KScreenClient reading a fake KScreen and a real
 // LibraryManager over a scratch library. The plasmashell stand-in runs the activation script it
-// receives against a model of Plasma 6.7.5's scripting API. Goals S15.226-S15.253 and S15.256-S15.264
-// in GOALS.md.
+// receives against a model of Plasma 6.7.5's scripting API. Goals S15.226-S15.253, S15.256-S15.264
+// and S15.911-S15.913 in GOALS.md.
 // Built with AddressSanitizer, so a reply that reaches a destroyed caller aborts the run (S15.247).
 
 #include "apply_controller.h"
@@ -17,6 +17,7 @@
 #include "kscreen_fixtures.h"
 #include "library_manager.h"
 #include "plasma_controller.h"
+#include "refresh_rate_reporter.h"
 #include "wpx_fixtures.h"
 
 #include <QCoreApplication>
@@ -2065,6 +2066,486 @@ void statusNoAnswer() {
     rig.daemonFake->release();
 }
 
+// ---- frame rates: the notice, the refresh-rate reporter and the setters (S15.911-S15.913) ----
+
+// `out` showing a mode at `hz`, as KScreen lists the current mode.
+QVariantMap atRate(QVariantMap out, double hz) {
+    out.insert(QStringLiteral("modes"),
+               QVariantList{QVariantMap{{QStringLiteral("id"), QStringLiteral("1")},
+                                        {QStringLiteral("refreshRate"), hz},
+                                        {QStringLiteral("size"), QVariantMap{{QStringLiteral("width"), qlonglong(1920)},
+                                                                             {QStringLiteral("height"), qlonglong(1080)}}}}});
+    out.insert(QStringLiteral("currentModeId"), QStringLiteral("1"));
+    return out;
+}
+
+enum class Hdmi { Shown, Mirrored, ZeroArea, Gone };
+
+// The rig's two screens at the given rates; HDMI-A-1 as `hdmi` says.
+QVariantMap screensAt(double dp1Hz, double hdmiHz, Hdmi hdmi = Hdmi::Shown) {
+    QVariantList outs{atRate(output({.name = QStringLiteral("DP-1"), .id = 1, .priority = 1}), dp1Hz)};
+    if (hdmi != Hdmi::Gone) {
+        OutputSpec spec{.name = QStringLiteral("HDMI-A-1"), .id = 2, .x = qlonglong(1920), .priority = 2};
+        if (hdmi == Hdmi::Mirrored) {
+            spec.replicationSource = qlonglong(1);
+        }
+        // An enabled screen with no area makes KScreen's whole answer unreadable (parseKScreenConfig),
+        // so the one that reaches the reporter is a disabled screen KScreen lists with no size.
+        if (hdmi == Hdmi::ZeroArea) {
+            spec.width = qlonglong(0);
+            spec.enabled = false;
+        }
+        outs.append(atRate(output(spec), hdmiHz));
+    }
+    return configOf(outs);
+}
+
+// Serves `config` from the fake KScreen and waits until the client holds it.
+bool showScreens(Rig& rig, const QVariantMap& config) {
+    const auto want = parseKScreenConfig(config);
+    rig.kscreenFake->config = config;
+    rig.kscreen->refresh();
+    return want && waitUntil([&] {
+        return rig.kscreen->state() == KScreenClient::State::Ready && rig.kscreen->monitors() == *want;
+    }, kWaitMs);
+}
+
+// Every call the app makes in answer to what it last read, and their replies, handled: each round
+// drains what the previous round's handlers sent.
+bool quiet(Rig& rig) {
+    for (int i = 0; i < 4; ++i) {
+        if (!rig.daemonDrained() || !rig.repliesHandled()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool reread(Rig& rig) {
+    rig.client->refresh();
+    return quiet(rig);
+}
+
+// The approved sentence, written out here rather than taken from the app.
+QString approvedNotice(int n) {
+    return QString::fromUtf8("Your screens refresh at most %1 times a second. Pictures above that can't be shown — they only "
+                             "cost power and memory — so WallpaperX plays at your screen's rate. You can keep a higher rate anyway.")
+        .arg(n);
+}
+
+QString describeReports(const QList<FakeCall>& calls) {
+    QStringList out;
+    for (const FakeCall& c : calls) {
+        out.append(c.args.value(0).toString() + u' ' + QString::number(c.args.value(1).toDouble()));
+    }
+    return u'[' + out.join(QStringLiteral(", ")) + u']';
+}
+
+void frameRateNotice() {
+    constexpr const char* goals = "S15.911";
+    Rig rig;
+    if (!build(rig, goals, QStringLiteral("notice"))) {
+        return;
+    }
+    // KScreen says HDMI-A-1 is 60 Hz throughout, so a notice decided from KScreen rather than from the
+    // daemon's status shows on the rows below where the daemon does not slow HDMI-A-1.
+    if (!showScreens(rig, screensAt(165, 60))) {
+        harnessFailure(std::string(goals) + ": the fake KScreen's 165 Hz and 60 Hz screens never reached the client");
+        return;
+    }
+    FakeDaemon& fake = *rig.daemonFake;
+    const QString dp1 = QStringLiteral("DP-1");
+    const QString hdmi = QStringLiteral("HDMI-A-1");
+    const QMap<QString, int> both{{dp1, 0}, {hdmi, 1}};
+    struct Row {
+        const char* what;
+        QMap<QString, int> outputs;
+        QSet<int> wallpapers;
+        QMap<QString, double> refresh;
+        int global;
+        QMap<int, QJsonValue> own;
+        bool keepHigher;
+        bool above;
+        int n;  // 0: no notice
+    };
+    // GOAL: S15.911 -- the notice is the approved sentence exactly when a screen holding a wallpaper,
+    //       named by the daemon, has a frame rate above the refresh rate the daemon holds for it and
+    //       keep-higher is off; N is the highest rounded refresh among only those screens; the "Keep a
+    //       higher rate anyway" row shows whenever such a screen exists, keep-higher on or off.
+    // WHY-THIS-SHAPE: one row per way the answer could come from the wrong input. HDMI-A-1 is 60 Hz in
+    //       KScreen on every row, so the rows where the daemon holds no rate, the screen holds no
+    //       wallpaper or has no daemon name tell a status-based notice from a KScreen-based one. The
+    //       165 Hz + 60 Hz row tells "N among the over-rate screens" from "N among all screens".
+    // CONTROL: control_batch.sh, 2026-10-20, each alone, reverted (bytes restored, green again), --phase '^frameRateNotice$',
+    //       in app/daemon/apply_controller.cpp: N taken as the highest refresh rate of every screen ->
+    //       "FAIL: S15.911: 165 Hz and 60 Hz both at 120: ... at most 165 times a second"; the wallpaper
+    //       test deleted -> "... the 60 Hz screen holds no wallpaper: the row shows 1"; the loop reading
+    //       KScreen's monitors instead of the daemon's refresh rates -> "... the daemon holds no refresh
+    //       rate for the 60 Hz screen: the row shows 1", and with the wallpaper test also gone -> also
+    //       "... the 60 Hz screen has no daemon name"; frameRateNotice() ignoring keep-higher -> "...
+    //       keep-higher on: the row shows 1 and the notice reads "Your screens ..."; screensAboveRefresh()
+    //       giving nothing under keep-higher -> "... keep-higher on: the row shows 0".
+    // COVERAGE-ASSERT: every row was read by the client and graded.
+    const Row rows[] = {
+        {"165 Hz and 60 Hz both at 120", both, {0, 1}, {{dp1, 165}, {hdmi, 60}}, 120, {}, false, true, 60},
+        {"100 Hz and 60 Hz both at 120", both, {0, 1}, {{dp1, 100}, {hdmi, 60}}, 120, {}, false, true, 100},
+        {"the 60 Hz screen's own rate 120, every screen's 60", both, {0, 1}, {{dp1, 165}, {hdmi, 60}}, 60, {{1, 120}}, false, true, 60},
+        {"the daemon holds no refresh rate for the 60 Hz screen", both, {0, 1}, {{dp1, 165}}, 120, {}, false, false, 0},
+        {"the 60 Hz screen holds no wallpaper", both, {0}, {{dp1, 165}, {hdmi, 60}}, 120, {}, false, false, 0},
+        {"the 60 Hz screen has no daemon name", {{dp1, 0}}, {0, 1}, {{dp1, 165}, {hdmi, 60}}, 120, {}, false, false, 0},
+        {"a 59.94 Hz screen at 60", both, {0, 1}, {{dp1, 165}, {hdmi, 59.94}}, 60, {}, false, false, 0},
+        {"keep-higher on", both, {0, 1}, {{dp1, 165}, {hdmi, 60}}, 120, {}, true, true, 0},
+    };
+    const auto load = [&](const Row& row) {
+        fake.outputs = row.outputs;
+        fake.wallpapers = row.wallpapers;
+        fake.refreshRates = row.refresh;
+        fake.frameRate = row.global;
+        fake.screenFrameRate = row.own;
+        fake.keepHigherFrameRate = row.keepHigher;
+        return reread(rig) && rig.client->status().frameRates && rig.client->status().outputs.size() == row.outputs.size() &&
+               rig.client->status().frameRates->keepHigher == row.keepHigher;
+    };
+    qsizetype graded = 0;
+    for (const Row& row : rows) {
+        if (!load(row)) {
+            harnessFailure(std::string(goals) + ": the client never read the status for " + row.what);
+            continue;
+        }
+        const QString want = row.n > 0 ? approvedNotice(row.n) : QString();
+        expect(rig.applier->frameRateAboveScreens() == row.above && rig.applier->frameRateNotice() == want,
+               QStringLiteral("S15.911: %1: the row shows %2 and the notice reads \"%3\", not %4 and \"%5\"")
+                   .arg(QLatin1StringView(row.what))
+                   .arg(rig.applier->frameRateAboveScreens())
+                   .arg(rig.applier->frameRateNotice())
+                   .arg(row.above)
+                   .arg(want));
+        ++graded;
+    }
+    expect(graded == qsizetype(std::size(rows)), QStringLiteral("S15.911: %1 of %2 notice rows were graded").arg(graded).arg(std::size(rows)));
+
+    // GOAL: S15.911 -- with no daemon, neither the notice nor the row shows, though the last status
+    //       read had a screen over its refresh rate.
+    // CONTROL: control_batch.sh, 2026-10-20, each alone, reverted (bytes restored, green again), --phase '^frameRateNotice$':
+    //       only both layers broken together go red -- screensAboveRefresh()'s daemon-state test deleted
+    //       (app/daemon/apply_controller.cpp) and the client keeping the last status when the daemon
+    //       leaves (app/daemon/daemon_client.cpp) -> "FAIL: S15.911: with no daemon (gone 1) the row
+    //       shows 1 ...". The state test deleted alone stays green: the client empties its status then.
+    if (!load(rows[0]) || rig.applier->frameRateNotice() != approvedNotice(60)) {
+        harnessFailure(std::string(goals) + ": the notice was not showing before the daemon left, so its going cannot be graded");
+        return;
+    }
+    fake.stop();
+    const bool gone = waitUntil([&] { return rig.client->state() == DaemonClient::State::Unavailable; }, kWaitMs);
+    expect(gone && !rig.applier->frameRateAboveScreens() && rig.applier->frameRateNotice().isEmpty(),
+           QStringLiteral("S15.911: with no daemon (gone %1) the row shows %2 and the notice reads \"%3\"")
+               .arg(gone).arg(rig.applier->frameRateAboveScreens()).arg(rig.applier->frameRateNotice()));
+    if (const QString why = fake.start();
+        !why.isEmpty() || !waitUntil([&] { return rig.client->state() == DaemonClient::State::Ready; }, kWaitMs)) {
+        harnessFailure(std::string(goals) + ": the daemon stand-in did not come back: " + why.toStdString());
+        return;
+    }
+
+    // GOAL: S15.911 -- unticking keep-higher shows the notice as soon as the daemon accepts it, not one
+    //       status read later, and the notice does not disappear while that read lands.
+    // WHY-THIS-SHAPE: GetStatus is held from before the change, so the notice at Done can only come from
+    //       what the reply recorded; every value the notice signal carries from then on is kept, so a
+    //       blank between the reply and the read is caught even if the end state is right.
+    // CONTROL: control_batch.sh, 2026-10-20, each alone, reverted (bytes restored, green again), --phase '^frameRateNotice$',
+    //       DaemonClient::setKeepHigherFrameRate recording nothing on the reply (app/daemon/daemon_client.cpp)
+    //       -> "FAIL: S15.911: after keep-higher was unticked (done 1, status read held 1) the notice read ""
+    //       with the read held ...".
+    Row keep = rows[0];
+    keep.keepHigher = true;
+    if (!load(keep) || !rig.applier->frameRateAboveScreens() || !rig.applier->frameRateNotice().isEmpty()) {
+        harnessFailure(std::string(goals) + ": keep-higher on did not leave the row shown and the notice hidden to start from");
+        return;
+    }
+    QStringList seen;
+    const auto watch = QObject::connect(rig.applier.get(), &ApplyController::frameRateNoticeChanged,
+                                        [&] { seen.append(rig.applier->frameRateNotice()); });
+    fake.hold = {QStringLiteral("GetStatus")};
+    rig.applier->setKeepHigherFrameRate(false);
+    const bool done = waitUntil([&] { return rig.applier->keepHigherState() == Progress::Done; }, kWaitMs);
+    const QString atDone = rig.applier->frameRateNotice();
+    const bool statusHeld = waitUntil([&] {
+        return std::ranges::any_of(fake.held, [](const QDBusMessage& m) { return m.member() == u"GetStatus"; });
+    }, kWaitMs);
+    fake.hold.clear();
+    fake.release();
+    const bool settled = quiet(rig);
+    QObject::disconnect(watch);
+    const auto shown = std::ranges::find_if(seen, [](const QString& s) { return !s.isEmpty(); });
+    const bool blanked = std::any_of(shown, seen.end(), [](const QString& s) { return s.isEmpty(); });
+    expect(done && statusHeld && settled && atDone == approvedNotice(60) && !blanked && rig.applier->frameRateNotice() == approvedNotice(60),
+           QStringLiteral("S15.911: after keep-higher was unticked (done %1, status read held %2) the notice read \"%3\" with the read "
+                          "held, blanked %4 before it landed, and reads \"%5\"")
+               .arg(done).arg(statusHeld).arg(atDone).arg(blanked).arg(rig.applier->frameRateNotice()));
+}
+
+void refreshReporter() {
+    constexpr const char* goals = "S15.912";
+    Rig rig;
+    if (!build(rig, goals, QStringLiteral("reporter"))) {
+        return;
+    }
+    FakeDaemon& fake = *rig.daemonFake;
+    const QString dp1 = QStringLiteral("DP-1");
+    const QString hdmi = QStringLiteral("HDMI-A-1");
+    if (!showScreens(rig, screensAt(165, 60))) {
+        harnessFailure(std::string(goals) + ": the fake KScreen's screens never reached the client");
+        return;
+    }
+    fake.outputs = {{dp1, 0}};
+    RefreshRateReporter reporter(*rig.kscreen, *rig.client);
+    const auto reports = [&] { return rig.sent("SetOutputRefreshRate"); };
+    const auto lastIs = [&](const QString& name, double hz) {
+        const auto r = reports();
+        return !r.isEmpty() && r.back().args == QVariantList{name, hz} && r.back().signature == u"sd";
+    };
+    const QString refused = QStringLiteral("io.wallpaperx.Daemon.Error.InvalidArgs");
+
+    // GOAL: S15.912 -- the reporter sends KScreen's rate only for names the daemon links, once: an
+    //       accepted rate is not sent again on later status reads, and HDMI-A-1, which the daemon does
+    //       not name, is never sent.
+    // CONTROL: control_batch.sh, 2026-10-20, each alone, reverted (bytes restored, green again), --phase '^refreshReporter$',
+    //       in app/daemon/refresh_rate_reporter.cpp: sync() also sending every KScreen screen the daemon does
+    //       not name -> "FAIL: S15.912: with only DP-1 linked, over three status reads the daemon was sent
+    //       [HDMI-A-1 60, DP-1 165]"; the "daemon already holds it" skip deleted -> "... was sent [DP-1 165,
+    //       DP-1 165, DP-1 165, ...".
+    bool ok = reread(rig);
+    for (const bool sound : {false, true}) {
+        fake.sound = sound;
+        ok = ok && reread(rig) && rig.client->sound() == sound;
+    }
+    expect(ok && describeReports(reports()) == u"[DP-1 165]" && reports().value(0).signature == u"sd",
+           QStringLiteral("S15.912: with only DP-1 linked, over three status reads the daemon was sent %1 (settled %2)")
+               .arg(describeReports(reports())).arg(ok));
+
+    // GOAL: S15.912 -- a linked screen that KScreen shows mirrored, with no area, or not at all is
+    //       reported as 0, and as its rate again once shown.
+    // CONTROL: control_batch.sh, 2026-10-20, each alone, reverted (bytes restored, green again), --phase '^refreshReporter$',
+    //       in app/daemon/refresh_rate_reporter.cpp: wanted() without `selectable()` -> "FAIL: S15.912:
+    //       HDMI-A-1 mirrored (staged 1): sent 0 0 ..." and the same for "disabled with no area"; wanted()
+    //       giving 30 for a screen KScreen does not list -> those two and "HDMI-A-1 gone (staged 1): sent 0 0".
+    // COVERAGE-ASSERT: each of the three cases was staged and graded.
+    fake.outputs.insert(hdmi, 1);
+    if (!reread(rig) || !lastIs(hdmi, 60)) {
+        harnessFailure(std::string(goals) + ": linking HDMI-A-1 did not report its 60 Hz, so its going cannot be graded: " +
+                       describeReports(reports()).toStdString());
+        return;
+    }
+    int cases = 0;
+    for (const auto& [kind, what] : {std::pair{Hdmi::Mirrored, "mirrored"}, std::pair{Hdmi::ZeroArea, "disabled with no area"},
+                                     std::pair{Hdmi::Gone, "gone"}}) {
+        const bool staged = showScreens(rig, screensAt(165, 60, kind)) && quiet(rig);
+        const bool zero = staged && lastIs(hdmi, 0) && !fake.refreshRates.contains(hdmi);
+        const bool back = showScreens(rig, screensAt(165, 60)) && quiet(rig) && lastIs(hdmi, 60);
+        expect(staged && zero && back, QStringLiteral("S15.912: HDMI-A-1 %1 (staged %2): sent 0 %3, its 60 again %4; all sent %5")
+                                           .arg(QLatin1StringView(what)).arg(staged).arg(zero).arg(back).arg(describeReports(reports())));
+        ++cases;
+    }
+    expect(cases == 3, QStringLiteral("S15.912: %1 of 3 hidden-screen cases were graded").arg(cases));
+
+    // GOAL: S15.912 -- a refused rate is not sent again when unrelated status changes follow, and is
+    //       sent again once KScreen reports another rate for that screen.
+    // WHY-THIS-SHAPE: the calls are counted across three unrelated reads that each provably reached the
+    //       client, so "no resend" is not the absence of reads.
+    // CONTROL: control_batch.sh, 2026-10-20, each alone, reverted (bytes restored, green again), --phase '^refreshReporter$',
+    //       in app/daemon/refresh_rate_reporter.cpp: the Failed entry never blocking a resend -> "FAIL:
+    //       S15.912: after DP-1's 144 was refused (sent 1), 3 of 3 unrelated status reads sent 18 more";
+    //       the block ignoring KScreen's rate -> "... after the refusal KScreen's new 120 for DP-1 was not
+    //       given to the daemon".
+    fake.refuse.insert(QStringLiteral("SetOutputRefreshRate"), {refused, QStringLiteral("no")});
+    const bool refusedSent = showScreens(rig, screensAt(144, 60)) && quiet(rig) && lastIs(dp1, 144);
+    const qsizetype afterRefusal = reports().size();
+    int unrelated = 0;
+    for (const bool sound : {false, true, false}) {
+        fake.sound = sound;
+        unrelated += reread(rig) && rig.client->sound() == sound ? 1 : 0;
+    }
+    expect(refusedSent && unrelated == 3 && reports().size() == afterRefusal,
+           QStringLiteral("S15.912: after DP-1's 144 was refused (sent %1), %2 of 3 unrelated status reads sent %3 more: %4")
+               .arg(refusedSent).arg(unrelated).arg(reports().size() - afterRefusal).arg(describeReports(reports())));
+    fake.refuse.clear();
+    const bool resent = showScreens(rig, screensAt(120, 60)) && quiet(rig) && lastIs(dp1, 120) && fake.refreshRates.value(dp1) == 120;
+    expect(resent, QStringLiteral("S15.912: after the refusal KScreen's new 120 for DP-1 was not given to the daemon: %1")
+                       .arg(describeReports(reports())));
+
+    // GOAL: S15.912 -- a name the daemon refused, then unlinked and linked again, is sent again.
+    // CONTROL: control_batch.sh, 2026-10-20, each alone, reverted (bytes restored, green again), --phase '^refreshReporter$',
+    //       the removeIf forgetting unlisted failures deleted (app/daemon/refresh_rate_reporter.cpp) -> "FAIL:
+    //       S15.912: HDMI-A-1 refused (staged 1), unlinked and linked again was sent 0 more".
+    fake.outputs.remove(hdmi);
+    fake.refreshRates.remove(hdmi);
+    bool staged = reread(rig);
+    fake.refuse.insert(QStringLiteral("SetOutputRefreshRate"), {refused, QStringLiteral("no")});
+    fake.outputs.insert(hdmi, 1);
+    staged = staged && reread(rig) && lastIs(hdmi, 60);
+    fake.refuse.clear();
+    const qsizetype beforeRelink = reports().size();
+    fake.outputs.remove(hdmi);
+    staged = staged && reread(rig);
+    fake.outputs.insert(hdmi, 1);
+    const bool relinked = staged && reread(rig) && reports().size() == beforeRelink + 1 && lastIs(hdmi, 60) && fake.refreshRates.value(hdmi) == 60;
+    expect(relinked, QStringLiteral("S15.912: HDMI-A-1 refused (staged %1), unlinked and linked again was sent %2 more: %3")
+                         .arg(staged).arg(reports().size() - beforeRelink).arg(describeReports(reports())));
+
+    // `forget`: the new daemon knows no refresh rates, as the real one does not save them.
+    const auto restart = [&](bool forget) {
+        fake.stop();
+        const bool gone = waitUntil([&] { return rig.client->state() == DaemonClient::State::Unavailable; }, kWaitMs);
+        if (forget) {
+            fake.refreshRates.clear();
+        }
+        return gone && fake.start().isEmpty() && waitUntil([&] { return rig.client->state() == DaemonClient::State::Ready; }, kWaitMs);
+    };
+
+    // GOAL: S15.912 -- a rate the old daemon refused is sent to a daemon that starts, even when the new
+    //       daemon's status reads the same as the old one's.
+    // CONTROL: control_batch.sh, 2026-10-20, each alone, reverted (bytes restored, green again), --phase '^refreshReporter$',
+    //       `++m_daemonStarts;` deleted (app/daemon/refresh_rate_reporter.cpp) -> "FAIL: S15.912: DP-1's
+    //       refused 100 (staged 1) after a daemon restart was sent 0 more".
+    fake.refuse.insert(QStringLiteral("SetOutputRefreshRate"), {refused, QStringLiteral("no")});
+    const bool refused100 = showScreens(rig, screensAt(100, 60)) && quiet(rig) && lastIs(dp1, 100);
+    fake.refuse.clear();
+    const qsizetype beforeRestart = reports().size();
+    const bool restarted = refused100 && restart(false) && quiet(rig);
+    expect(restarted && reports().size() > beforeRestart && lastIs(dp1, 100) && fake.refreshRates.value(dp1) == 100,
+           QStringLiteral("S15.912: DP-1's refused 100 (staged %1) after a daemon restart was sent %2 more: %3")
+               .arg(restarted).arg(reports().size() - beforeRestart).arg(describeReports(reports())));
+
+    // GOAL: S15.912 -- a call the old daemon fails after a new one has started is sent again to the new
+    //       one.
+    // WHY-THIS-SHAPE: the call is held across the restart and its failure released only after the new
+    //       daemon is Ready, so the failure arrives when the reporter already counts the new daemon.
+    // CONTROL: control_batch.sh, 2026-10-20, each alone, reverted (bytes restored, green again), --phase '^refreshReporter$',
+    //       in app/daemon/refresh_rate_reporter.cpp: the block no longer comparing which daemon the call
+    //       went to -> "FAIL: S15.912: DP-1's 90 failed by the old daemon after the new one started (held 1,
+    //       back 1) was sent 0 more"; the callback's closing `sync();` deleted -> the same line.
+    fake.hold = {QStringLiteral("SetOutputRefreshRate")};
+    const bool held = showScreens(rig, screensAt(90, 60)) && waitUntil([&] { return fake.held.size() == 1; }, kWaitMs);
+    const bool backAgain = held && restart(true) && quiet(rig);
+    const qsizetype beforeFailure = reports().size();
+    fake.hold.clear();
+    fake.refuseAt(0, refused, QStringLiteral("gone"));
+    const bool midCall = backAgain && quiet(rig) && reports().size() == beforeFailure + 1 && lastIs(dp1, 90) && fake.refreshRates.value(dp1) == 90;
+    expect(midCall, QStringLiteral("S15.912: DP-1's 90 failed by the old daemon after the new one started (held %1, back %2) was sent "
+                                   "%3 more: %4")
+                        .arg(held).arg(backAgain).arg(reports().size() - beforeFailure).arg(describeReports(reports())));
+
+    // GOAL: S15.912 -- the reporter does not poll: with nothing changing, nothing is sent or read.
+    // WHY-THIS-SHAPE: an absence over 1.5 s; it catches a poll at any interval under that, not a slower
+    //       one. The window is a fixed wait by nature, and an empty call list is the only pass.
+    // CONTROL: control_batch.sh, 2026-10-20, each alone, reverted (bytes restored, green again), --phase '^refreshReporter$',
+    //       a 200 ms QTimer calling DaemonClient::refresh added to the reporter's constructor
+    //       (app/daemon/refresh_rate_reporter.cpp) -> "FAIL: S15.912: with nothing changing for 1.5 s the
+    //       daemon received [GetStatus,GetStatus,...]".
+    const qsizetype calm = fake.calls.size();
+    const bool calmStarted = quiet(rig);
+    const qsizetype base = fake.calls.size();
+    waitUntil([] { return false; }, 1500);
+    QStringList extra;
+    for (qsizetype i = base; i < fake.calls.size(); ++i) {
+        extra.append(fake.calls[i].member);
+    }
+    expect(calmStarted && calm <= base && extra.isEmpty(),
+           QStringLiteral("S15.912: with nothing changing for 1.5 s the daemon received [%1]").arg(extra.join(u',')));
+}
+
+void frameRateSetters() {
+    constexpr const char* goals = "S15.913";
+    Rig rig;
+    if (!build(rig, goals, QStringLiteral("framerates"))) {
+        return;
+    }
+    FakeDaemon& fake = *rig.daemonFake;
+    // GOAL: S15.913 -- setFrameRate, setScreenFrameRate (0 = "Same as all screens") and
+    //       setKeepHigherFrameRate reach the daemon typed as it takes them, end Done, and the client
+    //       then reads what was set; a rate outside 30/60/120 is not sent.
+    // CONTROL: control_batch.sh, 2026-10-20, each alone, reverted (bytes restored, green again), --phase '^frameRateSetters$',
+    //       in app/daemon/daemon_client.cpp unless named: SetFrameRate sent `rate / 2` -> "FAIL: S15.913:
+    //       setFrameRate(120) ended state 2 and sent i ..."; SetMonitorFrameRate sent 60 -> "...
+    //       setScreenFrameRate(30) ..."; SetKeepHigherFrameRate sent `!keep` -> "... setKeepHigherFrameRate
+    //       (true) ..."; setScreenFrameRate refusing 0 (app/daemon/apply_controller.cpp) -> "...
+    //       setScreenFrameRate(0) ended state 2 and sent (none or several) (0 calls)"; setFrameRate's
+    //       allowed-rate test deleted (app/daemon/apply_controller.cpp) -> "... a rate of 45 sent [SetFrameRate]".
+    struct Step {
+        const char* what;
+        std::function<void()> act;
+        std::function<Progress()> state;
+        const char* member;
+        const char* signature;
+        std::function<QVariantList()> args;
+        std::function<bool()> read;
+    };
+    const auto dp1Id = [&] { return fake.outputs.value(QStringLiteral("DP-1"), -1); };
+    const auto screenRate = [&] { return rig.client->screenFrameRates().value(QStringLiteral("DP-1")); };
+    const Step steps[] = {
+        {"setFrameRate(120)", [&] { rig.applier->setFrameRate(120); }, [&] { return rig.applier->frameRateState(); }, "SetFrameRate", "i",
+         [] { return QVariantList{120}; }, [&] { return rig.client->frameRate() == 120 && fake.frameRate == QJsonValue(120); }},
+        {"setScreenFrameRate(30)", [&] { rig.applier->setScreenFrameRate(30); }, [&] { return rig.applier->screenFrameRateState(); },
+         "SetMonitorFrameRate", "ii", [&] { return QVariantList{dp1Id(), 30}; },
+         [&] { return screenRate() == QVariant(30) && fake.screenFrameRate.value(dp1Id()) == QJsonValue(30); }},
+        {"setScreenFrameRate(0)", [&] { rig.applier->setScreenFrameRate(0); }, [&] { return rig.applier->screenFrameRateState(); },
+         "SetMonitorFrameRate", "ii", [&] { return QVariantList{dp1Id(), 0}; },
+         [&] { return screenRate() == QVariant(0) && !fake.screenFrameRate.contains(dp1Id()); }},
+        {"setKeepHigherFrameRate(true)", [&] { rig.applier->setKeepHigherFrameRate(true); }, [&] { return rig.applier->keepHigherState(); },
+         "SetKeepHigherFrameRate", "b", [] { return QVariantList{true}; },
+         [&] { return rig.client->keepHigherFrameRate() && fake.keepHigherFrameRate == QJsonValue(true); }},
+    };
+    for (const Step& step : steps) {
+        const qsizetype before = fake.named(QString::fromLatin1(step.member)).size();
+        step.act();
+        const bool done = waitUntil([&] { return step.state() != Progress::Working; }, kWaitMs) && quiet(rig);
+        const auto sent = fake.named(QString::fromLatin1(step.member));
+        const bool one = sent.size() == before + 1;
+        QStringList args;
+        for (const QVariant& a : one ? sent.back().args : QVariantList{}) {
+            args.append(a.toString());
+        }
+        const QString got = one ? sent.back().signature + u' ' + args.join(u',') : QStringLiteral("(none or several)");
+        expect(done && step.state() == Progress::Done && one && sent.back().signature == QLatin1StringView(step.signature) &&
+                   sent.back().args == step.args() && step.read(),
+               QStringLiteral("S15.913: %1 ended state %2 and sent %3 (%4 calls); the client and the daemon read it %5")
+                   .arg(QLatin1StringView(step.what)).arg(int(step.state())).arg(got).arg(sent.size() - before).arg(step.read()));
+    }
+    const qsizetype allBefore = fake.calls.size();
+    rig.applier->setFrameRate(45);
+    rig.applier->setScreenFrameRate(45);
+    const bool drained = rig.daemonDrained();
+    QStringList stray;
+    for (qsizetype i = allBefore; i < fake.calls.size(); ++i) {
+        if (fake.calls[i].member != u"Marker") {
+            stray.append(fake.calls[i].member);
+        }
+    }
+    expect(drained && stray.isEmpty(), QStringLiteral("S15.913: a rate of 45 sent [%1]").arg(stray.join(u',')));
+
+    // GOAL: S15.913 -- a refused frame-rate change says which setting and the daemon's reason, worded as
+    //       the sound and pause refusals are.
+    // CONTROL: control_batch.sh, 2026-10-20, each alone, reverted (bytes restored, green again), --phase '^frameRateSetters$',
+    //       each of the three sentence starts reworded in app/daemon/apply_controller.cpp -> "FAIL: S15.913:
+    //       the refusals (failed 1) read "The frame rate was not set. ...", "... The screen rate for DP-1
+    //       ..." and "... Keep-higher was not changed. ...".
+    fake.refuse.insert(QStringLiteral("SetFrameRate"), {QStringLiteral("io.wallpaperx.Daemon.Error.RenderFailed"), QStringLiteral("disk full")});
+    fake.refuse.insert(QStringLiteral("SetMonitorFrameRate"), {QStringLiteral("org.freedesktop.DBus.Error.InvalidArgs"), QStringLiteral("no")});
+    fake.refuse.insert(QStringLiteral("SetKeepHigherFrameRate"), {QStringLiteral("io.wallpaperx.Daemon.Error.RenderFailed"), QStringLiteral("disk full")});
+    rig.applier->setFrameRate(30);
+    rig.applier->setScreenFrameRate(60);
+    rig.applier->setKeepHigherFrameRate(false);
+    const bool failed = waitUntil([&] {
+        return rig.applier->frameRateState() == Progress::Failed && rig.applier->screenFrameRateState() == Progress::Failed &&
+               rig.applier->keepHigherState() == Progress::Failed;
+    }, kWaitMs);
+    expect(failed && rig.applier->frameRateMessage() == u"The frame rate was not changed for every screen. The WallpaperX service could not do it: disk full" &&
+               rig.applier->screenFrameRateMessage() == u"The frame rate for DP-1 was not changed. The WallpaperX service refused it: no" &&
+               rig.applier->keepHigherMessage() == u"Keeping a higher frame rate was not changed. The WallpaperX service could not do it: disk full",
+           QStringLiteral("S15.913: the refusals (failed %1) read \"%2\", \"%3\" and \"%4\"")
+               .arg(failed).arg(rig.applier->frameRateMessage(), rig.applier->screenFrameRateMessage(), rig.applier->keepHigherMessage()));
+    fake.refuse.clear();
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -2107,6 +2588,9 @@ int main(int argc, char* argv[]) {
     runPhase("statusNoAnswer", statusNoAnswer);
     runPhase("soundStatus", soundStatus);
     runPhase("soundSetters", soundSetters);
+    runPhase("frameRateNotice", frameRateNotice);
+    runPhase("refreshReporter", refreshReporter);
+    runPhase("frameRateSetters", frameRateSetters);
 
     const bool failed = wallpaperx::testing::reportCheckFailures();
     const bool faulted = wallpaperx::testing::reportHarnessFaults("in this test file or its stand-ins, not in the app");

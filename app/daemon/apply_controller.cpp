@@ -7,6 +7,7 @@
 #include "library_manager.h"
 #include "plasma_controller.h"
 
+#include <algorithm>
 #include <utility>
 
 namespace wallpaperx {
@@ -60,7 +61,9 @@ ApplyController::ApplyController(KScreenClient& kscreen, LibraryManager& library
         emit applyChanged();
         emit pauseChanged();
         emit screenSoundChanged();
+        emit screenFrameRateChanged();
     });
+    connect(&m_daemon, &DaemonClient::statusChanged, this, &ApplyController::frameRateNoticeChanged);
 }
 
 QString ApplyController::applyMessage() const
@@ -157,18 +160,90 @@ void ApplyController::setScreenSound(bool on)
 
 void ApplyController::setSound(bool on)
 {
-    if (m_sound.state == Progress::Working) {
+    changeGlobalSetting(m_sound, &ApplyController::soundChanged, on, tr("Sound was not changed for every screen."),
+                        [this, on](DaemonClient::Done done) { m_daemon.setSound(this, on, std::move(done)); });
+}
+
+void ApplyController::setFrameRate(int rate)
+{
+    if (std::ranges::find(kFrameRates, rate) == std::end(kFrameRates)) {
         return;
     }
-    m_sound.value = on;
-    settle(m_sound, &ApplyController::soundChanged, Progress::Working, {});
-    m_daemon.setSound(this, on, [this](std::expected<void, QString> set) {
+    changeGlobalSetting(m_frameRate, &ApplyController::frameRateChanged, rate,
+                        tr("The frame rate was not changed for every screen."),
+                        [this, rate](DaemonClient::Done done) { m_daemon.setFrameRate(this, rate, std::move(done)); });
+}
+
+void ApplyController::setScreenFrameRate(int rate)
+{
+    if (rate != 0 && std::ranges::find(kFrameRates, rate) == std::end(kFrameRates)) {
+        return;
+    }
+    changeScreenSetting(m_screenFrameRate, &ApplyController::screenFrameRateChanged, rate, tr("The frame rate"),
+                        [this, rate](int monitorId, DaemonClient::Done done) {
+                            m_daemon.setScreenFrameRate(this, monitorId, rate, std::move(done));
+                        });
+}
+
+void ApplyController::setKeepHigherFrameRate(bool keep)
+{
+    changeGlobalSetting(m_keepHigher, &ApplyController::keepHigherChanged, keep,
+                        tr("Keeping a higher frame rate was not changed."),
+                        [this, keep](DaemonClient::Done done) { m_daemon.setKeepHigherFrameRate(this, keep, std::move(done)); });
+}
+
+std::optional<ApplyController::AboveRefresh> ApplyController::screensAboveRefresh() const
+{
+    const DaemonStatus& status = m_daemon.status();
+    if (m_daemon.state() != DaemonClient::State::Ready || !status.frameRates) {
+        return std::nullopt;
+    }
+    const FrameRates& rates = *status.frameRates;
+    // As the daemon applies them: a value it does not know gives way to the one above it.
+    const int global = rates.rate.value_or(kDefaultFrameRate);
+    std::optional<AboveRefresh> above;
+    // The daemon holds a refresh rate only for a screen it has a name for, and slows no other.
+    for (auto it = rates.refreshRates.cbegin(); it != rates.refreshRates.cend(); ++it) {
+        const int id = it.key();
+        const int refresh = qRound(it.value());
+        const int rate = rates.screenRates.value(id, global).value_or(global);
+        // Against the rounded rate, the one the notice names: 60 on a 59.94 Hz screen loses nothing.
+        if (!status.wallpapers.contains(id) || rate <= refresh) {
+            continue;
+        }
+        AboveRefresh& found = above ? *above : above.emplace();
+        found.fastest = std::max(found.fastest, refresh);
+    }
+    return above;
+}
+
+QString ApplyController::frameRateNotice() const
+{
+    const auto above = screensAboveRefresh();
+    if (!above || m_daemon.status().frameRates->keepHigher) {
+        return {};
+    }
+    return tr("Your screens refresh at most %1 times a second. Pictures above that can't be shown — they only cost "
+              "power and memory — so WallpaperX plays at your screen's rate. You can keep a higher rate anyway.")
+        .arg(above->fastest);
+}
+
+void ApplyController::changeGlobalSetting(Change& change, ChangeSignal changed, const QVariant& value,
+                                          const QString& what,
+                                          std::function<void(std::function<void(std::expected<void, QString>)>)> send)
+{
+    if (change.state == Progress::Working) {
+        return;
+    }
+    change.value = value;
+    settle(change, changed, Progress::Working, {});
+    // `change` is a member, as in changeScreenSetting.
+    send([this, &change, changed, what](std::expected<void, QString> set) {
         if (!set) {
-            settle(m_sound, &ApplyController::soundChanged, Progress::Failed,
-                   tr("Sound was not changed for every screen. %1").arg(set.error()));
+            settle(change, changed, Progress::Failed, QStringLiteral("%1 %2").arg(what, set.error()));
             return;
         }
-        settle(m_sound, &ApplyController::soundChanged, Progress::Done, {});
+        settle(change, changed, Progress::Done, {});
     });
 }
 

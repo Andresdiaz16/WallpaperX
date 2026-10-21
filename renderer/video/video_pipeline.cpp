@@ -22,7 +22,8 @@ VideoPipeline::VideoPipeline(Device& device, const std::string& file, const std:
       m_shaderDir(shaderDir),
       m_hooks(std::move(hooks)),
       m_decoding(std::make_unique<PictureSource>(device, file, playback, startAt)),
-      m_deepest(std::get<std::unique_ptr<PictureSource>>(m_decoding)->decoder().deepestSkip()) {}
+      m_deepest(std::get<std::unique_ptr<PictureSource>>(m_decoding)->decoder().deepestSkip()),
+      m_origin(std::get<std::unique_ptr<PictureSource>>(m_decoding)->decoder().timelineStart()) {}
 
 bool VideoPipeline::renderNext(OffscreenTargetManager& targets, const OffscreenTarget& target) {
     // Asserted here as well as in the two halves: the abort has to name the entry point the
@@ -115,6 +116,23 @@ void VideoPipeline::decodeAheadIfSafe() {
     } else {
         m_noDecodeThread = true;
     }
+}
+
+void VideoPipeline::leaveUnshown(std::span<const std::chrono::nanoseconds> spacings, uint8_t number) {
+    m_device.assertGpuThread("VideoPipeline::leaveUnshown");
+    const std::optional<NumberedGrids> grids =
+        spacings.empty() ? std::nullopt : std::optional(NumberedGrids{ShowGrids(m_origin, spacings), number});
+    if (auto* ahead = std::get_if<std::unique_ptr<DecodeAhead>>(&m_decoding)) {
+        (*ahead)->leaveUnshown(grids);
+    } else {
+        std::get<std::unique_ptr<PictureSource>>(m_decoding)->decoder().leaveUnshown(grids);
+    }
+}
+
+bool VideoPipeline::shows(std::span<const std::chrono::nanoseconds> spacings) const {
+    const PictureTiming& picture = timing();
+    if (!picture.presentation || !picture.duration || spacings.empty()) return true;
+    return ShowGrids(m_origin, spacings).shows(*picture.presentation, *picture.duration);
 }
 
 VideoPipeline::PictureTiming VideoPipeline::timing() const {

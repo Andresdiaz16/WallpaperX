@@ -61,6 +61,10 @@ public:
     // next decodes leave out what they did. Throws as take() does.
     Item wait(std::optional<PictureSkip> skip);
 
+    // What the thread's next decodes leave out beside `skip`, as VideoDecoder::leaveUnshown(). Starts as
+    // the source's own.
+    void leaveUnshown(std::optional<NumberedGrids> grids);
+
 private:
     struct Shared;
     DecodeAhead(Device& device);

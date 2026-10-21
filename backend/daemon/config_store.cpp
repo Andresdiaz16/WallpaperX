@@ -53,6 +53,14 @@ constexpr const char* kKeyHeight = "height";
 constexpr const char* kKeyProperties = "properties";
 constexpr const char* kKeyPause = "pause";
 constexpr const char* kKeySound = "sound";
+constexpr const char* kKeyFrameRate = "frame_rate";
+constexpr const char* kKeyKeepHigherFrameRate = "keep_higher_frame_rate";
+
+// The settings at the root, each carried as text and written only when set.
+constexpr std::pair<const char*, std::string PersistedConfig::*> kRootSettings[] = {
+    {kKeySound, &PersistedConfig::soundJson},
+    {kKeyFrameRate, &PersistedConfig::frameRateJson},
+    {kKeyKeepHigherFrameRate, &PersistedConfig::keepHigherFrameRateJson}};
 
 // load() returns from a dozen places; this is what keeps the descriptor from leaking out
 // of any of them.
@@ -274,17 +282,21 @@ std::string serialise(const PersistedConfig& config, SaveResult& result) {
             nlohmann::json pause = nlohmann::json::parse(entry.pauseJson, nullptr, false);
             if (!pause.is_discarded()) row[kKeyPause] = std::move(pause);
         }
-        // The same: absent means on.
-        if (!entry.soundJson.empty()) {
-            nlohmann::json sound = nlohmann::json::parse(entry.soundJson, nullptr, false);
-            if (!sound.is_discarded()) row[kKeySound] = std::move(sound);
+        // The same: absent means on, and the root's frame rate.
+        for (const auto& [key, text] :
+             {std::pair{kKeySound, &entry.soundJson}, std::pair{kKeyFrameRate, &entry.frameRateJson}}) {
+            if (text->empty()) continue;
+            nlohmann::json value = nlohmann::json::parse(*text, nullptr, false);
+            if (!value.is_discarded()) row[key] = std::move(value);
         }
         monitors.push_back(std::move(row));
     }
     nlohmann::json root{{kKeyVersion, ConfigStore::kSchemaVersion}, {kKeyMonitors, std::move(monitors)}};
-    if (!config.soundJson.empty()) {
-        nlohmann::json sound = nlohmann::json::parse(config.soundJson, nullptr, false);
-        if (!sound.is_discarded()) root[kKeySound] = std::move(sound);
+    for (const auto& [key, member] : kRootSettings) {
+        const std::string& text = config.*member;
+        if (text.empty()) continue;
+        nlohmann::json value = nlohmann::json::parse(text, nullptr, false);
+        if (!value.is_discarded()) root[key] = std::move(value);
     }
     // Compact: indenting makes a file about half as large again, and one load() refuses
     // must never be written.
@@ -430,8 +442,9 @@ LoadResult ConfigStore::load() const {
         }
         // Not judged here, like pause below: see PersistedWallpaper::propertiesJson. Counted with the
         // malformed rows when too deep to carry, which is what has the file copied aside.
-        if (root.contains(kKeySound) && !carriedText(root.at(kKeySound), result.soundJson)) {
-            ++result.malformedEntries;
+        PersistedConfig loaded;
+        for (const auto& [key, member] : kRootSettings) {
+            if (root.contains(key) && !carriedText(root.at(key), loaded.*member)) ++result.malformedEntries;
         }
 
         for (const nlohmann::json& element : root.at(kKeyMonitors)) {
@@ -453,7 +466,8 @@ LoadResult ConfigStore::load() const {
             const std::pair<const char*, std::string*> carried[] = {{kKeyOutputSize, &entry.outputSizeJson},
                                                                     {kKeyProperties, &entry.propertiesJson},
                                                                     {kKeyPause, &entry.pauseJson},
-                                                                    {kKeySound, &entry.soundJson}};
+                                                                    {kKeySound, &entry.soundJson},
+                                                                    {kKeyFrameRate, &entry.frameRateJson}};
             if (!std::ranges::all_of(carried, [&element](const auto& field) {
                     return !element.contains(field.first) || carriedText(element.at(field.first), *field.second);
                 })) {
@@ -465,25 +479,30 @@ LoadResult ConfigStore::load() const {
 
         // Judged again in the form save() writes, which can be longer than the file: 1e9 is written
         // back as 1000000000.0. A file accepted here is then one this run can save.
-        PersistedConfig loaded{std::move(result.entries), std::move(result.soundJson)};
+        loaded.monitors = std::move(result.entries);
         SaveResult dropped;
         const std::size_t saved = serialise(loaded, dropped).size();
-        result.entries = std::move(loaded.monitors);
-        result.soundJson = std::move(loaded.soundJson);
         if (saved > kMaxBytes) {
             result.entries.clear();
-            result.soundJson.clear();
             result.error = describe(m_file, "would be " + std::to_string(saved) + " bytes when saved, over the " +
                                                 std::to_string(kMaxBytes) + " byte limit");
             return result;
         }
+        result.entries = std::move(loaded.monitors);
+        result.soundJson = std::move(loaded.soundJson);
+        result.frameRateJson = std::move(loaded.frameRateJson);
+        result.keepHigherFrameRateJson = std::move(loaded.keepHigherFrameRateJson);
     } catch (const std::exception& e) {
         result.entries.clear();
         result.soundJson.clear();
+        result.frameRateJson.clear();
+        result.keepHigherFrameRateJson.clear();
         result.error = describe(m_file, std::string("could not be read: ") + e.what());
     } catch (...) {
         result.entries.clear();
         result.soundJson.clear();
+        result.frameRateJson.clear();
+        result.keepHigherFrameRateJson.clear();
         result.error = describe(m_file, "could not be read");
     }
     return result;

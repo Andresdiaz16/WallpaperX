@@ -15,6 +15,7 @@
 #include "vulkan/tier_selection.h"
 
 #include <algorithm>
+#include <array>
 #include <bitset>
 #include <chrono>
 #include <cmath>
@@ -28,6 +29,7 @@
 #include <memory>
 #include <new>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -111,9 +113,9 @@ std::string resolveShaderDir(const std::string& configured) {
 using SteadyTime = std::chrono::steady_clock::time_point;
 
 // Bounds on the time between two pictures. The floor is a budget, not a display fact: 120 pictures
-// a second per monitor on the one thread that also answers every monitor's frame request. It is
-// fixed because no screen's refresh rate ever reaches this daemon -- the plugin reports a size and
-// nothing else -- and it is held between the times successive pictures are due, not imposed on
+// a second per monitor on the one thread that also answers every monitor's frame request, and the
+// highest frame-rate setting; a lower setting or refresh rate thins the pictures shown instead
+// (showSpacing()). It is held between the times successive pictures are due, not imposed on
 // each gap in the file: timestamps rounded to whole milliseconds put a 120 a second file at 8, 8,
 // 9 ms, and raising every 8 without lowering the 9 plays it slow. The cost is real: a file authored
 // above 120 on a 144, 165 or 240 Hz screen is played slower than its author meant. The ceiling reads a
@@ -148,6 +150,11 @@ std::chrono::nanoseconds gapBetween(const PictureTiming& before, const PictureTi
 // A span of the file's own time as it passes on screen at `speed`, which playbackSpeed() bounds.
 std::chrono::nanoseconds atSpeed(std::chrono::nanoseconds span, double speed) {
     return std::chrono::nanoseconds(std::llround(static_cast<double>(span.count()) / speed));
+}
+
+// The file's own time between two pictures a screen drawing `rate` a second shows at `speed`.
+std::chrono::nanoseconds showSpacing(double rate, double speed) {
+    return std::chrono::nanoseconds(std::llround(1e9 * speed / rate));
 }
 
 // How long `picture` holds the screen at `speed`. Floored again after dividing: the due times are
@@ -246,6 +253,8 @@ WallpaperManager::WallpaperManager(Config config)
     m_restore = loaded.entries;
     // An explicit on is no setting at all, as play is for pause.
     if (soundFromJson(loaded.soundJson) != true) m_sound = loaded.soundJson;
+    if (frameRateFromJson(loaded.frameRateJson) != kDefaultFrameRate) m_frameRate = loaded.frameRateJson;
+    if (keepHigherFromJson(loaded.keepHigherFrameRateJson) != false) m_keepHigherFrameRate = loaded.keepHigherFrameRateJson;
     m_loadPreservable = loaded.preservable;
     m_loadMalformed = loaded.malformedEntries;
     m_loadError = loaded.error;
@@ -380,11 +389,12 @@ LiveWallpapers WallpaperManager::liveWallpapers() const {
     }
     live.pause = m_pauseSettings;
     live.sound = m_soundSettings;
+    live.frameRate = m_frameRateSettings;
     return live;
 }
 
 PersistedConfig WallpaperManager::configToWriteLocked() const {
-    return PersistedConfig{m_kept.rowsToWrite(liveWallpapers()), m_sound};
+    return PersistedConfig{m_kept.rowsToWrite(liveWallpapers()), m_sound, m_frameRate, m_keepHigherFrameRate};
 }
 
 std::string WallpaperManager::keptDetail(const std::string& base) const {
@@ -578,25 +588,45 @@ std::optional<OutputSize> WallpaperManager::reportedSizeLocked(int monitorId) co
     return std::nullopt;
 }
 
+std::optional<double> WallpaperManager::refreshRateLocked(int monitorId) const {
+    for (const auto& [name, boundId] : m_outputs) {
+        if (boundId != monitorId) continue;
+        const auto rate = m_outputRefreshRates.find(name);
+        if (rate == m_outputRefreshRates.end()) return std::nullopt;
+        return rate->second;
+    }
+    return std::nullopt;
+}
+
+double WallpaperManager::targetRateLocked(int monitorId) const {
+    std::optional<int> setting;
+    if (const auto own = m_frameRateSettings.find(monitorId); own != m_frameRateSettings.end()) {
+        setting = frameRateFromJson(own->second);
+    }
+    const auto rate = static_cast<double>(setting.value_or(frameRateFromJson(m_frameRate).value_or(kDefaultFrameRate)));
+    const std::optional<double> refresh = refreshRateLocked(monitorId);
+    if (!refresh || keepHigherFromJson(m_keepHigherFrameRate).value_or(false)) return rate;
+    return std::min(rate, *refresh);
+}
+
 // Bound names number at most kMaxMonitors, so past that there is always an unbound one to drop.
 // Which goes does not matter at any real connector count; the bound is against a client cycling
 // through names.
 void WallpaperManager::pruneOutputReportsLocked() {
     const auto limit = static_cast<std::size_t>(kMaxMonitors);
-    for (auto it = m_outputSizes.begin(); it != m_outputSizes.end() && m_outputSizes.size() > limit;) {
-        if (m_outputs.count(it->first) != 0) {
-            ++it;
-            continue;
+    const auto prune = [&](auto& reports, auto nameOf) {
+        for (auto it = reports.begin(); it != reports.end() && reports.size() > limit;) {
+            if (m_outputs.count(nameOf(*it)) != 0) {
+                ++it;
+                continue;
+            }
+            it = reports.erase(it);
         }
-        it = m_outputSizes.erase(it);
-    }
-    for (auto it = m_outputsNotDrawn.begin(); it != m_outputsNotDrawn.end() && m_outputsNotDrawn.size() > limit;) {
-        if (m_outputs.count(*it) != 0) {
-            ++it;
-            continue;
-        }
-        it = m_outputsNotDrawn.erase(it);
-    }
+    };
+    const auto key = [](const auto& entry) -> const std::string& { return entry.first; };
+    prune(m_outputSizes, key);
+    prune(m_outputRefreshRates, key);
+    prune(m_outputsNotDrawn, [](const std::string& name) -> const std::string& { return name; });
 }
 
 OutputSize WallpaperManager::targetSizeLocked(int monitorId) const {
@@ -1480,6 +1510,78 @@ bool WallpaperManager::setMonitorSound(int monitorId, bool on) {
     return commit == SettingCommit::Changed;
 }
 
+namespace {
+
+void requireFrameRate(int rate) {
+    if (!isFrameRate(rate)) {
+        throw InvalidRequest("unknown frame rate " + std::to_string(rate) + " (expected " + frameRateChoices() + ")");
+    }
+}
+
+}  // namespace
+
+bool WallpaperManager::setFrameRate(int rate) {
+    requireFrameRate(rate);
+    SettingCommit commit = SettingCommit::Skipped;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        // The default is no setting at all, as sound's on is.
+        commit = commitSettingLocked(m_frameRate, rate == kDefaultFrameRate ? std::string() : frameRateJsonText(rate));
+    }
+    if (commit == SettingCommit::Skipped) return false;
+    awaitPersisted();
+    return commit == SettingCommit::Changed;
+}
+
+bool WallpaperManager::setMonitorFrameRate(int monitorId, int rate) {
+    requireValidMonitorId(monitorId);
+    std::optional<std::string> next;
+    if (rate != 0) {
+        requireFrameRate(rate);
+        next = frameRateJsonText(rate);
+    }
+    SettingCommit commit = SettingCommit::Skipped;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        commit = commitSettingLocked(m_frameRateSettings, monitorId, std::move(next));
+    }
+    if (commit == SettingCommit::Skipped) return false;
+    awaitPersisted();
+    return commit == SettingCommit::Changed;
+}
+
+bool WallpaperManager::setKeepHigherFrameRate(bool keep) {
+    SettingCommit commit = SettingCommit::Skipped;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        commit = commitSettingLocked(m_keepHigherFrameRate, keepHigherJsonText(keep));
+    }
+    if (commit == SettingCommit::Skipped) return false;
+    awaitPersisted();
+    return commit == SettingCommit::Changed;
+}
+
+bool WallpaperManager::setOutputRefreshRate(const std::string& outputName, double rate) {
+    requireValidOutputName(outputName);
+    if (const std::string why = refreshRateError(rate); !why.empty()) throw InvalidRequest(why);
+
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    if (m_outputs.count(outputName) == 0) {
+        throw UnknownOutput("no monitor answers to output " + sanitizeForLog(outputName) +
+                            "; it must be named with SetMonitorOutput first");
+    }
+    const auto known = m_outputRefreshRates.find(outputName);
+    if (rate == 0.0) {
+        if (known == m_outputRefreshRates.end()) return false;
+        m_outputRefreshRates.erase(known);
+        return true;
+    }
+    if (known != m_outputRefreshRates.end() && known->second == rate) return false;
+    m_outputRefreshRates.insert_or_assign(outputName, rate);
+    pruneOutputReportsLocked();
+    return true;
+}
+
 // Unchanged writes only while the file is not known to hold it, as setOutputSize() does -- which is
 // why a save that cannot be queued is undone.
 template <class Exchange>
@@ -1731,6 +1833,8 @@ std::vector<int> WallpaperManager::restoreSaved() {
     // The same for `sound`, whose on is likewise erased.
     std::map<int, std::string> soundRead;
     std::set<int> soundConflicts;
+    std::map<int, std::string> frameRateRead;
+    std::set<int> frameRateConflicts;
 
     // Screen name -> the kept row that claimed it last, in file order. The sweep at the end
     // needs "who claimed this name last", which m_kept.carried()'s own order does not carry.
@@ -1835,12 +1939,21 @@ std::vector<int> WallpaperManager::restoreSaved() {
                 }
             }
         }
+        // Any value is a setting: only its absence follows the global one.
+        const bool frameRateTravels = !entry.frameRateJson.empty() && entry.monitorId >= kMaxMonitors;
+        if (!entry.frameRateJson.empty()) {
+            const auto [read, first] = frameRateRead.try_emplace(entry.monitorId, entry.frameRateJson);
+            if (!first && read->second != entry.frameRateJson) frameRateConflicts.insert(entry.monitorId);
+            read->second = entry.frameRateJson;
+            if (entry.monitorId < kMaxMonitors) m_frameRateSettings.insert_or_assign(entry.monitorId, entry.frameRateJson);
+        }
+        const bool settingTravels = pauseTravels || soundTravels || frameRateTravels;
 
         // A row with no wallpaper stops here rather than falling into the arm below, whose
         // health text is the user's only notice that a wallpaper did not come back. Only a
         // name or a setting for a bigger build is still worth carrying; a row with nothing left
         // on it would otherwise ride every save for the life of the install.
-        if (entry.type.empty() && entry.path.empty() && !nameTravels && !pauseTravels && !soundTravels) {
+        if (entry.type.empty() && entry.path.empty() && !nameTravels && !settingTravels) {
             if (entry.output.empty() && !entry.holdsMonitorSettings()) m_kept.countDroppedEntry();
             continue;
         }
@@ -1868,6 +1981,7 @@ std::vector<int> WallpaperManager::restoreSaved() {
                 // Applied above instead.
                 if (!pauseTravels) keep.pauseJson.clear();
                 if (!soundTravels) keep.soundJson.clear();
+                if (!frameRateTravels) keep.frameRateJson.clear();
                 // Nothing left to carry. Kept, it would ride every save for the life of the
                 // install and come back as a wallpaper that did not return.
                 if (keep.type.empty() && keep.path.empty() && keep.output.empty() && !keep.holdsMonitorSettings()) continue;
@@ -1896,6 +2010,7 @@ std::vector<int> WallpaperManager::restoreSaved() {
             }
             if (pauseTravels) held.pauseJson = entry.pauseJson;
             if (soundTravels) held.soundJson = entry.soundJson;
+            if (frameRateTravels) held.frameRateJson = entry.frameRateJson;
             continue;
         }
 
@@ -2052,6 +2167,11 @@ std::vector<int> WallpaperManager::restoreSaved() {
                     " monitors given conflicting sound settings by several entries; the last entry's "
                     "was kept, and the rest survive only if the file was copied (see below)");
     }
+    if (!frameRateConflicts.empty()) {
+        m_kept.note(std::to_string(frameRateConflicts.size()) +
+                    " monitors given conflicting frame-rate settings by several entries; the last entry's "
+                    "was kept, and the rest survive only if the file was copied (see below)");
+    }
 
     // Kept entries are invisible otherwise: they are in no monitor's status and are not
     // malformed, so nothing would tell the user those wallpapers did not come back.
@@ -2060,6 +2180,7 @@ std::vector<int> WallpaperManager::restoreSaved() {
     // Any rejected size, not only those left uncompensated: the rewrite removes its bytes either way.
     repaired = displacedNames > 0 || rejectedNames > 0 || !sizeRejectedFor.empty() || duplicateIds > 0 ||
                droppedProperties > 0 || clampedVolumes > 0 || snappedSpeeds > 0 || !pauseConflicts.empty() || !soundConflicts.empty() ||
+               !frameRateConflicts.empty() ||
                m_kept.anyDropped();
     if ((!m_kept.carried().empty() || repaired) && m_health.persistence.status == HealthStatus::Ok) {
         recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Ok,
@@ -2672,83 +2793,6 @@ WallpaperManager::VideoSession::OnScreen WallpaperManager::VideoSession::Waiting
     return {now, now};
 }
 
-void WallpaperManager::VideoSession::DecodeLoad::Average::add(double sample, double cap, uint32_t weight) {
-    // The mean of the first kSettled, then an eighth of each one after; the cap keeps one decode, however
-    // slow, from making a file that keeps up look slow for long.
-    const double counted = std::min(sample, cap);
-    for (; weight > 0 && samples < kSettled; --weight) value += (counted - value) / ++samples;
-    value = counted + (value - counted) * std::pow(1.0 - 1.0 / kSettled, weight);
-}
-
-void WallpaperManager::VideoSession::DecodeLoad::Span::add(double intervals, uint32_t read) {
-    perPicture.add(intervals, 1e9);
-    const double counted = std::clamp(std::min(intervals, static_cast<double>(read)), 1.0, double{kSettled});
-    covered = std::min(kSettled, covered + static_cast<uint32_t>(std::lround(counted)));
-}
-
-double WallpaperManager::VideoSession::DecodeLoad::span(size_t at) const {
-    at = std::min(at, kLevels - 1);
-    if (at == 0) return 1.0;
-    // Measured once its pictures cover kSettled intervals: one long gap at a sparse-key file's key level
-    // does, a lone short one -- a P picture just before a key one -- does not.
-    if (spans[at].covered >= kSettled) return spans[at].perPicture.value;
-    if (kept[0] == 0) return 1.0;
-    // As the pictures' types predict, from what was decoded before any skipping: too few key pictures
-    // seen there, or a B pyramid, can put it either side of what the level spans.
-    return static_cast<double>(kept[0]) / static_cast<double>(std::max<uint64_t>(kept[at], 1));
-}
-
-void WallpaperManager::VideoSession::DecodeLoad::saw(PictureSkip decodedAt, PictureSkip keptThrough) {
-    if (decodedAt != PictureSkip::Nothing) return;
-    for (size_t at = 0; at <= static_cast<size_t>(keptThrough); ++at) ++kept[at];
-}
-
-void WallpaperManager::VideoSession::DecodeLoad::add(std::chrono::nanoseconds took, std::chrono::nanoseconds shownFor,
-                                                     std::chrono::nanoseconds covered, PictureSkip previousAt,
-                                                     PictureSkip decodedAt, PictureSkip deepest, uint32_t read) {
-    const auto against = [&](std::chrono::nanoseconds span) {
-        return static_cast<double>(took.count()) / static_cast<double>(span.count());
-    };
-    const double intervals = static_cast<double>(covered.count()) / static_cast<double>(shownFor.count());
-    // The pictures this one stands for: each one skipped was read, so a gap a timestamp jump stretched
-    // counts no more than the packets behind it.
-    const auto weight =
-        static_cast<uint32_t>(std::lround(std::clamp(std::min(intervals, static_cast<double>(read)), 1.0, 1e6)));
-    // Capped at twice the average, or what a picture of this level spans if more: a file far over load
-    // must be seen to be, or a climb stops short at a level predicted to keep up that does not, and a
-    // level that skips would predict a lower one keeps up that was already seen not to.
-    const auto deepestAt = static_cast<size_t>(deepest);
-    everyPicture.add(against(shownFor), 2.0 * std::max({everyPicture.value, span(std::min(level, deepestAt)), 1.0}),
-                     weight);
-    if (decodedAt == std::min(skip(), deepest) && previousAt == decodedAt) {
-        // One a picture, not weighted: decoderBehind() then lasts kSettled pictures into a level, which
-        // lets the pictures it inherited late from the last one catch up without the sound being moved.
-        asRun.add(against(covered));
-        if (decodedAt != PictureSkip::Nothing) spans[static_cast<size_t>(decodedAt)].add(intervals, read);
-    }
-    const auto moveTo = [this](size_t to) {
-        level = to;
-        asRun = {};
-    };
-    const auto keepsUpAt = [this](size_t at) { return everyPicture.value / span(at) < kKeepsUp; };
-    // A level seen or predicted to leave nothing out cannot help, nor one the decoder does not apply.
-    for (size_t lower = 0; lower < std::min(level, deepestAt + 1); ++lower) {
-        if ((lower == 0 || span(lower) > kSkipped) && keepsUpAt(lower)) {
-            moveTo(lower);
-            return;
-        }
-    }
-    // Behind as this level's own pictures measure it, or as the cost of every picture predicts for it:
-    // that needs none of this level's pictures, which a decoder's frames in flight hold back for a while.
-    const Average& paced = level == 0 ? everyPicture : asRun;
-    const bool behind = (paced.samples >= kSettled && paced.value >= 1.0) ||
-                        (everyPicture.samples >= kSettled && everyPicture.value >= span(level));
-    if (!behind || unpaced()) return;
-    size_t to = level + 1;
-    while (to <= deepestAt && !(span(to) > kSkipped * span(level) && keepsUpAt(to))) ++to;
-    moveTo(to > deepestAt ? kUnpaced : to);
-}
-
 void WallpaperManager::markShown(VideoSession& session, SteadyTime now, double speed) {
     using Session = VideoSession;
     // Terminal for the schedule: what is on screen is what the session holds.
@@ -3170,6 +3214,8 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(uint64_t sessio
         uint64_t wallpaperSeq = 0;
         Motion motion = Motion::Stopped;
         std::optional<uint64_t> playing;
+        // The file's own time between the pictures its targetRateLocked() shows at the session's speed.
+        std::chrono::nanoseconds spacing{};
     };
     std::vector<Screen> screens;
     screens.reserve(session.members.size());
@@ -3218,7 +3264,8 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(uint64_t sessio
         for (const Session::Member& member : session.members) {
             MonitorState& state = *stateOf(member);
             Screen screen{member.monitorId, member.wallpaperSeq, motionLocked(member.monitorId, member.wallpaperSeq),
-                          playingSeqLocked(member.monitorId, member.wallpaperSeq)};
+                          playingSeqLocked(member.monitorId, member.wallpaperSeq),
+                          showSpacing(targetRateLocked(member.monitorId), speed)};
             paused = paused || pausedLocked(member.monitorId);
             if (const std::optional<SteadyTime> at = unwatchedAtLocked(state); at && (!unwatchedAt || *at < *unwatchedAt)) {
                 unwatchedAt = at;
@@ -3300,6 +3347,16 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(uint64_t sessio
         return std::nullopt;
     }
     session.idleSince.reset();
+    // A picture no playing screen's rate shows is passed over, unconverted, and left undecoded where
+    // nothing references it; each screen draws only those its own rate shows.
+    static_assert(kMaxMonitors <= ShowGrids::kMaxSpacings);
+    std::array<std::chrono::nanoseconds, kMaxMonitors> spacingsHeld{};
+    size_t spacingCount = 0;
+    for (const Screen& screen : screens) {
+        if (screen.playing) spacingsHeld[spacingCount++] = screen.spacing;
+    }
+    const std::span<const std::chrono::nanoseconds> spacings(spacingsHeld.data(), spacingCount);
+    session.decodeLoad.thinUnder(spacings);
     // One decode's sample: the decoder's own time for the picture, on whichever thread it ran, against
     // the time on screen at this round's speed. None for a picture that starts a pass while nothing is
     // skipped: its decode holds the loop's seek and key picture, paid once a pass. Skipping, it may be
@@ -3308,11 +3365,14 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(uint64_t sessio
     const auto measureDecode = [&](const PictureTiming& before, const PictureTiming& after,
                                    std::chrono::nanoseconds gap) {
         const SteadyTime ended = std::chrono::steady_clock::now();
-        session.decodeLoad.saw(after.skip, after.keptThrough);
+        const std::optional<bool> thinned = session.decodeLoad.thinnedHere(after.thinnedUnder);
+        if (!thinned) return ended;
+        session.decodeLoad.saw(after.skip, after.keptThrough, *thinned);
         if (!after.startsPass || after.skip != PictureSkip::Nothing) {
             session.decodeLoad.add(after.decodeTime, intervalAtSpeed(after, speed),
                                    std::max(atSpeed(gap, speed), kMinPictureInterval), before.skip, after.skip,
-                                   session.pipeline->deepestSkip(), after.readSince);
+                                   session.pipeline->deepestSkip(), after.readSince,
+                                   session.decodeLoad.thinnedHere(before.thinnedUnder).value_or(false), *thinned);
         }
         return ended;
     };
@@ -3325,6 +3385,7 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(uint64_t sessio
         // Inside the try, so it is withdrawn before the failure path frees the session it names.
         const std::shared_ptr<const std::string> line = session.blame->line.load();
         const PlayingBlame working(*line);
+        session.pipeline->leaveUnshown(spacings, session.decodeLoad.thinningNumber());
         // A decode that is still dropping pictures on the way to its own gets the next round: the picture
         // on screen stays, and the rounds between let every other screen and request have the GPU.
         if (resuming) {
@@ -3394,27 +3455,31 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(uint64_t sessio
             // one a round, then while the round's catch-up slice lasts. One still behind when the slice
             // runs out is held for the next round rather than drawn, until kCatchUpHold, so a file slow
             // to decode lands on the sound instead of running through late pictures; then it is drawn,
-            // the sound moved to it if past kSoundDrift.
+            // the sound moved to it if past kSoundDrift. A picture no screen's rate shows is passed over
+            // the same way, but whenever it is due and with no hold: it was never to be drawn.
             for (bool dropped = false;; dropped = true) {
                 const PictureTiming held = session.pipeline->timing();
-                if (!pace.timesPicture || held.startsPass ||
-                    waiting->planned().timeline + intervalAtSpeed(held, speed) > now) {
+                const bool unshown = !held.startsPass && !session.pipeline->shows(spacings);
+                if (!unshown && (!pace.timesPicture || held.startsPass ||
+                                 waiting->planned().timeline + intervalAtSpeed(held, speed) > now)) {
                     waiting->catchingUpSince.reset();
                     break;
                 }
                 const SteadyTime checked = std::chrono::steady_clock::now();
-                if (waiting->catchingUpSince && checked - *waiting->catchingUpSince >= kCatchUpHold) {
+                if (!unshown && waiting->catchingUpSince && checked - *waiting->catchingUpSince >= kCatchUpHold) {
                     pace = steerSoundLocked(heardOn, session, *waiting, sound, now, CatchUp::HoldRunOut);
                     break;
                 }
                 // One drop a round whatever the slice holds, as the screens before this one may have
                 // spent it; more only within it.
                 if (dropped && checked >= catchUpUntil) {
-                    if (!waiting->catchingUpSince) waiting->catchingUpSince = checked;
+                    if (!unshown && !waiting->catchingUpSince) waiting->catchingUpSince = checked;
                     return now;
                 }
                 const Decode step = decodeUntil(*session.pipeline, catchUpUntil, session.decodeLoad.skip());
                 if (step == Decode::Dropping) return now;
+                // The pipeline's ready hook asks for the round that takes the next picture.
+                if (step == Decode::Pending && unshown) return std::nullopt;
                 // Held as when the slice runs out, until the next picture is decoded or the hold ends.
                 if (step == Decode::Pending) {
                     if (!waiting->catchingUpSince) waiting->catchingUpSince = checked;
@@ -3460,6 +3525,9 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(uint64_t sessio
         bool drew = false;
         for (const Screen& screen : screens) {
             if (!screen.playing) continue;
+            // Keeps its picture through those its own rate does not show: the loop above kept every
+            // picture some screen shows.
+            if (waiting != nullptr && !timing.startsPass && !session.pipeline->shows({&screen.spacing, 1})) continue;
             drawing = screen.monitorId;
             const OffscreenTarget* target = nullptr;
             {
@@ -4263,6 +4331,24 @@ WallpaperManager::Snapshot WallpaperManager::snapshot() const {
     for (const auto& [monitorId, setting] : m_soundSettings) {
         if (!out.monitorSound.contains(monitorId)) out.monitorSound.emplace(monitorId, soundStatus(monitorId));
     }
+
+    out.frameRate = m_frameRate.empty() ? std::optional(kDefaultFrameRate) : frameRateFromJson(m_frameRate);
+    out.keepHigherFrameRate = keepHigherFromJson(m_keepHigherFrameRate);
+    const auto frameRateStatus = [this](int monitorId) {
+        MonitorFrameRateStatus status;
+        if (const auto own = m_frameRateSettings.find(monitorId); own != m_frameRateSettings.end()) {
+            status.rate = frameRateFromJson(own->second);
+            status.followsGlobal = false;
+        }
+        status.refreshRate = refreshRateLocked(monitorId);
+        status.target = targetRateLocked(monitorId);
+        return status;
+    };
+    std::set<int> frameRateShown;
+    for (const auto& [monitorId, state] : m_monitors) frameRateShown.insert(monitorId);
+    for (const auto& [monitorId, setting] : m_frameRateSettings) frameRateShown.insert(monitorId);
+    for (const auto& [name, monitorId] : m_outputs) frameRateShown.insert(monitorId);
+    for (const int monitorId : frameRateShown) out.monitorFrameRate.emplace(monitorId, frameRateStatus(monitorId));
     return out;
 }
 

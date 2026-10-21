@@ -1876,6 +1876,129 @@ void checkFrameAllocationFailure(NameWatcher& names, const std::string& validati
                                         .c_str());
 }
 
+// GOAL: S15.910 -- in the real daemon an allocation failing while SetOutputRefreshRate is handled is
+//       answered RenderFailed, never a crash or silence, and the daemon serves the next call whole.
+// WHY-THIS-SHAPE: tests/alloc_fail_shim.cpp in its handler mode fails the Nth operator new the daemon or
+//       sdbus-c++ makes on the D-Bus handler thread, N = 1, 2, ... until a call makes fewer than N; so every
+//       allocation of the call is reached without knowing which lie in the handler. Failures in sdbus-c++'s
+//       own unmarshalling are answered by sdbus-c++, not the handler, so the grade is "every call answered,
+//       the daemon alive, at least one RenderFailed", with every answer's name printed. Each call sends a new
+//       rate, so the changed path (its log line) runs every time.
+// CONTROL: control_batch.sh 2026-10-20 (F5), reverted, backend/daemon/dbus_service.cpp: the `catch (const
+//       std::exception& e)` arm of DbusService::setOutputRefreshRate deleted -> "FAIL: an allocation failing in
+//       SetOutputRefreshRate is answered RenderFailed (0 of 1)" (sdbus-c++ answered org.sdbuscpp.Error). Green:
+//       one allocation reachable, answered RenderFailed.
+// COVERAGE-ASSERT: at least one allocation failed, and the sweep ends on a call served whole.
+void checkHandlerAllocationFailure(NameWatcher& names, const std::string& validationEnv, const Check& check) {
+    constexpr const char* kGoal = "S15.910 (an allocation failing in SetOutputRefreshRate answers RenderFailed)";
+    constexpr const char* kRenderFailed = "io.wallpaperx.Daemon.Error.RenderFailed";
+    constexpr int kMaxSweep = 500;
+    ScratchDir work("allocfailhandler");
+    if (!work.ok()) {
+        throw ScratchDirectoryLost("a scratch directory could not be created");
+    }
+    const std::string controlPath = (work.path() / "control").string();
+    const int controlFd = ::open(controlPath.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    void* mapped = MAP_FAILED;
+    if (controlFd >= 0 && ::ftruncate(controlFd, sizeof(wallpaperx::testing::AllocFailControl)) == 0) {
+        mapped = ::mmap(nullptr, sizeof(wallpaperx::testing::AllocFailControl), PROT_READ | PROT_WRITE, MAP_SHARED,
+                        controlFd, 0);
+    }
+    if (controlFd >= 0) ::close(controlFd);
+    if (mapped == MAP_FAILED) {
+        phaseSetupFault(kGoal, "the shim's control file could not be made and mapped");
+        return;
+    }
+    struct Unmap {
+        void* at;
+        ~Unmap() { ::munmap(at, sizeof(wallpaperx::testing::AllocFailControl)); }
+    } unmap{mapped};
+    auto& control = *new (mapped) wallpaperx::testing::AllocFailControl{};
+
+    SpawnedDaemon daemon(std::vector<std::string>{validationEnv, preloading(WALLPAPERX_ALLOC_FAIL_SHIM),
+                                                  "WALLPAPERX_TEST_ALLOC_FAIL=" + controlPath,
+                                                  "WALLPAPERX_TEST_ALLOC_FAIL_ON=handler"});
+    const bool cameUp = names.waitFor(true);
+    if (!cameUp && reportedStartupFault(daemon, kGoal)) return;
+    check(cameUp, "a fresh daemon acquires the name before the handler allocation-failure phase");
+    if (!cameUp) return;
+    struct Stop {
+        SpawnedDaemon& daemon;
+        NameWatcher& names;
+        ~Stop() {
+            daemon.shutdown(SIGTERM);
+            static_cast<void>(names.waitFor(false));
+        }
+    } stop{daemon, names};
+
+    auto proxy = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName},
+                                    sdbus::ObjectPath{DbusService::kObjectPath});
+    wallpaperx::testing::setMonitorOutput(*proxy, 31, "DP-ALLOC");
+    // The first rate teaches the shim which thread handles calls.
+    wallpaperx::testing::setOutputRefreshRate(*proxy, "DP-ALLOC", 60.0);
+    if (control.workerTid.load() == 0) {
+        notVerified(kGoal, "the preloaded shim never saw a rate read, so it is not in effect");
+        return;
+    }
+
+    std::vector<int> unanswered;
+    std::map<std::string, int> answers;
+    int failed = 0, renderFailed = 0, sweptTo = 0;
+    bool servedWhole = false;
+    std::string erroredUnfailed;
+    for (int n = 1; n <= kMaxSweep && !servedWhole; ++n) {
+        sweptTo = n;
+        control.fired.store(0);
+        control.countdown.store(n);
+        std::string errorName;
+        try {
+            proxy->callMethod("SetOutputRefreshRate")
+                .onInterface(DbusService::kInterface)
+                .withTimeout(std::chrono::seconds(10))
+                .withArguments(std::string("DP-ALLOC"), 30.0 + (n % 900));
+        } catch (const sdbus::Error& e) {
+            errorName = e.getName();
+        }
+        control.countdown.store(0);
+        if (daemon.exited()) {
+            check(false, ("the daemon survives an allocation failing in SetOutputRefreshRate (it died at " +
+                          std::to_string(n) + ")")
+                             .c_str());
+            return;
+        }
+        const bool noReply =
+            errorName == "org.freedesktop.DBus.Error.NoReply" || errorName == "org.freedesktop.DBus.Error.Timeout";
+        if (control.fired.load() == 0) {
+            servedWhole = errorName.empty();
+            if (!servedWhole) erroredUnfailed = std::to_string(n) + ": " + errorName;
+            break;
+        }
+        ++failed;
+        ++answers[errorName.empty() ? "served" : errorName];
+        if (noReply) unanswered.push_back(n);
+        if (errorName == kRenderFailed) ++renderFailed;
+    }
+    std::string answered;
+    for (const auto& [name, count] : answers) answered += " " + name + " x" + std::to_string(count);
+    std::printf("daemon_system_test: allocation failure on the handler thread -- %d failed of %d tried; answers:%s\n",
+                failed, sweptTo, answered.c_str());
+    std::fflush(stdout);
+    if (failed == 0) {
+        notVerified(kGoal, "no allocation was ever failed: no preload took effect, or the runtime binds operator new "
+                           "inside itself");
+        return;
+    }
+    check(unanswered.empty(), ("an allocation failing in SetOutputRefreshRate: every call is answered (unanswered at " +
+                               joined(unanswered) + ")")
+                                  .c_str());
+    check(renderFailed >= 1, ("an allocation failing in SetOutputRefreshRate is answered RenderFailed (" +
+                              std::to_string(renderFailed) + " of " + std::to_string(failed) + ")")
+                                 .c_str());
+    check(servedWhole, ("the sweep ended on a SetOutputRefreshRate served whole (" + std::to_string(sweptTo) +
+                        " tried" + (erroredUnfailed.empty() ? "" : ", errored unfailed at " + erroredUnfailed) + ")")
+                           .c_str());
+}
+
 // GOAL: S15.327 -- SetOutputVisible logs a line only when the report changes what is recorded: of the
 //       six reports true, true, false, false, true, true for one screen, only the two changes are
 //       logged (a first `true` from a screen that never reported changes nothing), in that order.
@@ -6907,6 +7030,7 @@ int main(int argc, char** argv) {
         phase("hangupShutdown", [&] { checkHangupShutdown(names, check); });
         phase("outputVisibleLog", [&] { checkOutputVisibleLog(names, validationEnv, check); });
         phase("frameAllocationFailure", [&] { checkFrameAllocationFailure(names, validationEnv, bluePath, check); });
+        phase("handlerAllocationFailure", [&] { checkHandlerAllocationFailure(names, validationEnv, check); });
         phase("closedStdout", [&] { checkClosedStdout(names, bluePath, validationEnv, wantValidation, check); });
         phase("nestedBusPrivate", [&] { checkNestedBusPrivate(check); });
         phase("busLoss", [&] { checkBusLoss(check); });

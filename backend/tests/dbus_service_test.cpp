@@ -665,6 +665,17 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
         {"method", "SetMonitorSound", ArgList{{"in", "i:monitor_id"}, {"in", "b:on"}}},
         {"method", "SetOutputFocusState",
          ArgList{{"in", "s:output_name"}, {"in", "s:focus"}, {"in", "b:window_maximized"}}},
+        // GOAL: the four frame-rate setters are exported with these signatures: an int rate, a monitor's
+        //       int rate, a bool keep-higher, and an output's refresh rate as a double.
+        // CONTROL: via control_batch.sh, --phase '^host$', 2026-10-20, in DbusService::registerVTable
+        //       (backend/daemon/dbus_service.cpp), each alone -> "FAIL: wire signature of method <it> is
+        //       unchanged": SetFrameRate's "rate" renamed "fps"; SetMonitorFrameRate's rate taken as bool;
+        //       SetKeepHigherFrameRate's "keep" renamed "on"; SetOutputRefreshRate's rate taken as int32_t.
+        //       Reverted.
+        {"method", "SetFrameRate", ArgList{{"in", "i:rate"}}},
+        {"method", "SetMonitorFrameRate", ArgList{{"in", "i:monitor_id"}, {"in", "i:rate"}}},
+        {"method", "SetKeepHigherFrameRate", ArgList{{"in", "b:keep"}}},
+        {"method", "SetOutputRefreshRate", ArgList{{"in", "s:output_name"}, {"in", "d:refresh_rate"}}},
         {"method", "GetStatus", ArgList{{"out", "s:status"}}},
         {"signal", "FrameReady", ArgList{{"", "i:monitor_id"}, {"", "t:frame_generation"}}},
         // Argument-free: what the layouts now are is what the other consumers reported.
@@ -698,9 +709,11 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
     //       unreviewed.
     // WHY-THIS-SHAPE: sorted name lists, because the loop above walks the table and cannot see a
     //       member the table lacks.
-    // CONTROL: `sdbus::registerMethod("Debug").implementedAs([this]() { (void)this; })` added to
-    //       DbusService::registerVTable (backend/daemon/dbus_service.cpp) -> "FAIL: io.wallpaperx.Daemon
-    //       exports exactly the methods this table names", alone.
+    // CONTROL: re-run via control_batch.sh, --phase '^host$', 2026-10-20: `sdbus::registerMethod("Debug")
+    //       .implementedAs([this]() { (void)this; })` added to DbusService::registerVTable
+    //       (backend/daemon/dbus_service.cpp) -> "FAIL: io.wallpaperx.Daemon exports exactly the methods this
+    //       table names", alone. SetOutputRefreshRate's registration deleted -> that line and "FAIL: wire
+    //       signature of method SetOutputRefreshRate is unchanged". Reverted.
     {
         std::vector<std::string> expectedMethods, expectedSignals;
         for (const auto& [element, name, expectedArgs] : expected) {
@@ -1103,9 +1116,10 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
 
     std::printf("dbus_service_test: SetWallpaper replied in %lld ms, FrameReady at %lld ms\n",
                 static_cast<long long>(replyMs), static_cast<long long>(frameMs));
-    // CONTROL: backend/daemon/dbus_service.cpp:410, a 400 ms sleep at the start of DbusService::setWallpaper,
+    // CONTROL: backend/daemon/dbus_service.cpp, a 400 ms sleep at the start of DbusService::setWallpaper,
     //       control_batch 2026-10-15, dbus_service_lavapipe '^render$' -> "FAIL: SetWallpaper replies without
     //       waiting for the render to finish", alone; restored, green.
+    //       Re-run 2026-10-20 (T9b), the line number it named having moved: the same line, alone; restored, green.
     check(replyMs <= 2 || replyMs * 4 < frameMs, "SetWallpaper replies without waiting for the render to finish");
 
     {
@@ -4084,6 +4098,9 @@ void runSoundWireChecks(const wallpaperx::WallpaperManager::Config& base, const 
     //       (backend/daemon/wallpaper_manager.cpp) committing the text "true" for on in place of
     //       `commitSettingLocked(m_sound, soundJsonText(on))` -> "FAIL: SetSound(true) is reported on and
     //       leaves the file as it was, with no sound field".
+    //       Re-run 2026-10-20 (T9b), control_batch.sh, after serialise came to write the root settings from one table
+    //       (kRootSettings): its loop skipping `&PersistedConfig::soundJson` (backend/daemon/config_store.cpp) -> the
+    //       first line, the file unchanged after SetSound(false). The setSound break not re-run (untouched).
     {
         const std::string before = configTextOnceIdle(manager, config.configFile);
         const std::string offError = errorNameFrom([&] { setSound(proxy, false); });
@@ -4118,6 +4135,8 @@ void runSoundWireChecks(const wallpaperx::WallpaperManager::Config& base, const 
     //       and SetWallpaperWithProperties, in GetStatus and the file", alone. setMonitorSound's `if (!on)`
     //       before the lock dropped, storing off whatever is asked -> "FAIL: SetMonitorSound(true) is
     //       reported on and removes the field from the monitor's row" and S15.451's line.
+    //       Re-run 2026-10-20 (T9b), control_batch.sh, after rowsToWrite gained a frame-rate loop beside it: the
+    //       `live.sound` loop deleted -> the same two lines. The other two not re-run (untouched).
     {
         const std::string bareError = errorNameFrom([&] { setMonitorSound(proxy, kMonitorSoundBare, false); });
         const nlohmann::json bareEntry = monitorOf(kMonitorSoundBare);
@@ -4286,6 +4305,388 @@ void runSoundWireChecks(const wallpaperx::WallpaperManager::Config& base, const 
         }
         check(accepted, "a volume of 0, 0.5 and 1 is stored");
     }
+    });
+}
+
+// --------------------------------------------------------------------------- //
+// The frame-rate settings and the screens' refresh rates. Shader wallpapers, recorded and never drawn.
+// --------------------------------------------------------------------------- //
+constexpr int32_t kMonitorFrameRateNamed = 0;  // a wallpaper, answers to DP-FR
+constexpr int32_t kMonitorFrameRateOwn = 2;    // a frame-rate setting of its own and no wallpaper
+
+void runFrameRateWireChecks(const wallpaperx::WallpaperManager::Config& base, const std::string& unrenderablePath,
+                            const Check& check) {
+    using wallpaperx::testing::frameRateStatus;
+    using wallpaperx::testing::setFrameRate;
+    using wallpaperx::testing::setKeepHigherFrameRate;
+    using wallpaperx::testing::setMonitorFrameRate;
+    using wallpaperx::testing::setMonitorOutput;
+    using wallpaperx::testing::setOutputRefreshRate;
+    using nlohmann::json;
+    constexpr const char* kInvalidArgs = "org.freedesktop.DBus.Error.InvalidArgs";
+    constexpr const char* kUnknownOutput = "io.wallpaperx.Daemon.Error.UnknownOutput";
+    const char* kGoals = "S15.909-S15.910 (the frame-rate settings and screens' refresh rates on the wire)";
+    const wallpaperx::testing::ScratchDir scratch("dbusframerate");
+    if (!scratch.ok()) {
+        wallpaperx::testing::notVerified(kGoals, "a scratch directory for this phase's config file could not be made");
+        return;
+    }
+    wallpaperx::WallpaperManager::Config config = base;
+    config.configFile = scratch.path() / "wallpaperx" / "config.json";
+    bool firstRunComplete = false;
+    withNoDeviceManager(config, "the frame-rate wire phase", check, [&](wallpaperx::WallpaperManager& manager) {
+    auto serviceConn = sdbus::createSessionBusConnection();
+    DbusService service(*serviceConn, manager);
+    serviceConn->enterEventLoopAsync();
+    const sdbus::ServiceName daemonName{serviceConn->getUniqueName()};
+    const sdbus::ObjectPath objectPath{DbusService::kObjectPath};
+    AnnouncementLog announced;
+    auto listener = sdbus::createProxy(daemonName, objectPath);
+    listener->uponSignal("ConfigChanged").onInterface(DbusService::kInterface).call([&announced] { announced.record(); });
+    auto proxyOwner = sdbus::createProxy(daemonName, objectPath);
+    sdbus::IProxy& proxy = *proxyOwner;
+
+    // Null also for a GetStatus that failed, so no check reads null as an answer.
+    const auto sectionOf = [&proxy]() -> json {
+        const StatusReply status = getStatusOrExplain(proxy);
+        const json* section = frameRateStatus(status);
+        return section != nullptr ? *section : json(nullptr);
+    };
+    const auto monitorOf = [&sectionOf](int32_t monitorId) -> json {
+        const json section = sectionOf();
+        if (!section.is_object() || !section.contains("monitors") || !section["monitors"].is_object()) return nullptr;
+        const auto it = section["monitors"].find(std::to_string(monitorId));
+        return it != section["monitors"].end() ? *it : json(nullptr);
+    };
+    const auto settledCount = [&]() -> std::optional<int> {
+        if (!announcementsSettled(*listener)) return std::nullopt;
+        return announced.count();
+    };
+    const auto fileNow = [&]() { return configTextOnceIdle(manager, config.configFile); };
+
+    const std::string setupError = errorNameFrom([&] {
+        setWallpaper(proxy, "shader", unrenderablePath, kMonitorFrameRateNamed);
+        setMonitorOutput(proxy, kMonitorFrameRateNamed, "DP-FR");
+    });
+    if (!setupError.empty()) {
+        wallpaperx::testing::notVerified(kGoals, "the setup SetWallpaper/SetMonitorOutput answered '" + setupError + "'");
+        return;
+    }
+
+    // GOAL: S15.909 -- with nothing set, GetStatus's `frame_rate` reports rate 60, keep_higher false, and the
+    //       monitor holding a wallpaper as following the global rate, with no refresh rate and target 60.
+    {
+        const json section = sectionOf();
+        const json expected = {{"rate", 60},
+                               {"keep_higher", false},
+                               {"monitors",
+                                {{"0", {{"rate", nullptr}, {"follows_global", true}, {"refresh_rate", nullptr}, {"target", 60}}}}}};
+        check(section == expected, "with no frame-rate setting, GetStatus reports 60, keep_higher off, and the monitor following it");
+        if (section != expected) std::fprintf(stderr, "  frame_rate: %s\n", section.dump().c_str());
+    }
+
+    // GOAL: S15.909 -- SetFrameRate refuses every rate but 30, 60 and 120, and SetMonitorFrameRate every rate but
+    //       0, 30, 60 and 120 or a monitor id out of range, as InvalidArgs; a refusal changes no status, writes
+    //       nothing and announces nothing.
+    // CONTROL: control_batch.sh 2026-10-20, --phase '^frameRateWire$', reverted: `requireFrameRate(rate);` deleted from WallpaperManager::setFrameRate,
+    //       then from setMonitorFrameRate (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a frame rate other than
+    //       30, 60 or 120 ... is refused as InvalidArgs" and "... changes no status, writes nothing", each.
+    {
+        const json sectionBefore = sectionOf();
+        const std::string textBefore = fileNow();
+        const std::optional<int> countBefore = settledCount();
+        bool refused = true;
+        for (const int32_t rate : {0, 29, 45, 59, 61, 90, 121, 240, -60}) {
+            const std::string answer = errorNameFrom([&] { setFrameRate(proxy, rate); });
+            if (answer != kInvalidArgs) {
+                refused = false;
+                std::fprintf(stderr, "  SetFrameRate(%d) answered '%s'\n", rate, answer.c_str());
+            }
+        }
+        for (const auto& [monitorId, rate] : std::vector<std::pair<int32_t, int32_t>>{
+                 {kMonitorFrameRateNamed, 45}, {kMonitorFrameRateNamed, -30}, {kMonitorFrameRateNamed, 240}, {-1, 60}}) {
+            const std::string answer = errorNameFrom([&] { setMonitorFrameRate(proxy, monitorId, rate); });
+            if (answer != kInvalidArgs) {
+                refused = false;
+                std::fprintf(stderr, "  SetMonitorFrameRate(%d, %d) answered '%s'\n", monitorId, rate, answer.c_str());
+            }
+        }
+        check(refused, "a frame rate other than 30, 60 or 120 (or 0 for a monitor), or a bad monitor id, is refused as InvalidArgs");
+        const json sectionAfter = sectionOf();
+        const std::string textAfter = fileNow();
+        const std::optional<int> countAfter = settledCount();
+        check(sectionAfter == sectionBefore && !textBefore.empty() && textAfter == textBefore && countBefore && countAfter &&
+                  *countAfter == *countBefore,
+              "a refused frame rate changes no status, writes nothing and announces nothing");
+        if (sectionAfter != sectionBefore || textAfter != textBefore) {
+            std::fprintf(stderr, "  frame_rate %s -> %s\n  file %s\n    -> %s\n", sectionBefore.dump().c_str(),
+                         sectionAfter.dump().c_str(), textBefore.c_str(), textAfter.c_str());
+        }
+    }
+
+    // GOAL: S15.909 -- each accepted setting is reported and written: the global rate at the config root as
+    //       `frame_rate` except 60, which is the default and leaves the file byte for byte as before; a monitor's
+    //       rate on its row (a row of its own for a monitor with no wallpaper), 0 removing it; keep-higher at the
+    //       root as `keep_higher_frame_rate`, false removing it. GetStatus's target follows the setting.
+    // WHY-THIS-SHAPE: the file is read once the writer is idle, after every step; reading GetStatus alone would
+    //       pass a setting that never reaches the file.
+    // CONTROL: control_batch.sh 2026-10-20, --phase '^frameRateWire$', reverted: setFrameRate writing 60 too (wallpaper_manager.cpp) ->
+    //       "FAIL: ... the config file is byte for byte as before (60 is not written)"; the `live.frameRate` loop's
+    //       row write deleted (backend/daemon/kept_rows.cpp) -> "FAIL: each accepted frame-rate setting is reported
+    //       ... and written" and the restart line; GetStatus's follows_global always true
+    //       (backend/daemon/dbus_service.cpp) -> the same accepted-setting line.
+    {
+        const std::string pristine = fileNow();
+        struct Step {
+            const char* what;
+            std::function<void()> call;
+            std::function<bool(const json& root, const json& section)> holds;
+        };
+        const auto rowOf = [](const json& root, int32_t monitorId) -> json {
+            if (!root.is_object() || !root.contains("monitors") || !root["monitors"].is_array()) return nullptr;
+            for (const json& row : root["monitors"]) {
+                if (row.is_object() && row.value("monitor_id", -1) == monitorId) return row;
+            }
+            return nullptr;
+        };
+        const auto monitorIn = [](const json& section, int32_t monitorId) -> json {
+            if (!section.is_object() || !section.contains("monitors") || !section["monitors"].is_object()) return nullptr;
+            const auto it = section["monitors"].find(std::to_string(monitorId));
+            return it != section["monitors"].end() ? *it : json(nullptr);
+        };
+        const std::vector<Step> steps = {
+            {"SetFrameRate(30)", [&] { setFrameRate(proxy, 30); },
+             [&](const json& root, const json& section) {
+                 return root.value("frame_rate", json()) == 30 && section.value("rate", json()) == 30 &&
+                        monitorIn(section, kMonitorFrameRateNamed).value("target", json()) == 30;
+             }},
+            {"SetFrameRate(120)", [&] { setFrameRate(proxy, 120); },
+             [&](const json& root, const json& section) {
+                 return root.value("frame_rate", json()) == 120 && section.value("rate", json()) == 120 &&
+                        monitorIn(section, kMonitorFrameRateNamed).value("target", json()) == 120;
+             }},
+            {"SetMonitorFrameRate(2, 120) on a monitor with no wallpaper", [&] { setMonitorFrameRate(proxy, kMonitorFrameRateOwn, 120); },
+             [&](const json& root, const json& section) {
+                 const json row = rowOf(root, kMonitorFrameRateOwn);
+                 const json entry = monitorIn(section, kMonitorFrameRateOwn);
+                 return row.is_object() && row.value("frame_rate", json()) == 120 && row.value("path", std::string("x")).empty() &&
+                        entry.is_object() && entry.value("rate", json()) == 120 && entry.value("follows_global", true) == false &&
+                        entry.value("target", json()) == 120;
+             }},
+            {"SetMonitorFrameRate(0, 30)", [&] { setMonitorFrameRate(proxy, kMonitorFrameRateNamed, 30); },
+             [&](const json& root, const json& section) {
+                 const json row = rowOf(root, kMonitorFrameRateNamed);
+                 const json entry = monitorIn(section, kMonitorFrameRateNamed);
+                 return row.is_object() && row.value("frame_rate", json()) == 30 && entry.is_object() &&
+                        entry.value("rate", json()) == 30 && entry.value("follows_global", true) == false &&
+                        entry.value("target", json()) == 30;
+             }},
+            {"SetMonitorFrameRate(0, 0)", [&] { setMonitorFrameRate(proxy, kMonitorFrameRateNamed, 0); },
+             [&](const json& root, const json& section) {
+                 const json row = rowOf(root, kMonitorFrameRateNamed);
+                 const json entry = monitorIn(section, kMonitorFrameRateNamed);
+                 return row.is_object() && !row.contains("frame_rate") && entry.is_object() && entry.value("rate", json(0)).is_null() &&
+                        entry.value("follows_global", false) == true && entry.value("target", json()) == 120;
+             }},
+            {"SetMonitorFrameRate(2, 0)", [&] { setMonitorFrameRate(proxy, kMonitorFrameRateOwn, 0); },
+             [&](const json& root, const json&) { return rowOf(root, kMonitorFrameRateOwn).is_null() || !rowOf(root, kMonitorFrameRateOwn).contains("frame_rate"); }},
+            {"SetKeepHigherFrameRate(true)", [&] { setKeepHigherFrameRate(proxy, true); },
+             [&](const json& root, const json& section) {
+                 return root.value("keep_higher_frame_rate", json()) == true && section.value("keep_higher", json()) == true;
+             }},
+            {"SetKeepHigherFrameRate(false)", [&] { setKeepHigherFrameRate(proxy, false); },
+             [&](const json& root, const json& section) {
+                 return !root.contains("keep_higher_frame_rate") && section.value("keep_higher", json()) == false;
+             }},
+            {"SetFrameRate(60)", [&] { setFrameRate(proxy, 60); },
+             [&](const json& root, const json& section) {
+                 return root.is_object() && !root.contains("frame_rate") && section.value("rate", json()) == 60 &&
+                        monitorIn(section, kMonitorFrameRateNamed).value("target", json()) == 60;
+             }},
+        };
+        bool all = !pristine.empty();
+        size_t compared = 0;
+        for (const Step& step : steps) {
+            const std::string answer = errorNameFrom(step.call);
+            const std::string text = fileNow();
+            const json root = configRootOf(text);
+            const json section = sectionOf();
+            ++compared;
+            if (!answer.empty() || text.empty() || !step.holds(root, section)) {
+                all = false;
+                std::fprintf(stderr, "  %s answered '%s'\n    file: %s\n    frame_rate: %s\n", step.what, answer.c_str(),
+                             text.c_str(), section.dump().c_str());
+            }
+        }
+        check(all, "each accepted frame-rate setting is reported in GetStatus and written to the config file");
+        check(compared == steps.size(), "every frame-rate setting step was compared");
+        const std::string back = fileNow();
+        check(!pristine.empty() && back == pristine,
+              "with every frame-rate setting back at its default, the config file is byte for byte as before (60 is not written)");
+        if (back != pristine) std::fprintf(stderr, "  before: %s\n  after:  %s\n", pristine.c_str(), back.c_str());
+    }
+
+    // GOAL: S15.909 -- each frame-rate setting announces ConfigChanged exactly once for a change and never for a
+    //       repeat of the setting in force.
+    // WHY-THIS-SHAPE: read after announcementsSettled(), as S15.451's; "at least N" would pass a repeat's late signal.
+    // COVERAGE-ASSERT: every step compared.
+    // CONTROL: control_batch.sh 2026-10-20, --phase '^frameRateWire$', reverted: DbusService::setFrameRate's `changed` forced true -> "FAIL: a frame-rate
+    //       setting announces ConfigChanged once per change ..."; DbusService::setOutputRefreshRate announcing on a
+    //       change (backend/daemon/dbus_service.cpp) -> the same line.
+    {
+        struct Step {
+            const char* what;
+            std::function<void()> call;
+            int expected;
+        };
+        const std::vector<Step> steps = {
+            {"SetFrameRate(30), a change", [&] { setFrameRate(proxy, 30); }, 1},
+            {"SetFrameRate(30) again", [&] { setFrameRate(proxy, 30); }, 0},
+            {"SetMonitorFrameRate(0, 120), a change", [&] { setMonitorFrameRate(proxy, kMonitorFrameRateNamed, 120); }, 1},
+            {"SetMonitorFrameRate(0, 120) again", [&] { setMonitorFrameRate(proxy, kMonitorFrameRateNamed, 120); }, 0},
+            {"SetMonitorFrameRate(0, 0), a change", [&] { setMonitorFrameRate(proxy, kMonitorFrameRateNamed, 0); }, 1},
+            {"SetKeepHigherFrameRate(true), a change", [&] { setKeepHigherFrameRate(proxy, true); }, 1},
+            {"SetKeepHigherFrameRate(true) again", [&] { setKeepHigherFrameRate(proxy, true); }, 0},
+            {"SetKeepHigherFrameRate(false), a change", [&] { setKeepHigherFrameRate(proxy, false); }, 1},
+            {"SetFrameRate(60), a change", [&] { setFrameRate(proxy, 60); }, 1},
+            {"SetOutputRefreshRate(DP-FR, 50)", [&] { setOutputRefreshRate(proxy, "DP-FR", 50.0); }, 0},
+            {"SetOutputRefreshRate(DP-FR, 0)", [&] { setOutputRefreshRate(proxy, "DP-FR", 0.0); }, 0},
+        };
+        int compared = 0;
+        bool exact = true;
+        std::optional<int> before = settledCount();
+        for (const Step& step : steps) {
+            if (!before) break;
+            const std::string answer = errorNameFrom(step.call);
+            const std::optional<int> after = settledCount();
+            if (!answer.empty() || !after) {
+                std::fprintf(stderr, "  %s answered '%s'\n", step.what, answer.c_str());
+                exact = false;
+                break;
+            }
+            ++compared;
+            if (*after - *before != step.expected) {
+                exact = false;
+                std::fprintf(stderr, "  %s announced %d time(s), expected %d\n", step.what, *after - *before, step.expected);
+            }
+            before = after;
+        }
+        check(exact, "a frame-rate setting announces ConfigChanged once per change and never for a repeat; a refresh rate never");
+        check(compared == static_cast<int>(steps.size()), "every frame-rate announcement step was compared");
+    }
+
+    // GOAL: S15.910 -- SetOutputRefreshRate refuses a rate that is not 0 or 1 to 1000 (fractions inside are fine)
+    //       as InvalidArgs, and a name no monitor answers to as UnknownOutput, changing nothing.
+    // CONTROL: control_batch.sh 2026-10-20, --phase '^frameRateWire$', reverted: refreshRateError's bound 10 x 1000 (backend/daemon/frame_rate_setting.h)
+    //       -> "FAIL: a refresh rate other than 0 or 1 to 1000 is refused" and "... records nothing"; the
+    //       UnknownOutput arm deleted from DbusService::setOutputRefreshRate -> "FAIL: ... refused as UnknownOutput".
+    {
+        bool refused = true;
+        for (const double rate : {0.5, -1.0, 1000.5, 5000.0, std::nan(""), std::numeric_limits<double>::infinity()}) {
+            const std::string answer = errorNameFrom([&] { setOutputRefreshRate(proxy, "DP-FR", rate); });
+            if (answer != kInvalidArgs) {
+                refused = false;
+                std::fprintf(stderr, "  SetOutputRefreshRate(DP-FR, %g) answered '%s'\n", rate, answer.c_str());
+            }
+        }
+        check(refused, "a refresh rate other than 0 or 1 to 1000 is refused as InvalidArgs");
+        const std::string unbound = errorNameFrom([&] { setOutputRefreshRate(proxy, "DP-NOBODY", 60.0); });
+        check(unbound == kUnknownOutput, "a refresh rate for a name no monitor answers to is refused as UnknownOutput");
+        if (unbound != kUnknownOutput) std::fprintf(stderr, "  it answered '%s'\n", unbound.c_str());
+        const json entry = monitorOf(kMonitorFrameRateNamed);
+        check(entry.is_object() && entry.value("refresh_rate", json(0)).is_null(), "a refused refresh rate records nothing");
+        if (!entry.is_object() || !entry.value("refresh_rate", json(0)).is_null()) std::fprintf(stderr, "  monitor: %s\n", entry.dump().c_str());
+    }
+
+    // GOAL: S15.909/S15.910 -- GetStatus's target is min(setting, refresh rate), or the setting with keep-higher on;
+    //       1 and 1000 are accepted, 0 clears the refresh rate, and no refresh rate is written to the file.
+    // WHY-THIS-SHAPE: a refresh of 50 sits between the rates 30 and 60, so a target of max() or of the setting
+    //       alone is told apart from min() at each step.
+    // CONTROL: control_batch.sh 2026-10-20, --phase '^frameRateWire$', reverted: targetRateLocked returning max(), then ignoring keep-higher
+    //       (wallpaper_manager.cpp), then GetStatus's refresh_rate always null (dbus_service.cpp) -> "FAIL: GetStatus's
+    //       target is the lower of the setting and the refresh rate ...", each. The "never written" line has no
+    //       control: no one-line break makes production write a refresh rate.
+    {
+        const std::string textBefore = fileNow();
+        struct Step {
+            const char* what;
+            std::function<void()> call;
+            json refresh;
+            double target;
+        };
+        const std::vector<Step> steps = {
+            {"refresh 50 at rate 60", [&] { setOutputRefreshRate(proxy, "DP-FR", 50.0); }, 50.0, 50.0},
+            {"rate 30 at refresh 50", [&] { setFrameRate(proxy, 30); }, 50.0, 30.0},
+            {"rate 60, keep-higher on, at refresh 50", [&] { setFrameRate(proxy, 60); setKeepHigherFrameRate(proxy, true); }, 50.0, 60.0},
+            {"keep-higher off again", [&] { setKeepHigherFrameRate(proxy, false); }, 50.0, 50.0},
+            {"refresh 1", [&] { setOutputRefreshRate(proxy, "DP-FR", 1.0); }, 1.0, 1.0},
+            {"refresh 1000", [&] { setOutputRefreshRate(proxy, "DP-FR", 1000.0); }, 1000.0, 60.0},
+            {"refresh 0 clears it", [&] { setOutputRefreshRate(proxy, "DP-FR", 0.0); }, nullptr, 60.0},
+        };
+        bool all = true;
+        size_t compared = 0;
+        for (const Step& step : steps) {
+            const std::string answer = errorNameFrom(step.call);
+            const json entry = monitorOf(kMonitorFrameRateNamed);
+            ++compared;
+            if (!answer.empty() || !entry.is_object() || entry.value("refresh_rate", json("absent")) != step.refresh ||
+                entry.value("target", json()) != step.target) {
+                all = false;
+                std::fprintf(stderr, "  %s answered '%s'; monitor %s\n", step.what, answer.c_str(), entry.dump().c_str());
+            }
+        }
+        check(all, "GetStatus's target is the lower of the setting and the refresh rate unless keep-higher is on; 1 and 1000 "
+                   "are accepted and 0 clears it");
+        check(compared == steps.size(), "every refresh-rate step was compared");
+        // Leaves a refresh rate in force for the restart below to show it is not kept.
+        const std::string answer = errorNameFrom([&] { setOutputRefreshRate(proxy, "DP-FR", 50.0); });
+        const std::string textAfter = fileNow();
+        check(answer.empty() && !textBefore.empty() && textAfter == textBefore,
+              "a refresh rate is never written to the config file");
+        if (textAfter != textBefore) std::fprintf(stderr, "  before: %s\n  after:  %s\n", textBefore.c_str(), textAfter.c_str());
+        // The state the restart must bring back.
+        const std::string set = errorNameFrom([&] {
+            setFrameRate(proxy, 30);
+            setKeepHigherFrameRate(proxy, true);
+            setMonitorFrameRate(proxy, kMonitorFrameRateOwn, 120);
+        });
+        firstRunComplete = set.empty() && !fileNow().empty();
+        if (!firstRunComplete) std::fprintf(stderr, "  setting the state for the restart answered '%s'\n", set.c_str());
+    }
+    });
+    if (!firstRunComplete) {
+        wallpaperx::testing::notVerified(kGoals, "the first daemon did not leave the settings the restart reads");
+        return;
+    }
+
+    // GOAL: S15.909/S15.910 -- the frame-rate settings survive a restart; a screen's refresh rate does not.
+    // CONTROL: control_batch.sh 2026-10-20, --phase '^frameRateWire$', reverted: ConfigStore's load dropping keep_higher_frame_rate
+    //       (backend/daemon/config_store.cpp) -> "FAIL: the global rate, keep-higher and a monitor's own rate survive
+    //       a restart". The refresh-rate line has no control, for the reason above.
+    withNoDeviceManager(config, "the frame-rate wire phase after a restart", check, [&](wallpaperx::WallpaperManager& manager) {
+        // As the daemon starts: the saved rows are read back before the bus is served. Nothing is posted,
+        // so nothing is drawn.
+        static_cast<void>(manager.restoreSaved());
+        auto serviceConn = sdbus::createSessionBusConnection();
+        DbusService service(*serviceConn, manager);
+        serviceConn->enterEventLoopAsync();
+        auto proxy = sdbus::createProxy(sdbus::ServiceName{serviceConn->getUniqueName()}, sdbus::ObjectPath{DbusService::kObjectPath});
+        const StatusReply status = getStatusOrExplain(*proxy);
+        const json* section = frameRateStatus(status);
+        const json got = section != nullptr ? *section : json(nullptr);
+        const auto monitorIn = [&got](int32_t monitorId) -> json {
+            if (!got.is_object() || !got.contains("monitors") || !got["monitors"].is_object()) return nullptr;
+            const auto it = got["monitors"].find(std::to_string(monitorId));
+            return it != got["monitors"].end() ? *it : json(nullptr);
+        };
+        const json own = monitorIn(kMonitorFrameRateOwn);
+        const json named = monitorIn(kMonitorFrameRateNamed);
+        check(got.is_object() && got.value("rate", json()) == 30 && got.value("keep_higher", json()) == true && own.is_object() &&
+                  own.value("rate", json()) == 120 && own.value("follows_global", true) == false,
+              "the global rate, keep-higher and a monitor's own rate survive a restart");
+        check(named.is_object() && named.value("refresh_rate", json(0)).is_null() && named.value("target", json()) == 30,
+              "a screen's refresh rate does not survive a restart");
+        std::printf("dbus_service_test: frameRateWire: after the restart frame_rate is %s\n", got.dump().c_str());
     });
 }
 
@@ -9166,6 +9567,7 @@ int main() {
         phase("propertiesWire", [&] { runPropertiesWireChecks(config, imagePath, unrenderablePath, check); });
         phase("pauseWire", [&] { runPauseWireChecks(config, unrenderablePath, check); });
         phase("soundWire", [&] { runSoundWireChecks(config, unrenderablePath, check); });
+        phase("frameRateWire", [&] { runFrameRateWireChecks(config, unrenderablePath, check); });
         phase("focusStateWire", [&] { runFocusStateWireChecks(config, unrenderablePath, check); });
         phase("importModifierClient", [&] { runImportModifierClientChecks(config, imagePath, check); });
         phase("importModifierClientWire", [&] { runImportModifierClientWireChecks(config, check); });

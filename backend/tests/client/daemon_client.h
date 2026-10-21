@@ -463,6 +463,31 @@ inline void setMonitorSound(sdbus::IProxy& proxy, int32_t monitorId, bool on, st
         .withArguments(monitorId, on);
 }
 
+// The frame-rate settings and a screen's refresh rate. Shared for setOutputSize's reason.
+inline void setFrameRate(sdbus::IProxy& proxy, int32_t rate) {
+    proxy.callMethod("SetFrameRate").onInterface(DbusService::kInterface).withArguments(rate);
+}
+
+inline void setMonitorFrameRate(sdbus::IProxy& proxy, int32_t monitorId, int32_t rate) {
+    proxy.callMethod("SetMonitorFrameRate").onInterface(DbusService::kInterface).withArguments(monitorId, rate);
+}
+
+inline void setKeepHigherFrameRate(sdbus::IProxy& proxy, bool keep) {
+    proxy.callMethod("SetKeepHigherFrameRate").onInterface(DbusService::kInterface).withArguments(keep);
+}
+
+inline void setOutputRefreshRate(sdbus::IProxy& proxy, const std::string& outputName, double rate) {
+    proxy.callMethod("SetOutputRefreshRate").onInterface(DbusService::kInterface).withArguments(outputName, rate);
+}
+
+// GetStatus's top-level `frame_rate` object, or null. Guarded as soundStatus() is.
+inline const nlohmann::json* frameRateStatus(const StatusReply& status) {
+    const nlohmann::json& json = status.json();
+    if (!json.is_object() || !json.contains("frame_rate")) return nullptr;
+    const nlohmann::json& section = json["frame_rate"];
+    return section.is_object() ? &section : nullptr;
+}
+
 // Reports what the frame consumer can import, as the plugin's render thread does.
 //
 // Here rather than in one test file for the same reason as setMonitorOutput above: the

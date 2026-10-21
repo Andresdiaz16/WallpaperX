@@ -41,6 +41,8 @@ qt_add_executable(wallpaperx
     daemon/daemon_client.h
     daemon/apply_controller.cpp
     daemon/apply_controller.h
+    daemon/refresh_rate_reporter.cpp
+    daemon/refresh_rate_reporter.h
     library/audio_probe.cpp
     library/audio_probe.h
     library/current_exception.h

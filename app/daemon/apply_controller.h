@@ -21,7 +21,8 @@ class PlasmaController;
 
 // Puts the wallpaper open in the library on the monitor selected in the picker, keeps that
 // monitor's copy of its settings in step while it stays open, and sets the selected monitor's
-// pause mode and sound, and sound for every screen.
+// pause mode, sound and frame rate, and sound, frame rate and keeping a rate above the screens for
+// every screen.
 //
 // Apply asks the daemon first, which is what decides the picture, then Plasma, which only switches
 // the desktop to the plugin that draws it. Every failure ends in a state with a sentence saying
@@ -54,6 +55,23 @@ class ApplyController : public QObject {
     Q_PROPERTY(Progress soundState READ soundState NOTIFY soundChanged)
     Q_PROPERTY(QString soundMessage READ soundMessage NOTIFY soundChanged)
     Q_PROPERTY(QVariant pendingSound READ pendingSound NOTIFY soundChanged)
+    // And for the frame rate on every screen, the selected monitor's own (0 for following it), and
+    // keeping a frame rate above what a screen refreshes at.
+    Q_PROPERTY(Progress frameRateState READ frameRateState NOTIFY frameRateChanged)
+    Q_PROPERTY(QString frameRateMessage READ frameRateMessage NOTIFY frameRateChanged)
+    Q_PROPERTY(QVariant pendingFrameRate READ pendingFrameRate NOTIFY frameRateChanged)
+    Q_PROPERTY(Progress screenFrameRateState READ screenFrameRateState NOTIFY screenFrameRateChanged)
+    Q_PROPERTY(QString screenFrameRateMessage READ screenFrameRateMessage NOTIFY screenFrameRateChanged)
+    Q_PROPERTY(QVariant pendingScreenFrameRate READ pendingScreenFrameRate NOTIFY screenFrameRateChanged)
+    Q_PROPERTY(Progress keepHigherState READ keepHigherState NOTIFY keepHigherChanged)
+    Q_PROPERTY(QString keepHigherMessage READ keepHigherMessage NOTIFY keepHigherChanged)
+    Q_PROPERTY(QVariant pendingKeepHigher READ pendingKeepHigher NOTIFY keepHigherChanged)
+    // Whether a screen holding a wallpaper has a frame rate above the refresh rate the daemon holds
+    // for it. Always false outside KDE, where the daemon is told no refresh rate.
+    Q_PROPERTY(bool frameRateAboveScreens READ frameRateAboveScreens NOTIFY frameRateNoticeChanged)
+    // While frameRateAboveScreens and keeping a higher rate is off, why those screens play at their
+    // refresh rate; else empty.
+    Q_PROPERTY(QString frameRateNotice READ frameRateNotice NOTIFY frameRateNoticeChanged)
 
 public:
     // Idle: nothing asked yet. Working: a request is running; another is not accepted. Done and
@@ -78,6 +96,17 @@ public:
     Progress soundState() const { return m_sound.state; }
     QString soundMessage() const { return messageOf(m_sound); }
     QVariant pendingSound() const { return pendingOf(m_sound); }
+    Progress frameRateState() const { return m_frameRate.state; }
+    QString frameRateMessage() const { return messageOf(m_frameRate); }
+    QVariant pendingFrameRate() const { return pendingOf(m_frameRate); }
+    Progress screenFrameRateState() const { return m_screenFrameRate.state; }
+    QString screenFrameRateMessage() const { return messageOf(m_screenFrameRate); }
+    QVariant pendingScreenFrameRate() const { return pendingOf(m_screenFrameRate); }
+    Progress keepHigherState() const { return m_keepHigher.state; }
+    QString keepHigherMessage() const { return messageOf(m_keepHigher); }
+    QVariant pendingKeepHigher() const { return pendingOf(m_keepHigher); }
+    bool frameRateAboveScreens() const { return screensAboveRefresh().has_value(); }
+    QString frameRateNotice() const;
 
     // Does nothing while blockedReason() is not empty or an Apply is running.
     Q_INVOKABLE void apply();
@@ -89,6 +118,15 @@ public:
     Q_INVOKABLE void setScreenSound(bool on);
     // Switches sound on or off for every screen. Does nothing while a change is running.
     Q_INVOKABLE void setSound(bool on);
+    // Sets the frame rate on every screen, one of kFrameRates. Does nothing while a change is running,
+    // or for any other rate.
+    Q_INVOKABLE void setFrameRate(int rate);
+    // Sets the selected monitor's frame rate, one of kFrameRates or 0 to follow the one on every
+    // screen, under setPauseMode's rules.
+    Q_INVOKABLE void setScreenFrameRate(int rate);
+    // Keeps every screen at its frame rate even above what it refreshes at, or not. Does nothing
+    // while a change is running.
+    Q_INVOKABLE void setKeepHigherFrameRate(bool keep);
 
 signals:
     void applyChanged();
@@ -97,6 +135,10 @@ signals:
     void pauseChanged();
     void screenSoundChanged();
     void soundChanged();
+    void frameRateChanged();
+    void screenFrameRateChanged();
+    void keepHigherChanged();
+    void frameRateNoticeChanged();
 
 private:
     // A setting change, one at a time per setting: how the last one went, the connector it was for
@@ -118,6 +160,16 @@ private:
         return change.state == Progress::Working && forSelected(change) ? change.value : QVariant();
     }
     void settle(Change& change, ChangeSignal changed, Progress state, QString message);
+    // Sends a setting for every screen; `what` is the failure sentence's start.
+    void changeGlobalSetting(Change& change, ChangeSignal changed, const QVariant& value, const QString& what,
+                             std::function<void(std::function<void(std::expected<void, QString>)>)> send);
+    // The screens holding a wallpaper whose frame rate is above the refresh rate the daemon holds for
+    // them, from the daemon's status alone; nothing when there are none.
+    struct AboveRefresh {
+        // The highest of their refresh rates, rounded as the notice names it.
+        int fastest = 0;
+    };
+    std::optional<AboveRefresh> screensAboveRefresh() const;
     // Binds the selected monitor and hands its id to `send`; `what` names the setting in a failure.
     void changeScreenSetting(Change& change, ChangeSignal changed, const QVariant& value, const QString& what,
                              std::function<void(int monitorId, std::function<void(std::expected<void, QString>)>)> send);
@@ -160,6 +212,9 @@ private:
     Change m_pause;
     Change m_screenSound;
     Change m_sound{true};
+    Change m_frameRate{true};
+    Change m_screenFrameRate;
+    Change m_keepHigher{true};
 };
 
 } // namespace wallpaperx

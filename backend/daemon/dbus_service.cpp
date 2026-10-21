@@ -322,6 +322,20 @@ void DbusService::registerVTable() {
             sdbus::registerMethod("SetMonitorSound")
                 .implementedAs([this](int32_t monitorId, bool on) { setMonitorSound(monitorId, on); })
                 .withInputParamNames("monitor_id", "on"),
+            sdbus::registerMethod("SetFrameRate")
+                .implementedAs([this](int32_t rate) { setFrameRate(rate); })
+                .withInputParamNames("rate"),
+            sdbus::registerMethod("SetMonitorFrameRate")
+                .implementedAs([this](int32_t monitorId, int32_t rate) { setMonitorFrameRate(monitorId, rate); })
+                .withInputParamNames("monitor_id", "rate"),
+            sdbus::registerMethod("SetKeepHigherFrameRate")
+                .implementedAs([this](bool keep) { setKeepHigherFrameRate(keep); })
+                .withInputParamNames("keep"),
+            sdbus::registerMethod("SetOutputRefreshRate")
+                .implementedAs([this](const std::string& outputName, double rate) {
+                    setOutputRefreshRate(outputName, rate);
+                })
+                .withInputParamNames("output_name", "refresh_rate"),
             // A plugin that cannot report the desktop's focus. Kept for one built before
             // SetOutputFocusState.
             sdbus::registerMethod("SetOutputFocus")
@@ -360,8 +374,8 @@ void DbusService::registerVTable() {
             // schedule would have to poll. This says "the answer may have changed", once.
             sdbus::registerSignal("ImportModifiersChanged"),
             // No parameters, for the same reason: a consumer reads /config again, and that answer
-            // is the whole of what changed. Sent for a wallpaper set, a screen named and a sound
-            // setting changed.
+            // is the whole of what changed. Sent for a wallpaper set, a screen named and a sound or
+            // frame-rate setting changed.
             sdbus::registerSignal("ConfigChanged"),
             // No parameters: GetStatus's `persistence` may have changed, because a config write
             // returned. Apart from ConfigChanged, which has every consumer read /config again and
@@ -632,6 +646,84 @@ void DbusService::setMonitorSound(int32_t monitorId, bool on) {
         announceConfigChanged();
         m_worker.wake();
     }
+}
+
+void DbusService::setFrameRate(int32_t rate) {
+    bool changed = false;
+    try {
+        changed = m_manager.setFrameRate(rate);
+    } catch (const InvalidRequest& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetFrameRate rejected: %s\n", e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetFrameRate failed: %s\n", e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
+    }
+    if (changed) {
+        std::printf("wallpaperx-daemon: SetFrameRate(rate=%d)\n", rate);
+        std::fflush(stdout);
+        announceConfigChanged();
+        m_worker.wake();
+    }
+}
+
+void DbusService::setMonitorFrameRate(int32_t monitorId, int32_t rate) {
+    bool changed = false;
+    try {
+        changed = m_manager.setMonitorFrameRate(monitorId, rate);
+    } catch (const InvalidRequest& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetMonitorFrameRate rejected (monitor=%d): %s\n", monitorId, e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetMonitorFrameRate failed (monitor=%d): %s\n", monitorId, e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
+    }
+    if (changed) {
+        std::printf("wallpaperx-daemon: SetMonitorFrameRate(monitor=%d, rate=%d)\n", monitorId, rate);
+        std::fflush(stdout);
+        announceConfigChanged();
+        m_worker.wake();
+    }
+}
+
+void DbusService::setKeepHigherFrameRate(bool keep) {
+    bool changed = false;
+    try {
+        changed = m_manager.setKeepHigherFrameRate(keep);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetKeepHigherFrameRate failed: %s\n", e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
+    }
+    if (changed) {
+        std::printf("wallpaperx-daemon: SetKeepHigherFrameRate(keep=%s)\n", keep ? "true" : "false");
+        std::fflush(stdout);
+        announceConfigChanged();
+        m_worker.wake();
+    }
+}
+
+void DbusService::setOutputRefreshRate(const std::string& outputName, double rate) {
+    bool changed = false;
+    try {
+        changed = m_manager.setOutputRefreshRate(outputName, rate);
+        if (changed) {
+            std::printf("wallpaperx-daemon: SetOutputRefreshRate(output=%s, refresh_rate=%.3f)\n",
+                        sanitizeForLog(outputName).c_str(), rate);
+            std::fflush(stdout);
+        }
+    } catch (const UnknownOutput& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetOutputRefreshRate rejected: %s\n", e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorUnknownOutput}, e.what());
+    } catch (const InvalidRequest& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetOutputRefreshRate rejected: %s\n", e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
+    } catch (const std::exception& e) {
+        // The log line can fail after the rate was recorded, which still has to be applied.
+        if (changed) m_worker.wake();
+        std::fprintf(stderr, "wallpaperx-daemon: SetOutputRefreshRate failed: %s\n", e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
+    }
+    if (changed) m_worker.wake();
 }
 
 void DbusService::setOutputFocus(const std::string& client, const std::string& outputName, ScreenFocus focus,
@@ -1015,6 +1107,21 @@ std::string DbusService::getStatus() {
     }
     status["sound"] = {{"enabled", snap.sound ? nlohmann::json(*snap.sound) : nlohmann::json(nullptr)},
                        {"monitors", std::move(monitorSound)}};
+
+    // `rate` is null for a value a newer build wrote, which this one keeps and does not apply; a monitor's
+    // is null too while it follows the global one, which `follows_global` tells apart. `target` is the most
+    // pictures a second that monitor's video is drawn at now.
+    const auto orNull = [](const auto& value) { return value ? nlohmann::json(*value) : nlohmann::json(nullptr); };
+    nlohmann::json monitorFrameRate = nlohmann::json::object();
+    for (const auto& [monitorId, monitor] : snap.monitorFrameRate) {
+        monitorFrameRate[std::to_string(monitorId)] = {{"rate", orNull(monitor.rate)},
+                                                       {"follows_global", monitor.followsGlobal},
+                                                       {"refresh_rate", orNull(monitor.refreshRate)},
+                                                       {"target", monitor.target}};
+    }
+    status["frame_rate"] = {{"rate", orNull(snap.frameRate)},
+                            {"keep_higher", orNull(snap.keepHigherFrameRate)},
+                            {"monitors", std::move(monitorFrameRate)}};
 
     return status.dump();
 }

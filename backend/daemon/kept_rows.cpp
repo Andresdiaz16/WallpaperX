@@ -72,6 +72,7 @@ std::vector<PersistedWallpaper> KeptRows::rowsToWrite(const LiveWallpapers& live
         if (monitorId < m_maxMonitors) {
             row.pauseJson.clear();
             row.soundJson.clear();
+            row.frameRateJson.clear();
         }
     }
     for (const auto& [monitorId, text] : live.pause) {
@@ -83,6 +84,11 @@ std::vector<PersistedWallpaper> KeptRows::rowsToWrite(const LiveWallpapers& live
         PersistedWallpaper& row = rows[monitorId];
         row.monitorId = monitorId;
         row.soundJson = text;
+    }
+    for (const auto& [monitorId, text] : live.frameRate) {
+        PersistedWallpaper& row = rows[monitorId];
+        row.monitorId = monitorId;
+        row.frameRateJson = text;
     }
 
     std::vector<PersistedWallpaper> entries;

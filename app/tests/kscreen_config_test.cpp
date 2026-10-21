@@ -709,6 +709,8 @@ void internalFieldsHiddenFromQml() {
     // CONTROL: app/kde/kscreen_config.h, `Q_PROPERTY(int kscreenId MEMBER kscreenId CONSTANT)`
     //       added -> red on kscreenId; `Q_PROPERTY(QString panel MEMBER panel CONSTANT)` added ->
     //       red on panel; restored, green.
+    //       Re-run 2026-10-20 (T9b), control_batch.sh in app/build, after Monitor gained refreshRate: both breaks red
+    //       as stated, restored green.
     const QMetaObject& meta = Monitor::staticMetaObject;
     expect(meta.indexOfProperty("outputName") >= 0 && meta.indexOfProperty("mirrorOf") >= 0,
            QStringLiteral("S15.21: Monitor's meta-object does not list outputName and mirrorOf, so the lookups below prove nothing"));

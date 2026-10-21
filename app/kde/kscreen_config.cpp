@@ -114,6 +114,24 @@ QString describePanel(const QVariantMap& output)
     return physical + QLatin1Char(' ') + modes.join(QLatin1Char(' '));
 }
 
+// The refresh rate of the mode `currentModeId` names. KScreen's mode ids are strings; compared as
+// text, an integer one matches too.
+double currentRefreshRate(const QVariantMap& output)
+{
+    const QString current = output.value(QStringLiteral("currentModeId")).toString();
+    if (current.isEmpty()) {
+        return 0;
+    }
+    for (const QVariant& entry : output.value(QStringLiteral("modes")).toList()) {
+        const QVariantMap mode = entry.toMap();
+        if (mode.value(QStringLiteral("id")).toString() == current) {
+            const auto rate = number(mode.value(QStringLiteral("refreshRate")));
+            return rate && *rate >= 1 && *rate <= 1000 ? *rate : 0;
+        }
+    }
+    return 0;
+}
+
 } // namespace
 
 QVariant plainVariant(const QVariant& value)
@@ -190,6 +208,7 @@ std::expected<QList<Monitor>, QString> parseKScreenConfig(const QVariantMap& con
 
         monitor.displayName = monitor.outputName;
         monitor.panel = describePanel(output);
+        monitor.refreshRate = currentRefreshRate(output);
         // The id routes each getEdid answer to one monitor, so it must be exact and unique.
         if (const QVariant id = output.value(QStringLiteral("id")); id.isValid()) {
             const auto value = wholeNumber(id, 0, std::numeric_limits<int>::max());

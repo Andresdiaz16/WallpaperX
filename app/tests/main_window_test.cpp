@@ -40,7 +40,7 @@ using wallpaperx::testing::notVerified;
 
 namespace {
 
-constexpr const char* kGoals = "S15.54, S15.55, S15.82, S15.243, S15.245, S15.248-S15.250";
+constexpr const char* kGoals = "S15.54, S15.55, S15.82, S15.243, S15.245, S15.248-S15.250, S15.913";
 constexpr int kWaitMs = 5000;
 
 // Qt answers a platform plugin it cannot load with qFatal, which aborts before this file can
@@ -267,10 +267,10 @@ void importerWired(Window& w, QQuickItem* root, LibraryManager& library, Importe
     library.clearSelection();
 }
 
-// The first shown one, as the user would see it.
-QQuickItem* firstInheriting(QQuickItem* root, const char* className) {
-    for (QQuickItem* item : allInheriting(root, className)) {
-        if (item->isVisible()) {
+// The shown selector whose values are pause modes; the window holds frame-rate selectors too.
+QQuickItem* pauseSelector(QQuickItem* root) {
+    for (QQuickItem* item : allInheriting(root, "QQuickComboBox")) {
+        if (item->isVisible() && item->property("valueRole").toString() == u"mode") {
             return item;
         }
     }
@@ -369,7 +369,7 @@ void applyAndPause(Window& w, QQuickItem* root, LibraryManager& library, Service
     //       sides at once cannot pass "offered == daemon" with fewer choices graded. Controlled with
     //       backend/daemon/pause_mode.h's toString() and ScreenSettings.qml's model both cut to
     //       "play" (control_batch, 2026-10-04) -> red, "S15.245: the daemon names 1 mode(s), not 4".
-    QQuickItem* combo = firstInheriting(root, "QQuickComboBox");
+    QQuickItem* combo = pauseSelector(root);
     if (combo == nullptr) {
         expect(false, QStringLiteral("S15.245: Main shows no pause selector with DP-1 selected"));
         return;
@@ -440,7 +440,7 @@ void scopedMessages(Window& w, QQuickItem* root, LibraryManager& library, Servic
            QStringLiteral("S15.250: in the window, \"Ocean Waves is on DP-1.\" shows there %1, with River %2, back %3, on HDMI-A-1 %4, back %5")
                .arg(there).arg(onRiver).arg(backOcean).arg(onHdmi).arg(backDp1));
 
-    QQuickItem* combo = firstInheriting(root, "QQuickComboBox");
+    QQuickItem* combo = pauseSelector(root);
     if (combo == nullptr) {
         expect(false, QStringLiteral("S15.248: Main shows no pause selector with DP-1 selected"));
         return;
@@ -660,6 +660,111 @@ void soundSwitches(Window& w, QQuickItem* root, Services& s) {
     }
 }
 
+// The shown frame-rate selector with `entries` entries: 3 for every screen, 4 for this screen.
+QQuickItem* rateSelector(QQuickItem* root, int entries) {
+    for (QQuickItem* item : allInheriting(root, "QQuickComboBox")) {
+        if (item->isVisible() && item->property("valueRole").toString() == u"rate" && item->property("count").toInt() == entries) {
+            return item;
+        }
+    }
+    return nullptr;
+}
+
+void frameRateControls(Window& w, QQuickItem* root, Services& s) {
+    FakeDaemon& fake = s.daemonFake;
+    const int dp1 = fake.outputs.value(QStringLiteral("DP-1"), -1);
+    if (!w.client.select(QStringLiteral("DP-1")) || !settle(w.window) || dp1 < 0 || !fake.wallpapers.contains(dp1)) {
+        testing::harnessFailure("S15.913: DP-1 holds no wallpaper in the stand-in daemon, so the keep-higher row cannot be shown");
+        return;
+    }
+    // DP-1 at 120 over a 60 Hz refresh rate the daemon holds, so the keep-higher row shows.
+    fake.refreshRates.insert(QStringLiteral("DP-1"), 60);
+    fake.frameRate = 120;
+    fake.screenFrameRate.remove(dp1);
+    fake.keepHigherFrameRate = false;
+    s.daemon.refresh();
+    const QString keepText = QStringLiteral("Keep a higher rate anyway");
+    if (!waitFor([&] { return s.applier.frameRateAboveScreens(); }, kWaitMs) || !settle(w.window)) {
+        testing::harnessFailure("S15.913: the stand-in's 120 over 60 Hz never reached the window");
+        return;
+    }
+    QQuickItem* global = rateSelector(root, 3);
+    QQuickItem* screen = rateSelector(root, 4);
+    QQuickItem* keep = buttonNamed(root, keepText);
+    if (global == nullptr || screen == nullptr || keep == nullptr) {
+        expect(false, QStringLiteral("S15.913: Main shows the every-screen selector %1, this screen's %2, the keep-higher box %3")
+                          .arg(global != nullptr).arg(screen != nullptr).arg(keep != nullptr));
+        return;
+    }
+
+    // GOAL: S15.913 -- with no daemon the two frame-rate selectors and the keep-higher box are greyed
+    //       out, and they are usable again once it is back.
+    // WHY-THIS-SHAPE: read before, during and after, so a control that is always disabled fails the
+    //       "before" half rather than passing. The box is read through the pointer taken while shown:
+    //       with no daemon its row is hidden too, which would make a visibility check vacuous.
+    // CONTROL: control_batch.sh, 2026-10-20, each alone, reverted (bytes restored, green again): the
+    //       daemon-state test deleted from the `enabled:` of Main.qml's every-screen selector -> "FAIL:
+    //       S15.913: ... with no daemon (gone 1) greyed 0 (every screen 1, this screen 0, keep-higher 0)";
+    //       of ScreenSettings.qml's selector -> "... (every screen 0, this screen 1, keep-higher 0)"; of
+    //       Main.qml's keep-higher box -> "... (every screen 0, this screen 0, keep-higher 1)".
+    {
+        const bool before = global->isEnabled() && screen->isEnabled() && keep->isEnabled();
+        fake.stop();
+        const bool gone = waitFor([&] { return s.daemon.state() == DaemonClient::State::Unavailable; }, kWaitMs) && settle(w.window);
+        const bool globalOn = global->isEnabled();
+        const bool screenOn = screen->isEnabled();
+        const bool keepOn = keep->isEnabled();
+        const bool greyed = !globalOn && !screenOn && !keepOn;
+        const QString why = fake.start();
+        const bool back = why.isEmpty() && waitFor([&] { return s.daemon.state() == DaemonClient::State::Ready; }, kWaitMs) && settle(w.window);
+        const bool after = global->isEnabled() && screen->isEnabled() && keep->isEnabled();
+        expect(before && gone && greyed && back && after,
+               QStringLiteral("S15.913: the frame-rate controls were usable %1; with no daemon (gone %2) greyed %3 (every screen %4, this "
+                              "screen %5, keep-higher %6); back %7 usable %8")
+                   .arg(before).arg(gone).arg(greyed).arg(globalOn).arg(screenOn).arg(keepOn).arg(back).arg(after));
+    }
+
+    // GOAL: S15.913 -- a refused frame-rate change shows its sentence under its control in the window,
+    //       as the sound and pause refusals do: every screen's and keep-higher's whichever screen is
+    //       selected, this screen's only under DP-1.
+    // CONTROL: control_batch.sh, 2026-10-20, each alone, reverted (bytes restored, green again): the
+    //       message label given `text: ""` -- every screen's (app/qml/Main.qml), this screen's
+    //       (app/qml/ScreenSettings.qml), keep-higher's (app/qml/Main.qml) -> "FAIL: S15.913: the frame-rate
+    //       refusals (failed 1) show all three on DP-1 0 ..."; screenFrameRateMessage() returning the message
+    //       whatever is selected (app/daemon/apply_controller.h) -> "... on DP-1 1, every screen's and
+    //       keep-higher's only on HDMI-A-1 0".
+    {
+        fake.refuse.insert(QStringLiteral("SetFrameRate"), {QStringLiteral("io.wallpaperx.Daemon.Error.RenderFailed"), QStringLiteral("disk full")});
+        fake.refuse.insert(QStringLiteral("SetMonitorFrameRate"), {QStringLiteral("org.freedesktop.DBus.Error.InvalidArgs"), QStringLiteral("no")});
+        fake.refuse.insert(QStringLiteral("SetKeepHigherFrameRate"), {QStringLiteral("io.wallpaperx.Daemon.Error.RenderFailed"), QStringLiteral("disk full")});
+        global->setProperty("currentIndex", 0);
+        QMetaObject::invokeMethod(global, "activated", Q_ARG(int, 0));
+        screen->setProperty("currentIndex", 2);
+        QMetaObject::invokeMethod(screen, "activated", Q_ARG(int, 2));
+        clickOn(w.window, keep);
+        const bool failed = waitFor([&] {
+            return s.applier.frameRateState() == ApplyController::Progress::Failed &&
+                   s.applier.screenFrameRateState() == ApplyController::Progress::Failed &&
+                   s.applier.keepHigherState() == ApplyController::Progress::Failed;
+        }, kWaitMs) && settle(w.window);
+        const auto shown = [&](const char* prefix) {
+            const QQuickItem* label = labelStarting(root, QString::fromUtf8(prefix));
+            return label != nullptr && label->isVisible();
+        };
+        const char* everyScreen = "The frame rate was not changed for every screen.";
+        const char* thisScreen = "The frame rate for DP-1 was not changed.";
+        const char* keepHigher = "Keeping a higher frame rate was not changed.";
+        const bool onDp1 = shown(everyScreen) && shown(thisScreen) && shown(keepHigher);
+        const bool onHdmi = w.client.select(QStringLiteral("HDMI-A-1")) && settle(w.window) && shown(everyScreen) && !shown(thisScreen) && shown(keepHigher);
+        expect(failed && onDp1 && onHdmi,
+               QStringLiteral("S15.913: the frame-rate refusals (failed %1) show all three on DP-1 %2, every screen's and keep-higher's only on "
+                              "HDMI-A-1 %3")
+                   .arg(failed).arg(onDp1).arg(onHdmi));
+        fake.refuse.clear();
+        w.client.select(QStringLiteral("DP-1"));
+    }
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -735,6 +840,7 @@ int main(int argc, char* argv[]) {
         applyAndPause(w, window->contentItem(), *library, services);
         scopedMessages(w, window->contentItem(), *library, services);
         soundSwitches(w, window->contentItem(), services);
+        frameRateControls(w, window->contentItem(), services);
     }
 
     root.reset();

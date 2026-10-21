@@ -97,6 +97,17 @@ private:
     void setSound(bool on);
     void setMonitorSound(int32_t monitorId, bool on);
 
+    // The frame-rate settings, as the sound ones are: global, one monitor's (0 drops it), and whether a
+    // rate above a screen's refresh rate is kept. A change announces ConfigChanged and wakes the worker,
+    // which plays at the new rate from its next round.
+    void setFrameRate(int32_t rate);
+    void setMonitorFrameRate(int32_t monitorId, int32_t rate);
+    void setKeepHigherFrameRate(bool keep);
+
+    // How many times a second the screen named `outputName` refreshes, 0 for not known. Not saved;
+    // wakes the worker when it changed.
+    void setOutputRefreshRate(const std::string& outputName, double rate);
+
     // What the screen named `outputName` says about its windows, recorded against `client` -- the
     // sender -- so it ends when that process leaves the bus. Wakes the worker for the same reason.
     void setOutputFocus(const std::string& client, const std::string& outputName, ScreenFocus focus,

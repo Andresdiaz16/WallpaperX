@@ -3966,6 +3966,10 @@ void runOutputLossReportChecks() {
         //       Observed 2026-08-19. The three re-run together via control_batch.sh, 2026-09-30, after
         //       each guard gained a pause term: the same line, "ids on disk: 1 2 8 40 41 42", monitor 2
         //       empty. All three reverted.
+        //       Re-run 2026-10-20 (T9b), control_batch.sh, on the guards' current forms -- `... && !nameTravels &&
+        //       !settingTravels)` and `... && keep.output.empty() && !keep.holdsMonitorSettings()) continue;` each
+        //       made `if (false && ...`, and rowsToWrite's empty-row skip (now ending `!row.holdsMonitorSettings())
+        //       continue;`) deleted -> the same line, "ids on disk: 1 2 8 40 41 42", monitor 2 empty. Reverted.
         std::vector<int> refusedRowsOnDisk;
         for (const int id : refusedInRangeIds) {
             if (onDisk.count(id) != 0) refusedRowsOnDisk.push_back(id);
@@ -8935,6 +8939,8 @@ void runOutputSizeRuntimeChecks() {
         //       again beside it" and "FAIL: moving a sized name to another monitor redraws both, each at its
         //       new size", with the restart clause below reported NOT VERIFIED since its size never reached
         //       the file. Without the unrelated report the same mutation stayed green. Reverted.
+        //       Re-run 2026-10-20 (T9b), control_batch.sh, after the function became one prune lambda over sizes,
+        //       refresh rates and undrawn names: `limit` set to 0 -> the same three lines. Reverted.
         // CONTROL: `if (leaving != monitorId) redrawIfResizedLocked(leaving, sizeLeaving, redraw);` deleted
         //       from WallpaperManager::setMonitorOutput (backend/daemon/wallpaper_manager.cpp), via
         //       control_run.sh, 2026-09-29 -> "FAIL: moving a sized name to another monitor redraws both,
@@ -10779,6 +10785,8 @@ void runPropertiesRepairChecks() {
     //       usable values", and the kept-row line, which waits on the rewrite. Reverted. Re-run via
     //       control_batch.sh, 2026-09-30, after `repaired` gained the pause-conflict term: the same
     //       three lines.
+    //       Re-run 2026-10-20 (T9b), control_batch.sh, after `repaired` gained the frame-rate conflict term: the same
+    //       three lines.
     const bool copied = std::filesystem::exists(copy) && readFile(copy) == usersOwn;
     check(copied, "a start that drops property values copies the file aside first");
     if (!copied) std::fprintf(stderr, "  copies: %s\n", joined(preservedCopyNames(file, preservedCopyDir(scratch))).c_str());
@@ -11189,6 +11197,9 @@ void runSavedSpeedSnapChecks() {
         //       `snappedSpeeds > 0 ||` removed from `repaired` in WallpaperManager::restoreSaved
         //       (backend/daemon/wallpaper_manager.cpp) -> the rewrite and kept-row lines, and (re-run
         //       2026-10-15) "FAIL: a snapped speed copies the file aside before the repair".
+        //       Re-run 2026-10-20 (T9b), control_batch.sh, after `repaired` gained the frame-rate conflict term:
+        //       `snappedSpeeds > 0 ||` removed -> "FAIL: a snapped speed copies the file aside before the repair",
+        //       the rewrite line and the kept-row line. The other breaks not re-run (their lines untouched).
         // WHY-THIS-SHAPE (copy): read before the second file below is written, since that start
         //       repairs too and would leave a copy of its own; snapping is this file's only repair.
         const bool copied = std::filesystem::exists(copy) && readFile(copy) == original;
@@ -11315,6 +11326,8 @@ void runSavedVolumeOutsideRangeChecks() {
     //       clamped volumes"; `clampedVolumes > 0 ||` removed from `repaired` in WallpaperManager::restoreSaved
     //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a clamped volume copies the file aside before the
     //       repair", the count line and the rewrite line.
+    //       Re-run 2026-10-20 (T9b), control_batch.sh, after `repaired` gained the frame-rate conflict term:
+    //       `clampedVolumes > 0 ||` removed -> the copy line, the count line and the rewrite line.
     const WallpaperManager::Snapshot snap = manager.snapshot();
     const auto holds = [&snap](int id, const WallpaperProperties& expected) {
         return snap.monitors.count(id) == 1 && snap.monitors.at(id).properties == expected;
@@ -11533,6 +11546,8 @@ void runPauseUnknownValueChecks() {
 //       `row.pauseJson.clear();` deleted from KeptRows::rowsToWrite (backend/daemon/kept_rows.cpp) -> "FAIL:
 //       SetMonitorPause(play) removes the pause of a monitor whose row is kept for its type". Each alone left
 //       it green, measured 2026-09-30: the other defence clears the stale copy. Reverted.
+//       Re-run 2026-10-20 (T9b), control_batch.sh, after both clearing sites gained the frame-rate field: the pair ->
+//       this line, row 5 still "always_paused". Reverted.
 void runPauseKeptRowChecks() {
     constexpr const char* kGoals = "S15.135 (a kept row's pause does not compete with the live setting)";
     const ScratchDir scratch("pausekeptrow");
@@ -11587,6 +11602,8 @@ void runPauseKeptRowChecks() {
 //       taken only for a monitor whose first row was play), the first row winning -> "FAIL: the last row's
 //       pause value wins", "monitor 0 always_paused", and the rewrite line; (g) the kept row's `if
 //       (pauseTravels) held.pauseJson = entry.pauseJson;` deleted -> the rewrite line alone.
+//       Re-run 2026-10-20 (T9b), control_batch.sh, after `repaired` gained the frame-rate conflict term: (e) -> the
+//       copy line and the rewrite line. The others not re-run (their lines untouched).
 void runPauseConflictChecks() {
     constexpr const char* kGoals = "S15.136-S15.138 (several rows giving one monitor different pause values)";
     const ScratchDir scratch("pauseconflict");
@@ -11913,6 +11930,10 @@ void runSoundStoreChecks() {
 //       and the written-back line; soundHeardLocked reading the root as `soundFromJson(m_sound) != true` ->
 //       "FAIL: a focused screen whose sound values are unknown at both levels is heard", alone; restoreSaved's
 //       erase of an explicit true never taken -> "FAIL: an explicit sound true is not written again", alone.
+//       Re-run 2026-10-20 (T9b), control_batch.sh, after the constructor and ConfigStore::load
+//       (backend/daemon/config_store.cpp) gained the frame-rate root fields: the constructor break -> the null line
+//       and the written-back line; `if (!soundTravels)` made unconditional -> the written-back line alone. The other
+//       three not re-run (their lines untouched).
 void runSoundUnknownValueChecks() {
     constexpr const char* kGoals = "S15.462 (sound values a newer build wrote are kept, and treated as on)";
     const ScratchDir scratch("soundunknown");
@@ -11975,6 +11996,8 @@ void runSoundUnknownValueChecks() {
 //       WallpaperManager::restoreSaved (backend/daemon/wallpaper_manager.cpp) AND `row.soundJson.clear();`
 //       deleted from KeptRows::rowsToWrite's clearing loop (backend/daemon/kept_rows.cpp) -> this line red.
 //       Reverted. Each alone was not run.
+//       Re-run 2026-10-20 (T9b), control_batch.sh, after both clearing sites gained the frame-rate field: the pair ->
+//       this line, row 5 still `"sound":false`. Reverted.
 void runSoundKeptRowChecks() {
     constexpr const char* kGoals = "S15.463 (a kept row's sound does not compete with the live setting)";
     const ScratchDir scratch("soundkeptrow");
@@ -12018,6 +12041,8 @@ void runSoundKeptRowChecks() {
 //       line red; `!soundConflicts.empty() ||` deleted from `repaired` -> the copy and rewrite lines red; an
 //       explicit true's `m_soundSettings.erase(entry.monitorId);` made a no-op, an earlier false winning -> "FAIL:
 //       the last row's sound value wins" and the rewrite line.
+//       Re-run 2026-10-20 (T9b), control_batch.sh, beside the new frame-rate conflict code: the insert deleted -> the
+//       count, copy and rewrite lines; the `repaired` term deleted -> the copy and rewrite lines.
 void runSoundConflictChecks() {
     constexpr const char* kGoals = "S15.464 (several rows giving one monitor different sound values)";
     const ScratchDir scratch("soundconflict");

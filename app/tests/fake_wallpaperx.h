@@ -18,6 +18,7 @@
 //     "Error: <it> at line N\n\nBacktrace:\n...", as ScriptEngine::evaluateScript words it;
 //   - locked widgets and a refused policy answer Failed before the script runs, with Plasma's text.
 
+#include "daemon_client.h"
 #include "kscreen_config.h"
 
 #include <QDBusConnection>
@@ -37,6 +38,7 @@
 #include <QStringList>
 #include <QVariant>
 
+#include <algorithm>
 #include <memory>
 #include <utility>
 
@@ -186,6 +188,14 @@ public:
     bool reportsSound = true;
     QJsonValue sound = true;
     QMap<int, QJsonValue> screenSound;
+    // GetStatus's `frame_rate`: null is a value a newer daemon wrote. A monitor with no entry in
+    // screenFrameRate follows frameRate. Refresh rates are keyed by connector, as the daemon keeps them.
+    // With reportsFrameRate false there is no `frame_rate` key, as a daemon older than the setting answers.
+    bool reportsFrameRate = true;
+    QJsonValue frameRate = kDefaultFrameRate;
+    QJsonValue keepHigherFrameRate = false;
+    QMap<int, QJsonValue> screenFrameRate;
+    QMap<QString, double> refreshRates;
 
     // The daemon's PersistenceChanged, from the connection owning the stand-in's name.
     bool announcePersistenceChanged() {
@@ -224,6 +234,39 @@ public:
             }
             root.insert(QStringLiteral("sound"), QJsonObject{{QStringLiteral("enabled"), sound}, {QStringLiteral("monitors"), monitors}});
         }
+        if (reportsFrameRate) {
+            // As the daemon lists them: every monitor holding a wallpaper, with its own rate, or named.
+            QSet<int> listed = wallpapers;
+            for (auto it = screenFrameRate.cbegin(); it != screenFrameRate.cend(); ++it) {
+                listed.insert(it.key());
+            }
+            for (const int id : outputs) {
+                listed.insert(id);
+            }
+            QJsonObject monitors;
+            for (const int id : listed) {
+                QJsonValue refresh;
+                if (const QString name = outputs.key(id); !name.isEmpty() && refreshRates.contains(name)) {
+                    refresh = refreshRates.value(name);
+                }
+                const bool own = screenFrameRate.contains(id);
+                // `target` as the daemon works it out: the rate it applies, no higher than the refresh
+                // rate it holds unless keeping a higher one.
+                const int global = frameRate.isDouble() ? frameRate.toInt() : kDefaultFrameRate;
+                const QJsonValue setting = screenFrameRate.value(id);
+                double target = own && setting.isDouble() ? setting.toInt() : global;
+                if (refresh.isDouble() && !keepHigherFrameRate.toBool(false)) {
+                    target = std::min(target, refresh.toDouble());
+                }
+                monitors.insert(QString::number(id), QJsonObject{{QStringLiteral("rate"), own ? setting : QJsonValue()},
+                                                                 {QStringLiteral("follows_global"), !own},
+                                                                 {QStringLiteral("refresh_rate"), refresh},
+                                                                 {QStringLiteral("target"), target}});
+            }
+            root.insert(QStringLiteral("frame_rate"), QJsonObject{{QStringLiteral("rate"), frameRate},
+                                                                  {QStringLiteral("keep_higher"), keepHigherFrameRate},
+                                                                  {QStringLiteral("monitors"), monitors}});
+        }
         return QString::fromUtf8(QJsonDocument(root).toJson(QJsonDocument::Compact));
     }
 
@@ -249,10 +292,39 @@ protected:
             } else {
                 screenSound.insert(id, false);
             }
+        } else if (call.member == u"SetFrameRate") {
+            frameRate = call.args.value(0).toInt();
+        } else if (call.member == u"SetMonitorFrameRate") {
+            const int id = call.args.value(0).toInt();
+            if (const int rate = call.args.value(1).toInt(); rate == 0) {
+                screenFrameRate.remove(id);
+            } else {
+                screenFrameRate.insert(id, rate);
+            }
+        } else if (call.member == u"SetKeepHigherFrameRate") {
+            keepHigherFrameRate = call.args.value(0).toBool();
+        } else if (call.member == u"SetOutputRefreshRate") {
+            const QString name = call.args.value(0).toString();
+            if (!outputs.contains(name)) {
+                return;
+            }
+            if (const double rate = call.args.value(1).toDouble(); rate == 0) {
+                refreshRates.remove(name);
+            } else {
+                refreshRates.insert(name, rate);
+            }
         }
     }
     void answer(const QDBusMessage& m) override {
-        m_bus.send(m.member() == u"GetStatus" ? m.createReply(status()) : m.createReply());
+        if (m.member() == u"GetStatus") {
+            m_bus.send(m.createReply(status()));
+        } else if (m.member() == u"SetOutputRefreshRate" && !outputs.contains(m.arguments().value(0).toString())) {
+            // As the daemon refuses a name no monitor answers to; checked when the reply is built.
+            m_bus.send(m.createErrorReply(QStringLiteral("io.wallpaperx.Daemon.Error.UnknownOutput"),
+                                          QStringLiteral("no monitor answers to output ") + m.arguments().value(0).toString()));
+        } else {
+            m_bus.send(m.createReply());
+        }
     }
 };
 

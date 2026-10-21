@@ -5334,50 +5334,58 @@ void runResumeCreditChecks(const WallpaperManager::Config& config, const std::st
 
 constexpr int kMonitorClamp = 0;
 
+// The frame-rate setting a rate phase runs at, through the manager's own setter (60 is the default, so
+// setting it changes nothing). False, failed, when refused.
+bool runAtFrameRate(WallpaperManager& manager, int rate) {
+    try {
+        manager.setFrameRate(rate);
+    } catch (const std::exception& e) {
+        wallpaperx::testing::check(false, ("the frame rate " + std::to_string(rate) + " is accepted").c_str());
+        std::fprintf(stderr, "  refused: %s\n", e.what());
+        return false;
+    }
+    return true;
+}
+
 // S13.175 and S13.176 -- the two bounds the daemon puts on the gap between one picture and the
 // next, each driven by a file whose own timing sits outside it. Its own phase, with one monitor and
 // one collecting consumer, because both halves are measurements of how often that monitor commits
-// and anything else drawing on the same GPU thread is noise in them.
+// and anything else drawing on the same GPU thread is noise in them. Run at the frame-rate setting
+// 120 (S15.895) and at the default 60 (S15.896).
 void runIntervalClampChecks(const WallpaperManager::Config& config, const std::string& fast,
-                            const std::string& gap) {
+                            const std::string& gap, int frameRate) {
     const char* kGoals = "S13.175-S13.176 (a file asking for more pictures a second than a screen can show is "
                          "played at the daemon's own ceiling, and a gap longer than five seconds is not waited out)";
     PhaseGrade grade("the interval-clamp phase");
 
-    // GOAL: S13.175 -- a file declaring a thousand pictures a second is committed AT MOST 120 times
-    //       a second, and STILL PLAYS EVERY PICTURE: it is slowed down, not thinned out. False for
+    // GOAL: S13.175 -- a file declaring a thousand pictures a second is committed AT MOST the frame-rate
+    //       setting's times a second (the thinning half is graded per setting below). False for
     //       the code before this fix, whose floor was four milliseconds -- 250 a second -- which
     //       the QA pass measured as 688 renders a second across four screens, the daemon at 43% of
     //       a core and every other client's frame fetch going from 0.8 ms to 12 ms. Also false for
     //       a fix that capped the rate by dropping pictures, which would play a two-second clip in
     //       a quarter of a second and show a quarter of its content.
     // WHY-THIS-SHAPE: two oracles, because either alone is satisfied by a wrong daemon. The rate
-    //       alone is satisfied by one that renders 120 times a second and skips four pictures in
-    //       five. "Every picture" alone is satisfied by the unfixed daemon, which plays all of them
-    //       at a thousand a second. The second oracle is the number of PACKETS the decoder was
-    //       given against the number of pictures committed: a daemon thinning the file decodes far
-    //       more than it shows, and no status field can say that.
-    //       The rate is measured across a fixed number of pictures rather than counting pictures in
-    //       a fixed time, and the bound is twice the daemon's own floor, so a loaded machine cannot
-    //       cross it -- the unfixed daemon is eight times over.
-    // CONTROL: two, both in backend/daemon/wallpaper_manager.cpp, via control_batch.sh, --phase
-    //       intervalClamp, 2026-09-29, both reverted. (1) kMinPictureInterval made
-    //       `std::chrono::milliseconds(4)` -> "FAIL: a file declaring a thousand pictures a second is
-    //       committed no faster than the daemon's own ceiling ...", printing 250.0 a second. (2) a second
-    //       `(void)session.pipeline->decodeNext();` after the first in advanceSessionLocked(), so every
-    //       other picture is thrown away -- which is what a rate cap implemented by thinning would do ->
-    //       "FAIL: and it plays every picture rather than thinning the file out to keep up", 248 packets
-    //       for 125 pictures, while the rate check stayed green at 120.0. That is why both oracles are here.
-    //       Re-run 2026-10-19 (T7), RTX: (2) rewritten for the round's takeReady(), decodeUntil() first taking a
-    //       picture and throwing it away -> held, the same line. (1) re-run 2026-10-19 (T7b), RTX: held.
+    //       alone is satisfied by one that slows the file to the setting. Packets per picture alone is
+    //       satisfied by one that thins right and draws too often. The second oracle is the number of
+    //       PACKETS the decoder was given against the number of pictures committed, which no status
+    //       field can say. The rate is measured across a fixed number of pictures rather than counting
+    //       pictures in a fixed time, and the bound is twice the setting at 120, so a loaded machine
+    //       cannot cross it.
+    // CONTROL: kMinPictureInterval made `std::chrono::milliseconds(4)` (backend/daemon/wallpaper_manager.cpp),
+    //       via control_batch.sh, --phase intervalClamp, 2026-09-29 -> "FAIL: a file declaring a thousand
+    //       pictures a second is committed no faster than the daemon's own ceiling ...", 250.0 a second.
+    //       Re-run 2026-10-20 (F2): no longer red alone, since the frame-rate grid now also holds the rate at
+    //       120. Held with targetRateLocked() also returning 250 (same file): "FAIL: a file declaring a thousand
+    //       pictures a second is committed no faster than the daemon's own ceiling ...", 247.4 a second.
     // COVERAGE-ASSERT: the packet count is asserted to be non-zero, so a run in which the decode
-    //       hook saw nothing -- which would make "it decoded no more than it showed" trivially true
-    //       -- fails instead of reading as the rate having been established.
+    //       hook saw nothing fails instead of reading as the rate having been established.
     {
         FrameReadyLog signals;
         PictureLog pictures;
         WallpaperManager manager(config);
         CaptureGradeOnExit captureGrade{grade, manager};
+        if (!runAtFrameRate(manager, frameRate)) return;
         Collector collector(manager, kMonitorClamp, ":1.770");
         RenderWorker worker(manager, [&signals, &pictures, &collector](int monitorId, uint64_t generation) {
             pictures.record(monitorId, generation);
@@ -5423,23 +5431,62 @@ void runIntervalClampChecks(const WallpaperManager::Config& config, const std::s
         } else {
             const double seconds = std::chrono::duration<double>(*to - *from).count();
             const double perSecond = static_cast<double>(kTo - kFrom) / seconds;
-            const double floorRate = 1.0 / kMinPictureIntervalSeconds;
-            std::printf("video_wallpaper_test: the %g fps fixture committed %llu pictures in %.3f s (%.1f a second; "
-                        "the daemon's floor allows %.1f), sending %d packet(s) to the decoder\n",
-                        kFastClipDeclaredFps, static_cast<unsigned long long>(kTo - kFrom), seconds, perSecond,
-                        floorRate, packets);
+            const double floorRate = std::min(1.0 / kMinPictureIntervalSeconds, static_cast<double>(frameRate));
+            std::printf("video_wallpaper_test: at frame rate %d, the %g fps fixture committed %llu pictures in %.3f s "
+                        "(%.1f a second; the daemon allows %.1f), sending %d packet(s) to the decoder\n",
+                        frameRate, kFastClipDeclaredFps, static_cast<unsigned long long>(kTo - kFrom), seconds,
+                        perSecond, floorRate, packets);
             std::fflush(stdout);
-            reportUnless(perSecond <= 2 * floorRate,
-                         "a file declaring a thousand pictures a second is committed no faster than the daemon's "
-                         "own ceiling on how often a wallpaper may be drawn",
-                         std::to_string(perSecond) + " a second, where the floor on the gap between pictures "
-                                                     "allows " + std::to_string(floorRate));
             reportUnless(packets > 0, "the decoder was actually asked for the pictures that were shown",
                          std::to_string(packets) + " packet(s)");
-            reportUnless(packets > 0 && static_cast<double>(packets) <= 1.5 * static_cast<double>(kTo),
-                         "and it plays every picture rather than thinning the file out to keep up",
-                         std::to_string(packets) + " packet(s) decoded for " + std::to_string(kTo) +
-                             " picture(s) committed");
+            if (frameRate >= 120) {
+                reportUnless(perSecond <= 2 * floorRate,
+                             "a file declaring a thousand pictures a second is committed no faster than the daemon's "
+                             "own ceiling on how often a wallpaper may be drawn",
+                             std::to_string(perSecond) + " a second, where the floor on the gap between pictures "
+                                                         "allows " + std::to_string(floorRate));
+                // GOAL: S13.175 as restated 2026-10-20 -- at 120 the file plays at its own speed, thinned, not
+                //       slowed: each committed picture stands for 1/120 s of the file, about 1000/120 = 8.3 packets
+                //       sent per picture shown. False for a daemon that slows the file (1 per picture, every
+                //       picture played) or thins past the setting (16.7 per picture at a 60 grid).
+                // WHY-THIS-SHAPE: packets per committed picture, as the 60 form below; the old "every picture"
+                //       bound (packets <= 1.5 x pictures) is the superseded wording and is red by design now.
+                //       25% either side keeps both wrong answers out (1 and 16.7 against 8.3).
+                // CONTROL: control_batch.sh 2026-10-20 (F2), NVIDIA, reverted, --phase '^intervalClamp$', both in
+                //       renderer/video/picture_skip.h: ShowGrid::shows() answering true at once -> this line, 1995
+                //       packets for 125 pictures at 62.5 a second; ShowGrid::shows()' step doubled -> this line,
+                //       123 packets for 125 pictures (every picture, slowed). Green: 1031 packets.
+                const double perPicture = static_cast<double>(packets) / static_cast<double>(kTo);
+                const double expected = kFastClipDeclaredFps / frameRate;
+                reportUnless(packets > 0 && perPicture >= 0.75 * expected && perPicture <= 1.25 * expected,
+                             "at frame rate 120, it plays at its own speed, thinned to one picture each 1/120 s of "
+                             "the file, neither slowed down nor thinned further",
+                             std::to_string(packets) + " packet(s) decoded for " + std::to_string(kTo) +
+                                 " picture(s) committed");
+            } else {
+                // GOAL: S15.896 -- at the default 60, the thousand-a-second file is committed at most 60 a second,
+                //       and by thinning, not slowing: each committed picture stands for 1/60 s of the file, so
+                //       about 1000/60 packets are sent per picture shown. False for a daemon that slows the file
+                //       (1 per picture), ignores the setting (120 a second, 8.3 per picture) or thins too far.
+                // WHY-THIS-SHAPE: the same two oracles as at 120, the second restated -- at 60 thinning is the
+                //       point. The rate bound is 1.5x, not 120's 2x: 2x of 60 is 120, which a daemon ignoring the
+                //       setting would meet exactly. Packets per picture within 25% of the file's rate over 60.
+                // CONTROL: control_batch.sh 2026-10-20 (F1), NVIDIA, reverted: targetRateLocked() returning 120
+                //       (backend/daemon/wallpaper_manager.cpp) -> both lines red; ShowGrid::shows()' step doubled
+                //       (renderer/video/picture_skip.h) -> the packets line alone. Green: 62.5 a second, 1995 packets.
+                reportUnless(perSecond <= 1.5 * floorRate,
+                             "at frame rate 60, a file declaring a thousand pictures a second is committed no faster "
+                             "than 60 a second",
+                             std::to_string(perSecond) + " a second, where the setting allows " +
+                                 std::to_string(floorRate));
+                const double perPicture = static_cast<double>(packets) / static_cast<double>(kTo);
+                const double expected = kFastClipDeclaredFps / frameRate;
+                reportUnless(packets > 0 && perPicture >= 0.75 * expected && perPicture <= 1.25 * expected,
+                             "at frame rate 60, it is thinned to one picture each 1/60 s of the file, neither slowed "
+                             "down nor thinned further",
+                             std::to_string(packets) + " packet(s) decoded for " + std::to_string(kTo) +
+                                 " picture(s) committed");
+            }
         }
         reportUnless(collector.threw().empty(), "the consumer's hand-overs did not throw", collector.threw());
         reportUnless(static_cast<uint64_t>(collector.served()) * 2 >= kTo,
@@ -5468,11 +5515,13 @@ void runIntervalClampChecks(const WallpaperManager::Config& config, const std::s
     // CONTROL: gapBetween() (backend/daemon/wallpaper_manager.cpp) made to return kMinPictureInterval
     //       always -> "FAIL: and the wait is still the daemon's ceiling rather than no wait at all",
     //       "0.008503 s". Both via control_batch.sh, --phase intervalClamp, 2026-09-29. Reverted.
+    //       Both re-run 2026-10-20 (F1) on --phase intervalClamp60, the same block at 60: held.
     {
         FrameReadyLog signals;
         PictureLog pictures;
         WallpaperManager manager(config);
         CaptureGradeOnExit captureGrade{grade, manager};
+        if (!runAtFrameRate(manager, frameRate)) return;
         Collector collector(manager, kMonitorClamp, ":1.771");
         RenderWorker worker(manager, [&signals, &pictures, &collector](int monitorId, uint64_t generation) {
             pictures.record(monitorId, generation);
@@ -5543,13 +5592,16 @@ double medianOf(const std::vector<double>& sorted) { return sorted.empty() ? 0.0
 
 // S13.183 -- the 120 a second cap is held between the times successive pictures are DUE, not on
 // each gap in the file on its own.
-void runCapBudgetChecks(const WallpaperManager::Config& config, const std::string& rate120) {
-    const char* kGoal = "S13.183 (a 120 a second file with millisecond timestamps plays at 120, not slower)";
+// Run at the frame-rate setting 120 (S15.895) and at the default 60 (S15.896): at 60 the same file plays
+// at 60 a second, every other picture passed over.
+void runCapBudgetChecks(const WallpaperManager::Config& config, const std::string& rate120, int frameRate) {
+    const char* kGoal = "S13.183 (a 120 a second file with millisecond timestamps plays at the frame rate, not slower)";
     PhaseGrade grade("the cap-budget phase");
     FrameReadyLog signals;
     PictureLog pictures;
     WallpaperManager manager(config);
     CaptureGradeOnExit captureGrade{grade, manager};
+    if (!runAtFrameRate(manager, frameRate)) return;
     Collector collector(manager, kMonitorClamp, ":1.772");
     RenderWorker worker(manager, [&signals, &pictures, &collector](int monitorId, uint64_t generation) {
         pictures.record(monitorId, generation);
@@ -5593,12 +5645,20 @@ void runCapBudgetChecks(const WallpaperManager::Config& config, const std::strin
     //       at 10 a second and misses the 30 s wait, via control_batch.sh, --phase capBudget, 2026-09-29 ->
     //       "FAIL: a 120 a second file with millisecond timestamps plays at 120 a second, not slower",
     //       median 10.00 over the 175 windows that arrived, not NOT VERIFIED. Reverted.
+    //       F1 2026-10-20, frame rate 120, NVIDIA: both re-run, held; targetRateLocked() returning 60
+    //       (backend/daemon/wallpaper_manager.cpp) -> the same line, median 60.
     // COVERAGE-ASSERT: the number of windows compared is asserted, and a wait that ran out grades the
     //       windows that did arrive: only a video that drew less than one window after the first
     //       picture is not graded, since a slow video is the defect and a stopped one is not a rate.
-    constexpr uint64_t kWindow = 120;
-    // Three seconds of pictures: 240 one-second windows, which is plenty for a median.
-    constexpr uint64_t kPictures = 360;
+    // GOAL: S15.896 -- at 60 the same file plays at 60 a second, median one-second window at least 59.5 (the
+    //       119/120 margin of 120's bound), every other picture passed over. False for a grid that passes over
+    //       a picture it should show, or a floor that slows the shown pictures.
+    // CONTROL: control_batch.sh 2026-10-20 (F1), NVIDIA, reverted: targetRateLocked() returning 120
+    //       (backend/daemon/wallpaper_manager.cpp) -> "... drawn no faster than 60 a second"; ShowGrid::shows()'
+    //       step doubled (renderer/video/picture_skip.h) -> "... plays at 60 a second, not slower".
+    const uint64_t kWindow = static_cast<uint64_t>(frameRate);
+    // Three seconds of pictures: two seconds of one-second windows, which is plenty for a median.
+    const uint64_t kPictures = 3 * kWindow;
     const bool reached = signals.wait(kMonitorClamp, kPictures + 5);
     const uint64_t arrived = latestGeneration(pictures, kMonitorClamp);
     if (!reached && arrived < 6 + kWindow) {
@@ -5610,14 +5670,358 @@ void runCapBudgetChecks(const WallpaperManager::Config& config, const std::strin
     const uint64_t windowsEnd = reached ? kPictures + 6 - kWindow : arrived + 1 - kWindow;
     const std::vector<double> rates = windowRates(pictures.forMonitor(kMonitorClamp), 6, windowsEnd, kWindow);
     const double median = medianOf(rates);
-    std::printf("video_wallpaper_test: the 120 a second file with millisecond timestamps: median one-second window "
-                "%.2f a second over %zu windows (slowest %.2f, fastest %.2f)\n",
-                median, rates.size(), rates.empty() ? 0.0 : rates.front(), rates.empty() ? 0.0 : rates.back());
+    std::printf("video_wallpaper_test: at frame rate %d, the 120 a second file with millisecond timestamps: median "
+                "one-second window %.2f a second over %zu windows (slowest %.2f, fastest %.2f)\n",
+                frameRate, median, rates.size(), rates.empty() ? 0.0 : rates.front(),
+                rates.empty() ? 0.0 : rates.back());
     std::fflush(stdout);
     reportUnless(rates.size() >= 100, "enough one-second windows were compared for a median to mean something",
                  std::to_string(rates.size()) + " window(s)");
-    reportUnless(median >= 119.0, "a 120 a second file with millisecond timestamps plays at 120 a second, not slower",
-                 std::to_string(median) + " a second in the median one-second window");
+    const double atLeast = frameRate * 119.0 / 120.0;
+    reportUnless(median >= atLeast,
+                 frameRate >= 120 ? "a 120 a second file with millisecond timestamps plays at 120 a second, not slower"
+                                  : "at frame rate 60, a 120 a second file with millisecond timestamps plays at 60 a "
+                                    "second, not slower",
+                 std::to_string(median) + " a second in the median one-second window, where " + std::to_string(atLeast) +
+                     " is the bound");
+    if (frameRate < 120) {
+        reportUnless(median <= frameRate + 1.0,
+                     "at frame rate 60, a 120 a second file is drawn no faster than 60 a second",
+                     std::to_string(median) + " a second in the median one-second window");
+    }
+}
+
+std::string rate120CodecClipPath(const std::string& codec) {
+    return std::string(WALLPAPERX_VIDEO_ASSET_DIR) + "/wallpaper_rate120_" + codec + ".mp4";
+}
+
+// How evenly one monitor drew from generation `from` to `to`: its one-second windows and the gaps
+// between successive generations, each sorted. Generations not both announced are left out.
+struct DrawShape {
+    std::vector<double> windows;
+    std::vector<double> gaps;
+    double median() const { return medianOf(windows); }
+    double gapAt(double quantile) const {
+        return gaps.empty() ? 0.0 : gaps[std::min(gaps.size() - 1, static_cast<size_t>(quantile * gaps.size()))];
+    }
+    double fractionAbove(double seconds) const {
+        if (gaps.empty()) return 1.0;
+        return static_cast<double>(std::count_if(gaps.begin(), gaps.end(), [&](double g) { return g > seconds; })) /
+               static_cast<double>(gaps.size());
+    }
+    std::string describe(double interval) const {
+        // A histogram in eighths of the interval, up to three intervals.
+        std::array<int, 25> bins{};
+        for (const double g : gaps) bins[std::min<size_t>(24, static_cast<size_t>(g / interval * 8.0))]++;
+        std::string out = "median window " + std::to_string(median()) + "/s over " + std::to_string(windows.size()) +
+                          " windows; gaps " + std::to_string(gaps.size()) + ", quartiles " +
+                          std::to_string(gapAt(0.25) * 1e3) + "/" + std::to_string(gapAt(0.5) * 1e3) + "/" +
+                          std::to_string(gapAt(0.75) * 1e3) + " ms, longest " +
+                          std::to_string(gaps.empty() ? 0.0 : gaps.back() * 1e3) + " ms; histogram (eighths of " +
+                          std::to_string(interval * 1e3) + " ms):";
+        for (size_t i = 0; i < bins.size(); ++i) {
+            if (bins[i] != 0) out += " " + std::to_string(i) + ":" + std::to_string(bins[i]);
+        }
+        return out;
+    }
+};
+
+DrawShape drawShapeOf(const std::vector<PictureLog::Event>& shown, uint64_t from, uint64_t to, uint64_t window) {
+    DrawShape shape;
+    shape.windows = windowRates(shown, from, to > window ? to - window : from, window);
+    std::map<uint64_t, Clock::time_point> first;
+    for (const PictureLog::Event& e : shown) first.emplace(e.generation, e.at);
+    for (uint64_t g = from; g < to; ++g) {
+        const auto a = first.find(g);
+        const auto b = first.find(g + 1);
+        if (a != first.end() && b != first.end()) {
+            shape.gaps.push_back(std::chrono::duration<double>(b->second - a->second).count());
+        }
+    }
+    std::sort(shape.gaps.begin(), shape.gaps.end());
+    return shape;
+}
+
+// The checks S15.897-S15.899 put on one monitor's drawing at `rate` a second, from a 120 a second file:
+// the rate, its evenness, and no picture held for two of its intervals. `what` names the case. `slack` is
+// how far the gap quartiles may sit from the interval: a quarter of it, or one picture of the file where
+// the screen's interval is no whole number of the file's pictures (50 a second from 120: 16.7 and 25 ms).
+void gradeEvenDrawing(const DrawShape& shape, double rate, const std::string& what, size_t minGaps,
+                      std::optional<double> slackSeconds = std::nullopt) {
+    const double interval = 1.0 / rate;
+    const double slack = slackSeconds.value_or(0.25 * interval);
+    std::printf("video_wallpaper_test: %s: %s\n", what.c_str(), shape.describe(interval).c_str());
+    std::fflush(stdout);
+    reportUnless(shape.windows.size() >= minGaps / 2 && shape.gaps.size() >= minGaps,
+                 (what + ": enough windows and gaps were measured to grade it").c_str(),
+                 std::to_string(shape.windows.size()) + " window(s), " + std::to_string(shape.gaps.size()) + " gap(s)");
+    reportUnless(shape.median() >= rate * 119.0 / 120.0 && shape.median() <= rate + 1.0,
+                 (what + ": draws its rate, no slower and no faster").c_str(),
+                 std::to_string(shape.median()) + " a second in the median one-second window");
+    reportUnless(shape.gapAt(0.25) >= interval - slack && shape.gapAt(0.75) <= interval + slack,
+                 (what + ": its pictures are evenly spaced, one interval apart").c_str(),
+                 "gap quartiles " + std::to_string(shape.gapAt(0.25) * 1e3) + " and " +
+                     std::to_string(shape.gapAt(0.75) * 1e3) + " ms against " + std::to_string(interval * 1e3) + " +- " +
+                     std::to_string(slack * 1e3));
+    reportUnless(shape.fractionAbove(1.5 * interval) <= 0.03,
+                 (what + ": no picture is held for two intervals while the file has one for the second").c_str(),
+                 std::to_string(shape.fractionAbove(1.5 * interval) * 100.0) + "% of gaps above 1.5 intervals");
+}
+
+// S15.897 and S15.898 -- a 120 a second file on one screen at the frame-rate setting `frameRate`, in
+// H.264, H.265 and AV1. Its own phase per setting, one monitor and one consumer, RUN_SERIAL.
+// GOAL: S15.897 -- at 60 the 120 a second file draws 60 a second, evenly; at 120 it draws 120. False for a
+//       daemon that slows, ignores the setting, or picks pictures off an uneven grid. S15.898 -- on H.265
+//       (x265 defaults) at 60 no picture is doubled: false if a gap is two intervals while the file has a
+//       picture for it (the ~52 a second pattern from leaving out pictures a screen shows).
+// WHY-THIS-SHAPE: commit times are wall-clock, so every bound is on a robust statistic, never on one gap:
+//       the median one-second window (a stall moves only the windows holding it), gap quartiles within 25% of
+//       the interval (an alternating 1-and-2 picture pick moves the quartiles, a few late rounds do not), and
+//       at most 3% of gaps above 1.5 intervals (the doubling defect is ~13% of gaps; a late round on an idle,
+//       serial run is rare). "None late" for every single gap is printed (longest gap), not asserted: a
+//       correct daemon on a busy host can be late once, and that would be asserting on the scheduler.
+// CONTROL: control_batch.sh 2026-10-20 (F2), NVIDIA, reverted: targetRateLocked() returning 120
+//       (backend/daemon/wallpaper_manager.cpp) -> thinRate60's rate and evenness lines, all three codecs;
+//       returning 60 -> thinRate120's three lines, all codecs; showSpacing() times 1.25 (same file) -> all three
+//       lines at 60, all codecs; DecodeLoad::skip() held at Unreferenced (backend/daemon/decode_load.h)
+//       -> the H.265 lines alone, median 24.3 a second, 75 gaps of 50-67 ms. Re-run at decode_load.h,
+//       control_batch.sh 2026-10-20 (F5): held, the three hevc lines at 60.
+// COVERAGE-ASSERT: the numbers of windows and gaps compared are asserted, and a wait that ran out is
+//       NOT VERIFIED, never graded as a slow file.
+void runThinRateChecks(const WallpaperManager::Config& config, const std::string& codec, int frameRate,
+                       std::optional<std::string> clip = std::nullopt) {
+    const std::string path = clip.value_or(rate120CodecClipPath(codec));
+    const std::string goal = "S15.897-S15.898 (" + codec + " at " + std::to_string(frameRate) + ")";
+    if (!std::filesystem::exists(path)) {
+        notVerified(goal.c_str(), "the fixture " + path + " was not generated");
+        return;
+    }
+    PhaseGrade grade("the thinned-rate phase");
+    FrameReadyLog signals;
+    PictureLog pictures;
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    if (!runAtFrameRate(manager, frameRate)) return;
+    Collector collector(manager, kMonitorClamp, ":1.780");
+    RenderWorker worker(manager, [&signals, &pictures, &collector](int monitorId, uint64_t generation) {
+        pictures.record(monitorId, generation);
+        signals.record(monitorId, generation);
+        collector.announced(monitorId, generation);
+    });
+    collector.attach(worker);
+    WorkerUnblock unblock{worker};
+
+    wallpaperx::testing::nameScreen(manager, kMonitorClamp, screenOf(kMonitorClamp));
+    manager.requestWallpaper("video", path, kMonitorClamp);
+    worker.post(kMonitorClamp);
+    if (!signals.wait(kMonitorClamp, 1)) {
+        grade.expectNoDevice();
+        notVerified(goal.c_str(), "the video produced no first picture on this host");
+        return;
+    }
+    // Three seconds of drawing, inside the file's four, from generation 6 on.
+    const uint64_t to = 6 + 3 * static_cast<uint64_t>(frameRate);
+    if (!signals.wait(kMonitorClamp, to)) {
+        notVerified(goal.c_str(), "the video drew " + std::to_string(latestGeneration(pictures, kMonitorClamp)) +
+                                      " picture(s), not " + std::to_string(to) + ", so no rate can be measured -- a "
+                                      "stopped clock must not be graded as a slow one");
+        return;
+    }
+    const DrawShape shape = drawShapeOf(pictures.forMonitor(kMonitorClamp), 6, to, static_cast<uint64_t>(frameRate));
+    gradeEvenDrawing(shape, frameRate, "the 120 a second " + codec + " file at frame rate " + std::to_string(frameRate),
+                     2 * static_cast<size_t>(frameRate));
+    reportUnless(collector.threw().empty(), "the consumer's hand-overs did not throw", collector.threw());
+}
+
+// S15.902 -- with no decode thread, the pictures a round passes over unshown are bounded by the round's
+// catch-up slice. Its own phase, one monitor on the thousand-a-second file at 60, every packet held 2 ms.
+// GOAL: S15.902 -- a round that passes over unshown pictures on the render thread stops at the catch-up slice
+//       (4 ms) and lets other work have the thread, so a task posted meanwhile waits about a slice and a
+//       decode or two, not a whole run of ~16 unshown pictures (32 ms at 2 ms each). False if the run is
+//       unbounded.
+// WHY-THIS-SHAPE: the slice is not visible from outside, but what it is for is: the median wait of a task
+//       posted to the worker. 100 samples, median against 12 ms (slice + two held decodes + margin); one
+//       wait is never graded alone, since a late wake-up is the scheduler's. Graded only where the render
+//       thread sends most packets: with a decode thread the passing-over is that thread's, and the phase
+//       says so instead of passing (the NVIDIA entry; the Lavapipe twin decodes in software, no thread).
+// CONTROL: control_batch.sh 2026-10-20 (F2), Lavapipe twin, reverted: the slice test in
+//       backend/daemon/wallpaper_manager.cpp's pass-over loop disabled (`dropped && false`) -> this line, median
+//       wait 65.8 ms against 1.07 green.
+// COVERAGE-ASSERT: the number of waits measured and the render thread's share of the packets are asserted.
+void runThinSliceChecks(const WallpaperManager::Config& config, const std::string& fast) {
+    const char* kGoal = "S15.902 (with no decode thread, passing over unshown pictures is bounded by the slice)";
+    PhaseGrade grade("the thinning-slice phase");
+    FrameReadyLog signals;
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    struct Undelay {
+        ~Undelay() { g_sendDelayMs.store(0); }
+    } undelay;
+    Collector collector(manager, kMonitorClamp, ":1.783");
+    RenderWorker worker(manager, [&signals, &collector](int monitorId, uint64_t generation) {
+        signals.record(monitorId, generation);
+        collector.announced(monitorId, generation);
+    });
+    collector.attach(worker);
+    WorkerUnblock unblock{worker};
+    wallpaperx::testing::nameScreen(manager, kMonitorClamp, screenOf(kMonitorClamp));
+    manager.requestWallpaper("video", fast, kMonitorClamp);
+    worker.post(kMonitorClamp);
+    if (!signals.wait(kMonitorClamp, 1)) {
+        grade.expectNoDevice();
+        notVerified(kGoal, "the fast video produced no first picture on this host");
+        return;
+    }
+    const std::optional<pid_t> renderThread = workerThreadId(worker);
+    check(renderThread.has_value(), "the render worker says which thread it is");
+    if (!renderThread) return;
+    g_countedThread.store(*renderThread);
+    g_decodeCalls.store(0);
+    g_countedThreadDecodes.store(0);
+    g_sendDelayMs.store(2);
+
+    std::vector<double> waits;
+    for (int i = 0; i < 100; ++i) {
+        auto ran = std::make_shared<std::promise<Clock::time_point>>();
+        std::future<Clock::time_point> future = ran->get_future();
+        const Clock::time_point posted = Clock::now();
+        worker.postTask([ran](RenderWorker::TaskState) { ran->set_value(Clock::now()); });
+        if (future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+            check(false, "a task posted to the render worker while it passes over pictures runs within 5 s");
+            return;
+        }
+        waits.push_back(std::chrono::duration<double, std::milli>(future.get() - posted).count());
+        std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    }
+    g_sendDelayMs.store(0);
+    const int all = g_decodeCalls.load();
+    const int onRender = g_countedThreadDecodes.load();
+    std::sort(waits.begin(), waits.end());
+    std::printf("video_wallpaper_test: thinning with packets held 2 ms: %d of %d packet(s) on the render thread; "
+                "task waits median %.2f ms, 90th %.2f, longest %.2f\n",
+                onRender, all, waits[waits.size() / 2], waits[waits.size() * 9 / 10], waits.back());
+    std::fflush(stdout);
+    if (all < 100 || onRender * 2 < all) {
+        notVerified(kGoal, std::to_string(onRender) + " of " + std::to_string(all) +
+                               " packets were sent on the render thread: a decode thread passes over the pictures "
+                               "on this host, so the render thread's slice is not what bounds them");
+        return;
+    }
+    reportUnless(waits.size() == 100, "every task wait was measured", std::to_string(waits.size()));
+    reportUnless(waits[waits.size() / 2] <= 12.0,
+                 "with no decode thread, a round passing over unshown pictures stops at its catch-up slice, so "
+                 "work posted meanwhile waits no longer than the slice and a decode",
+                 std::to_string(waits[waits.size() / 2]) + " ms median wait");
+}
+
+// S15.899 -- two screens sharing one decoder on the 120 a second H.264 file. Its own phase, RUN_SERIAL.
+void runThinSharedChecks(const WallpaperManager::Config& config) {
+    const std::string path = rate120CodecClipPath("h264");
+    const char* kGoal = "S15.899 (two screens sharing one decoder each draw their own rate)";
+    if (!std::filesystem::exists(path)) {
+        notVerified(kGoal, "the fixture " + path + " was not generated");
+        return;
+    }
+    constexpr int kFast = 0;
+    constexpr int kSlow = 1;
+    PhaseGrade grade("the shared thinned-rate phase");
+    FrameReadyLog signals;
+    PictureLog pictures;
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    Collector fastCollector(manager, kFast, ":1.781");
+    Collector slowCollector(manager, kSlow, ":1.782");
+    RenderWorker worker(manager, [&](int monitorId, uint64_t generation) {
+        pictures.record(monitorId, generation);
+        signals.record(monitorId, generation);
+        fastCollector.announced(monitorId, generation);
+        slowCollector.announced(monitorId, generation);
+    });
+    fastCollector.attach(worker);
+    slowCollector.attach(worker);
+    WorkerUnblock unblock{worker};
+
+    g_files.watch(path);
+    g_files.resetCounts();
+    for (const int id : {kFast, kSlow}) wallpaperx::testing::nameScreen(manager, id, screenOf(id));
+    manager.setOutputRefreshRate(screenOf(kSlow), 50.0);
+    for (const int id : {kFast, kSlow}) manager.requestWallpaper("video", path, id);
+    for (const int id : {kFast, kSlow}) worker.post(id);
+    if (!signals.wait(kFast, 1) || !signals.wait(kSlow, 1)) {
+        grade.expectNoDevice();
+        notVerified(kGoal, "the video produced no first picture on both screens on this host");
+        return;
+    }
+
+    // GOAL: S15.899, first half -- beside a 60 screen, a screen whose refresh caps it at 50 draws 50 a second
+    //       evenly (no gap above 1.5 of its 20 ms), while both draw from one decoder. False for thinning on the
+    //       fastest screen's grid alone, whose 60-grid pictures a 50 screen can only take unevenly.
+    // WHY-THIS-SHAPE: as runThinRateChecks; and the file is open exactly once while both play (the ledger's
+    //       opens less closes), so the two screens are proven to share one session, not graded apart.
+    // CONTROL: control_batch.sh 2026-10-20 (F2), NVIDIA, reverted, backend/daemon/wallpaper_manager.cpp: the
+    //       per-screen shows() taking all spacings -> both screens' rate and evenness lines (80 a second each);
+    //       ShowGrids::shows() (renderer/video/picture_skip.h) consulting only its first spacing -> the 50
+    //       screen's three lines, 29.7 a second, 50 gaps of 67 ms; the join in videoSessionLocked() and
+    //       mergeSharedSessionsLocked() both disabled -> "the two screens ... share one decoder" (the join alone
+    //       stays green: the merge folds the sessions).
+    const uint64_t slowTo = 6 + 3 * 50;
+    if (!signals.wait(kSlow, slowTo) || !signals.wait(kFast, 6 + 3 * 60)) {
+        notVerified(kGoal, "the two screens did not draw three seconds of pictures, so no rate can be measured");
+        return;
+    }
+    const int open = g_files.opens(path) - g_files.closes(path);
+    reportUnless(open == 1, "the two screens playing the same file share one decoder",
+                 std::to_string(open) + " open(s) of the file at once (" + std::to_string(g_files.opens(path)) +
+                     " opened, " + std::to_string(g_files.closes(path)) + " closed)");
+    gradeEvenDrawing(drawShapeOf(pictures.forMonitor(kSlow), 6, slowTo, 50), 50,
+                     "beside a 60 screen, the screen refreshing at 50", 100, 1.0 / 120.0);
+    gradeEvenDrawing(drawShapeOf(pictures.forMonitor(kFast), 6, 6 + 3 * 60, 60), 60,
+                     "beside a 50 screen, the 60 screen", 120);
+
+    // GOAL: S15.899, second half -- with the other screen at 120, the 60 screen draws exactly every other
+    //       picture of the shared stream. False for one that draws every picture, or skips unevenly.
+    // WHY-THIS-SHAPE: counts, not times: both screens draw in the same round, so between two successive draws
+    //       of the 60 screen the 120 screen draws exactly twice, under any interleaving that holds the rule.
+    //       Only the run after both have drawn 30 more pictures since the change is counted.
+    // CONTROL: the same per-screen shows() break -> this line, "1:120" (one draw of the 120 screen per interval).
+    manager.setOutputRefreshRate(screenOf(kSlow), 0.0);
+    manager.setMonitorFrameRate(kFast, 120);
+    for (const int id : {kFast, kSlow}) worker.post(id);
+    const uint64_t slowFrom = latestGeneration(pictures, kSlow) + 30;
+    const uint64_t slowEnd = slowFrom + 120;
+    if (!signals.waitAtLeast(kSlow, slowEnd) || !signals.waitAtLeast(kFast, latestGeneration(pictures, kFast) + 2)) {
+        notVerified(kGoal, "the 60 screen did not draw two more seconds beside the 120 one");
+        return;
+    }
+    std::map<uint64_t, Clock::time_point> slowAt;
+    for (const PictureLog::Event& e : pictures.forMonitor(kSlow)) slowAt.emplace(e.generation, e.at);
+    std::vector<Clock::time_point> fastTimes;
+    for (const PictureLog::Event& e : pictures.forMonitor(kFast)) fastTimes.push_back(e.at);
+    std::map<long, int> perInterval;
+    int intervals = 0;
+    int exactlyTwo = 0;
+    for (uint64_t g = slowFrom; g < slowEnd; ++g) {
+        const auto a = slowAt.find(g);
+        const auto b = slowAt.find(g + 1);
+        if (a == slowAt.end() || b == slowAt.end()) continue;
+        const long between = std::count_if(fastTimes.begin(), fastTimes.end(),
+                                           [&](Clock::time_point t) { return t > a->second && t <= b->second; });
+        ++perInterval[between];
+        ++intervals;
+        if (between == 2) ++exactlyTwo;
+    }
+    std::string histogram;
+    for (const auto& [count, times] : perInterval) histogram += " " + std::to_string(count) + ":" + std::to_string(times);
+    std::printf("video_wallpaper_test: beside a 120 screen, draws of the 120 screen between two of the 60 screen's:%s\n",
+                histogram.c_str());
+    std::fflush(stdout);
+    reportUnless(intervals >= 100, "enough of the 60 screen's intervals were counted", std::to_string(intervals));
+    reportUnless(intervals > 0 && exactlyTwo * 100 >= intervals * 97,
+                 "beside a 120 screen, the 60 screen draws exactly every other picture of the shared stream",
+                 std::to_string(exactlyTwo) + " of " + std::to_string(intervals) + " intervals held exactly two;" +
+                     histogram);
+    reportUnless(fastCollector.threw().empty() && slowCollector.threw().empty(), "the consumers' hand-overs did not throw",
+                 fastCollector.threw() + slowCollector.threw());
 }
 
 constexpr int kMonitorHighRate = 0;
@@ -5816,19 +6220,21 @@ std::optional<StalledStretch> stalledWindowRates(RenderWorker& worker, FrameRead
     return stretch;
 }
 
-// S15.109-S15.111 -- the schedule when the file asks for more than the 120-a-second cap: a 240 a second
+// S15.109-S15.110 -- the schedule when the file asks for more than the 120-a-second cap: a 240 a second
 // file at speed 1 and then at speed 2, each with the render thread held up for less than one capped
-// interval; then a 120 a second file at speed 2, slowed below the cap.
-void runHighRateChecks(const WallpaperManager::Config& config, const std::string& rate240,
-                       const std::string& rate120) {
-    const char* kGoals = "S15.109-S15.111 (a video asking for more than 120 pictures a second: its rate, a late picture "
-                         "at speed 2, and the lag it banks)";
+// interval. A file above the cap is thinned, not slowed, so it banks no lag to bound.
+// Run at the frame-rate setting 120 (S15.895) and at the default 60 (S15.896), where the cap is 60 a second.
+void runHighRateChecks(const WallpaperManager::Config& config, const std::string& rate240, int frameRate) {
+    const std::string rate = std::to_string(frameRate);
+    const char* kGoals = "S15.109-S15.110 (a video asking for more than 120 pictures a second: its rate and a late "
+                         "picture at speed 2)";
     PhaseGrade grade("the high-rate phase");
     FrameReadyLog signals;
     PictureLog pictures;
     WorkerDelayLog workerDelay;
     WallpaperManager manager(config);
     CaptureGradeOnExit captureGrade{grade, manager};
+    if (!runAtFrameRate(manager, frameRate)) return;
     Collector collector(manager, kMonitorHighRate, ":1.773");
     RenderWorker worker(manager, [&signals, &pictures, &collector, &workerDelay](int monitorId, uint64_t generation) {
         if (monitorId == kMonitorHighRate) workerDelay.record(generation);
@@ -5882,7 +6288,7 @@ void runHighRateChecks(const WallpaperManager::Config& config, const std::string
         reportUnless(all.size() >= 200, ("every picture of " + label + " was announced, so 200 windows compared").c_str(),
                      std::to_string(all.size()) + " window(s)" +
                          (stretch->reachedEnd ? "" : ", and the video missed the 30 s wait for its last picture"));
-        reportUnless(medianOf(all) <= 121.0, (label + " plays no faster than the 120 a second cap").c_str(),
+        reportUnless(medianOf(all) <= frameRate + 1.0, (label + " plays no faster than the " + rate + " a second cap").c_str(),
                      std::to_string(medianOf(all)) + " a second in the median one-second window");
         if (stretch->holds < 60) {
             notVerified(kGoals, label + " ran only " + std::to_string(stretch->holds) +
@@ -5910,31 +6316,26 @@ void runHighRateChecks(const WallpaperManager::Config& config, const std::string
 
     // GOAL: S15.109 -- a video asking for more than 120 pictures a second plays at 120, and no faster: a
     //       240 a second file at speed 1 holds a median one-second window of at least 119.5 while pictures
-    //       are drawn up to 6 ms late, and at most 121. False for lateness judged against the file's own
-    //       time, which trails on purpose under the cap: every second picture restarts the schedule and
-    //       keeps its delay.
-    // WHY-THIS-SHAPE: under WorkerStalls, not on an idle machine: in this process the defect costs idle
-    //       playback only 119.6 a second against 120.0, too close for any bound. The holds turn each
-    //       restart into milliseconds lost. The median is taken only over windows in which the host
-    //       provably pushed no picture past the 8.33 ms allowance (see kHoldLimit): over every window, six
-    //       busy loops on the two cores the test was pinned to moved a correct daemon's median to
-    //       92.6-114.7, below the defects' 109.9-113.4, so no unfiltered bound separates them. Idle, 120 to
-    //       240 of the 240 windows are clear. The median window, for runCapBudgetChecks()' reason.
-    //       Missing windows and a slow video fail: they are the daemon's.
-    // CONTROL: each in backend/daemon/wallpaper_manager.cpp via control_batch.sh, --phase highRate,
-    //       2026-09-29 unless dated, reverted. (a) markShown's late test put back to `if (now -
-    //       planned.timeline <= interval) shown = planned;` -> "FAIL: a 240 a second video at speed 1 plays
-    //       at 120 a second, pictures drawn up to 6 ms late included", re-run 2026-09-30 on NVIDIA: every
-    //       window clear, median 109.23, and the speed-2 line red beside it (108.47). (b)
-    //       VideoSession::Waiting::planned() returning `OnScreen{timeline, timeline}`, no floor under the due
-    //       time -> "FAIL: the 240 a second file at speed 1 plays no faster than the 120 a second cap",
-    //       re-run 2026-09-30 on NVIDIA: median 239.97, and at speed 2 261.88. (c) kMinPictureInterval
-    //       made 1/10 s -> "FAIL: every picture of the 240 a second file at speed 1 was announced, so 200
-    //       windows compared" (172) and the rate line (10.00), not NOT VERIFIED.
+    //       are drawn up to 6 ms late, and at most 121. False for a rate cap that lets the file run faster.
+    // WHY-THIS-SHAPE: under WorkerStalls, so pictures are drawn late; the median is taken only over
+    //       windows in which the host provably pushed no picture past the 8.33 ms allowance (see
+    //       kHoldLimit), since a busy host alone moves an unfiltered median well below the cap. The median
+    //       window, for runCapBudgetChecks()' reason. Missing windows and a slow video fail: they are the
+    //       daemon's.
+    // CONTROL: control_batch.sh 2026-10-20 (F1), NVIDIA, --phase highRate, reverted, in
+    //       backend/daemon/wallpaper_manager.cpp: targetRateLocked() returning 240 with
+    //       VideoSession::Waiting::planned() given no floor under the due time -> "the 240 a second file at
+    //       speed 1 plays no faster than the 120 a second cap"; targetRateLocked() returning 60 -> the speed-1
+    //       rate line.
+    // GOAL: S15.896 -- at 60, the same file at speed 1 and 2 holds a median of at least 59.5 and at most 61 under
+    //       the same holds. CONTROL: control_batch.sh 2026-10-20 (F1), NVIDIA, reverted, --phase highRate60:
+    //       targetRateLocked() returning 120 (backend/daemon/wallpaper_manager.cpp) -> both "no faster than the 60
+    //       a second cap" lines; ShowGrid::shows()' step doubled (renderer/video/picture_skip.h) -> both rate lines;
+    //       showSpacing() squaring the speed -> the speed-2 line alone.
     if (!gradeUnderStalls("the 240 a second file at speed 1",
-                          "a 240 a second video at speed 1 plays at 120 a second, pictures drawn up to 6 ms late "
-                          "included",
-                          119.5)) {
+                          "a 240 a second video at speed 1 plays at " + rate + " a second, pictures drawn up to 6 ms "
+                          "late included",
+                          frameRate - 0.5)) {
         return;
     }
 
@@ -5951,107 +6352,13 @@ void runHighRateChecks(const WallpaperManager::Config& config, const std::string
     //       backend/daemon/wallpaper_manager.cpp reduced to `atSpeed(ownInterval(picture), speed)`, via
     //       control_batch.sh, --phase highRate, 2026-09-29 -> "FAIL: at speed 2, pictures held up by less
     //       than one capped interval keep the video at 120 a second", median 113.35-113.71 (Lavapipe 113.40) with
-    //       every window clear, the speed-1 line green. Reverted.
+    //       every window clear, the speed-1 line green. Reverted. Re-run F1 2026-10-20 at frame rate 120: held.
     if (!setSpeed(2.0)) return;
     if (!gradeUnderStalls("the 240 a second file at speed 2",
-                          "at speed 2, pictures held up by less than one capped interval keep the video at 120 a "
-                          "second",
-                          119.5)) {
+                          "at speed 2, pictures held up by less than one capped interval keep the video at " + rate +
+                              " a second",
+                          frameRate - 0.5)) {
         return;
-    }
-
-    // GOAL: S15.111 -- the lag a long run at the cap banks is bounded to one interval: after two seconds
-    //       of the 120 a second file at speed 2, where it asks for 240 a second and gets 120, slowing to
-    //       0.5 (60 a second) shows about 15 pictures in the first 250 ms and 60 in the first second -- not
-    //       the banked file time replayed at the cap -- and goes on playing.
-    // WHY-THIS-SHAPE: the 120 a second file, not the 240 one: at 0.5 the 240 file asks for exactly the
-    //       cap, so a replay at the cap would look like the rate asked. Counted from the change, because a
-    //       replay lands there: 15 in 250 ms asked, bounded at 20, while a 200 ms lag shows 27. Both counts
-    //       are upper bounds, which a slow or paused host only lowers. The banking stretch is a premise: a
-    //       second before the change that did not run near the cap is reported as not graded. The floor of
-    //       30 is graded only when a thread stamping the clock every 5 ms saw the process run through the
-    //       second; "keeps playing" waits for one more picture, so a stopped video fails whatever the host did.
-    // CONTROL: via control_batch.sh, --phase highRate, 2026-10-14, in backend/daemon/wallpaper_manager.cpp,
-    //       each restored: (a) shownAt's `plan.due - interval` made `plan.due - 24 * interval`, a 200 ms bound
-    //       on the lag; (b) shownAt's trail bound removed, the plan always kept; (c) the Waiting
-    //       advanceSessionLocked builds given 100 times its gap at a speed under 1; (d) the clock's wait
-    //       check returning 100 s ahead at a speed under 1. NVIDIA: (a) the burst line alone, 27 in 250 ms;
-    //       (b) both bound lines, 30 and 119; (c) the floor line, 0 pictures; (d) "keeps playing" after the
-    //       30 s wait, and the floor line, 0 pictures.
-    {
-        const uint64_t beforeRequest = latestGeneration(pictures, kMonitorHighRate);
-        try {
-            manager.requestWallpaper("video", rate120, kMonitorHighRate, {{"speed", 2.0}});
-        } catch (const std::exception& e) {
-            check(false, "the 120 a second file is accepted at speed 2");
-            std::fprintf(stderr, "  refused: %s\n", e.what());
-            return;
-        }
-        worker.post(kMonitorHighRate);
-        if (!signals.wait(kMonitorHighRate, beforeRequest + 1)) {
-            check(false, "the 120 a second file draws once requested at speed 2");
-            return;
-        }
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-        const Clock::time_point banked = Clock::now();
-        size_t atCap = 0;
-        for (const PictureLog::Event& e : pictures.forMonitor(kMonitorHighRate)) {
-            if (e.generation > beforeRequest && e.at >= banked - std::chrono::seconds(1)) ++atCap;
-        }
-        if (atCap < 100) {
-            notVerified("S15.111", "the 120 a second file at speed 2 drew " + std::to_string(atCap) +
-                                       " pictures in the second before slowing, so no lag was banked at the cap");
-            return;
-        }
-        if (!setSpeed(0.5)) return;
-        const Clock::time_point changed = Clock::now();
-        const Clock::time_point burstEnd = changed + std::chrono::milliseconds(250);
-        const Clock::time_point secondEnd = changed + std::chrono::seconds(1);
-        std::chrono::nanoseconds paused{0};
-        {
-            // Stamps the clock every 5 ms across the second: the time it did not get to run beyond that is
-            // how long the host paused this process, which a count taken over wall-clock time must not
-            // grade as the daemon's.
-            std::jthread watch([&paused, secondEnd](std::stop_token stop) {
-                Clock::time_point last = Clock::now();
-                while (!stop.stop_requested() && last < secondEnd) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                    const Clock::time_point now = Clock::now();
-                    if (now - last > std::chrono::milliseconds(20)) paused += now - last - std::chrono::milliseconds(5);
-                    last = now;
-                }
-            });
-            std::this_thread::sleep_until(secondEnd + std::chrono::milliseconds(50));
-        }
-        std::set<uint64_t> inBurst;
-        std::set<uint64_t> inSecond;
-        for (const PictureLog::Event& e : pictures.forMonitor(kMonitorHighRate)) {
-            if (e.at >= changed && e.at < burstEnd) inBurst.insert(e.generation);
-            if (e.at >= changed && e.at < secondEnd) inSecond.insert(e.generation);
-        }
-        const double pausedMs = std::chrono::duration<double, std::milli>(paused).count();
-        std::printf("video_wallpaper_test: the 120 a second file, %zu pictures in the second at speed 2, then slowed "
-                    "to 0.5: %zu picture(s) in the first 250 ms, %zu in the first second; the host paused this "
-                    "process %.1f ms of it\n",
-                    atCap, inBurst.size(), inSecond.size(), pausedMs);
-        std::fflush(stdout);
-        reportUnless(inBurst.size() <= 20,
-                     "slowing below the cap after a long run at it shows no burst of banked pictures in its first "
-                     "quarter second",
-                     std::to_string(inBurst.size()) + " picture(s) in 250 ms, where 15 are asked for");
-        reportUnless(inSecond.size() <= 80,
-                     "slowing below the cap after a long run at it shows the rate asked for, not the lag it banked",
-                     std::to_string(inSecond.size()) + " picture(s) in one second, where 60 are asked for");
-        const uint64_t last = latestGeneration(pictures, kMonitorHighRate);
-        check(signals.wait(kMonitorHighRate, last + 1), "the video keeps playing once slowed to speed 0.5");
-        if (paused > std::chrono::milliseconds(250)) {
-            notVerified("S15.111's floor", "the host paused this process " + std::to_string(pausedMs) +
-                                               " ms of the second after slowing, so its picture count is not graded");
-        } else {
-            reportUnless(inSecond.size() >= 30, "the video plays at no less than half the rate asked for once slowed to "
-                                                "speed 0.5",
-                         std::to_string(inSecond.size()) + " picture(s) in one second, where 60 are asked for");
-        }
     }
 }
 
@@ -12365,31 +12672,51 @@ int main(int argc, char** argv) {
             }
         });
         phase("irregularWallpaper", [&] { runIrregularWallpaperChecks(config, clip, still); });
+        // Each rate phase at the frame-rate setting 120 (S15.895) and, with "60" in its name, at the default 60
+        // (S15.896).
         const bool clampSelected = phaseSelected("intervalClamp");
+        const bool clamp60Selected = phaseSelected("intervalClamp60");
         const bool capSelected = phaseSelected("capBudget");
+        const bool cap60Selected = phaseSelected("capBudget60");
         if (std::filesystem::exists(fast) && std::filesystem::exists(gap)) {
-            if (clampSelected) guardedPhase("intervalClamp", [&] { runIntervalClampChecks(config, fast, gap); });
-            if (capSelected && std::filesystem::exists(rate120)) {
-                guardedPhase("capBudget", [&] { runCapBudgetChecks(config, rate120); });
-            } else if (capSelected) {
+            if (clampSelected) guardedPhase("intervalClamp", [&] { runIntervalClampChecks(config, fast, gap, 120); });
+            if (clamp60Selected) guardedPhase("intervalClamp60", [&] { runIntervalClampChecks(config, fast, gap, 60); });
+            if ((capSelected || cap60Selected) && std::filesystem::exists(rate120)) {
+                if (capSelected) guardedPhase("capBudget", [&] { runCapBudgetChecks(config, rate120, 120); });
+                if (cap60Selected) guardedPhase("capBudget60", [&] { runCapBudgetChecks(config, rate120, 60); });
+            } else if (capSelected || cap60Selected) {
                 notVerified("S13.183", "the fixture " + rate120 + " was not generated, so the cap's budget was not "
                                        "exercised");
             }
-        } else if (clampSelected || capSelected) {
+        } else if (clampSelected || clamp60Selected || capSelected || cap60Selected) {
             notVerified("S13.175-S13.176",
                         "the interval-clamp fixtures " + fast + " and " + gap +
                             " were not both generated, so neither bound on the gap between two pictures was "
                             "exercised -- a file declaring a thousand pictures a second would go ungraded");
         }
-        phase("highRate", [&] {
-            if (std::filesystem::exists(rate240) && std::filesystem::exists(rate120)) {
-                runHighRateChecks(config, rate240, rate120);
+        if (phaseSelected("thinRate60")) {
+            guardedPhase("thinRate60", [&] {
+                for (const char* codec : {"h264", "hevc", "av1"}) runThinRateChecks(config, codec, 60);
+            });
+        }
+        if (phaseSelected("thinRate120")) {
+            guardedPhase("thinRate120", [&] {
+                for (const char* codec : {"h264", "hevc", "av1"}) runThinRateChecks(config, codec, 120);
+            });
+        }
+        if (phaseSelected("thinSlice")) guardedPhase("thinSlice", [&] { runThinSliceChecks(config, fast); });
+        if (phaseSelected("thinShared")) guardedPhase("thinShared", [&] { runThinSharedChecks(config); });
+        const auto highRateAt = [&](int frameRate) {
+            if (std::filesystem::exists(rate240)) {
+                runHighRateChecks(config, rate240, frameRate);
             } else {
-                notVerified("S15.109-S15.111", "the fixtures " + rate240 + " and " + rate120 +
-                                               " were not both generated, so playback above the 120-a-second cap "
-                                               "was not exercised");
+                notVerified("S15.109-S15.110", "the fixture " + rate240 +
+                                                   " was not generated, so playback above the frame-rate cap was not "
+                                                   "exercised");
             }
-        });
+        };
+        phase("highRate", [&] { highRateAt(120); });
+        phase("highRate60", [&] { highRateAt(60); });
         phase("handoverLog", [&] { runHandoverLogChecks(config, clip); });
         phase("departure", [&] { runDepartureChecks(config, onePicture); });
         phase("resumeCredit", [&] { runResumeCreditChecks(config, clip, still, onePicture); });

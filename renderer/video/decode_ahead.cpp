@@ -37,6 +37,7 @@ struct DecodeAhead::Shared {
     // allocates.
     std::vector<Item> items;
     PictureSkip skip = PictureSkip::Nothing;
+    std::optional<NumberedGrids> unshown;
     bool stopping = false;
     bool exited = false;
     // A take() found nothing, so the next item calls the ready hook.
@@ -62,6 +63,7 @@ std::unique_ptr<DecodeAhead> DecodeAhead::start(Device& device, std::unique_ptr<
     shared.around = std::move(around);
     shared.ready = std::move(ready);
     shared.source = std::move(source);
+    shared.unshown = shared.source->decoder().unshown();
     // Everything that can throw from here on hands the source back below.
     try {
         shared.source->askDeviceThrough([&shared] { return ask(shared); });
@@ -114,9 +116,13 @@ void DecodeAhead::run(Shared& shared) noexcept {
     struct Call {
         Shared* shared;
         PictureSkip skip = PictureSkip::Nothing;
+        std::optional<NumberedGrids> unshown;
         PictureSource::Step step = PictureSource::Dropping{};
     } call{&shared};
-    const auto decode = [&call] { call.step = call.shared->source->next(1, call.skip); };
+    const auto decode = [&call] {
+        call.shared->source->decoder().leaveUnshown(call.unshown);
+        call.step = call.shared->source->next(1, call.skip);
+    };
 
     for (;;) {
         {
@@ -124,6 +130,7 @@ void DecodeAhead::run(Shared& shared) noexcept {
             shared.changed.wait(lock, [&] { return shared.stopping || shared.pictures() < kDepth; });
             if (shared.stopping) break;
             call.skip = shared.skip;
+            call.unshown = shared.unshown;
         }
         // One picture dropped at a time, so a stop is seen between drops.
         std::optional<Item> item;
@@ -208,6 +215,11 @@ std::optional<DecodeAhead::Item> DecodeAhead::take(PictureSkip skip) {
         return std::nullopt;
     }
     return pop();
+}
+
+void DecodeAhead::leaveUnshown(std::optional<NumberedGrids> grids) {
+    std::lock_guard<std::mutex> lock(m_shared->mutex);
+    m_shared->unshown = grids;
 }
 
 DecodeAhead::Item DecodeAhead::wait(std::optional<PictureSkip> skip) {
