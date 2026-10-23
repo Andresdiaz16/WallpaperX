@@ -206,6 +206,9 @@ void Device::destroyResources() {
         // The pool owns them; destroying it below frees them all.
         m_freeCommandBuffers.clear();
 
+        if (const VkSemaphore marker = m_marker.exchange(VK_NULL_HANDLE)) vkDestroySemaphore(m_device, marker, nullptr);
+        m_lastMarker.store(0);
+
         if (m_commandPool) {
             vkDestroyCommandPool(m_device, m_commandPool, nullptr);
             m_commandPool = VK_NULL_HANDLE;
@@ -592,6 +595,19 @@ void Device::createLogicalDevice() {
         synchronizedQueues = queues.internallySynchronizedQueues == VK_TRUE;
         if (synchronizedQueues) deviceExtensions.push_back(VK_KHR_INTERNALLY_SYNCHRONIZED_QUEUES_EXTENSION_NAME);
     }
+    // ffmpeg turns on inline parameter sets from the extension name alone, so the name is listed
+    // only with the feature behind it; without them ffmpeg's cached session parameters miss sets
+    // that arrive as container side data.
+    bool inlineParameters = false;
+    if (enableDecode && hasExtension(available, VK_KHR_VIDEO_MAINTENANCE_2_EXTENSION_NAME)) {
+        VkPhysicalDeviceVideoMaintenance2FeaturesKHR maintenance{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_MAINTENANCE_2_FEATURES_KHR};
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        query.pNext = &maintenance;
+        vkGetPhysicalDeviceFeatures2(m_physicalDevice, &query);
+        inlineParameters = maintenance.videoMaintenance2 == VK_TRUE;
+        if (inlineParameters) deviceExtensions.push_back(VK_KHR_VIDEO_MAINTENANCE_2_EXTENSION_NAME);
+    }
 
     // The chain, in the order the header states. A tier's structs are linked and their flags
     // set together, so a struct that is out of the chain reads VK_FALSE.
@@ -612,12 +628,19 @@ void Device::createLogicalDevice() {
         m_features.descriptorBuffer.descriptorBuffer = VK_TRUE;
         m_features.descriptorBuffer.pNext = nullptr;
     }
-    if (synchronizedQueues) {
+    const auto append = [&](auto& feature) {
         auto* tail = reinterpret_cast<VkBaseOutStructure*>(&m_features.features2);
         while (tail->pNext != nullptr) tail = tail->pNext;
-        tail->pNext = reinterpret_cast<VkBaseOutStructure*>(&m_features.internallySynchronizedQueues);
+        tail->pNext = reinterpret_cast<VkBaseOutStructure*>(&feature);
+        feature.pNext = nullptr;
+    };
+    if (synchronizedQueues) {
+        append(m_features.internallySynchronizedQueues);
         m_features.internallySynchronizedQueues.internallySynchronizedQueues = VK_TRUE;
-        m_features.internallySynchronizedQueues.pNext = nullptr;
+    }
+    if (inlineParameters) {
+        append(m_features.videoMaintenance2);
+        m_features.videoMaintenance2.videoMaintenance2 = VK_TRUE;
     }
     // Every queue is created, and fetched, with the same flags.
     const VkDeviceQueueCreateFlags queueFlags =
@@ -845,6 +868,29 @@ Device::SubmitTicket Device::submit(const std::function<void(VkCommandBuffer)>& 
     return SubmitTicket{serial};
 }
 
+Device::SubmitTicket Device::submitMarker() {
+    assertGpuThread("Device::submitMarker");
+    if (!timelineSemaphore()) return submit([](VkCommandBuffer) {});
+    VkSemaphore marker = m_marker.load(std::memory_order_relaxed);
+    if (marker == VK_NULL_HANDLE) {
+        VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+        type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        info.pNext = &type;
+        if (const VkResult r = observe(vkCreateSemaphore(m_device, &info, nullptr, &marker)); r != VK_SUCCESS) {
+            throwVkFailure("Device::submitMarker: vkCreateSemaphore", r);
+        }
+        m_marker.store(marker, std::memory_order_release);
+    }
+    // The serial submit() is about to give the batch: nothing else submits meanwhile on this thread.
+    const uint64_t serial = m_nextSerial.load(std::memory_order_relaxed);
+    SubmitScope scope;
+    scope.timelineSignal.emplace_back(marker, serial);
+    const SubmitTicket ticket = submit([](VkCommandBuffer) {}, scope);
+    m_lastMarker.store(serial, std::memory_order_release);
+    return ticket;
+}
+
 void Device::wait(SubmitTicket ticket) {
     assertGpuThread("Device::wait");
     // First, so the stalled test below is asked about work that is still outstanding now: a
@@ -981,8 +1027,14 @@ Device::SubmitTicket Device::lastSubmission() const {
 
 bool Device::hasCompleted(SubmitTicket ticket) {
     if (ticket.m_serial <= m_completedThrough.load(std::memory_order_acquire)) return true;
-    // The pending list is the GPU thread's alone.
-    if (std::this_thread::get_id() != m_gpuThread.load(std::memory_order_relaxed)) return false;
+    // The pending list is the GPU thread's alone. A marker's signal covers every batch submitted before
+    // it on this queue, so one at or past the ticket that has signalled answers for it.
+    if (std::this_thread::get_id() != m_gpuThread.load(std::memory_order_relaxed)) {
+        if (ticket.m_serial > m_lastMarker.load(std::memory_order_acquire)) return false;
+        uint64_t reached = 0;
+        return vkGetSemaphoreCounterValue(m_device, m_marker.load(std::memory_order_acquire), &reached) == VK_SUCCESS &&
+               reached >= ticket.m_serial;
+    }
     // Checked before retiring, so a ticket old enough to have been forgotten costs no driver
     // call at all -- which is the common case for a caller polling one repeatedly.
     if (!isPending(ticket.m_serial)) return true;

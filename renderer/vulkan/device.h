@@ -110,6 +110,11 @@ public:
         return m_features.internallySynchronizedQueues.internallySynchronizedQueues == VK_TRUE;
     }
 
+    // Whether VK_KHR_video_maintenance2 is enabled, which a decoder library given this device's
+    // extension list takes as leave to pass each picture's parameter sets inline rather than
+    // through session parameters it builds and caches.
+    bool videoInlineParameters() const { return m_features.videoMaintenance2.videoMaintenance2 == VK_TRUE; }
+
     const DeviceInfo& info() const { return m_info; }
     DescriptorTier descriptorTier() const { return m_selectedTier; }
 
@@ -228,6 +233,12 @@ public:
     // this queue, which submission order and the barriers in them already give.
     SubmitTicket submit(const std::function<void(VkCommandBuffer)>& record) { return submit(record, {}); }
 
+    // submit() of an empty batch that also signals a timeline semaphore of this Device's, so that
+    // hasCompleted() off the GPU thread learns of this batch, and of every one before it, once the
+    // GPU has run it rather than at the GPU thread's next look. Throws as submit() does, and
+    // GpuFailure when the semaphore cannot be made.
+    SubmitTicket submitMarker();
+
     // submit() with no semaphores, waited on before it returns. For work whose result the
     // host reads next: a readback that maps the buffer it copied into, an upload whose
     // staging buffer is freed at the end of the call.
@@ -297,8 +308,8 @@ public:
 
     // Whether `ticket`'s batch has completed, without blocking. Only ever goes from false to
     // true. On the GPU thread it retires whatever has finished on the way; on any other it
-    // answers from the GPU thread's last look, so it can still say false for a batch that has
-    // finished since -- never true for one that has not.
+    // answers from the GPU thread's last look and the last submitMarker() batch, so it can still
+    // say false for a batch that has finished since -- never true for one that has not.
     bool hasCompleted(SubmitTicket ticket);
 
     // Aborts unless called from the thread that created this Device.
@@ -411,8 +422,8 @@ private:
 
     // The feature chain vkCreateDevice was given, kept whole so it can be read back. Linked
     // from features2 through vulkan11, vulkan12, vulkan13, the extension structs of the
-    // descriptor tier in use, then internallySynchronizedQueues. A struct is linked and its
-    // flags set in one place, or neither: that is what lets an unlinked struct read VK_FALSE
+    // descriptor tier in use, then internallySynchronizedQueues, then videoMaintenance2. A struct
+    // is linked and its flags set in one place, or neither: that is what lets an unlinked struct read VK_FALSE
     // throughout, which every accessor above relies on. The links point into this object,
     // which is why the Device is not movable.
     struct EnabledFeatures {
@@ -429,6 +440,8 @@ private:
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
         VkPhysicalDeviceInternallySynchronizedQueuesFeaturesKHR internallySynchronizedQueues{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INTERNALLY_SYNCHRONIZED_QUEUES_FEATURES_KHR};
+        VkPhysicalDeviceVideoMaintenance2FeaturesKHR videoMaintenance2{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_MAINTENANCE_2_FEATURES_KHR};
 
         EnabledFeatures() = default;
         EnabledFeatures(const EnabledFeatures&) = delete;
@@ -460,6 +473,11 @@ private:
     // last found.
     std::atomic<uint64_t> m_nextSerial{1};
     std::atomic<uint64_t> m_completedThrough{0};
+    // submitMarker()'s timeline semaphore, made at its first call, and the serial of the last batch
+    // that signals it, which is also the value it signals. Written on the GPU thread, read on any:
+    // the serial is stored after the semaphore.
+    std::atomic<VkSemaphore> m_marker{VK_NULL_HANDLE};
+    std::atomic<uint64_t> m_lastMarker{0};
 
     // Whether something the GPU may still have been reading was left unfreed. Written only by
     // abandon(); destroying the device or the VMA allocator around an orphan is a validation

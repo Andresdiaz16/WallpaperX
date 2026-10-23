@@ -1763,6 +1763,16 @@ private:
         std::optional<Heard> heard;
 
         DecodeLoad decodeLoad;
+        // overflowsCap()'s answer and what it was asked of: the playing screens' spacings, in order, and
+        // the cap's at the session's speed. Asked again only when those change, since it walks every
+        // point of every grid.
+        struct CapVerdict {
+            std::array<std::chrono::nanoseconds, kMaxMonitors> spacings{};
+            size_t count = 0;
+            std::chrono::nanoseconds cap{};
+            bool over = false;
+        };
+        std::optional<CapVerdict> capVerdict;
     };
     // Before the output and the sessions, whose threads call it until they are destroyed.
     std::mutex m_clockWakeMutex;

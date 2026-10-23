@@ -32,6 +32,8 @@ struct AVPacket;
 
 namespace wallpaperx {
 
+struct CodecHeader;
+
 // What a conversion to RGB needs of a decoded picture beyond its pixels. Read off the frame
 // ffmpeg produced, never assumed: the matrix and range decide the conversion, and a wrong
 // default is a visibly wrong picture. UNSPECIFIED is common and is the converter's to resolve.
@@ -169,7 +171,8 @@ private:
 // which retries in software after any failure. The device is asked whether it accepts the
 // stream -- codec, profile, bit depth, coded size, the image it would decode into -- and a no
 // selects software. So does a picture its images cannot hold or smaller than the device decodes,
-// checked before it is decoded; DecodedFrame says why the two can differ. When
+// checked before it is decoded; DecodedFrame says why the two can differ; and a stream lacking a
+// picture it references, which Path::SoftwareMissingReference describes. When
 // ffmpeg's hardware path fails after the device's yes, which it can for reasons of its own, the
 // device is asked whether it still answers: one that does not is a GpuFailure, one that does
 // means decoding continues in software, as next() describes.
@@ -182,9 +185,11 @@ private:
 // Frames handed out may outlive this decoder but not the Device. A size or format change
 // mid-stream leaves an image pool no picture uses, and a switch to software leaves the hardware
 // decoder it replaces; next() frees each once this renderer's last read of it has finished, and
-// never waits for those reads. That free still enters ffmpeg's unbounded wait on its own decode
-// work, which a device that stalls without being declared lost never returns from -- unguarded,
-// because the only bounded question here is itself a wait and the playback path may make none.
+// never waits for those reads. The hardware decoder's free also enters ffmpeg's unbounded wait on
+// its own decode work, which a device that stalls without being declared lost never returns from,
+// so retiring it submits an empty batch, once per decoder, and next() frees it only once both that
+// batch and those reads have completed -- polled, never waited for. A batch the Device refuses, or
+// one that never completes, leaves the decoder for the destructor to ask again or leak.
 //
 // Destroying this decoder frees the rest once no frame is out, where ffmpeg waits without bound
 // twice over: on each image's semaphore, which covers this renderer's reads of it, and on its own
@@ -199,14 +204,33 @@ class VideoDecoder {
 public:
     // Where frames come from. The software states say why hardware was not used.
     enum class Path {
-        Undecided,          // no frame decoded yet, and hardware is still possible
+        Undecided,          // no frame decoded yet by the decoder now open, and hardware is still possible
         Hardware,
         SoftwareNoDecoder,  // the device has no video decode queue at all (Lavapipe)
         SoftwareCodec,      // the device, or ffmpeg, decodes but not this codec
         // The device decodes this codec but not this stream -- profile, depth, size -- or not
         // into one multi-planar image FrameConverter::readsDeviceImage() accepts and can copy
-        // from under this profile; or ffmpeg's hardware path failed on a device that still answers.
+        // from under this profile; or ffmpeg's hardware path failed on a device that still answers; or an
+        // H.264 or HEVC packet that is not a reset point carries AV_PKT_DATA_NEW_EXTRADATA with parameter sets
+        // unlike the device codec's, which ffmpeg's hardware path does not follow unless
+        // Device::videoInlineParameters(). At a reset point the device codec is emptied, freed and opened
+        // again from the new extradata instead; a change in the length-prefix size alone stays on it. Software
+        // continues from the picture after the last returned; after that last cause, only for the rest of the
+        // pass: the next pass returns to the device as Path::SoftwareMissingReference's hand-back does, and
+        // leaves it for software, emptied, at the last reset point it was sent before that packet. A device codec
+        // opened by such a switch, or by a hand-back, that fails on a device that still answers -- its setup, or
+        // the device's memory for its images -- also leaves the device for the rest of the pass only.
         SoftwareRefused,
+        // An H.264 or HEVC stream lacking a picture another references, for which ffmpeg would make up a
+        // stand-in: damaged, starting part way into a group -- a cut file, an H.264 I picture that is not
+        // an IDR, an HEVC CRA with pictures kept for later -- or permitting frame_num gaps. On the device
+        // ffmpeg binds the stand-in in DPB slots never activated, sharing another picture's image, and
+        // destroys an image view the decode still reads; so each stand-in sends the stream to software
+        // until the first reset point, as resetsDecoder() defines one, after the packet that needed it,
+        // and the device decodes from there. Not once parameter sets beyond the stream's extradata have been
+        // sent this pass: a device decoder opened from it would lack them, so software keeps the rest of the
+        // pass. The third stand-in in one pass keeps it in software for good.
+        SoftwareMissingReference,
     };
 
     // Opens `file` and readies the decoder; the path is decided when the first frame is decoded,
@@ -234,6 +258,10 @@ public:
     // packet counts as one. The scan stops about one window past the budget, so a reset point further
     // back is never found and the start is the stream's first picture. In software, a seek that has
     // to retry further back than the budget starts at the stream's first picture too.
+    //
+    // In an FLV or NUT file the start is made by the first next(), which first reads the packets before the
+    // position, without decoding them, to learn which extradata applies there; startPending() says so. That
+    // read grows with the position, holds whichever thread calls next(), and counts against no drop limit.
     VideoDecoder(Device& device, const std::string& file, std::optional<StreamPosition> startAt = std::nullopt);
     ~VideoDecoder();
 
@@ -252,7 +280,12 @@ public:
     // failure costs about a keyframe interval wherever in the file it falls. A seek that cannot
     // be shown to have landed at or before that picture -- a transport stream's can land past it --
     // is retried further back. A container that cannot seek is decoded from its first packet,
-    // exactly but at a cost that grows with the position.
+    // exactly but at a cost that grows with the position. So is a stream that sent parameter sets beyond
+    // its extradata, or that the device started part way in and was sent a packet, which the software
+    // decoder, opened from the extradata, would lack; a start among these keeps its position however far
+    // in it lies, every picture before it decoded and dropped. Handing a stream back to the device, as
+    // Path::SoftwareMissingReference describes, seeks nowhere: the software decoder is emptied at the
+    // reset point and the device decodes from it, so none is returned twice there either.
     //
     // Pictures without timestamps -- a raw bitstream -- or whose timestamps did not increase are
     // matched by the packet each was decoded from instead: software decodes from the first packet
@@ -272,18 +305,22 @@ public:
 
     // next() that gives up for now once it has decoded and dropped `dropLimit` pictures on the way to
     // the one it returns -- what a start part way in and a software resume both decode through. It
-    // drops at least one before giving up. Dropping then: nothing is lost, and the next call of either
-    // form carries on from there.
+    // drops at least one before giving up, unless stopStartOn() gives up the start's read. Dropping then:
+    // nothing is lost, and the next call of either form carries on from there.
     struct Dropping {};
     std::variant<std::optional<DecodedFrame>, Dropping> next(uint32_t dropLimit, PictureSkip skip = PictureSkip::Nothing);
 
     // Starts the stream again: the next picture is its first, and a later hardware failure resumes
     // among the pictures returned since, never earlier ones. The path is kept, so a decoder that fell
-    // back to software stays there. The codec is flushed, not reopened, and the container rewound;
-    // the rewind reopens the container only when no seek is shown to reach its first video packet,
-    // and then reads the file this decoder opened even if its path has since been deleted or renamed
-    // over. The file must not be rewritten in place while this decoder holds it: nothing can detect
-    // that, so replacing a wallpaper takes a new decoder or pipeline. Throws as next() does.
+    // back to software stays there, unless it is Path::SoftwareMissingReference and has not given up, or
+    // went to software for side data the device could not take: those hand the stream back at the new
+    // pass's first reset point. The codec is flushed, not reopened, and given the stream's own extradata
+    // again with the first packet if side data replaced it -- a device codec that cannot take its parameter
+    // sets that way is opened again from it instead; the container is rewound, and the rewind reopens the
+    // container only when no seek is shown to reach its first video packet, and then reads the file this
+    // decoder opened even if its path has since been deleted or renamed over. The file must not be rewritten
+    // in place while this decoder holds it: nothing can detect that, so replacing a wallpaper takes a new
+    // decoder or pipeline. Throws as next() does.
     void restart();
 
     // Whether the pictures since this decoder opened began part way in, at or before the constructor's
@@ -291,10 +328,23 @@ public:
     // start falls back to the first picture.
     bool startedMidStream() const { return m_startedAfter.has_value(); }
 
+    // Whether the next next() first makes the constructor's start, reading the file up to its position.
+    // Whatever the path: a stream opened in software reads it too.
+    bool startPending() const { return m_deferredStart.has_value(); }
+
+    // While `*stop` is true, next(dropLimit) gives that read up at the packet it reaches and returns Dropping
+    // with the start still pending; nothing is sought from a read cut short, and a later call carries the read
+    // on. next() without a limit ignores it. Read once a packet on the thread calling next(), so it must stay
+    // valid while next() can be called; null, the default, never stops the read.
+    void stopStartOn(const std::atomic<bool>* stop) { m_stopStart = stop; }
+
     // Where, on the timeline presentationTime() uses, the latest-ending video packet read so far that is
     // meant to be shown ends: once next() has run out, the stream's end, which a skipped last picture
     // leaves no other way to know. Nothing before a packet with a timestamp.
     std::optional<std::chrono::nanoseconds> readThrough() const { return m_readThrough; }
+
+    // How many extradata changes the decoder has recorded in the file. On the thread that calls next().
+    size_t extradataChangesRecorded() const { return m_extradataMap.changes.size(); }
 
     Path path() const { return m_path; }
 
@@ -309,10 +359,24 @@ public:
     // throws but GpuFailure.
     static bool deviceAnswers(Device& device);
 
+    // The same question asked without waiting: an empty batch submitted once and then polled. Unsent
+    // until a thread that may submit has submitted it; Refused where the Device would not take it, as
+    // one with a stalled batch will not.
+    struct ProbeUnsent {};
+    struct ProbeRefused {};
+    using Probe = std::variant<ProbeUnsent, Device::SubmitTicket, ProbeRefused>;
+
+    // How a decoder whose next() runs off the GPU thread sends that probe: `probe` must not wait. It
+    // posts the probe to the GPU thread and returns ProbeUnsent until that thread has submitted it,
+    // then the outcome, once. Unset, the decoder submits it itself.
+    void probeDeviceThrough(std::function<Probe()> probe) { m_probeDevice = std::move(probe); }
+
     // The highest level next() applies, decided by the codec; one asked above it is applied as this.
     // H.264 and HEVC: NonKey in software, Unreferenced while the stream is or may be decoded on the
     // device, where FFmpeg 9.0.2's Vulkan decode, given a reference picture skipped, binds a stand-in
-    // sharing another picture's image and can destroy an image view the GPU still reads. MPEG-1, -2 and
+    // sharing another picture's image and can destroy an image view the GPU still reads. HEVC's
+    // Unreferenced leaves out a sub-layer non-reference picture only in the highest temporal sub-layer
+    // its parameter sets declare: a higher sub-layer can reference one below it. MPEG-1, -2 and
     // -4 Part 2: Unreferenced, since resetsDecoder() reads none of their reset points to come back down
     // from deeper at. Nothing for every other codec: AV1 and VP9 ignore a level changed after opening.
     PictureSkip deepestSkip() const;
@@ -344,16 +408,34 @@ private:
     bool holds(const AVBufferRef& frames, int width, int height) const;
     void releaseIdleFramesContexts() noexcept;
     void releaseRetiredCodec() noexcept;
+    Probe probeDevice() noexcept;
     void openContainer();
-    void openDecoder();
+    // From the stream's parameters, with `extradata` in place of the stream's own when given.
+    void openDecoder(const std::optional<std::vector<uint8_t>>& extradata = std::nullopt);
     void closeDecoder() noexcept;
     void retireDecoder() noexcept;
     void closeAll() noexcept;
     void reopenInSoftware();
+    void advanceHandBack();
+    // Replaces the emptied codec with the one Emptying names, which decodes from the held packet.
+    void switchDecoder();
+    // Path::SoftwareRefused after the device codec failed on a device that still answers: for good from the
+    // constructor's codec; from a switch's, whose stream the device has decoded before, for the rest of the pass.
+    void refuseAfterFailure();
+    // Whether `err`, from an ffmpeg call watched for allocations, is a shortage to raise as ResourceExhausted:
+    // the host's, or any on the constructor's codec. Only the device's own memory, on a switch's codec, is not.
+    bool raisesShortage(int err) const;
+    // The extradata in effect at the held packet: its own side data, else where the map places it, else what
+    // the open codec holds.
+    std::optional<std::vector<uint8_t>> extradataAtHeld() const;
+    // Every seek of the container: after one, packet numbers and the extradata in effect are unknown until
+    // the packet it lands on is read.
+    int seek(int stream, int64_t target, int flags);
     void seekAgain();
     // Positions the container for a decode that resumes after m_returned, and sets what it drops.
-    // Software only: the hardware decoder seeks only in startAt().
-    void seekToResume();
+    // Software only: the hardware decoder seeks only in startAt(). `fromFirstPacket` reads from the first
+    // packet whatever the distance, so a start keeps its position.
+    void seekToResume(bool fromFirstPacket = false);
     void startAt(StreamPosition position);
     void startAtResetPoint(int64_t resume);
     // Gives up a start part way in: the next picture is the stream's first, as a plain open's is.
@@ -370,6 +452,9 @@ private:
         int size;
         static PacketMark of(const AVPacket& packet);
         bool matches(const AVPacket& packet) const;
+        // Whether this packet lies at or before `other` in the file: by byte position where both have one,
+        // else by decode time; empty when neither orders them.
+        std::optional<bool> notAfter(const PacketMark& other) const;
     };
     struct ResetPoint {
         PacketMark mark;
@@ -416,6 +501,23 @@ private:
     bool decodeWorkCanDrain() noexcept;
     int readVideoPacket();
     void numberPacket();
+    // Places the packet just read against m_extradataMap: what extradata is in effect there, and what the map
+    // learns from it.
+    void followExtradata();
+    // Whether a start in this file reads it up to the position first: mapExtradataUpTo() would read.
+    bool mapsBeforeStart() const;
+    // Reads without decoding, from the first packet, the packets up to `resume`, where the container's
+    // landings cannot otherwise be placed. Only before the first seek. Advisory: a read error or a run of
+    // packets far past the count the distance implies ends the map there; after a read error the start's
+    // landing is Assumed rather than Unknown. False when m_stopStart cut it short
+    // under `stoppable`; another call carries on from the packet it reached.
+    bool mapExtradataUpTo(int64_t resume, bool stoppable);
+    // The codec and m_extradata, as the NAL unit readers take them.
+    CodecHeader header() const;
+    // The extradata the open codec holds.
+    CodecHeader codecHeader() const;
+    void alignCodecExtradata();
+    void recordExtradataSent();
     void failDecode(const char* what, int err);
 
     Device& m_device;
@@ -446,6 +548,9 @@ private:
     struct RetiredCodec {
         AVCodecContext* codec;
         Device::SubmitTicket lastReader;
+        // Sent at retirement; the codec is freed once this and lastReader have both completed. Refused,
+        // the codec is left for closeDecoder() to free or leak.
+        Probe probe;
     };
     std::optional<RetiredCodec> m_retiredCodec;
     PFN_vkGetPhysicalDeviceVideoFormatPropertiesKHR m_videoFormatProperties = nullptr;
@@ -524,6 +629,9 @@ private:
     // frame arrives. A format negotiation that comes back without Vulkan while this is set is
     // ffmpeg retreating from a hardware setup that failed after the device's yes.
     bool m_awaitingHardwareSetup = false;
+    // Whether ffmpeg has asked for a device picture during the send or receive call now running, which
+    // decodes at most the one packet next() sent last: allocatePicture() reads a second as a stand-in.
+    bool m_pictureAllocated = false;
     // What next() must do before it decodes again, decided inside an ffmpeg call. Ordered: a reopen
     // in software also seeks, so it is never lowered to a seek.
     enum class Pending {
@@ -537,10 +645,81 @@ private:
     };
     Pending m_pending = Pending::Nothing;
     void require(Pending pending) { m_pending = std::max(m_pending, pending); }
+    // How far a stream a stand-in sent to software has come towards the device: until software sends
+    // the packet that needed the stand-in or one after it in decode order, by decode time or else byte
+    // position; then until a reset point, which is held while the software decoder is emptied. Empty on
+    // the device, and once given up. A stand-in packet with neither is only met again, or not this pass.
+    // NextPass is a stream sent to software by side data the device cannot take: it stays there until
+    // restart(), which makes it AwaitingReset. Emptying is any switch of codec at the held reset point:
+    // `to` is Path::Undecided for the device, which is then freed first if it is the codec emptied, else
+    // Path::SoftwareRefused, which leaves the stream NextPass.
+    struct PassingStandIn {
+        PacketMark packet;
+    };
+    struct AwaitingReset {};
+    struct Emptying {
+        Path to;
+    };
+    struct NextPass {};
+    std::variant<std::monostate, PassingStandIn, AwaitingReset, Emptying, NextPass> m_handBack;
+    // The last reset point sent to a device codec that cannot take parameter sets inline, and where such a
+    // codec leaves the stream for software on a later pass: the one sent last before a packet it could not take.
+    std::optional<PacketMark> m_resetSent;
+    std::optional<PacketMark> m_leaveDeviceAt;
+    // A switch has opened a codec, so a device codec now open is a switch's, not the constructor's.
+    bool m_switched = false;
+    // Whether this pass may still hand the stream back, so the parameter sets sent are tracked in software.
+    bool handingBackThisPass() const {
+        return !std::holds_alternative<std::monostate>(m_handBack) && !std::holds_alternative<NextPass>(m_handBack);
+    }
+    // Whether a codec opened from the stream's extradata now knows every parameter set sent: InExtradata
+    // while every packet sent since the last read from the first packet gave none beyond it. MaybeBeyond
+    // once one did, and once a device codec that started part way in, skipping packets, has accepted one.
+    // Then the device takes no stream back, and a software reopen reads from the first packet. StartSkipped
+    // while that device codec has accepted none: a seek leaves software as informed as it, so a reopen
+    // seeks and counts as InExtradata. Tracked only while a codec could be opened from it: on the device,
+    // or awaiting a hand-back.
+    enum class ParameterSetsSent { InExtradata, StartSkipped, MaybeBeyond };
+    ParameterSetsSent m_parameterSets = ParameterSetsSent::InExtradata;
+    // The extradata in effect at the packet last read: the latest AV_PKT_DATA_NEW_EXTRADATA at or before it in
+    // the file, or the stream's own while none. Known while the packets read follow on from packet 1, or from a
+    // landing m_extradataMap places; Landing from a seek until the packet it lands on is read; Assumed after a
+    // landing within the map's `assumedThrough`, used as Known but never extending the map, which would record
+    // the unread packets as changing nothing; Unknown after any other landing the map does not reach, where
+    // m_extradata is only the last one read.
+    std::optional<std::vector<uint8_t>> m_extradata;
+    enum class ExtradataAt { Known, Landing, Assumed, Unknown };
+    ExtradataAt m_extradataAt = ExtradataAt::Known;
+    bool extradataPlaced() const { return m_extradataAt == ExtradataAt::Known || m_extradataAt == ExtradataAt::Assumed; }
+    // Each AV_PKT_DATA_NEW_EXTRADATA that changed the extradata in effect, in file order, with the packet that
+    // carried it: all of them up to `through`, the furthest packet read while Known. Extended only by a packet
+    // shown to lie past `through`. Never shrinks: the file is not rewritten while this decoder holds it.
+    // `assumedThrough`, in decode time, is the start's position where a read error ended the read before it:
+    // up to there a landing past `through` takes the last change as in effect, so the start lands where it
+    // was asked to. Wrong only where the file changes its extradata between the damage and the landing.
+    struct ExtradataChange {
+        PacketMark at;
+        std::vector<uint8_t> bytes;
+    };
+    struct ExtradataMap {
+        std::vector<ExtradataChange> changes;
+        std::optional<PacketMark> through;
+        std::optional<int64_t> assumedThrough;
+    };
+    ExtradataMap m_extradataMap;
+    // The extradata the open codec holds, where it differs from the stream's own: the one it was opened with,
+    // or the AV_PKT_DATA_NEW_EXTRADATA last sent to it. A flush keeps it, as ffmpeg's codec does.
+    std::optional<std::vector<uint8_t>> m_codecExtradata;
+    // The constructor's start, while the first next() has yet to make it.
+    std::optional<StreamPosition> m_deferredStart;
+    const std::atomic<bool>* m_stopStart = nullptr;
+    // Stand-ins met this pass, and the packet sent last, which a stand-in is blamed on.
+    uint32_t m_standIns = 0;
+    std::optional<PacketMark> m_lastSent;
     // While the pictures since the open began part way in: the timestamp the start dropped through,
     // which a software resume that has lost m_returned's timestamp starts from again.
     std::optional<int64_t> m_startedAfter;
-    // A failure decided inside the format callback, which cannot throw through ffmpeg's frames;
+    // A failure decided inside the format or picture callback, which cannot throw through ffmpeg's frames;
     // rethrown when ffmpeg reports the error that follows. Hardware only, whose codec is
     // single-threaded and so calls back on the thread that called next().
     std::exception_ptr m_parkedFailure;
@@ -548,6 +727,7 @@ private:
     // frame thread runs it; decode() turns it into the file's failure. Per codec: openDecoder() clears it.
     std::atomic<bool> m_softwareFormatRefused{false};
     std::function<bool()> m_askDevice;
+    std::function<Probe()> m_probeDevice;
 };
 
 }

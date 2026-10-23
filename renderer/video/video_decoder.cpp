@@ -30,6 +30,7 @@ extern "C" {
 
 #include <algorithm>
 #include <cerrno>
+#include <cstring>
 #include <iterator>
 #include <new>
 #include <stdexcept>
@@ -49,6 +50,12 @@ constexpr const char* kComponent = "VideoDecoder";
 // The catch-up holds the GPU lock; 250 is x264's and x265's default keyframe interval, so a default
 // closed-GOP file always reaches its picture.
 constexpr int64_t kCatchUpPictures = 250;
+
+// The stand-ins in one pass after which a stream stays in software for good. A healthy stream starting
+// part way into a group makes one every pass, and a second leaves room for one damaged spot. Each hand-back costs
+// a new device session and its images, and software decoding from a keyframe to the next reset point, so
+// a stream needing more than that is cheaper decoded in software throughout.
+constexpr uint32_t kStandInsPerPass = 3;
 
 [[noreturn]] void throwFileFailure(const std::string& reason, int err, const std::string& file) {
     ffmpeg_file::throwFileFailure(kComponent, reason, err, file);
@@ -98,6 +105,44 @@ void listQueueFamilies(const Device& device, AVVulkanDeviceContext& hw) {
     };
     add(device.graphicsQueueFamily(), 0);
     for (const Device::VideoDecodeFamily& decode : device.videoDecodeFamilies()) add(decode.family, decode.ops);
+}
+
+// ffmpeg reports a failed vkAllocateMemory as ENOMEM, the same as a failed host allocation. It loads its device
+// functions through instanceProcAddr(), so this holds the latest failure on this thread since watchAllocations(),
+// one a later success does not hide: a device codec is single-threaded and allocates on the thread that calls
+// into it.
+thread_local VkResult t_deviceAllocation = VK_SUCCESS;
+
+void watchAllocations() { t_deviceAllocation = VK_SUCCESS; }
+
+// Whether `err`, from an ffmpeg call made since watchAllocations(), is the device's memory running out.
+bool outOfDeviceMemory(int err) {
+    return err == AVERROR(ENOMEM) && t_deviceAllocation == VK_ERROR_OUT_OF_DEVICE_MEMORY;
+}
+
+// What a watched ffmpeg step that reports no error of its own failed with, as far as its allocations tell:
+// ENOMEM after a failed one, else 0.
+int failedAllocation() {
+    return t_deviceAllocation == VK_ERROR_OUT_OF_DEVICE_MEMORY || t_deviceAllocation == VK_ERROR_OUT_OF_HOST_MEMORY
+               ? AVERROR(ENOMEM)
+               : 0;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL allocateMemory(VkDevice device, const VkMemoryAllocateInfo* info,
+                                              const VkAllocationCallbacks* allocator, VkDeviceMemory* memory) {
+    const VkResult result = vkAllocateMemory(device, info, allocator, memory);
+    if (result != VK_SUCCESS) t_deviceAllocation = result;
+    return result;
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL deviceProcAddr(VkDevice device, const char* name) {
+    if (std::strcmp(name, "vkAllocateMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&allocateMemory);
+    return vkGetDeviceProcAddr(device, name);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL instanceProcAddr(VkInstance instance, const char* name) {
+    if (std::strcmp(name, "vkGetDeviceProcAddr") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&deviceProcAddr);
+    return vkGetInstanceProcAddr(instance, name);
 }
 
 // The decoder that can hand its work to a Vulkan device, or null when ffmpeg has none for this
@@ -213,6 +258,21 @@ AVDiscard discardFor(PictureSkip skip) {
     return AVDISCARD_DEFAULT;
 }
 
+// Whether AVDISCARD_NONREF would leave out a picture in `packet` that a later one can reference. ffmpeg
+// drops every HEVC sub-layer non-reference picture, which a picture of a higher temporal sub-layer may
+// still reference; so only one in the highest sub-layer is safe, and none in a packet or stream that
+// cannot be read.
+bool nonrefLeavesOutReferenced(const CodecHeader& stream, const AVPacket& packet) {
+    if (stream.stream->codec_id != AV_CODEC_ID_HEVC) return false;
+    const uint8_t* header = firstSlice(stream, packet);
+    if (header == nullptr) return true;
+    const int type = (header[0] >> 1) & 0x3f;
+    const bool subLayerNonReference = type <= 14 && type % 2 == 0;
+    const int temporalId = (header[1] & 7) - 1;
+    const uint8_t layers = hevcSubLayers(stream);
+    return subLayerNonReference && (layers == 0 || temporalId + 1 < layers);
+}
+
 // Whether going from `from` to `to` starts decoding pictures that can reference ones `from` left out.
 // Nothing references an unreferenced picture, and an intra one references nothing.
 bool lowersOntoSkipped(PictureSkip from, PictureSkip to) {
@@ -264,6 +324,12 @@ void tagSent(AVPacket& packet, PictureSkip skip, std::optional<uint8_t> thinnedU
     const uintptr_t number = reinterpret_cast<uintptr_t>(packet.opaque) >> kTagBits << kTagBits;
     const uintptr_t thinned = thinnedUnder ? kThinnedBit | (uintptr_t{*thinnedUnder} << kGridsShift) : 0;
     packet.opaque = reinterpret_cast<void*>(number | static_cast<uintptr_t>(skip) | thinned);
+}
+
+// By reference: the header points into `replacement`'s bytes.
+CodecHeader headerWith(const AVCodecParameters& stream, const std::optional<std::vector<uint8_t>>& replacement) {
+    const CodecHeader own = CodecHeader::of(stream);
+    return replacement ? CodecHeader{own.stream, replacement->data(), replacement->size()} : own;
 }
 
 }  // namespace
@@ -428,7 +494,12 @@ VideoDecoder::VideoDecoder(Device& device, const std::string& file, std::optiona
         openContainer();
         // The decoder first: whether it is the device's decides how the start seeks.
         openDecoder();
-        if (position) startAt(*position);
+        // A read that grows with the position is left to next(), which a caller can run off this thread.
+        if (position && mapsBeforeStart()) {
+            m_deferredStart = position;
+        } else if (position) {
+            startAt(*position);
+        }
     } catch (...) {
         closeAll();
         throw;
@@ -500,23 +571,42 @@ void VideoDecoder::closeDecoder() noexcept {
 }
 
 // Playback's close, which waits on none of this renderer's reads. A hardware codec is kept for
-// releaseRetiredCodec(), and the frames contexts for releaseIdleFramesContexts(). The path never
-// returns to hardware, so no codec is retired while another is.
+// releaseRetiredCodec(), and the frames contexts for releaseIdleFramesContexts(). A stream is handed
+// back to the device only once no codec is retired, so none is retired while another is.
 void VideoDecoder::retireDecoder() noexcept {
     av_frame_free(&m_frame);
     if (m_codec == nullptr || m_codec->hw_device_ctx == nullptr) {
         avcodec_free_context(&m_codec);
         return;
     }
-    m_retiredCodec = RetiredCodec{std::exchange(m_codec, nullptr), m_device.lastSubmission()};
+    // The probe goes out now, not once lastReader has completed: the hand-back to the device waits for this
+    // codec's free, and a reset point can follow in the same call.
+    const Device::SubmitTicket lastReader = m_device.lastSubmission();
+    m_retiredCodec = RetiredCodec{std::exchange(m_codec, nullptr), lastReader, probeDevice()};
 }
 
 // Before releaseIdleFramesContexts(), so the contexts this codec held are released in the same call.
-// The free waits without bound on ffmpeg's own outstanding decode work.
+// The free waits without bound on ffmpeg's own outstanding decode work, which the ticket does not
+// cover, so it also waits for the device to have run the probe sent at retirement: polled, never
+// waited for.
 void VideoDecoder::releaseRetiredCodec() noexcept {
-    if (!m_retiredCodec || !m_device.hasCompleted(m_retiredCodec->lastReader)) return;
+    if (!m_retiredCodec) return;
+    Probe& probe = m_retiredCodec->probe;
+    if (std::holds_alternative<ProbeUnsent>(probe)) probe = probeDevice();
+    const auto* sent = std::get_if<Device::SubmitTicket>(&probe);
+    if (sent == nullptr || !m_device.hasCompleted(m_retiredCodec->lastReader) || !m_device.hasCompleted(*sent)) return;
     avcodec_free_context(&m_retiredCodec->codec);
     m_retiredCodec.reset();
+}
+
+VideoDecoder::Probe VideoDecoder::probeDevice() noexcept {
+    try {
+        if (m_probeDevice) return m_probeDevice();
+        return m_device.submitMarker();
+    } catch (...) {
+        // Anything but a batch submitted is a no.
+        return ProbeRefused{};
+    }
 }
 
 // A context only this decoder references has no picture left, in ffmpeg or handed out, and no
@@ -550,7 +640,7 @@ void VideoDecoder::openContainer() {
     m_stream = stream;
 }
 
-void VideoDecoder::openDecoder() {
+void VideoDecoder::openDecoder(const std::optional<std::vector<uint8_t>>& extradata) {
     const AVStream& stream = *m_format->streams[m_stream];
     const AVCodecID id = stream.codecpar->codec_id;
 
@@ -569,8 +659,21 @@ void VideoDecoder::openDecoder() {
 
     m_codec = avcodec_alloc_context3(codec);
     if (m_codec == nullptr) throwOutOfMemory("VideoDecoder");
+    m_codecExtradata.reset();
     if (const int err = avcodec_parameters_to_context(m_codec, stream.codecpar); err < 0) {
         throwFileFailure("cannot configure the decoder", err, m_file);
+    }
+    if (extradata && !extradata->empty()) {
+        auto* bytes = static_cast<uint8_t*>(av_mallocz(extradata->size() + AV_INPUT_BUFFER_PADDING_SIZE));
+        if (bytes == nullptr) throwOutOfMemory("VideoDecoder");
+        std::memcpy(bytes, extradata->data(), extradata->size());
+        av_freep(&m_codec->extradata);
+        m_codec->extradata = bytes;
+        m_codec->extradata_size = static_cast<int>(extradata->size());
+        const CodecHeader own = CodecHeader::of(*stream.codecpar);
+        if (own.size != extradata->size() || std::memcmp(own.extradata, extradata->data(), own.size) != 0) {
+            m_codecExtradata = extradata;
+        }
     }
     m_codec->pkt_timebase = stream.time_base;
     m_softwareFormatRefused.store(false, std::memory_order_relaxed);
@@ -592,7 +695,7 @@ void VideoDecoder::openDecoder() {
             // for AV1 a decoder with no software output of its own. attachDevice() settled the
             // path, so this opens again on ffmpeg's default decoder.
             avcodec_free_context(&m_codec);
-            openDecoder();
+            openDecoder(extradata);
             return;
         }
         m_codec->get_buffer2 = &VideoDecoder::allocatePicture;
@@ -607,6 +710,11 @@ void VideoDecoder::openDecoder() {
 }
 
 void VideoDecoder::reopenInSoftware() {
+    // A device that fails while it is emptied for a switch gives the switch up.
+    if (std::holds_alternative<Emptying>(m_handBack)) m_handBack = std::monostate{};
+    if (m_path == Path::SoftwareMissingReference && ++m_standIns < kStandInsPerPass && m_lastSent) {
+        m_handBack = PassingStandIn{*m_lastSent};
+    }
     m_pending = Pending::Nothing;
     m_flushed = false;
     m_skipping = PictureSkip::Nothing;
@@ -614,8 +722,84 @@ void VideoDecoder::reopenInSoftware() {
     m_parkedFailure = nullptr;
     retireDecoder();
     av_packet_unref(m_packet);
-    seekToResume();
+    const bool fromFirstPacket = m_parameterSets == ParameterSetsSent::MaybeBeyond;
+    if (!fromFirstPacket) m_parameterSets = ParameterSetsSent::InExtradata;
+    seekToResume(fromFirstPacket);
     openDecoder();
+}
+
+// Called with each packet about to be sent for the first time. A reset point is where a fresh device
+// decoder makes no stand-in, and one after the packet that needed it is past whatever the stream lacked:
+// a nearer one would meet the same gap again. Not while a resume is still proving where its seek landed,
+// which only software does; a drop by timestamp carries on across the hand-back as it would in software.
+// Nor once the device codec, opened from the extradata, could lack a parameter set sent this pass.
+void VideoDecoder::advanceHandBack() {
+    if (const auto* passing = std::get_if<PassingStandIn>(&m_handBack)) {
+        // A resume can land past it: the stand-in may have been met while dropping towards the resume point.
+        const PacketMark& standIn = passing->packet;
+        const bool same = standIn.matches(*m_packet);
+        const bool after = standIn.dts != AV_NOPTS_VALUE && m_packet->dts != AV_NOPTS_VALUE
+                               ? m_packet->dts > standIn.dts
+                               : standIn.position && m_packet->pos > *standIn.position;
+        if (same || after) m_handBack = AwaitingReset{};
+        if (!after) return;
+    }
+    // Not where the device would leave the stream again at once.
+    if (!std::holds_alternative<AwaitingReset>(m_handBack) ||
+        !(std::holds_alternative<std::monostate>(m_resume) || std::holds_alternative<DropThrough>(m_resume)) ||
+        m_parameterSets != ParameterSetsSent::InExtradata || !resetsDecoder(header(), *m_packet) ||
+        (m_leaveDeviceAt && m_leaveDeviceAt->matches(*m_packet))) {
+        return;
+    }
+    // A drop can run within one next() call from the stand-in to here.
+    releaseRetiredCodec();
+    if (!m_retiredCodec) m_handBack = Emptying{Path::Undecided};
+}
+
+// Every picture decoded before a reset point is shown before any decoded after it, so the emptied
+// decoder's last picture is the one before the held packet's, which the new one decodes first.
+void VideoDecoder::switchDecoder() {
+    const Path to = std::get<Emptying>(m_handBack).to;
+    const std::optional<std::vector<uint8_t>> extradata = extradataAtHeld();
+    if (to == Path::Undecided && decodesOnDevice()) {
+        // Freed before the next is opened: a second video session can be more than the card has. Emptied
+        // means every picture is out, not that the GPU has finished decoding them, and ffmpeg's free waits on
+        // that without bound, so the device is asked first. Its images stay with the pictures out. Unanswered,
+        // the codec is left for the destructor, on the GPU thread, to ask again and leak.
+        av_frame_free(&m_frame);
+        if (!deviceHealthy()) {
+            throw GpuFailure(describeRejection(
+                kComponent, "switching decoders: the hardware decoder's work did not finish and the device no "
+                            "longer answers", m_file));
+        }
+        avcodec_free_context(&m_codec);
+    } else {
+        retireDecoder();
+    }
+    m_handBack = to == Path::Undecided ? decltype(m_handBack){std::monostate{}} : decltype(m_handBack){NextPass{}};
+    m_path = to;
+    m_skipping = PictureSkip::Nothing;
+    m_switched = true;
+    openDecoder(extradata);
+}
+
+bool VideoDecoder::raisesShortage(int err) const {
+    return err == AVERROR(ENOMEM) && !(m_switched && outOfDeviceMemory(err));
+}
+
+void VideoDecoder::refuseAfterFailure() {
+    m_path = Path::SoftwareRefused;
+    if (m_switched) m_handBack = NextPass{};
+}
+
+std::optional<std::vector<uint8_t>> VideoDecoder::extradataAtHeld() const {
+    size_t size = 0;
+    if (const uint8_t* side = av_packet_get_side_data(m_packet, AV_PKT_DATA_NEW_EXTRADATA, &size);
+        side != nullptr && size > 0) {
+        return std::vector<uint8_t>(side, side + size);
+    }
+    if (extradataPlaced()) return m_extradata;
+    return m_codecExtradata;
 }
 
 void VideoDecoder::seekAgain() {
@@ -669,7 +853,7 @@ void VideoDecoder::startAtResetPoint(int64_t resume) {
     for (int64_t back = 0;; back = nextSeekBack(back)) {
         const int64_t target = av_sat_sub64(resume, back);
         bool fromStart = target <= streamStart();
-        if (!fromStart && ffmpeg_file::seekFrame(*m_format, m_stream, target, AVSEEK_FLAG_BACKWARD) < 0) {
+        if (!fromStart && seek(m_stream, target, AVSEEK_FLAG_BACKWARD) < 0) {
             // Where a failed seek left the container is not known, and reading from the first packet
             // is bounded only when the position itself is within the budget; seekToResume() decides alike.
             if (!withinCatchUp(resume - streamStart())) {
@@ -678,11 +862,7 @@ void VideoDecoder::startAtResetPoint(int64_t resume) {
             }
             fromStart = true;
         }
-        if (fromStart) {
-            rewind();
-        } else {
-            m_packetsRead.reset();
-        }
+        if (fromStart) rewind();
         const Window window = scanWindow(resume, newer, fromStart, back == 0);
         if (!window.last) {
             // From the start, the first packet is not timestamped at or before the position.
@@ -709,6 +889,8 @@ void VideoDecoder::startAtResetPoint(int64_t resume) {
         m_returned.lastTimestamp = withinBudget ? resume : av_sat_sub64(reset.time, 1);
         m_resume = DropThrough{};
         m_startedAfter = m_returned.lastTimestamp;
+        // The codec is never sent the packets before this one, nor any parameter set they carry.
+        if (!reset.fileStart) m_parameterSets = ParameterSetsSent::StartSkipped;
         return;
     }
 }
@@ -730,7 +912,7 @@ VideoDecoder::Window VideoDecoder::scanWindow(int64_t resume, const std::optiona
         if (!window.first) window.first = PacketMark::of(*m_packet);
         const int64_t time = m_packet->pts != AV_NOPTS_VALUE ? m_packet->pts : m_packet->dts;
         if (time != AV_NOPTS_VALUE && time <= resume &&
-            (fileStart || resetsDecoder(*m_format->streams[m_stream]->codecpar, *m_packet))) {
+            (fileStart || resetsDecoder(header(), *m_packet))) {
             window.last = ResetPoint{PacketMark::of(*m_packet), time, fileStart};
             if (stopAtFirst) return window;
         }
@@ -746,10 +928,7 @@ VideoDecoder::Window VideoDecoder::scanWindow(int64_t resume, const std::optiona
 // could be that same one, which would then be sent twice.
 bool VideoDecoder::seekToPacket(const PacketMark& mark, std::optional<int64_t> target) {
     av_packet_unref(m_packet);
-    if (target && ffmpeg_file::seekFrame(*m_format, m_stream, *target, AVSEEK_FLAG_BACKWARD) >= 0) {
-        m_packetsRead.reset();
-        if (skipToPacket(mark)) return true;
-    }
+    if (target && seek(m_stream, *target, AVSEEK_FLAG_BACKWARD) >= 0 && skipToPacket(mark)) return true;
     rewind();
     return skipToPacket(mark);
 }
@@ -780,7 +959,7 @@ PictureSkip VideoDecoder::deepestSkip() const {
     }
 }
 
-void VideoDecoder::seekToResume() {
+void VideoDecoder::seekToResume(bool fromFirstPacket) {
     // Packets read before a seek lie nowhere near the picture the resume returns. Not in restart(): the
     // packets read past a pass's last picture are part of its distance to the next pass's first.
     m_readSinceReturned = 0;
@@ -813,23 +992,26 @@ void VideoDecoder::seekToResume() {
     // Each retry aims further back, so a demuxer that lands past its target costs a few keyframe
     // intervals rather than the whole file. A start has shown nothing, so it has no continuity to keep
     // past the catch-up budget and starts at the stream's first picture instead.
-    const Seeked* unlanded = std::get_if<Seeked>(&m_resume);
-    const int64_t back = unlanded != nullptr ? nextSeekBack(unlanded->back) : 0;
-    const bool starting = m_returned.count == 0;
-    if (starting && back != 0 && !withinCatchUp(back)) {
-        startAtFirstPicture();
-        return;
+    if (!fromFirstPacket) {
+        const Seeked* unlanded = std::get_if<Seeked>(&m_resume);
+        const int64_t back = unlanded != nullptr ? nextSeekBack(unlanded->back) : 0;
+        const bool starting = m_returned.count == 0;
+        if (starting && back != 0 && !withinCatchUp(back)) {
+            startAtFirstPicture();
+            return;
+        }
+        const int64_t target = av_sat_sub64(*m_returned.lastTimestamp, back);
+        if (target > streamStart() && seek(m_stream, target, AVSEEK_FLAG_BACKWARD) >= 0) {
+            m_resume = Seeked{back};
+            return;
+        }
+        if (starting && !withinCatchUp(*m_returned.lastTimestamp - streamStart())) {
+            startAtFirstPicture();
+            return;
+        }
     }
-    const int64_t target = av_sat_sub64(*m_returned.lastTimestamp, back);
-    if (target > streamStart() && ffmpeg_file::seekFrame(*m_format, m_stream, target, AVSEEK_FLAG_BACKWARD) >= 0) {
-        m_packetsRead.reset();
-        m_resume = Seeked{back};
-    } else if (starting && !withinCatchUp(*m_returned.lastTimestamp - streamStart())) {
-        startAtFirstPicture();
-    } else {
-        rewind();
-        m_resume = DropThrough{};
-    }
+    rewind();
+    m_resume = DropThrough{};
 }
 
 int64_t VideoDecoder::streamStart() const {
@@ -864,15 +1046,33 @@ VideoDecoder::Verdict VideoDecoder::judgeGrid(const AVPacket& packet) {
 // otherwise the container is opened again.
 void VideoDecoder::rewind() {
     av_packet_unref(m_packet);
-    m_packetsRead.reset();
+    m_parameterSets = ParameterSetsSent::InExtradata;
     if (m_firstPacket && seekToFirstPacket()) {
         m_packetsRead = 0;
         numberPacket();
+        // Shown to be packet 1, where the stream's own extradata applies unless the packet brings its own. The
+        // landing usually says so already; not for a packet with neither byte position nor decode time, which
+        // the map cannot place.
+        m_extradataAt = ExtradataAt::Known;
+        m_extradata.reset();
+        size_t size = 0;
+        if (const uint8_t* side = av_packet_get_side_data(m_packet, AV_PKT_DATA_NEW_EXTRADATA, &size);
+            side != nullptr && size > 0) {
+            m_extradata.emplace(side, side + size);
+        }
         return;
     }
     avformat_close_input(&m_format);
     openContainer();
     m_packetsRead = 0;
+    m_extradata.reset();
+    m_extradataAt = ExtradataAt::Known;
+}
+
+int VideoDecoder::seek(int stream, int64_t target, int flags) {
+    m_packetsRead.reset();
+    m_extradataAt = ExtradataAt::Landing;
+    return ffmpeg_file::seekFrame(*m_format, stream, target, flags);
 }
 
 // No one target reaches packet 1 in every container. Its decode time does in a transport stream,
@@ -889,7 +1089,7 @@ bool VideoDecoder::seekToFirstPacket() {
 
 bool VideoDecoder::seekLandsOnFirstPacket(int64_t target, int flags) {
     const int stream = (flags & AVSEEK_FLAG_BYTE) != 0 ? -1 : m_stream;
-    if (ffmpeg_file::seekFrame(*m_format, stream, target, flags) < 0) return false;
+    if (seek(stream, target, flags) < 0) return false;
     if (readVideoPacket() >= 0 && m_firstPacket->matches(*m_packet)) return true;
     av_packet_unref(m_packet);
     return false;
@@ -909,6 +1109,12 @@ bool VideoDecoder::PacketMark::matches(const AVPacket& packet) const {
            packet.pts == pts && packet.size == size;
 }
 
+std::optional<bool> VideoDecoder::PacketMark::notAfter(const PacketMark& other) const {
+    if (position && other.position) return *position <= *other.position;
+    if (dts != AV_NOPTS_VALUE && other.dts != AV_NOPTS_VALUE) return dts <= other.dts;
+    return std::nullopt;
+}
+
 void VideoDecoder::assertMayDecodeHere(const char* what) const {
     if (!m_device.queuesInternallySynchronized()) m_device.assertGpuThread(what);
 }
@@ -921,6 +1127,9 @@ void VideoDecoder::restart() {
     m_returned = {};
     m_resume = std::monostate{};
     m_startedAfter.reset();
+    m_deferredStart.reset();
+    m_standIns = 0;
+    if (!std::holds_alternative<std::monostate>(m_handBack)) m_handBack = AwaitingReset{};
     rewind();
 }
 
@@ -965,10 +1174,13 @@ void VideoDecoder::recordReturned(int64_t timestamp, std::optional<uint64_t> pac
 
 // A seek can land on a picture that is not a keyframe: a transport stream's does, having no index.
 // Its references were never decoded, and recordLanding() proves nothing from it. Software only, as
-// every Seeked state is.
+// every Seeked state is. Where the map places the landing, a reset point counts without the container's
+// flag: libavformat's own parser sets that flag, and after a seek past a length-size change it reads with
+// the stream's own extradata. Elsewhere the extradata read with could be as wrong, so the flag alone counts.
 bool VideoDecoder::beforeLandingKeyframe() const {
     const auto* seeked = std::get_if<Seeked>(&m_resume);
-    return seeked != nullptr && seeked->landing == Landing::NoPacket && (m_packet->flags & AV_PKT_FLAG_KEY) == 0;
+    return seeked != nullptr && seeked->landing == Landing::NoPacket && (m_packet->flags & AV_PKT_FLAG_KEY) == 0 &&
+           !(extradataPlaced() && resetsDecoder(header(), *m_packet));
 }
 
 // Called with each packet decoded. The first after a seek is a keyframe and shows where it landed;
@@ -1004,7 +1216,7 @@ bool VideoDecoder::attachDevice() {
 
     // ffmpeg loads libvulkan itself only for a device it creates; on this path an unset loader
     // is called through as a null pointer.
-    hw->get_proc_addr = vkGetInstanceProcAddr;
+    hw->get_proc_addr = instanceProcAddr;
     hw->inst = m_device.instance();
     hw->phys_dev = m_device.physicalDevice();
     hw->act_dev = m_device.device();
@@ -1019,13 +1231,14 @@ bool VideoDecoder::attachDevice() {
     // order they are freed in.
     // Each refusal below is this ffmpeg and this driver declining, not the GPU failing, so the
     // device is asked which it is -- the same question every refusal during decoding asks.
+    watchAllocations();
     if (const int err = av_hwdevice_ctx_init(ref.ref); err < 0) {
-        if (err == AVERROR(ENOMEM)) throwOutOfMemory("VideoDecoder");
+        if (raisesShortage(err)) throwOutOfMemory("VideoDecoder");
         if (!deviceHealthy()) {
             throw GpuFailure("VideoDecoder: ffmpeg cannot decode on " + m_device.info().gpuName + " (" +
                              avErrorString(err) + ") and the device no longer answers");
         }
-        m_path = Path::SoftwareRefused;
+        refuseAfterFailure();
         return false;
     }
 
@@ -1145,13 +1358,14 @@ bool VideoDecoder::attachHardwareFrames(AVCodecContext* codec) {
 
     // Past the device's yes. ffmpeg still has reasons of its own to fail here, so the device is
     // asked whether it is the one at fault.
+    watchAllocations();
     if (const int initError = av_hwframe_ctx_init(frames.ref); initError < 0) {
-        if (initError == AVERROR(ENOMEM)) throwOutOfMemory("VideoDecoder");
+        if (raisesShortage(initError)) throwOutOfMemory("VideoDecoder");
         if (!deviceHealthy()) {
             throw GpuFailure("VideoDecoder: creating decode images on " + m_device.info().gpuName + " failed (" +
                              avErrorString(initError) + ") and the device no longer answers");
         }
-        m_path = Path::SoftwareRefused;
+        refuseAfterFailure();
         return false;
     }
     m_framesContexts.reserve(m_framesContexts.size() + 1);
@@ -1177,6 +1391,9 @@ AVPixelFormat VideoDecoder::chooseFormat(AVCodecContext* codec, const AVPixelFor
         if (software == AV_PIX_FMT_NONE) self->m_softwareFormatRefused.store(true, std::memory_order_relaxed);
         return software;
     }
+    // A codec already given up: H.264 asks again at the packet's next slice, and a yes would set up a second
+    // video session on a codec about to be retired.
+    if (self->m_pending == Pending::ReopenInSoftware || self->m_parkedFailure) return AV_PIX_FMT_NONE;
     try {
         return self->choose(codec, offered);
     } catch (const std::bad_alloc&) {
@@ -1202,15 +1419,17 @@ AVPixelFormat VideoDecoder::choose(AVCodecContext* codec, const AVPixelFormat* o
             return AV_PIX_FMT_VULKAN;
         }
     } else if (m_awaitingHardwareSetup) {
-        // ffmpeg's own decoder setup failed after the device's yes, and it says nothing of why.
+        // ffmpeg's own decoder setup failed after the device's yes, and it says nothing of why. The watch
+        // attachHardwareFrames() started covers that setup, so its allocations are what can tell.
         m_awaitingHardwareSetup = false;
+        if (raisesShortage(failedAllocation())) throwOutOfMemory("VideoDecoder");
         if (!deviceHealthy()) {
             throw GpuFailure(describeRejection(kComponent,
                                                m_device.info().gpuName + " accepted the wallpaper and no longer answers "
                                                                          "after its hardware decoder failed to initialise",
                                                m_file));
         }
-        m_path = Path::SoftwareRefused;
+        refuseAfterFailure();
     } else {
         // The codec offers no Vulkan output for this stream's pixel format.
         m_path = Path::SoftwareRefused;
@@ -1224,14 +1443,49 @@ AVPixelFormat VideoDecoder::choose(AVCodecContext* codec, const AVPixelFormat* o
 // ffmpeg's request for the image a picture decodes into, made before any decode work for it is
 // recorded. AV1 keeps its images across a size change within one pixel format, so a picture can
 // arrive that they cannot hold or that the device cannot decode; either is the device declining it.
+//
+// A second request while decoding one H.264 or HEVC packet is ffmpeg making up a reference the stream
+// lacks: a frame_num gap, or a reference set naming a picture never decoded. Both codecs ask for every
+// stand-in and the packet's own picture before recording any decode work for the packet, so refusing the
+// second request leaves none recorded. A real second picture in one packet is read as a stand-in too,
+// but ffmpeg 9.0.2 decodes one only in H.264 -- a field its packet's next picture does not pair with, or
+// a frame followed by an IDR, which it logs as broken packetizing -- and HEVC refuses a second first
+// slice and decodes only the base layer here. Not AV1, whose temporal unit can carry a hidden frame
+// beside the shown one.
+//
+// A failed device picture is never left to ffmpeg: H.264 and HEVC drop a picture they get no image for and
+// go on recording decode work that references it. failDecode() decides it, so only the device's memory
+// running out on a codec a switch opened, or a failed call on one that answers, goes to software.
 int VideoDecoder::allocatePicture(AVCodecContext* codec, AVFrame* frame, int flags) {
     auto* self = static_cast<VideoDecoder*>(codec->opaque);
-    if (codec->hw_frames_ctx != nullptr && !self->holds(*codec->hw_frames_ctx, frame->width, frame->height)) {
-        self->m_path = Path::SoftwareRefused;
-        self->require(Pending::ReopenInSoftware);
-        return AVERROR(ENOSYS);
+    if (codec->hw_frames_ctx != nullptr) {
+        // A codec already given up: H.264 asks again for the next slice of a picture it could not start,
+        // which would read as a stand-in.
+        if (self->m_pending == Pending::ReopenInSoftware || self->m_parkedFailure) return AVERROR(ENOSYS);
+        if (!self->holds(*codec->hw_frames_ctx, frame->width, frame->height)) {
+            self->m_path = Path::SoftwareRefused;
+            self->require(Pending::ReopenInSoftware);
+            return AVERROR(ENOSYS);
+        }
+        const bool onePicturePerPacket = codec->codec_id == AV_CODEC_ID_H264 || codec->codec_id == AV_CODEC_ID_HEVC;
+        if (std::exchange(self->m_pictureAllocated, true) && onePicturePerPacket) {
+            self->m_path = Path::SoftwareMissingReference;
+            self->require(Pending::ReopenInSoftware);
+            return AVERROR(ENOSYS);
+        }
     }
-    return avcodec_default_get_buffer2(codec, frame, flags);
+    watchAllocations();
+    const int err = avcodec_default_get_buffer2(codec, frame, flags);
+    if (codec->hw_frames_ctx == nullptr || err >= 0) return err;
+    // Nothing may throw through ffmpeg's frames.
+    try {
+        self->failDecode("allocating a decode image", err);
+    } catch (const std::bad_alloc&) {
+        self->m_parkedFailure = std::make_exception_ptr(ResourceExhausted("VideoDecoder: out of memory"));
+    } catch (...) {
+        self->m_parkedFailure = std::current_exception();
+    }
+    return err;
 }
 
 bool VideoDecoder::holds(const AVBufferRef& frames, int width, int height) const {
@@ -1250,6 +1504,7 @@ int VideoDecoder::readVideoPacket() {
         if (err < 0) return err;
         if (m_packet->stream_index == m_stream) {
             if (m_packetsRead) numberPacket();
+            followExtradata();
             // One the container marks as decoded only for reference, as outside an edit list, is
             // never shown, so it neither ends a pass nor puts distance between two pictures.
             if ((m_packet->flags & AV_PKT_FLAG_DISCARD) != 0) return 0;
@@ -1262,6 +1517,121 @@ int VideoDecoder::readVideoPacket() {
             return 0;
         }
         av_packet_unref(m_packet);
+    }
+}
+
+void VideoDecoder::followExtradata() {
+    const PacketMark here = PacketMark::of(*m_packet);
+    const auto covered = [&] { return m_extradataMap.through && here.notAfter(*m_extradataMap.through).value_or(false); };
+    const auto assumed = [&] {
+        const int64_t order = here.dts != AV_NOPTS_VALUE ? here.dts : here.pts;
+        return m_extradataMap.assumedThrough && order != AV_NOPTS_VALUE && order <= *m_extradataMap.assumedThrough;
+    };
+    if (m_extradataAt == ExtradataAt::Landing) {
+        m_extradataAt = covered() ? ExtradataAt::Known : assumed() ? ExtradataAt::Assumed : ExtradataAt::Unknown;
+        if (extradataPlaced()) {
+            m_extradata.reset();
+            const auto& changes = m_extradataMap.changes;
+            const auto last = std::find_if(changes.rbegin(), changes.rend(), [&](const ExtradataChange& change) {
+                return change.at.notAfter(here).value_or(false);
+            });
+            if (last != changes.rend()) m_extradata = last->bytes;
+        }
+    }
+    // A packet that cannot be ordered against `through` could be one already mapped.
+    const bool extends = m_extradataAt == ExtradataAt::Known &&
+                         (!m_extradataMap.through || here.notAfter(*m_extradataMap.through) == false);
+    if (extends && changesExtradata(header(), *m_packet)) {
+        size_t size = 0;
+        const uint8_t* side = av_packet_get_side_data(m_packet, AV_PKT_DATA_NEW_EXTRADATA, &size);
+        m_extradataMap.changes.push_back({here, std::vector<uint8_t>(side, side + size)});
+    }
+    size_t size = 0;
+    if (const uint8_t* side = av_packet_get_side_data(m_packet, AV_PKT_DATA_NEW_EXTRADATA, &size);
+        side != nullptr && size > 0) {
+        m_extradata.emplace(side, side + size);
+    }
+    if (extends) m_extradataMap.through = here;
+}
+
+// FLV's sequence-header tags and NUT's side data are each reported once, on the packet after them, and a seek
+// that lands past one says nothing of it; MP4 restates its sample description at every landing, and other
+// demuxers report no change. So only for those two is the file before a start read to place its landings.
+bool VideoDecoder::mapsBeforeStart() const {
+    const AVCodecID id = m_format->streams[m_stream]->codecpar->codec_id;
+    return (id == AV_CODEC_ID_H264 || id == AV_CODEC_ID_HEVC) &&
+           av_match_name(m_format->iformat->name, "flv,live_flv,kux,nut") != 0;
+}
+
+// Packets without a timestamp never reach `resume`, so the count the distance implies bounds the read too.
+// Counted from packet 1, so a read carried on after a stop keeps the same bound. ffmpeg's interrupt_callback
+// is no stop here: av_read_frame() never consults it on a custom I/O context.
+bool VideoDecoder::mapExtradataUpTo(int64_t resume, bool stoppable) {
+    if (resume <= streamStart()) return true;
+    const AVStream& stream = *m_format->streams[m_stream];
+    const std::optional<std::chrono::nanoseconds> interval = nominalInterval(stream);
+    const std::optional<std::chrono::nanoseconds> span = inNanoseconds(resume - streamStart(), stream.time_base);
+    const int64_t expected = interval && span && interval->count() > 0 ? *span / *interval : 0;
+    const uint64_t limit = static_cast<uint64_t>(av_sat_add64(expected, kCatchUpPictures));
+    const std::atomic<bool>* stop = stoppable ? m_stopStart : nullptr;
+    bool complete = true;
+    while (m_packetsRead && *m_packetsRead < limit) {
+        if (stop != nullptr && stop->load(std::memory_order_relaxed)) {
+            complete = false;
+            break;
+        }
+        const int err = readVideoPacket();
+        if (err == AVERROR(ENOMEM)) throwOutOfMemory("VideoDecoder");
+        // Anything else ends the map here; playback reports damage it reads itself.
+        if (err < 0) {
+            if (err != AVERROR_EOF) m_extradataMap.assumedThrough = resume;
+            break;
+        }
+        const int64_t order = m_packet->dts != AV_NOPTS_VALUE ? m_packet->dts : m_packet->pts;
+        av_packet_unref(m_packet);
+        if (order != AV_NOPTS_VALUE && order > resume) break;
+    }
+    m_readSinceReturned = 0;
+    return complete;
+}
+
+CodecHeader VideoDecoder::header() const { return headerWith(*m_format->streams[m_stream]->codecpar, m_extradata); }
+
+CodecHeader VideoDecoder::codecHeader() const {
+    return headerWith(*m_format->streams[m_stream]->codecpar, m_codecExtradata);
+}
+
+// Called with each packet about to be sent for the first time. A flushed codec reads every packet by the
+// extradata it adopted last, length-prefix size included, and neither a container read from its first packet
+// again nor one sought past a change repeats the side data that applies there. While m_extradata is Known or
+// Assumed it is the extradata that applies, so a codec holding another is handed it with this packet; while
+// Unknown the codec keeps what it has.
+void VideoDecoder::alignCodecExtradata() {
+    if ((!m_codecExtradata && !m_extradata) || !extradataPlaced()) return;
+    const AVCodecID id = m_codec->codec_id;
+    if (id != AV_CODEC_ID_H264 && id != AV_CODEC_ID_HEVC) return;
+    size_t carried = 0;
+    if (av_packet_get_side_data(m_packet, AV_PKT_DATA_NEW_EXTRADATA, &carried) != nullptr && carried > 0) return;
+    const CodecHeader applies = header();
+    const CodecHeader held = codecHeader();
+    // An empty extradata cannot be sent as side data: ffmpeg ignores an empty block.
+    if (applies.size == 0 ||
+        (held.size == applies.size && std::memcmp(held.extradata, applies.extradata, applies.size) == 0)) {
+        return;
+    }
+    uint8_t* side = av_packet_new_side_data(m_packet, AV_PKT_DATA_NEW_EXTRADATA, applies.size);
+    if (side == nullptr) throwOutOfMemory("VideoDecoder");
+    std::memcpy(side, applies.extradata, applies.size);
+}
+
+void VideoDecoder::recordExtradataSent() {
+    size_t size = 0;
+    const uint8_t* side = av_packet_get_side_data(m_packet, AV_PKT_DATA_NEW_EXTRADATA, &size);
+    if (side == nullptr || size == 0) return;
+    if (changesExtradata(CodecHeader::of(*m_format->streams[m_stream]->codecpar), *m_packet)) {
+        m_codecExtradata.emplace(side, side + size);
+    } else {
+        m_codecExtradata.reset();
     }
 }
 
@@ -1280,12 +1650,12 @@ void VideoDecoder::failDecode(const char* what, int err) {
     }
     const std::string failed = std::string(what) + " failed";
     const bool hardware = m_awaitingHardwareSetup || m_path == Path::Hardware;
-    if (err == AVERROR_EXTERNAL && hardware) {
+    if (hardware && (err == AVERROR_EXTERNAL || (m_switched && outOfDeviceMemory(err)))) {
         if (!deviceHealthy()) {
             throw GpuFailure(describeRejection(
                 kComponent, failed + ": the hardware decoder failed and the device no longer answers", m_file));
         }
-        m_path = Path::SoftwareRefused;
+        refuseAfterFailure();
         require(Pending::ReopenInSoftware);
         return;
     }
@@ -1308,16 +1678,28 @@ std::variant<std::optional<DecodedFrame>, VideoDecoder::Dropping> VideoDecoder::
     std::optional<uint32_t> dropLimit, PictureSkip skip) {
     releaseRetiredCodec();
     releaseIdleFramesContexts();
+    if (m_deferredStart) {
+        if (!mapExtradataUpTo(av_sat_sub64(m_deferredStart->m_timestamp, 1), dropLimit.has_value())) return Dropping{};
+        startAt(*std::exchange(m_deferredStart, std::nullopt));
+    }
     uint32_t dropped = 0;
     for (;;) {
         // What the format callback decided during the last ffmpeg call comes before what that
         // call returned: a refusal of every format reads as bad input or as the end otherwise.
         if (m_pending == Pending::ReopenInSoftware) reopenInSoftware();
         if (m_pending == Pending::SeekAgain) seekAgain();
+        m_pictureAllocated = false;
+        watchAllocations();
         int err = avcodec_receive_frame(m_codec, m_frame);
         if (m_pending != Pending::Nothing) continue;
         if (m_parkedFailure || m_softwareFormatRefused.load(std::memory_order_relaxed)) {
             failDecode("avcodec_receive_frame", err);
+        }
+        // A device allocation that failed without a callback deciding it, such as a slice's bitstream buffer:
+        // H.264 and HEVC go on past it, recording decode work against what they never got.
+        if (failedAllocation() != 0) {
+            failDecode("avcodec_receive_frame", AVERROR(ENOMEM));
+            continue;
         }
         if (err == 0) {
             m_awaitingHardwareSetup = false;
@@ -1346,7 +1728,13 @@ std::variant<std::optional<DecodedFrame>, VideoDecoder::Dropping> VideoDecoder::
             frame.m_readSince = std::max(std::exchange(m_readSinceReturned, 0), 1U);
             recordReturned(timestamp, packet);
             if (m_returned.lastTimestamp) frame.m_position = StreamPosition(*m_returned.lastTimestamp);
+            // A probe sent at the top of this call has usually completed by now.
+            releaseRetiredCodec();
             return frame;
+        }
+        if (err == AVERROR_EOF && std::holds_alternative<Emptying>(m_handBack)) {
+            switchDecoder();
+            continue;
         }
         // Nothing more can be sent after the flush, so a decoder that still asks for input has
         // no more pictures to give.
@@ -1395,7 +1783,48 @@ std::variant<std::optional<DecodedFrame>, VideoDecoder::Dropping> VideoDecoder::
                 throwFileFailure("cannot read the wallpaper", err, m_file);
             } else {
                 recordLanding();
+                if (m_pending != Pending::Nothing) continue;
             }
+        }
+        if (!m_flushed && !m_packetVerdict) {
+            // First, so the guards below judge the packet as it will be sent.
+            alignCodecExtradata();
+            const CodecHeader opened = CodecHeader::of(*m_format->streams[m_stream]->codecpar);
+            // ffmpeg 9.0.2 adopts side-data parameter sets without telling its Vulkan decoder, which goes on
+            // decoding with the session parameters it built before; with inline parameters it builds none. A new
+            // length-prefix size alone it applies itself. Without them, a device codec handed other parameter sets
+            // at a reset point is emptied there and opened again from them. Anywhere else the packet is never sent
+            // and software takes the rest of the pass, from the first packet: a seek could land where the map
+            // cannot place it. Later passes leave the device for software, emptied, at the last reset point sent
+            // before that packet, which seeks nowhere.
+            if (decodesOnDevice() && !m_device.videoInlineParameters() && !std::holds_alternative<Emptying>(m_handBack)) {
+                if (m_leaveDeviceAt && m_leaveDeviceAt->matches(*m_packet)) {
+                    m_handBack = Emptying{Path::SoftwareRefused};
+                } else if (changesParameterSets(codecHeader(), *m_packet)) {
+                    if (!resetsDecoder(header(), *m_packet)) {
+                        m_leaveDeviceAt = m_resetSent;
+                        m_parameterSets = ParameterSetsSent::MaybeBeyond;
+                        m_path = Path::SoftwareRefused;
+                        m_handBack = NextPass{};
+                        require(Pending::ReopenInSoftware);
+                        continue;
+                    }
+                    m_handBack = Emptying{Path::Undecided};
+                }
+            }
+            // Against the extradata a codec is opened with, which is the one in effect while InExtradata.
+            if (m_parameterSets == ParameterSetsSent::InExtradata && (decodesOnDevice() || handingBackThisPass()) &&
+                beyondExtradata(opened, *m_packet)) {
+                m_parameterSets = ParameterSetsSent::MaybeBeyond;
+            }
+            advanceHandBack();
+        }
+        if (std::holds_alternative<Emptying>(m_handBack)) {
+            // The reset point stays held for the next decoder.
+            err = avcodec_send_packet(m_codec, nullptr);
+            if (err == AVERROR_EOF) throw std::logic_error("VideoDecoder: a decoder was emptied twice");
+            if (err < 0) failDecode("avcodec_send_packet", err);
+            continue;
         }
         // Read by ffmpeg per packet. A level goes up at once, and down onto pictures that can reference
         // skipped ones only at a packet that resets the decoder. A container's key flag is not enough: it
@@ -1403,7 +1832,7 @@ std::variant<std::optional<DecodedFrame>, VideoDecoder::Dropping> VideoDecoder::
         const PictureSkip wanted =
             std::holds_alternative<std::monostate>(m_resume) ? std::min(skip, deepestSkip()) : PictureSkip::Nothing;
         if (!lowersOntoSkipped(m_skipping, wanted) ||
-            (!m_flushed && resetsDecoder(*m_format->streams[m_stream]->codecpar, *m_packet))) {
+            (!m_flushed && resetsDecoder(header(), *m_packet))) {
             m_skipping = wanted;
         }
         // Once a packet: a field pair's second field is judged by its first.
@@ -1411,14 +1840,27 @@ std::variant<std::optional<DecodedFrame>, VideoDecoder::Dropping> VideoDecoder::
         const Verdict verdict = *m_packetVerdict;
         // The grid only ever adds Unreferenced, which can be left at any packet, so it needs no level of
         // its own; the packet is tagged with the asked level alone.
-        const PictureSkip applied = verdict.grid == Grid::LeavesOut
-                                        ? std::min(std::max(m_skipping, PictureSkip::Unreferenced), deepestSkip())
-                                        : m_skipping;
+        PictureSkip applied = verdict.grid == Grid::LeavesOut
+                                  ? std::min(std::max(m_skipping, PictureSkip::Unreferenced), deepestSkip())
+                                  : m_skipping;
+        // The deeper levels leave out every picture that could reference this one.
+        if (applied == PictureSkip::Unreferenced && !m_flushed &&
+            nonrefLeavesOutReferenced(header(), *m_packet)) {
+            applied = PictureSkip::Nothing;
+        }
         m_codec->skip_frame = discardFor(applied);
         if (applied != PictureSkip::Nothing) m_returned.skipped = true;
         if (!m_flushed) {
             tagSent(*m_packet, m_skipping, verdict.grid != Grid::Off ? std::optional(verdict.under) : std::nullopt);
+            m_lastSent = PacketMark::of(*m_packet);
+            recordExtradataSent();
+            if (decodesOnDevice() && !m_device.videoInlineParameters() &&
+                ((m_firstPacket && m_firstPacket->matches(*m_packet)) || resetsDecoder(header(), *m_packet))) {
+                m_resetSent = m_lastSent;
+            }
         }
+        m_pictureAllocated = false;
+        watchAllocations();
         err = avcodec_send_packet(m_codec, m_flushed ? nullptr : m_packet);
         // EAGAIN is "read the output first, then send this one again", and ffmpeg promises the
         // receive that follows will not ask for input; a second EAGAIN for the same packet is
@@ -1429,10 +1871,18 @@ std::variant<std::optional<DecodedFrame>, VideoDecoder::Dropping> VideoDecoder::
         if (m_parkedFailure || m_softwareFormatRefused.load(std::memory_order_relaxed)) {
             failDecode("avcodec_send_packet", err);
         }
+        if (failedAllocation() != 0) {
+            failDecode("avcodec_send_packet", AVERROR(ENOMEM));
+            continue;
+        }
         if (err == AVERROR(EAGAIN)) {
             throw std::logic_error("VideoDecoder: ffmpeg refused the same packet twice without giving a frame");
         }
         if (err < 0 && !isDamagedPacket(err)) failDecode("avcodec_send_packet", err);
+        // Accepted: a refusal at the start's first packet has set m_pending by now.
+        if (m_pending == Pending::Nothing && !m_flushed && m_parameterSets == ParameterSetsSent::StartSkipped) {
+            m_parameterSets = ParameterSetsSent::MaybeBeyond;
+        }
     }
 }
 

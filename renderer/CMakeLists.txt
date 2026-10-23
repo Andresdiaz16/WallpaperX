@@ -438,7 +438,9 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
     set(COUNTER_H264_RAW "${COUNTER_H264} -bf 3 -bsf:v h264_mp4toannexb -f h264")
     set(COUNTER_HEVC_RAW "-c:v libx265 -x265-params log-level=error:keyint=24:min-keyint=24:scenecut=0:bframes=3 -bsf:v hevc_mp4toannexb -f hevc")
     set(COUNTER_H264_OPENGOP "-c:v libx264 -threads 1 -crf 18 -keyint_min 48 -g 48 -sc_threshold 0 -bf 3 -x264-params open-gop=1:b-adapt=0")
+    set(COUNTER_GAP "-c:v libx264 -threads 1 -crf 18 -keyint_min 30 -g 30 -sc_threshold 0 -bf 0")
     set(COUNTER_HEVC_OPENGOP "-c:v libx265 -x265-params log-level=error:keyint=48:min-keyint=48:scenecut=0:bframes=3:b-adapt=0:open-gop=1")
+    set(COUNTER_GAP_BF "-c:v libx264 -threads 1 -crf 18 -keyint_min 30 -g 30 -sc_threshold 0 -bf 3 -x264-params b-pyramid=normal:b-adapt=0:ref=1")
     # The size-change parts: one second each, the count continuing across the parts of a join. 160x120
     # HEVC is below what this GPU decodes, so that join's middle is a refusal.
     set(WALLPAPERX_SIZE_CHANGE_PARTS
@@ -503,6 +505,16 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         "counter_seg.ts|320x240|30|4|0|${COUNTER_H264} -bf 3 -f mpegts"
         "counter_jump_a.ts|320x240|30|2|0|${COUNTER_H264} -bf 0 -f mpegts"
         "counter_jump_b.ts|320x240|30|2|1000|${COUNTER_H264} -bf 0 -f mpegts"
+        # The same jump with B pictures, which the frame-rate grid can leave out: thinning starts in the first
+        # half, whose timestamps rise, and goes on past the jump back.
+        "counter_jump_bf_a.ts|320x240|30|2|0|${COUNTER_H264} -bf 3 -f mpegts"
+        "counter_jump_bf_b.ts|320x240|30|2|1000|${COUNTER_H264} -bf 3 -f mpegts"
+        # 120 a second with B pictures nothing references; the second has every other packet's timestamp moved
+        # 1.5 pictures later, so decoded pictures' timestamps fall out of order and ffmpeg times them by their
+        # decode times instead. Judged by packet timestamps, the 60 a second grid would then leave out B
+        # pictures it shows by those times.
+        "counter_rate120.mp4|320x240|120|4|0|${COUNTER_H264} -bf 3 -b-pyramid none"
+        "counter_rate120_moved.mp4|320x240|120|4|0|${COUNTER_H264} -bf 3 -b-pyramid none -bsf:v setts=pts=PTS+(N-2*trunc(N/2))*DURATION*3/2"
         "counter_repeat.mkv|320x240|30|2|0|${COUNTER_H264} -bf 0 -bsf:v setts=pts=2*trunc(N/2)+2:dts=N -f matroska"
         "counter_resize_large.h264|320x240|30|1|0|${COUNTER_H264} -bf 3 -bsf:v h264_mp4toannexb -f h264"
         "counter_resize_small.h264|160x120|30|1|30|${COUNTER_H264} -bf 3 -bsf:v h264_mp4toannexb -f h264"
@@ -541,6 +553,28 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         "counter_loop_long.ts|128x96|30|100|0|${COUNTER_H264} -bf 3 -f mpegts"
         "counter_loop_short.h264|128x96|30|0.65|0|${COUNTER_H264} -bf 3 -bsf:v h264_mp4toannexb -f h264"
         "counter_loop_long.h264|128x96|30|100|0|${COUNTER_H264} -bf 3 -bsf:v h264_mp4toannexb -f h264"
+        # Damaged: a reference packet dropped from the bitstream, so the next picture needs a stand-in. The
+        # dropped picture draws its predecessor's number, so ffmpeg's stand-in (a copy of the previous
+        # reference) holds the right content and every picture left still names itself once. One gap at
+        # 99 with IDRs every 30; a gap in every group at 10, 40, 70 ...
+        "counter_gap.mp4|128x96|30|10|0-not(N-99)|${COUNTER_GAP} -bsf:v noise=drop=not(n-99)"
+        "counter_gap_every.mp4|128x96|30|10|0-not(N-10-30*trunc(N/30))|${COUNTER_GAP} -bsf:v noise=drop=not(n-10-30*trunc(n/30))"
+        # Parameter sets beyond the extradata: a second part whose SPS/PPS use id 1, joined after the first,
+        # then a gap at 159 inside it (counter_ps_gap.mp4, below).
+        "counter_ps_a.h264|128x96|30|4|0|${COUNTER_GAP} -f h264"
+        "counter_ps_b.h264|128x96|30|6|120-not(N-39)|${COUNTER_GAP} -x264-params sps-id=1 -f h264"
+        # B pictures, pyramid (P98, then the reference B96, then B95 and B97), one reference picture: packets
+        # 96-98 (B96, B95, B97) dropped, so P102 meets a frame-number gap. Its stand-in copies P98, the one
+        # reference P102 predicts from, so every picture left decodes right; 95-97 are never shown.
+        "counter_gap_bf.mp4|128x96|30|10|0|${COUNTER_GAP_BF} -bsf:v noise=drop=not(trunc(abs(n-97)/2))"
+        # Parameter sets on every packet, so a stream cut before them still decodes (counter_cut_start.ts).
+        "counter_cut_src.ts|128x96|30|10|0|${COUNTER_GAP_BF} -flags +global_header -bsf:v dump_extra=freq=all -f mpegts"
+        # Healthy, for cutting at a non-IDR I (48) with a forced IDR at 150 (counter_cut_nonidr.mp4).
+        "counter_nonidr_src.mp4|128x96|30|10|0|${COUNTER_H264_OPENGOP} -force_key_frames 5 -forced-idr 1"
+        # Healthy HEVC (320x240: at 128x96 this card decoded HEVC in software), CRAs every 48, then a second
+        # encode from 180 whose first picture is an IDR; x265 writes a forced keyframe as a CRA, not an IDR.
+        "counter_cra_a.mp4|320x240|30|6|0|${COUNTER_HEVC_OPENGOP}:frame-threads=1 -tag:v hvc1"
+        "counter_cra_b.mp4|320x240|30|4|180|${COUNTER_HEVC_OPENGOP}:frame-threads=1 -tag:v hvc1"
     )
     foreach(RECIPE ${WALLPAPERX_COUNTER_RECIPES})
         string(REPLACE "|" ";" RECIPE_PARTS "${RECIPE}")
@@ -573,8 +607,10 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         "counter_big.h264|counter_big_0.h264|counter_big_30.h264|counter_big_60.h264"
         "counter_shrink_grow.ts|counter_sg_0.ts|counter_sg_30.ts|counter_sg_60.ts"
         "counter_shrink_grow.hevc|counter_sg_0.hevc|counter_sg_30.hevc|counter_sg_60.hevc"
-        "counter_big.hevc|counter_big_0.hevc|counter_big_30.hevc|counter_big_60.hevc")
-    foreach(JOIN "counter_jump.ts|counter_jump_a.ts|counter_jump_b.ts" ${WALLPAPERX_SIZE_CHANGE_JOINS})
+        "counter_big.hevc|counter_big_0.hevc|counter_big_30.hevc|counter_big_60.hevc"
+        "counter_ps.h264|counter_ps_a.h264|counter_ps_b.h264")
+    foreach(JOIN "counter_jump.ts|counter_jump_a.ts|counter_jump_b.ts" "counter_jump_bf.ts|counter_jump_bf_a.ts|counter_jump_bf_b.ts"
+                 ${WALLPAPERX_SIZE_CHANGE_JOINS})
         string(REPLACE "|" ";" JOIN_PARTS "${JOIN}")
         list(POP_FRONT JOIN_PARTS JOIN_NAME)
         list(TRANSFORM JOIN_PARTS PREPEND ${WALLPAPERX_VIDEO_ASSET_DIR}/)
@@ -608,6 +644,75 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         VERBATIM
     )
     list(APPEND WALLPAPERX_VIDEO_ASSETS ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_shrink_grow.mkv)
+    add_custom_command(
+        OUTPUT ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_ps_gap.mp4
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error -framerate 30 -f h264 -i ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_ps.h264
+                -c copy -bsf:v "noise=drop=not(n-159)" ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_ps_gap.mp4
+        DEPENDS ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_ps.h264
+        COMMENT "Generating video fixture counter_ps_gap.mp4"
+        VERBATIM
+    )
+    list(APPEND WALLPAPERX_VIDEO_ASSETS ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_ps_gap.mp4)
+    # The same stream with its parameter sets moved out of the packets: the change at 120 reaches the decoder only as
+    # NEW_EXTRADATA side data, which FLV carries.
+    add_custom_command(
+        OUTPUT ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_ps_gap.flv
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error -framerate 30 -f h264 -i ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_ps.h264
+                -c copy -bsf:v "extract_extradata=remove=1,noise=drop=not(n-159)" ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_ps_gap.flv
+        DEPENDS ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_ps.h264
+        COMMENT "Generating video fixture counter_ps_gap.flv"
+        VERBATIM
+    )
+    list(APPEND WALLPAPERX_VIDEO_ASSETS ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_ps_gap.flv)
+    # HEVC with a reference dropped: x265 open GOP with pyramid Bs, so packet 97 is the P showing 99. That
+    # picture is flat mid-grey, which is what ffmpeg's HEVC stand-in holds, so its dependents still decode.
+    string(REPLACE "OFFSET" "0" HEVC_GAP_BITS "${COUNTER_BITS}")
+    add_custom_command(
+        OUTPUT ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_hevc_src.mp4
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error -f lavfi -i color=size=320x240:rate=30:duration=10
+                -vf "format=yuv420p,geq=lum=if(eq(N\\,99)\\,128\\,${HEVC_GAP_BITS}):cb=128:cr=128,setparams=${BT709}"
+                -c:v libx265 -x265-params log-level=error:open-gop=1:keyint=60:min-keyint=60:bframes=2:b-pyramid=1:b-adapt=0:scenecut=0:frame-threads=1
+                -tag:v hvc1 ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_hevc_src.mp4
+        COMMENT "Generating video fixture counter_hevc_src.mp4"
+        VERBATIM
+    )
+    list(APPEND WALLPAPERX_VIDEO_ASSETS ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_hevc_src.mp4)
+    # Derived by stream copy: output|input options|input|output options. A cut start drops the first 45
+    # packets, so the stream begins inside a group; -copyinkf keeps the non-key packets that lead it.
+    foreach(DERIVED
+            "counter_cut_start.ts||counter_cut_src.ts|-copyinkf -bsf:v noise=drop=not(trunc(n/45)) -f mpegts"
+            "counter_hevc_gap.mp4||counter_hevc_src.mp4|-bsf:v noise=drop=not(n-97)"
+            "counter_cut_nonidr.mp4|-ss 1.6|counter_nonidr_src.mp4|"
+            "counter_cra_a_cut.mp4|-ss 1.6|counter_cra_a.mp4|")
+        string(REPLACE "|" ";" DERIVED_PARTS "${DERIVED}")
+        list(GET DERIVED_PARTS 0 DERIVED_NAME)
+        list(GET DERIVED_PARTS 1 DERIVED_IN)
+        list(GET DERIVED_PARTS 2 DERIVED_SOURCE)
+        list(GET DERIVED_PARTS 3 DERIVED_OUT)
+        separate_arguments(DERIVED_IN UNIX_COMMAND "${DERIVED_IN}")
+        separate_arguments(DERIVED_OUT UNIX_COMMAND "${DERIVED_OUT}")
+        add_custom_command(
+            OUTPUT ${WALLPAPERX_VIDEO_ASSET_DIR}/${DERIVED_NAME}
+            COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error ${DERIVED_IN} -i ${WALLPAPERX_VIDEO_ASSET_DIR}/${DERIVED_SOURCE}
+                    -c copy ${DERIVED_OUT} ${WALLPAPERX_VIDEO_ASSET_DIR}/${DERIVED_NAME}
+            DEPENDS ${WALLPAPERX_VIDEO_ASSET_DIR}/${DERIVED_SOURCE}
+            COMMENT "Generating video fixture ${DERIVED_NAME}"
+            VERBATIM
+        )
+        list(APPEND WALLPAPERX_VIDEO_ASSETS ${WALLPAPERX_VIDEO_ASSET_DIR}/${DERIVED_NAME})
+    endforeach()
+    # An HEVC stream starting at a CRA (48) that reaches an IDR at 180: the cut part, then the IDR part.
+    set(CRA_LIST ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_cut_cra.txt)
+    file(WRITE ${CRA_LIST} "file 'counter_cra_a_cut.mp4'\nfile 'counter_cra_b.mp4'\n")
+    add_custom_command(
+        OUTPUT ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_cut_cra.mp4
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error -f concat -safe 0 -i ${CRA_LIST} -c copy -tag:v hvc1
+                ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_cut_cra.mp4
+        DEPENDS ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_cra_a_cut.mp4 ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_cra_b.mp4
+        COMMENT "Generating video fixture counter_cut_cra.mp4"
+        VERBATIM
+    )
+    list(APPEND WALLPAPERX_VIDEO_ASSETS ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_cut_cra.mp4)
     add_custom_target(wallpaperx-video-fixtures DEPENDS ${WALLPAPERX_VIDEO_ASSETS})
 else()
     message(STATUS "  ffmpeg CLI: not found -- video decoder fixtures are not generated and "
@@ -879,12 +984,12 @@ set_tests_properties(frame_converter_shader_read PROPERTIES LABELS "novulkan")
 set(WALLPAPERX_PIPELINE_MODES sequence-device sequence-host resume-timestamps resume-no-timestamps
     resume-late-seek resume-end resume-seek-failure resume-drop-count shape shape-device steady-device
     steady-host loop-device loop-host loop-cost-device loop-cost-host loop-resume release-device retire-device
-    halves-device halves-host timing-device timing-host start-at-device start-at-device-ts start-at-host
+    retire-unanswered halves-device halves-host timing-device timing-host start-at-device start-at-device-ts start-at-host
     start-at-device-open-gop start-at-device-open-gop-hevc start-at-device-open-gop-mp4 start-at-host-open-gop
     start-at-device-budget start-at-device-av1 bounded-decode-device bounded-decode-host
     decode-thread-depth decode-thread-pending decode-thread-failure decode-thread-catch-up decode-thread-hidden
     decode-thread-software decode-thread-alloc decode-thread-left-running decode-thread-pools decode-thread-resume
-    device-completed-off-thread device-queue-flags)
+    decode-thread-start-read device-completed-off-thread device-queue-flags damaged-device damaged-device-no-inline damaged-host)
 foreach(MODE ${WALLPAPERX_PIPELINE_MODES})
     string(REPLACE "-" "_" MODE_NAME "${MODE}")
     wallpaperx_add_test(NAME video_pipeline_${MODE_NAME} COMMAND wallpaperx-video-pipeline-probe ${MODE})
@@ -1120,7 +1225,7 @@ if(WALLPAPERX_LAVAPIPE_ICD)
                                     LABELS "lavapipe" SKIP_RETURN_CODE 77)
     # The pipeline's entries that need no hardware decoder.
     foreach(MODE sequence-host shape steady-host loop-host loop-cost-host halves-host timing-host start-at-host
-                 start-at-host-open-gop bounded-decode-host)
+                 start-at-host-open-gop bounded-decode-host damaged-host)
         string(REPLACE "-" "_" MODE_NAME "${MODE}")
         wallpaperx_add_test(NAME video_pipeline_${MODE_NAME}_lavapipe COMMAND wallpaperx-video-pipeline-probe ${MODE})
         set_tests_properties(video_pipeline_${MODE_NAME}_lavapipe

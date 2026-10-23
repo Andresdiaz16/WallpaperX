@@ -23,7 +23,9 @@ VideoPipeline::VideoPipeline(Device& device, const std::string& file, const std:
       m_hooks(std::move(hooks)),
       m_decoding(std::make_unique<PictureSource>(device, file, playback, startAt)),
       m_deepest(std::get<std::unique_ptr<PictureSource>>(m_decoding)->decoder().deepestSkip()),
-      m_origin(std::get<std::unique_ptr<PictureSource>>(m_decoding)->decoder().timelineStart()) {}
+      m_origin(std::get<std::unique_ptr<PictureSource>>(m_decoding)->decoder().timelineStart()) {
+    decodeAheadIfSafe();
+}
 
 bool VideoPipeline::renderNext(OffscreenTargetManager& targets, const OffscreenTarget& target) {
     // Asserted here as well as in the two halves: the abort has to name the entry point the
@@ -96,15 +98,17 @@ void VideoPipeline::hold(PictureSource::Picture picture) {
     m_unconverted = std::move(picture.frame);
 }
 
-// After a picture, which settles whether the device decodes the stream. A stream decoded in
-// software stays on this thread, as does one on a system that had no thread to give, which is told
-// once. Out of memory leaves the picture decoded and the next one tries again.
+// After a picture, which settles whether the device decodes the stream; or before the first, when the
+// decoder has a start to make that reads the file up to its position, whatever its path. A stream decoded
+// in software from its first picture stays on this thread; one the decode thread already holds keeps
+// decoding there if it settles in software, which touches no queue. So does a stream on a system that had
+// no thread to give, which is told once. Out of memory leaves the source on this thread, to try again
+// after the next picture.
 void VideoPipeline::decodeAheadIfSafe() {
     std::unique_ptr<PictureSource>& source = std::get<std::unique_ptr<PictureSource>>(m_decoding);
-    if (m_noDecodeThread || source->decoder().path() != VideoDecoder::Path::Hardware ||
-        !m_device.queuesInternallySynchronized()) {
-        return;
-    }
+    const VideoDecoder& decoder = source->decoder();
+    const bool eligible = decoder.path() == VideoDecoder::Path::Hardware || decoder.startPending();
+    if (m_noDecodeThread || !eligible || !m_device.queuesInternallySynchronized()) return;
     std::unique_ptr<DecodeAhead> ahead;
     try {
         ahead = DecodeAhead::start(m_device, source, m_hooks.around, m_hooks.ready);

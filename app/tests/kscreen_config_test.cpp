@@ -701,9 +701,9 @@ void positionsInRange() {
 
 // S15.21
 void internalFieldsHiddenFromQml() {
-    // GOAL: S15.21 -- KScreen's own output id and the panel description are not properties QML
-    //       can read: the id is valid only for one backend instance, and nothing in QML may key on
-    //       it.
+    // GOAL: S15.21 -- KScreen's own output id, the panel description and the current mode's refresh
+    //       rate are not properties QML can read: the id is valid only for one backend instance, and
+    //       nothing in QML may key on it; the refresh rate goes to the daemon, not to the screen picker.
     // WHY-THIS-SHAPE: asked of the meta-object QML reads; a lookup of two properties QML must see
     //       rules out a meta-object where every lookup fails.
     // CONTROL: app/kde/kscreen_config.h, `Q_PROPERTY(int kscreenId MEMBER kscreenId CONSTANT)`
@@ -711,11 +711,15 @@ void internalFieldsHiddenFromQml() {
     //       red on panel; restored, green.
     //       Re-run 2026-10-20 (T9b), control_batch.sh in app/build, after Monitor gained refreshRate: both breaks red
     //       as stated, restored green.
+    // CONTROL: control_batch.sh 2026-10-20 (O1), app/build, reverted: `Q_PROPERTY(double refreshRate MEMBER
+    //       refreshRate CONSTANT)` added to app/kde/kscreen_config.h -> "FAIL: S15.21: refreshRate is a property
+    //       QML can read" alone; the kscreenId break re-run beside it -> its own line alone.
     const QMetaObject& meta = Monitor::staticMetaObject;
     expect(meta.indexOfProperty("outputName") >= 0 && meta.indexOfProperty("mirrorOf") >= 0,
            QStringLiteral("S15.21: Monitor's meta-object does not list outputName and mirrorOf, so the lookups below prove nothing"));
     expect(meta.indexOfProperty("kscreenId") < 0, QStringLiteral("S15.21: kscreenId is a property QML can read"));
     expect(meta.indexOfProperty("panel") < 0, QStringLiteral("S15.21: panel is a property QML can read"));
+    expect(meta.indexOfProperty("refreshRate") < 0, QStringLiteral("S15.21: refreshRate is a property QML can read"));
 }
 
 } // namespace

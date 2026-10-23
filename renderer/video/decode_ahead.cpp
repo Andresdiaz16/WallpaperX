@@ -5,6 +5,7 @@
 #include "../vulkan/device.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <system_error>
@@ -25,7 +26,10 @@ constexpr std::chrono::seconds kStopBound{10};
 }  // namespace
 
 struct DecodeAhead::Shared {
-    // First, so it is destroyed last, after the pictures it decoded.
+    // Set as the stop begins, for the source's start to read once a packet without the lock; before the
+    // source, which holds its address.
+    std::atomic<bool> stopStart{false};
+    // Destroyed after everything but the flag, so after the pictures it decoded.
     std::unique_ptr<PictureSource> source;
     Around around;
     Ready ready;
@@ -38,12 +42,20 @@ struct DecodeAhead::Shared {
     std::vector<Item> items;
     PictureSkip skip = PictureSkip::Nothing;
     std::optional<NumberedGrids> unshown;
-    bool stopping = false;
+    // Stopping still answers questions, so a decode call that needs one ends as it would have; once
+    // Abandoned, none is answered.
+    enum class Phase { Running, Stopping, Abandoned };
+    Phase phase = Phase::Running;
     bool exited = false;
     // A take() found nothing, so the next item calls the ready hook.
     bool awaited = false;
     enum class Question { None, Asked, Healthy, Unhealthy };
     Question question = Question::None;
+    // The decoder's probe: none posted, posted and ProbeUnsent until the GPU thread submits it, then its
+    // outcome until the decoder collects it. Never waited for, so a stop has nothing of it to answer.
+    std::optional<VideoDecoder::Probe> probe;
+
+    bool probeUnsent() const { return probe && std::holds_alternative<VideoDecoder::ProbeUnsent>(*probe); }
 
     size_t pictures() const {
         return static_cast<size_t>(std::count_if(items.begin(), items.end(), [](const Item& item) {
@@ -67,9 +79,13 @@ std::unique_ptr<DecodeAhead> DecodeAhead::start(Device& device, std::unique_ptr<
     // Everything that can throw from here on hands the source back below.
     try {
         shared.source->askDeviceThrough([&shared] { return ask(shared); });
+        shared.source->decoder().probeDeviceThrough([&shared] { return probe(shared); });
+        shared.source->decoder().stopStartOn(&shared.stopStart);
         ahead->m_thread = std::thread([&shared] { run(shared); });
     } catch (...) {
         shared.source->askDeviceThrough({});
+        shared.source->decoder().probeDeviceThrough({});
+        shared.source->decoder().stopStartOn(nullptr);
         source = std::move(shared.source);
         try {
             throw;
@@ -84,12 +100,36 @@ std::unique_ptr<DecodeAhead> DecodeAhead::start(Device& device, std::unique_ptr<
 
 DecodeAhead::~DecodeAhead() {
     if (!m_thread.joinable()) return;
+    const auto deadline = std::chrono::steady_clock::now() + kStopBound;
     bool exited = false;
     {
         std::unique_lock<std::mutex> lock(m_shared->mutex);
-        m_shared->stopping = true;
+        m_shared->phase = Shared::Phase::Stopping;
+        m_shared->stopStart.store(true, std::memory_order_relaxed);
         m_shared->changed.notify_all();
-        exited = m_shared->changed.wait_for(lock, kStopBound, [this] { return m_shared->exited; });
+        // An answer begun before the deadline can run past it by the Device's own submit bound.
+        while (m_shared->changed.wait_until(lock, deadline, [this] {
+            return m_shared->exited || m_shared->question == Shared::Question::Asked;
+        })) {
+            if (m_shared->exited) {
+                exited = true;
+                break;
+            }
+            lock.unlock();
+            bool healthy = false;
+            try {
+                healthy = VideoDecoder::deviceAnswers(m_device);
+            } catch (...) {
+                // Anything but a clean yes is a no: the decoder then leaves its device codec unfreed.
+            }
+            lock.lock();
+            m_shared->question = healthy ? Shared::Question::Healthy : Shared::Question::Unhealthy;
+            m_shared->changed.notify_all();
+        }
+        if (!exited) {
+            m_shared->phase = Shared::Phase::Abandoned;
+            m_shared->changed.notify_all();
+        }
     }
     if (exited) {
         m_thread.join();
@@ -127,8 +167,9 @@ void DecodeAhead::run(Shared& shared) noexcept {
     for (;;) {
         {
             std::unique_lock<std::mutex> lock(shared.mutex);
-            shared.changed.wait(lock, [&] { return shared.stopping || shared.pictures() < kDepth; });
-            if (shared.stopping) break;
+            shared.changed.wait(
+                lock, [&] { return shared.phase != Shared::Phase::Running || shared.pictures() < kDepth; });
+            if (shared.phase != Shared::Phase::Running) break;
             call.skip = shared.skip;
             call.unshown = shared.unshown;
         }
@@ -156,7 +197,7 @@ void DecodeAhead::run(Shared& shared) noexcept {
         {
             std::lock_guard<std::mutex> lock(shared.mutex);
             shared.items.push_back(std::move(*item));
-            wake = std::exchange(shared.awaited, false) && !shared.stopping;
+            wake = std::exchange(shared.awaited, false) && shared.phase == Shared::Phase::Running;
         }
         shared.changed.notify_all();
         if (wake) notifyReady(shared);
@@ -170,21 +211,59 @@ void DecodeAhead::run(Shared& shared) noexcept {
 }
 
 bool DecodeAhead::ask(Shared& shared) {
+    bool running = false;
     {
         std::lock_guard<std::mutex> lock(shared.mutex);
-        if (shared.stopping) return false;
+        if (shared.phase == Shared::Phase::Abandoned) return false;
         shared.question = Shared::Question::Asked;
+        running = shared.phase == Shared::Phase::Running;
     }
     shared.changed.notify_all();
-    notifyReady(shared);
+    // A stopping destructor is woken by the notify; the hook is for a GPU thread still taking pictures.
+    if (running) notifyReady(shared);
     std::unique_lock<std::mutex> lock(shared.mutex);
-    shared.changed.wait(lock, [&] { return shared.stopping || shared.question != Shared::Question::Asked; });
+    shared.changed.wait(lock, [&] {
+        return shared.phase == Shared::Phase::Abandoned || shared.question != Shared::Question::Asked;
+    });
     const bool healthy = shared.question == Shared::Question::Healthy;
     shared.question = Shared::Question::None;
     return healthy;
 }
 
+// Posting wakes the GPU thread as a question does, so the probe is not left until the next picture.
+VideoDecoder::Probe DecodeAhead::probe(Shared& shared) {
+    bool running = false;
+    {
+        std::lock_guard<std::mutex> lock(shared.mutex);
+        if (shared.probe) {
+            if (std::holds_alternative<VideoDecoder::ProbeUnsent>(*shared.probe)) return VideoDecoder::ProbeUnsent{};
+            return *std::exchange(shared.probe, std::nullopt);
+        }
+        shared.probe = VideoDecoder::ProbeUnsent{};
+        running = shared.phase == Shared::Phase::Running;
+    }
+    shared.changed.notify_all();
+    if (running) notifyReady(shared);
+    return VideoDecoder::ProbeUnsent{};
+}
+
+// Only this thread moves a posted probe on from ProbeUnsent, so it is still posted when the lock is retaken.
+void DecodeAhead::sendProbe(std::unique_lock<std::mutex>& lock) {
+    if (!m_shared->probeUnsent()) return;
+    lock.unlock();
+    VideoDecoder::Probe sent = VideoDecoder::ProbeRefused{};
+    try {
+        // A marker, so the decoding thread sees it complete without this thread looking again.
+        sent = m_device.submitMarker();
+    } catch (...) {
+        // Anything but a batch submitted is a no.
+    }
+    lock.lock();
+    m_shared->probe = sent;
+}
+
 void DecodeAhead::answer(std::unique_lock<std::mutex>& lock) {
+    sendProbe(lock);
     if (m_shared->question != Shared::Question::Asked) return;
     lock.unlock();
     const bool healthy = VideoDecoder::deviceAnswers(m_device);
@@ -229,7 +308,7 @@ DecodeAhead::Item DecodeAhead::wait(std::optional<PictureSkip> skip) {
         answer(lock);
         if (!m_shared->items.empty()) return pop();
         m_shared->changed.wait(lock, [this] {
-            return !m_shared->items.empty() || m_shared->question == Shared::Question::Asked;
+            return !m_shared->items.empty() || m_shared->question == Shared::Question::Asked || m_shared->probeUnsent();
         });
     }
 }

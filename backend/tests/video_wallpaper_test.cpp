@@ -203,6 +203,14 @@ std::atomic<int> g_countedThreadDecodes{0};
 // Pictures the wallpaper's decoder delivered since the last reset, on any thread.
 std::atomic<int> g_pictureDeliveries{0};
 
+// While armed, when each pass of the one playing file began at the decoder: a packet whose timestamp is below the
+// one sent before it. The decoder runs a bounded queue ahead of the screen, so pass to pass the spacing is the
+// pass's wall time.
+std::atomic<bool> g_passWatch{false};
+std::mutex g_passMutex;
+int64_t g_passLastPts = INT64_MIN;
+std::vector<std::chrono::steady_clock::time_point> g_passStarts;
+
 // The wallpaper files the daemon has open, keyed by the descriptor it reads each through, and how
 // often each path was opened and closed since the last reset.
 //
@@ -805,6 +813,11 @@ extern "C" int avcodec_send_packet(AVCodecContext* context, const AVPacket* pack
         if (crashDueFor(CrashOn::CatchUp, context)) faultNow();
         if (packet != nullptr) g_recordWatch.packet();
         if (packet != nullptr) g_farRead.sent();
+        if (packet != nullptr && packet->pts != AV_NOPTS_VALUE && g_passWatch.load(std::memory_order_relaxed)) {
+            std::lock_guard<std::mutex> lock(g_passMutex);
+            if (packet->pts < g_passLastPts) g_passStarts.push_back(std::chrono::steady_clock::now());
+            g_passLastPts = packet->pts;
+        }
         g_decodeCalls.fetch_add(1, std::memory_order_relaxed);
         if (::gettid() == g_countedThread.load()) g_countedThreadDecodes.fetch_add(1, std::memory_order_relaxed);
         if (const int delay = g_sendDelayMs.load(std::memory_order_relaxed); delay > 0) {
@@ -3152,7 +3165,10 @@ void runClockChecks(const WallpaperManager::Config& config, const std::string& c
         // CONTROL: in backend/daemon/wallpaper_manager.cpp, gapBetween() made to return
         //       kMinPictureInterval always, via control_batch.sh, 2026-09-29, this phase alone -> "FAIL: the
         //       pictures are paced by the file's own rate", printing "20 pictures took 0.166692 s", where
-        //       the file's own rate makes them 2.000 s. Reverted.
+        //       the file's own rate makes them 2.000 s. Reverted. Re-run at the default frame rate 60,
+        //       control_batch.sh 2026-10-20 (O1), --phase '^clock$', NVIDIA -> the same line, 0.166670 s
+        //       (green 2.000 s): kMinPictureInterval stays 1/120 s whatever the setting, so the rate is
+        //       not what this check depends on.
         const std::optional<Clock::time_point> from = firstSeen(shown, kRateFrom);
         const std::optional<Clock::time_point> to = firstSeen(shown, kGradedPictures);
         if (!from || !to) {
@@ -4168,9 +4184,10 @@ void runSpeedChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const std:
     // WHY-THIS-SHAPE: the time a fixed NUMBER of pictures takes, never pictures counted in a fixed
     //       time. Speed 1 makes these 20 take 2.0 s and speed 2 1.0 s: the upper bound, 1.5 s, splits
     //       the two, and the lower, 0.5 s, is half the speed-2 time, which a clock free-running at the
-    //       120-a-second cap (0.17 s) cannot meet. The times are FrameReady receipts, so a client-side
+    //       daemon's 1/120 s floor on one picture's interval (0.17 s) cannot meet; the frame-rate setting
+    //       does not move that floor. The times are FrameReady receipts, so a client-side
     //       stall that delays generation 5's signal shortens the span; a burst of receipts under 1 ms
-    //       apart (the daemon spaces these 50 ms, and even the cap 8.3 ms) means that happened, and the
+    //       apart (the daemon spaces these 50 ms, and even the floor 8.3 ms) means that happened, and the
     //       lower bound is then not graded. A stall only lengthens the span, so the upper bound always is.
     // CONTROL: `speed = playbackSpeed(it->second.properties);` in advanceSessionLocked
     //       (backend/daemon/wallpaper_manager.cpp) replaced by `speed = 1.0;`, via control_run.sh,
@@ -4180,8 +4197,9 @@ void runSpeedChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const std:
     //       `speed = session.speed;`; re-run 2026-10-18 via control_batch.sh, --phase '^speed$', NVIDIA, as
     //       `speed = 1.0;` after the round's speed-change block -> the same line and the speed-0.5 one.
     // CONTROL: gapBetween() (backend/daemon/wallpaper_manager.cpp) made to return kMinPictureInterval
-    //       always, a clock free-running at the cap -> the same line, by the lower bound: "20 pictures
-    //       took 0.166630 s". Reverted.
+    //       always, a clock free-running at the floor -> the same line, by the lower bound: "20 pictures
+    //       took 0.166630 s". Reverted. Re-run at the default frame rate 60, control_batch.sh 2026-10-20 (O1),
+    //       --phase '^speed$', NVIDIA -> the same line, 0.166632 s (green 1.000 s).
     // CONTROL (harness): FrameReady for generation 5 held 800 ms in this phase's proxy callback -- a
     //       client stall -> "NOT VERIFIED -- S15.100's lower bound ...", the span read 0.200 s; the same
     //       stall with the burst test disabled -> "FAIL: a video set with speed 2 shows its pictures
@@ -5372,12 +5390,14 @@ void runIntervalClampChecks(const WallpaperManager::Config& config, const std::s
     //       field can say. The rate is measured across a fixed number of pictures rather than counting
     //       pictures in a fixed time, and the bound is twice the setting at 120, so a loaded machine
     //       cannot cross it.
-    // CONTROL: kMinPictureInterval made `std::chrono::milliseconds(4)` (backend/daemon/wallpaper_manager.cpp),
-    //       via control_batch.sh, --phase intervalClamp, 2026-09-29 -> "FAIL: a file declaring a thousand
-    //       pictures a second is committed no faster than the daemon's own ceiling ...", 250.0 a second.
-    //       Re-run 2026-10-20 (F2): no longer red alone, since the frame-rate grid now also holds the rate at
-    //       120. Held with targetRateLocked() also returning 250 (same file): "FAIL: a file declaring a thousand
-    //       pictures a second is committed no faster than the daemon's own ceiling ...", 247.4 a second.
+    // CONTROL: three things in backend/daemon/wallpaper_manager.cpp hold the ceiling: the frame-rate grid
+    //       (targetRateLocked()), the 120 cap kPictureRateCap (overflowsCap() thins to its grid) and the floor
+    //       kMinPictureInterval derived from it. control_batch.sh, --phase intervalClamp, G3e 2026-10-23, NVIDIA,
+    //       reverted: kMinPictureInterval 4 ms with targetRateLocked() returning 250 stays green (120.7 a second:
+    //       the cap thins it); kPictureRateCap 250 with targetRateLocked() returning 250 -> "FAIL: a file declaring
+    //       a thousand pictures a second is committed no faster than the daemon's own ceiling ...", 250.0 a second.
+    //       The same with the floor kept at 1/120 s commits 120.0 a second, so the floor alone still holds this
+    //       line; only the packets-per-picture check below goes red ("498 packet(s) decoded for 125 picture(s)").
     // COVERAGE-ASSERT: the packet count is asserted to be non-zero, so a run in which the decode
     //       hook saw nothing fails instead of reading as the rate having been established.
     {
@@ -6022,6 +6042,303 @@ void runThinSharedChecks(const WallpaperManager::Config& config) {
                      histogram);
     reportUnless(fastCollector.threw().empty() && slowCollector.threw().empty(), "the consumers' hand-overs did not throw",
                  fastCollector.threw() + slowCollector.threw());
+}
+
+// Draws by `monitorId` announced in (from, to], a second.
+double drawRateIn(const PictureLog& pictures, int monitorId, Clock::time_point from, Clock::time_point to) {
+    const std::vector<PictureLog::Event> events = pictures.forMonitor(monitorId);
+    const long n = std::count_if(events.begin(), events.end(), [&](const PictureLog::Event& e) { return e.at > from && e.at <= to; });
+    return static_cast<double>(n) / std::chrono::duration<double>(to - from).count();
+}
+
+// The gaps between successive draws by `monitorId` in (from, to], sorted, in seconds.
+std::vector<double> drawGapsIn(const PictureLog& pictures, int monitorId, Clock::time_point from, Clock::time_point to) {
+    std::vector<Clock::time_point> at;
+    for (const PictureLog::Event& e : pictures.forMonitor(monitorId)) {
+        if (e.at > from && e.at <= to) at.push_back(e.at);
+    }
+    std::sort(at.begin(), at.end());
+    std::vector<double> gaps;
+    for (size_t i = 1; i < at.size(); ++i) gaps.push_back(std::chrono::duration<double>(at[i] - at[i - 1]).count());
+    std::sort(gaps.begin(), gaps.end());
+    return gaps;
+}
+
+// The render worker's time on a CPU so far, from /proc's schedstat for that thread; nothing if unreadable.
+std::optional<double> threadCpuSeconds(pid_t tid) {
+    std::ifstream in("/proc/self/task/" + std::to_string(tid) + "/schedstat");
+    long long onCpu = 0;
+    if (!(in >> onCpu)) return std::nullopt;
+    return static_cast<double>(onCpu) / 1e9;
+}
+
+// S15.921 / S15.923 (a screen joining) -- a file above 120 a second shared by a 120 screen and one its refresh
+// caps at `slowRate` (50 or 75): the shared session is over the cap. Each pair in a session of its own: a refresh
+// changed while an over-the-cap session plays slows it today (G2a), which is reported, not graded here. Its own
+// phase, RUN_SERIAL.
+void runCapSharedChecks(const WallpaperManager::Config& config, double slowRate) {
+    const std::string path = rate240ClipPath();
+    const char* kGoal = "S15.921 (a shared file over the cap plays at its own speed, each screen at its rate)";
+    if (!std::filesystem::exists(path)) {
+        notVerified(kGoal, "the fixture " + path + " was not generated");
+        return;
+    }
+    constexpr int kFast = 0;
+    constexpr int kSlow = 1;
+    constexpr double kPassSeconds = 3.0;  // wallpaper_rate240.mp4: 720 pictures at 240 a second
+    PhaseGrade grade("the shared over-the-cap phase");
+    FrameReadyLog signals;
+    PictureLog pictures;
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    struct Unwatch {
+        ~Unwatch() { g_passWatch.store(false); }
+    } unwatch;
+    Collector fastCollector(manager, kFast, ":1.784");
+    Collector slowCollector(manager, kSlow, ":1.785");
+    RenderWorker worker(manager, [&](int monitorId, uint64_t generation) {
+        pictures.record(monitorId, generation);
+        signals.record(monitorId, generation);
+        fastCollector.announced(monitorId, generation);
+        slowCollector.announced(monitorId, generation);
+    });
+    fastCollector.attach(worker);
+    slowCollector.attach(worker);
+    WorkerUnblock unblock{worker};
+
+    g_files.watch(path);
+    g_files.resetCounts();
+    for (const int id : {kFast, kSlow}) wallpaperx::testing::nameScreen(manager, id, screenOf(id));
+    manager.setMonitorFrameRate(kFast, 120);
+    manager.setMonitorFrameRate(kSlow, 120);
+    manager.setOutputRefreshRate(screenOf(kSlow), slowRate);
+    // The 120 screen alone first, so the session's first cap verdict is taken under the cap and the join must
+    // recompute it.
+    manager.requestWallpaper("video", path, kFast);
+    worker.post(kFast);
+    if (!signals.wait(kFast, 30)) {
+        grade.expectNoDevice();
+        notVerified(kGoal, "the video produced no 30 pictures on the first screen on this host");
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_passMutex);
+        g_passStarts.clear();
+        g_passLastPts = INT64_MIN;
+    }
+    g_passWatch.store(true);
+    manager.requestWallpaper("video", path, kSlow);
+    worker.post(kSlow);
+    worker.post(kFast);
+    if (!signals.wait(kSlow, 1)) {
+        notVerified(kGoal, "the second screen drew no picture of the shared file");
+        return;
+    }
+    const int open = g_files.opens(path) - g_files.closes(path);
+    reportUnless(open == 1, "the two screens over the cap share one decoder",
+                 std::to_string(open) + " open(s) of the file at once");
+
+    // Two passes after a settling one, timed pass start to pass start at the decoder. False (and red) when the
+    // passes never come: a session that stalls is not one that plays at its own speed.
+    const auto measure = [&](const std::string& what) {
+        size_t base = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_passMutex);
+            base = g_passStarts.size();
+        }
+        const Clock::time_point deadline = Clock::now() + std::chrono::seconds(20);
+        std::vector<Clock::time_point> starts;
+        while (Clock::now() < deadline) {
+            {
+                std::lock_guard<std::mutex> lock(g_passMutex);
+                starts.assign(g_passStarts.begin() + static_cast<std::ptrdiff_t>(base), g_passStarts.end());
+            }
+            if (starts.size() >= 3) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        if (starts.size() < 3) {
+            check(false, (what + ": the shared file plays at its own speed -- it began only " +
+                          std::to_string(starts.size()) + " of 3 passes in 20 s").c_str());
+            return;
+        }
+        const Clock::time_point from = starts[1];
+        const Clock::time_point to = starts[2];
+        const double wall = std::chrono::duration<double>(to - from).count();
+        const double ratio = kPassSeconds / wall;
+        const double fast = drawRateIn(pictures, kFast, from, to);
+        const double slow = drawRateIn(pictures, kSlow, from, to);
+        std::printf("video_wallpaper_test: %s: one pass of %.1f s took %.3f s (file/wall %.3f); draws a second: "
+                    "120 screen %.1f, other %.1f\n", what.c_str(), kPassSeconds, wall, ratio, fast, slow);
+        std::fflush(stdout);
+        // GOAL: S15.921 -- over the cap the shared file's own time keeps pace with the wall clock (file/wall 1.0) and
+        //       each screen draws its own rate; S15.923 -- the cap verdict taken with the 120 screen alone is
+        //       recomputed when the other screen joins, and when its refresh changes.
+        // WHY-THIS-SHAPE: file time read as whole passes at the decoder, not drawn pictures, so no picture content is
+        //       needed; one 3 s pass, after a settling one, makes the queue's lead cancel. The 120 screen plays first
+        //       so the first verdict is under the cap. Before the cap rule this ran 0.67-0.86.
+        // CONTROL: control_batch.sh 2026-10-21 (G2a), NVIDIA, reverted, backend/daemon/wallpaper_manager.cpp:
+        //       overflowsCap() returning false -> "120 beside 50: the shared file plays at its own speed"; the verdict
+        //       never recomputed after the first -> the same line.
+        reportUnless(ratio >= 0.95 && ratio <= 1.03, (what + ": the shared file plays at its own speed").c_str(),
+                     "file/wall " + std::to_string(ratio));
+        reportUnless(fast >= 120 * 0.95 && fast <= 120 * 1.03, (what + ": the 120 screen draws 120 a second").c_str(),
+                     std::to_string(fast));
+        reportUnless(slow >= slowRate * 0.95 && slow <= slowRate * 1.03,
+                     (what + ": the other screen draws its own rate").c_str(), std::to_string(slow));
+    };
+    measure("120 beside " + std::to_string(static_cast<int>(slowRate)));
+    reportUnless(fastCollector.threw().empty() && slowCollector.threw().empty(), "the consumers' hand-overs did not throw",
+                 fastCollector.threw() + slowCollector.threw());
+}
+
+// S15.922 / S15.923 (a screen leaving) -- two screens sharing the thousand-a-second file at pairs of rates over and
+// under the cap with no screen at 120. Its own phase, RUN_SERIAL.
+void runCapNoTopChecks(const WallpaperManager::Config& config, const std::string& fast) {
+    const char* kGoal = "S15.922 (over the cap with no 120 screen, both screens draw their rates)";
+    const std::string other = rate120CodecClipPath("h264");
+    if (!std::filesystem::exists(fast) || !std::filesystem::exists(other) || !std::filesystem::exists(rate240ClipPath())) {
+        notVerified(kGoal, "the fixtures " + fast + ", " + other + " and " + rate240ClipPath() + " were not all generated");
+        return;
+    }
+    constexpr int kA = 0;
+    constexpr int kB = 1;
+    // One session per case: screen B plays alone, screen A joins it (and, for `leaves`, goes to another file).
+    // Every rate is set before the join, so no case depends on a refresh changed under a playing session.
+    struct Case {
+        const char* what;
+        int frameA, frameB;
+        double refreshA, refreshB;
+        bool leaves;
+        bool rate240 = false;
+    };
+    const std::string rate240 = rate240ClipPath();
+    const auto run = [&](const Case& c, const std::function<void(PictureLog&, Clock::time_point, Clock::time_point, double)>& grade) {
+        PhaseGrade phaseGrade("the over-the-cap phase without a 120 screen");
+        FrameReadyLog signals;
+        PictureLog pictures;
+        WallpaperManager manager(config);
+        CaptureGradeOnExit captureGrade{phaseGrade, manager};
+        Collector aCollector(manager, kA, ":1.786");
+        Collector bCollector(manager, kB, ":1.787");
+        RenderWorker worker(manager, [&](int monitorId, uint64_t generation) {
+            pictures.record(monitorId, generation);
+            signals.record(monitorId, generation);
+            aCollector.announced(monitorId, generation);
+            bCollector.announced(monitorId, generation);
+        });
+        aCollector.attach(worker);
+        bCollector.attach(worker);
+        WorkerUnblock unblock{worker};
+        for (const int id : {kA, kB}) wallpaperx::testing::nameScreen(manager, id, screenOf(id));
+        manager.setMonitorFrameRate(kA, c.frameA);
+        manager.setMonitorFrameRate(kB, c.frameB);
+        manager.setOutputRefreshRate(screenOf(kA), c.refreshA);
+        manager.setOutputRefreshRate(screenOf(kB), c.refreshB);
+        const std::string& file = c.rate240 ? rate240 : fast;
+        manager.requestWallpaper("video", file, kB);
+        worker.post(kB);
+        if (!signals.wait(kB, 1)) {
+            phaseGrade.expectNoDevice();
+            notVerified(kGoal, "the video produced no first picture on this host");
+            return false;
+        }
+        const std::optional<pid_t> renderThread = workerThreadId(worker);
+        check(renderThread.has_value(), "the render worker says which thread it is");
+        if (!renderThread) return false;
+        manager.requestWallpaper("video", file, kA);
+        worker.post(kA);
+        if (!signals.wait(kA, 1)) {
+            check(false, (std::string(c.what) + ": the joining screen drew a picture of the shared file").c_str());
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        if (c.leaves) {
+            manager.requestWallpaper("video", other, kA);
+            worker.post(kA);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        }
+        const Clock::time_point from = Clock::now();
+        const std::optional<double> cpuFrom = threadCpuSeconds(*renderThread);
+        std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+        const Clock::time_point to = Clock::now();
+        const std::optional<double> cpuTo = threadCpuSeconds(*renderThread);
+        const double cpu = cpuFrom && cpuTo ? (*cpuTo - *cpuFrom) / std::chrono::duration<double>(to - from).count() : -1.0;
+        grade(pictures, from, to, cpu);
+        reportUnless(aCollector.threw().empty() && bCollector.threw().empty(), "the consumers' hand-overs did not throw",
+                     aCollector.threw() + bCollector.threw());
+        return true;
+    };
+    // The 50 screen's draw gaps in the window: quartiles, printed, and the first `minimum` count asserted.
+    const auto quartiles = [&](PictureLog& pictures, Clock::time_point from, Clock::time_point to, const std::string& what)
+        -> std::optional<std::pair<double, double>> {
+        const std::vector<double> gaps = drawGapsIn(pictures, kB, from, to);
+        std::printf("video_wallpaper_test: %s: the 50 screen's gaps, quartiles %.2f / %.2f ms over %zu\n", what.c_str(),
+                    gaps.empty() ? 0.0 : gaps[gaps.size() / 4] * 1e3, gaps.empty() ? 0.0 : gaps[gaps.size() * 3 / 4] * 1e3,
+                    gaps.size());
+        std::fflush(stdout);
+        if (gaps.size() < 100) {
+            check(false, (what + ": the 50 screen drew 100 gaps to grade -- it drew " + std::to_string(gaps.size())).c_str());
+            return std::nullopt;
+        }
+        return std::pair{gaps[gaps.size() / 4], gaps[gaps.size() * 3 / 4]};
+    };
+
+    // GOAL: S15.923 -- the cap verdict is recomputed when a screen leaves: a 120 screen joins the 50 one (over the
+    //       cap), then leaves, and the 50 screen alone draws its own even 20 ms grid again. False for a stale "over".
+    // WHY-THIS-SHAPE: only a verdict that changes is visible, so the leave goes from over to under; on the
+    //       thousand-a-second file the 50 grid lands on pictures, where the cap's 120 grid gives 16.7/25 ms steps
+    //       (the 120 file gives both rules the same steps).
+    // CONTROL: control_batch.sh 2026-10-21 (G2a), NVIDIA, reverted, backend/daemon/wallpaper_manager.cpp: the
+    //       verdict recomputed only when the count of spacings grows -> "after a 120 screen left: the 50 screen
+    //       draws every 20 ms".
+    run({"after a 120 screen left", 120, 0, 0.0, 50.0, true}, [&](PictureLog& pictures, Clock::time_point from, Clock::time_point to, double) {
+        if (const auto q = quartiles(pictures, from, to, "after a 120 screen left")) {
+            reportUnless(q->first >= 0.0175 && q->second <= 0.0225, "after a 120 screen left: the 50 screen draws every 20 ms",
+                         std::to_string(q->first * 1e3) + " / " + std::to_string(q->second * 1e3) + " ms quartiles");
+        }
+    });
+
+    // GOAL: S15.922 -- under the cap (60 beside 50) the 50 screen's draws are as before the rule; over it with no
+    //       120 screen (100 beside 75, 75 beside 60) both keep drawing their own rates.
+    // WHY-THIS-SHAPE: under the cap the floor under the due times moves some of the 50 screen's pictures on this
+    //       file (one gap in five comes out 16.7 ms), where the cap's grid gives three in five: so the share of gaps
+    //       under 17.5 ms is graded, not evenness. The over pairs play wallpaper_rate240.mp4, whose 3 s pass keeps the
+    //       extra draw each slower screen makes at a pass's first picture (E16, not fixed) out of the rate. Rates
+    //       over a fixed 3 s wall window, so a stall reads as a low rate, never as a pass. The render thread's CPU
+    //       share is printed, not asserted: the one break known to hit this path stalls (0 draws, 0% CPU), so no
+    //       control has shown a spin, and an assertion never seen red is not shipped.
+    // CONTROL: control_batch.sh 2026-10-21 (G2a), NVIDIA, reverted, backend/daemon/wallpaper_manager.cpp:
+    //       overflowsCap() returning true -> "60 beside 50: the 50 screen draws on its own 20 ms grid"; the "no
+    //       screen draws it, pass it over" clause removed -> "100 beside 75: the faster screen draws its own rate"
+    //       and the other three rate lines, 0.0 draws a second on both screens.
+    run({"60 beside 50", 0, 0, 0.0, 50.0, false}, [&](PictureLog& pictures, Clock::time_point from, Clock::time_point to, double) {
+        if (quartiles(pictures, from, to, "60 beside 50")) {
+            const std::vector<double> gaps = drawGapsIn(pictures, kB, from, to);
+            const double shortShare = static_cast<double>(std::count_if(gaps.begin(), gaps.end(), [](double g) { return g < 0.0175; })) /
+                                      static_cast<double>(gaps.size());
+            reportUnless(shortShare <= 0.4, "60 beside 50: the 50 screen draws on its own 20 ms grid",
+                         std::to_string(shortShare * 100) + "% of its gaps under 17.5 ms");
+        }
+    });
+    struct Pair {
+        Case c;
+        double rateA, rateB;
+    };
+    for (const Pair& p : {Pair{{"100 beside 75", 120, 120, 100.0, 75.0, false, true}, 100, 75},
+                          Pair{{"75 beside 60", 120, 0, 75.0, 0.0, false, true}, 75, 60}}) {
+        run(p.c, [&](PictureLog& pictures, Clock::time_point from, Clock::time_point to, double cpu) {
+            const double a = drawRateIn(pictures, kA, from, to);
+            const double b = drawRateIn(pictures, kB, from, to);
+            std::printf("video_wallpaper_test: %s: draws a second %.1f and %.1f; render thread on a CPU %.0f%% of the time\n",
+                        p.c.what, a, b, cpu * 100);
+            std::fflush(stdout);
+            const std::string what = p.c.what;
+            reportUnless(a >= p.rateA * 0.95 && a <= p.rateA * 1.03, (what + ": the faster screen draws its own rate").c_str(),
+                         std::to_string(a));
+            reportUnless(b >= p.rateB * 0.95 && b <= p.rateB * 1.03, (what + ": the slower screen draws its own rate").c_str(),
+                         std::to_string(b));
+        });
+    }
 }
 
 constexpr int kMonitorHighRate = 0;
@@ -12706,6 +13023,12 @@ int main(int argc, char** argv) {
         }
         if (phaseSelected("thinSlice")) guardedPhase("thinSlice", [&] { runThinSliceChecks(config, fast); });
         if (phaseSelected("thinShared")) guardedPhase("thinShared", [&] { runThinSharedChecks(config); });
+        if (phaseSelected("capShared")) {
+            guardedPhase("capShared", [&] {
+                for (const double slow : {50.0, 75.0}) runCapSharedChecks(config, slow);
+            });
+        }
+        if (phaseSelected("capNoTop")) guardedPhase("capNoTop", [&] { runCapNoTopChecks(config, fast); });
         const auto highRateAt = [&](int frameRate) {
             if (std::filesystem::exists(rate240)) {
                 runHighRateChecks(config, rate240, frameRate);

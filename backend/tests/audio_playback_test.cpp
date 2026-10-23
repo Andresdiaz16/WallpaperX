@@ -8685,8 +8685,9 @@ void runLoopRestartLoadChecks() {
 }
 
 // GOAL: S15.567 -- a picture the daemon drops is never converted: over five 60 ms stalls of the heard
-//       120-a-second tone, conversions beyond the pictures committed stay under half the pictures
-//       dropped. False if every decoded picture is converted, dropped or not.
+//       120-a-second tone, at the default frame rate 60 (so also every picture the setting passes over),
+//       conversions beyond the pictures committed stay under half the pictures dropped. False if every
+//       decoded picture is converted, dropped or not.
 // WHY-THIS-SHAPE: a conversion is FrameConverter's one draw, interposed at vkCmdDraw (three vertices, one
 //       instance), and nothing else here draws that. A picture converted while it waits and dropped once it
 //       falls behind is still converted, which the fixed code does for a few; so the bound is half the
@@ -8695,7 +8696,10 @@ void runLoopRestartLoadChecks() {
 //       two at the window's edges), so the counter sees every shown picture's conversion.
 // CONTROL: control_run.sh 2026-10-12, reverted: `convert();` added after `m_unconverted = std::move(*frame);` in
 //       renderer/video/video_pipeline.cpp -> "FAIL: convert rule: a dropped picture is not converted" (420
-//       conversions for 389 commits and 31 dropped; 394 for 389 green).
+//       conversions for 389 commits and 31 dropped; 394 for 389 green). Re-run at the default 60,
+//       control_batch.sh 2026-10-20 (O1), --phase '^convertDropped$', both entries, reverted: `convert();` after
+//       hold()'s `m_unconverted = std::move(picture.frame);` -> the same line, 420 conversions for 200 commits and
+//       10 dropped on NVIDIA (green 200 for 200), 420 for 195 and 15 on Lavapipe (green 195 for 195).
 void runConvertDroppedChecks() {
     const char* kGoals = "S15.567 (a dropped picture is never converted)";
     SoundServer sound(kGoals);

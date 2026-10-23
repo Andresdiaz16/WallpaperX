@@ -1713,10 +1713,10 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
     # Step 13 Stage E1: a `video` wallpaper drawn end to end. SKIP_RETURN_CODE because two things
     # it needs can be absent: the ffmpeg command line that generates its fixture, and a host whose
     # Vulkan stack comes up at all; neither may read as a pass.
-    # RUN_SERIAL, not a lock, for the phases that count pictures a second against a 120 a second
-    # cap: any neighbour's load moves that (measured at -j8: 104.7-119.0 a second, alone 119.99),
-    # and a lock would only keep out entries holding the same lock.
-    set(_wx_video_serial capBudget capBudget60 highRate highRate60 thinRate60 thinRate120 thinShared thinSlice)
+    # RUN_SERIAL, not a lock, for the phases that count pictures a second against the frame-rate
+    # setting, 120 or 60 a second: any neighbour's load moves that (measured at -j8: 104.7-119.0 a
+    # second against 120, alone 119.99), and a lock would only keep out entries holding the same lock.
+    set(_wx_video_serial capBudget capBudget60 highRate highRate60 thinRate60 thinRate120 thinShared thinSlice capShared capNoTop)
     wallpaperx_add_phase_tests(BASE video_wallpaper TARGET wallpaperx-video-wallpaper-test
         SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/tests/video_wallpaper_test.cpp
         ENVIRONMENT "WALLPAPERX_FORCE_TIER="

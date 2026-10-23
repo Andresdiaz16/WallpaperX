@@ -1400,12 +1400,13 @@ void runRestoreChecks() {
     //       file had been replaced.
     // CONTROL: via control_run.sh, --phase 'restore does not write', 2026-09-29, both in
     //       backend/daemon/wallpaper_manager.cpp and needed together: the `if (repaired)` guard on
-    //       `m_repair = m_kept.rowsToWrite(liveWallpapers());` in WallpaperManager::restoreSaved()
+    //       `m_repair = configToWriteLocked();` in WallpaperManager::restoreSaved()
     //       deleted, AND `awaitPersisted();` added after writeRepairedConfig()'s
     //       `queuePersist(std::move(*repair));` -> "FAIL: restoring entries that need no repair does
     //       not rewrite the config file" and "FAIL: restoring entries that need no repair does not
     //       touch the config file's mtime". Without the wait the queued write has not reached the
     //       file when the read below happens, and the guard deletion alone stays green. Reverted.
+    //       Re-run 2026-10-20 (O1), control_batch.sh, the same two breaks -> both lines, restored green.
     //       This check therefore cannot see an asynchronous repair
     //       write; the daemon_system twin, which samples across a process restart, can, and is
     //       what really carries the rule.
@@ -6048,7 +6049,7 @@ void runStartupRepairChecks() {
     //       Asking whether monitor 1 carries "DP-4" is true of the unrepaired file as well --
     //       the fixture's second row says exactly that -- so only asking for the wallpaper and
     //       the name on one row separates the file this run wrote from the file it read.
-    // CONTROL: `if (repaired) m_repair = m_kept.rowsToWrite(liveWallpapers());` disabled at the
+    // CONTROL: `if (repaired) m_repair = configToWriteLocked();` disabled at the
     //       end of WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp), so
     //       writeRepairedConfig() has nothing to write -> "FAIL: the repair a start performs is
     //       on disk before any client call", printing "monitor 1 holds type '' path '' output
@@ -6056,7 +6057,9 @@ void runStartupRepairChecks() {
     //       nothing left to repair", printing a second-start detail carrying "2 screen names
     //       displaced by another entry" again. Observed via control_run.sh over the whole binary,
     //       2026-09-29: 31 red in all, every check in the binary that reads a startup repair back,
-    //       and S10.18 reported NOT VERIFIED. Reverted.
+    //       and S10.18 reported NOT VERIFIED. Reverted. Re-run 2026-10-20 (O1), control_batch.sh, this phase
+    //       alone, the guard made `if (false)` -> this line, the second-start line and "a kept row left holding
+    //       nothing is not written back"; restored green.
     const bool repairOnDisk = afterFirstStart.count(1) == 1 && afterFirstStart.at(1).path == present.string() &&
                               afterFirstStart.at(1).output == "DP-4";
     check(repairOnDisk, "the repair a start performs is on disk before any client call");

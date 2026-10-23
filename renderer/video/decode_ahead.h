@@ -26,18 +26,23 @@ class Device;
 // Made, used and destroyed on the GPU thread, and only for a device whose queues are internally
 // synchronised; the thread it starts is the only other one to touch the source. The source's
 // decoder asks whether the device answers through the GPU thread, so take() and wait() answer a
-// pending question before anything else, and the ready hook is called when one is asked.
+// pending question before anything else, and the ready hook is called when one is asked. Its probe,
+// the same question unwaited, is submitted there too and wakes the GPU thread the same way, though
+// no decode waits for its answer.
 //
-// Destruction stops the thread once the decode call it is in returns. One still inside after
-// kStopBound -- ffmpeg's own waits on the GPU are unbounded -- is left running, rather than the GPU
-// thread held behind it: the source, the pictures queued and this object's state are leaked, and
-// Device::recordThreadLeftRunning() keeps the Device, which the thread still reads, from being freed.
+// Destruction stops the thread once the decode call it is in returns, and gives up a start's read of the
+// file (VideoDecoder::startPending()) at its next packet, leaving the start unmade. It answers the
+// questions that call asks meanwhile, so a stop is never read as a device that no longer answers. One
+// still inside after kStopBound -- ffmpeg's own waits on the GPU are unbounded -- is left running, rather
+// than the GPU thread held behind it: the source, the pictures queued and this object's state are leaked,
+// and Device::recordThreadLeftRunning() keeps the Device, which the thread still reads, from being freed.
+// An answer begun inside the bound can outlast it by Device::immediateSubmit()'s own bound.
 class DecodeAhead {
 public:
     // Runs each decode the thread makes; must call the step it is given once.
     using Around = std::function<void(const std::function<void()>&)>;
-    // Called from the thread, with nothing locked, once there is an item a take() found missing
-    // or a question for the GPU thread.
+    // Called from the thread, with nothing locked, once there is an item a take() found missing,
+    // or a question or a probe for the GPU thread.
     using Ready = std::function<void()>;
 
     // Starts the thread on `source`. Null, with `source` as it was, when the system has no thread
@@ -72,6 +77,9 @@ private:
     static void run(Shared& shared) noexcept;
     // The decoder's question, put to the GPU thread from the decoding one.
     static bool ask(Shared& shared);
+    // The decoder's probe, posted to the GPU thread from the decoding one; never waits.
+    static VideoDecoder::Probe probe(Shared& shared);
+    void sendProbe(std::unique_lock<std::mutex>& lock);
     static void notifyReady(Shared& shared) noexcept;
     void answer(std::unique_lock<std::mutex>& lock);
     Item pop();

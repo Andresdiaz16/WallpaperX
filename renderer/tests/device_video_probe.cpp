@@ -389,6 +389,53 @@ void runDecodeInvariants(Device& device) {
 void runDecodeChecks(Device& device) {
     runDecodeInvariants(device);
 
+    // GOAL: S15.924 -- VK_KHR_video_maintenance2 is listed exactly when its feature struct is in the chain with its
+    //       flag set, videoInlineParameters() says the same, and a device that decodes and whose driver offers the
+    //       extension and its feature has it enabled.
+    // WHY-THIS-SHAPE: ffmpeg switches to inline parameter sets on the name alone, so a name without the feature (or
+    //       the reverse) is the defect; agreement alone would also hold for a Device that never enables it, hence
+    //       the offered-and-decoding clause, asked of the driver directly rather than of the Device.
+    // CONTROL: control_batch.sh 2026-10-21 (G2a), RTX 3080 Ti, reverted, renderer/vulkan/device.cpp: the struct
+    //       not appended while the name is listed -> "VK_KHR_video_maintenance2 is listed ... -- it is not" (and the
+    //       other two lines); the name not listed while the struct is -> that line alone; `inlineParameters` forced
+    //       false -> "a decoding device whose driver offers VK_KHR_video_maintenance2 and its feature does not
+    //       enable it".
+    {
+        const void* head = device.enabledFeatures().pNext;
+        const auto* m2 = static_cast<const VkPhysicalDeviceVideoMaintenance2FeaturesKHR*>(
+            findInChain(head, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_MAINTENANCE_2_FEATURES_KHR));
+        const bool linkedSet = m2 != nullptr && m2->videoMaintenance2 == VK_TRUE;
+        const bool listed = listedIn(device.enabledDeviceExtensions(), VK_KHR_VIDEO_MAINTENANCE_2_EXTENSION_NAME);
+        check(listed == linkedSet,
+              "VK_KHR_video_maintenance2 is listed exactly when its feature struct is in the chain with its flag set "
+              "-- it is not");
+        check(device.videoInlineParameters() == linkedSet,
+              "videoInlineParameters() disagrees with the video-maintenance-2 struct vkCreateDevice was given");
+        uint32_t count = 0;
+        vkEnumerateDeviceExtensionProperties(device.physicalDevice(), nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> available(count);
+        vkEnumerateDeviceExtensionProperties(device.physicalDevice(), nullptr, &count, available.data());
+        bool offered = false;
+        for (const VkExtensionProperties& e : available) {
+            if (std::strcmp(e.extensionName, VK_KHR_VIDEO_MAINTENANCE_2_EXTENSION_NAME) == 0) offered = true;
+        }
+        if (offered) {
+            VkPhysicalDeviceVideoMaintenance2FeaturesKHR feature{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_MAINTENANCE_2_FEATURES_KHR};
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            query.pNext = &feature;
+            vkGetPhysicalDeviceFeatures2(device.physicalDevice(), &query);
+            offered = feature.videoMaintenance2 == VK_TRUE;
+        }
+        const bool decodes = device.info().videoDecodeOps != 0;
+        std::printf("device_video_probe (decode): VK_KHR_video_maintenance2 %s by the driver, %s, inline parameters "
+                    "%s\n",
+                    offered ? "offered with its feature" : "not offered", listed ? "listed" : "not listed",
+                    device.videoInlineParameters() ? "on" : "off");
+        check(!(decodes && offered) || linkedSet,
+              "a decoding device whose driver offers VK_KHR_video_maintenance2 and its feature does not enable it");
+    }
+
     const auto& families = device.videoDecodeFamilies();
     if (families.empty()) {
         // Not a skip: "this driver has no decoder, reports none, and still works" is the whole of

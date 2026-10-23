@@ -34,11 +34,16 @@
 #include "vulkan/gpu_fault.h"
 
 #include "support/check.h"
+#include "support/length_change_flv.h"
+#include "support/picture_counter.h"
+#include "support/reset_point_reference.h"
 #include "support/validation_grade.h"
 #include "support/video_probe_support.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/mem.h>
 #include <libavutil/error.h>
 #include <libavutil/mathematics.h>
 #include <libavutil/hwcontext.h>
@@ -140,6 +145,26 @@ bool g_recordSends = false;
 std::vector<std::pair<int, bool>> g_sends;
 // Beside each send: whether the packet holds an H.264 IDR slice, read from its length-prefixed NAL units.
 std::vector<bool> g_sendsIdr;
+// While set, each HEVC packet sent with a 4-byte length layout: its skip_frame, first slice NAL type and
+// TemporalId, read here by support/reset_point_reference.h, not by the decoder's own walker.
+struct HevcSend {
+    int skipFrame;
+    int type;
+    int temporalId;
+};
+bool g_recordHevcSends = false;
+std::vector<HevcSend> g_hevcSends;
+// While set, each packet sent: its skip_frame, pts, and whether it holds an IDR slice under a 4- or 2-byte layout.
+struct LayoutSend {
+    int skipFrame;
+    int64_t pts;
+    bool idr;
+};
+bool g_recordLayoutSends = false;
+// av_read_frame strips the byte position and decode time from any packet carrying NEW_EXTRADATA.
+bool g_unmarkChangePacket = false;
+std::vector<LayoutSend> g_layoutSends;
+bool exactIdr(const AVPacket& packet, int prefix);
 
 // The thinning tag checks (runThinningTagChecks). While g_recordThinning is set, each packet's first real send
 // records, by its presentation time in ns, the grids' number the test had in force (g_numberInForce) and the
@@ -224,6 +249,7 @@ const char* pathName(VideoDecoder::Path path) {
         case VideoDecoder::Path::SoftwareNoDecoder: return "SoftwareNoDecoder";
         case VideoDecoder::Path::SoftwareCodec: return "SoftwareCodec";
         case VideoDecoder::Path::SoftwareRefused: return "SoftwareRefused";
+        case VideoDecoder::Path::SoftwareMissingReference: return "SoftwareMissingReference";
     }
     return "?";
 }
@@ -311,6 +337,8 @@ SkipDecode decodeSkipping(Device& device, const std::string& file, wallpaperx::P
 
 void runSkipLevelChecks(Device& device, const char* label, bool hardware, const SkipDecode& all, const SkipDecode& some);
 void runThinnedReopenCheck(Device& device);
+void runThinnedJumpResumeCheck(Device& device);
+void runThinnedMismatchCheck(Device& device);
 
 // GOAL: S15.576 -- VideoDecoder::next(PictureSkip::Unreferenced) leaves out the pictures nothing references:
 //       counter_long.mp4 (H.264, three B-frames between references, the middle one referenced) decodes to
@@ -352,6 +380,357 @@ void runPictureSkipChecks(Device& device, const char* label, bool hardware) {
     check(some.timed && some.rising,
           std::string(label) + ": the pictures a skipping decode returns carry presentation times, and they rise");
     runSkipLevelChecks(device, label, hardware, all, some);
+}
+
+// Whether `packet`'s units, read with `prefix`-byte lengths, fill it exactly and include an IDR slice.
+bool exactIdr(const AVPacket& packet, int prefix) {
+    size_t at = 0;
+    bool found = false;
+    const auto size = static_cast<size_t>(packet.size);
+    while (packet.data != nullptr && at + static_cast<size_t>(prefix) < size) {
+        size_t length = 0;
+        for (int b = 0; b < prefix; ++b) length = (length << 8) | packet.data[at + static_cast<size_t>(b)];
+        at += static_cast<size_t>(prefix);
+        if (length == 0 || length > size - at) return false;
+        found = found || (packet.data[at] & 0x1f) == 5;
+        at += length;
+    }
+    return at == size && found;
+}
+
+
+// The first send at AVDISCARD_DEFAULT after `pictures` taken at NonKey and the switch to Nothing, or nothing.
+std::optional<LayoutSend> firstFullSend(VideoDecoder& decoder, int pictures, int after, int& took) {
+    took = 0;
+    for (int i = 0; i < pictures && decoder.next(wallpaperx::PictureSkip::NonKey); ++i) ++took;
+    g_layoutSends.clear();
+    g_recordLayoutSends = true;
+    struct Stop {
+        ~Stop() { g_recordLayoutSends = false; }
+    } stop;
+    for (int i = 0; i < after && decoder.next(wallpaperx::PictureSkip::Nothing); ++i) ++took;
+    for (const LayoutSend& send : g_layoutSends) {
+        if (send.skipFrame == AVDISCARD_DEFAULT) return send;
+    }
+    return std::nullopt;
+}
+
+// GOAL: S15.926 (the decoder's half) -- a NEW_EXTRADATA that changes the NAL length size is followed by the
+//       decoder's packet walker: in software the level drops from NonKey to Nothing only at a packet the walker
+//       reads as an IDR, so after the change it drops at an IDR (180). False if the walker reads the later part
+//       with the stream's own length size: it then finds no IDR and the level never drops.
+// WHY-THIS-SHAPE: FLV built here from counter_ps.h264, 4-then-2 and 2-then-4. A 4-byte length under 65536 read
+//       as two 2-byte ones still finds the unit, so only a 4-byte reading of 2-byte data goes wrong: 4-then-2
+//       carries the verdict, 2-then-4 shows the opposite change is read too. The rewind half is
+//       runLengthChangePassChecks' (S15.930).
+// CONTROL: control_batch.sh 2026-10-23, reverted, video_decoder_content, renderer/video/video_decoder.cpp decode():
+//       the level-drop resetsDecoder() reading the stream's own header instead of header() -> "length 4-then-2:
+//       after the change the level drops to Nothing at an IDR (never)". Breaking header() or the side data kept in
+//       m_extradata now also starves the codec, so those fail as the fixture's ("ffmpeg decodes 121 of 300").
+// COVERAGE-ASSERT: the phase must return the 66 pictures it asks for, and a fresh decoder all 300, so a
+//       fixture ffmpeg could not decode fails as the harness's, not as a verdict.
+void runLengthChangePassChecks(Device& device, const std::string& file, const std::string& who, int firstPrefix);
+
+// The drawn counter of each picture `decoder` returns, up to `limit`; -1 for one that cannot be read.
+std::vector<int> hostCounters(VideoDecoder& decoder, size_t limit) {
+    std::vector<int> ids;
+    while (ids.size() < limit) {
+        const std::optional<wallpaperx::DecodedFrame> frame = decoder.next();
+        if (!frame) break;
+        const wallpaperx::DecodedFrame::HostPlanes planes = frame->hostPlanes();
+        const VkRect2D shown = frame->visible();
+        ids.push_back(wallpaperx::testing::readCounter(
+            [&](int column, int row) {
+                const int64_t x = shown.offset.x + (2 * column + 1) * static_cast<int64_t>(shown.extent.width) / 16;
+                const int64_t y = shown.offset.y + (2 * row + 1) * static_cast<int64_t>(shown.extent.height) / 12;
+                return static_cast<int>(planes.data[0][y * planes.stride[0] + x]);
+            },
+            125, 50));
+    }
+    return ids;
+}
+
+// GOAL: S15.928 (software) -- a file whose NAL length size changes mid-stream shows every picture, each with its
+//       right drawn number, on passes 2 and 3 as on pass 1. False if a later pass loses or misnumbers any (G2b's
+//       defect: pass 2 lost pictures 0-119). S15.930 -- a rewind proven to land on packet 1 puts the stream's own
+//       extradata back in effect: on 2-then-4, after a pass that read past the change, the walker finds the IDR
+//       at 60 again. False if the changed 4-byte header stays in effect: 2-byte data read with 4-byte lengths
+//       finds no IDR before the change, so the level drops only at 120 (pts 4000) or later.
+//       S15.929 -- a resume from a picture's position gives the codec the extradata in effect at the landing:
+//       resumed at 200 (past the change) and at 60 (before it), every picture from the landing on is right
+//       and the codec reads on from the landing.
+// WHY-THIS-SHAPE: pictures graded by drawn counter against a plain libavcodec decode, not by timestamps. The
+//       resume also checks the sends: the decoder's recovery re-reads from packet 1, so a wrong landing extradata
+//       still shows every picture right and only the re-read betrays it. The rewind is graded through the
+//       walker's IDR choice on 2-then-4: a 2-byte reader of 4-byte data still finds the units (see above).
+// CONTROL: control_batch.sh 2026-10-22, each alone, reverted, video_decoder_content, renderer/video/video_decoder.cpp:
+//       alignCodecExtradata() returning at once -> "length 4-then-2: pass 2 shows every picture, rightly numbered:
+//       180 of 300 shown, first difference at 0 (120 where 0 was due)", and on 2-then-4 "after restart() the level
+//       drops ... before the change (pts 6000, IDR)"; followExtradata() not applying the map at a landing ->
+//       "2-then-4: resumed at picture 200, the codec reads on from the landing ... (690 sends, first pts 2000,
+//       repeats)"; mapExtradataUpTo() reading to the end and the landing taking the last change regardless ->
+//       "resumed at picture 60 ... (542 sends, first pts 0, repeats)" (reading to the end alone stays green).
+//       NOT controlled: rewind() keeping m_extradata stays green, FLV's packet 1 seems to bring its own.
+// COVERAGE-ASSERT: the reference must be 300 readable counters, and every pass and resume compares
+//       its full expected length, so an empty or short decode cannot pass.
+void runLengthChangePassChecks(Device& device, const std::string& file, const std::string& who, int firstPrefix) {
+    std::string why;
+    const std::optional<wallpaperx::testing::CounterReference> reference =
+        wallpaperx::testing::decodeCounterReference(file, why);
+    // The two joined halves each count from 0, so the counters repeat; each must still be readable.
+    if (!reference || reference->ids.size() != 300 ||
+        std::find(reference->ids.begin(), reference->ids.end(), -1) != reference->ids.end()) {
+        std::fprintf(stderr, "FAIL: %sthe reference decode gives %zu pictures, not 300 readable ones (%s)\n",
+                     who.c_str(), reference ? reference->ids.size() : 0, why.c_str());
+        fail("the length-change reference could not be read, which is not a verdict on the decoder");
+        return;
+    }
+    const std::vector<int>& ids = reference->ids;
+    const auto describe = [&](const std::vector<int>& got, size_t from) {
+        size_t first = 0;
+        while (first < got.size() && from + first < ids.size() && got[first] == ids[from + first]) ++first;
+        return std::to_string(got.size()) + " of " + std::to_string(ids.size() - from) + " shown, first difference at " +
+               std::to_string(first) + " (" + (first < got.size() ? std::to_string(got[first]) : std::string("none")) +
+               " where " + (from + first < ids.size() ? std::to_string(ids[from + first]) : std::string("none")) +
+               " was due)";
+    };
+    // GOAL: S15.932 -- the extradata change map does not grow across passes: the one change (picture 120) is
+    //       recorded once and passes 2 and 3 add nothing, also when the change's packet carries neither a byte
+    //       position nor a decode time. False if a pass re-records it.
+    // WHY-THIS-SHAPE: counted through extradataChangesRecorded() after each pass, on this thread, which calls
+    //       next(); pictures alone cannot show it, as a lookup takes the last matching change. The unmarked run
+    //       strips the change packet's position and dts in an av_read_frame interposer: a packet that cannot be
+    //       ordered against what was mapped must not be appended, and only a count after a later pass shows that.
+    // CONTROL: control_batch.sh 2026-10-22, video_decoder_content, renderer/video/video_decoder.cpp
+    //       followExtradata(): `extends` true for every packet -> "the change map holds 1, 2, 3 changes";
+    //       `extends` true also for a packet notAfter() cannot order -> "unmarked change packet: ... does not grow across passes: 1, 2, 3".
+    // COVERAGE-ASSERT: the marked run must record exactly one change on pass 1, so a map that never fills fails.
+    for (const bool unmarked : {false, true}) {
+        VideoDecoder decoder(device, file);
+        g_unmarkChangePacket = unmarked;
+        struct Clear {
+            ~Clear() { g_unmarkChangePacket = false; }
+        } clear;
+        std::vector<size_t> recorded;
+        for (int pass = 1; pass <= 3; ++pass) {
+            if (pass > 1) decoder.restart();
+            const std::vector<int> got = hostCounters(decoder, 400);
+            recorded.push_back(decoder.extradataChangesRecorded());
+            if (!unmarked) {
+                check(got == ids, who + "pass " + std::to_string(pass) + " shows every picture, rightly numbered: " +
+                                      describe(got, 0));
+            }
+        }
+        const std::string counts = std::to_string(recorded[0]) + ", " + std::to_string(recorded[1]) + ", " +
+                                   std::to_string(recorded[2]);
+        std::printf("%s%s: changes recorded after passes 1-3: %s\n", who.c_str(),
+                    unmarked ? "unmarked change packet" : "marked", counts.c_str());
+        if (unmarked) {
+            check(recorded[1] == recorded[0] && recorded[2] == recorded[0],
+                  who + "unmarked change packet: the change map does not grow across passes: " + counts);
+        } else {
+            check(recorded[0] == 1 && recorded[1] == 1 && recorded[2] == 1,
+                  who + "the change map holds the file's one change once on every pass: the change map holds " + counts +
+                      " changes");
+        }
+    }
+    if (firstPrefix == 2) {
+        VideoDecoder decoder(device, file);
+        int whole = 0;
+        while (decoder.next()) ++whole;
+        decoder.restart();
+        int took = 0;
+        const std::optional<LayoutSend> after = firstFullSend(decoder, 2, 60, took);
+        check(whole == 300 && took == 62, who + "pass 1 returns 300 and the rewound pass the 62 asked for (" +
+                                              std::to_string(whole) + ", " + std::to_string(took) + ")");
+        check(after && after->idr && after->pts < 4000,
+              who + "after restart() the level drops to Nothing at an IDR before the change (" +
+                  (after ? "pts " + std::to_string(after->pts) + (after->idr ? ", IDR" : ", not an IDR")
+                         : std::string("never")) + ")");
+    }
+    for (const size_t landing : {size_t{200}, size_t{60}}) {
+        std::optional<wallpaperx::StreamPosition> position;
+        {
+            VideoDecoder first(device, file);
+            for (size_t i = 0; i <= landing; ++i) {
+                const std::optional<wallpaperx::DecodedFrame> frame = first.next();
+                if (!frame) break;
+                position = frame->position();
+            }
+        }
+        if (!position) {
+            std::fprintf(stderr, "FAIL: %sno position for picture %zu to resume from\n", who.c_str(), landing);
+            fail("the resume's position could not be taken, which is not a verdict on the landing");
+            continue;
+        }
+        VideoDecoder resumed(device, file, position);
+        g_layoutSends.clear();
+        g_recordLayoutSends = true;
+        const std::vector<int> got = hostCounters(resumed, 400);
+        g_recordLayoutSends = false;
+        // The decoder's recovery from an unreadable packet re-reads from packet 1, so pictures alone could not
+        // tell a wrong landing extradata from a right one; a codec handed the right one never needs that.
+        std::vector<int64_t> sent;
+        for (const LayoutSend& send : g_layoutSends) sent.push_back(send.pts);
+        std::sort(sent.begin(), sent.end());
+        const bool once = std::adjacent_find(sent.begin(), sent.end()) == sent.end();
+        check(!sent.empty() && sent.front() > 0 && once,
+              who + "resumed at picture " + std::to_string(landing) + ", the codec reads on from the landing, never "
+                    "again from packet 1 (" + std::to_string(sent.size()) + " sends, first pts " +
+                    (sent.empty() ? std::string("none") : std::to_string(sent.front())) + (once ? "" : ", repeats") + ")");
+        const std::vector<int> due(ids.begin() + static_cast<long>(landing), ids.end());
+        check(got == due, who + "resumed at picture " + std::to_string(landing) +
+                              ", every picture from the landing on is right: " + describe(got, landing));
+    }
+}
+
+void runLengthChangeChecks(Device& device) {
+    for (const auto& [firstPrefix, secondPrefix] : {std::pair{4, 2}, std::pair{2, 4}}) {
+        const std::string name = std::to_string(firstPrefix) + "-then-" + std::to_string(secondPrefix);
+        const std::filesystem::path path =
+            std::filesystem::temp_directory_path() / ("wpx_length_" + name + "_" + std::to_string(getpid()) + ".flv");
+        struct Remove {
+            std::filesystem::path path;
+            ~Remove() { std::filesystem::remove(path); }
+        } remove{path};
+        const std::string file = wallpaperx::testing::buildLengthChangeFlv(asset("counter_ps.h264"), path, firstPrefix, secondPrefix);
+        if (file.empty()) {
+            std::fprintf(stderr, "FAIL: length change %s: the harness could not build the FLV from counter_ps.h264\n",
+                         name.c_str());
+            fail("the length-change fixture could not be built, which is not a verdict on the decoder");
+            continue;
+        }
+        const std::string who = "content, software: length " + name + ": ";
+        try {
+            {
+                VideoDecoder whole(device, file);
+                int pictures = 0;
+                while (whole.next()) ++pictures;
+                if (pictures != 300) {
+                    std::fprintf(stderr, "FAIL: %sffmpeg decodes %d of 300 pictures\n", who.c_str(), pictures);
+                    fail("the length-change fixture does not decode, which is not a verdict on the walker");
+                    continue;
+                }
+            }
+            VideoDecoder decoder(device, file);
+            // Keyframes 0, 30 ... 150 at NonKey; then Nothing, which may start only at an IDR: 180.
+            int took = 0;
+            const std::optional<LayoutSend> after = firstFullSend(decoder, 6, 60, took);
+            check(took == 66, who + "the decode returns the 66 pictures asked for (" + std::to_string(took) + ")");
+            check(after && after->idr && after->pts >= 4000,
+                  who + "after the change the level drops to Nothing at an IDR (" +
+                      (after ? "pts " + std::to_string(after->pts) + (after->idr ? ", IDR" : ", not an IDR")
+                             : std::string("never")) + ")");
+            runLengthChangePassChecks(device, file, who, firstPrefix);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "FAIL: %sdecoding raised: %s\n", who.c_str(), e.what());
+            fail("the length-change decode raised");
+        }
+    }
+}
+
+// hvcC's numTemporalLayers (bits 5-3 of record byte 21) as ffmpeg hands it on, or -1 when the file
+// does not open as HEVC with an hvcC record.
+int declaredSubLayers(const std::string& file) {
+    AVFormatContext* format = nullptr;
+    if (avformat_open_input(&format, file.c_str(), nullptr, nullptr) < 0) return -1;
+    int layers = -1;
+    if (avformat_find_stream_info(format, nullptr) >= 0) {
+        for (unsigned i = 0; i < format->nb_streams; ++i) {
+            const AVCodecParameters& par = *format->streams[i]->codecpar;
+            if (par.codec_id == AV_CODEC_ID_HEVC && par.extradata_size > 22 && par.extradata[0] == 1) {
+                layers = (par.extradata[21] >> 3) & 7;
+            }
+        }
+    }
+    avformat_close_input(&format);
+    return layers;
+}
+
+// GOAL: S15.925 -- at PictureSkip::Unreferenced an HEVC sub-layer non-reference (_N) picture is left out only
+//       in the highest temporal sub-layer the stream declares: counter_opengop_hevc.mp4 declares 1, so its _N
+//       pictures go with AVDISCARD_NONREF and fewer pictures come back; a copy whose hvcC declares 3 sub-layers
+//       puts the same _N pictures (TemporalId 0) below the top, so each goes with AVDISCARD_DEFAULT and every
+//       picture comes back. False if a lower sub-layer _N picture is sent to be left out.
+// WHY-THIS-SHAPE: no x265 setting puts a _N picture below the top sub-layer, so the declaration is raised in
+//       the hvcC instead, which ffmpeg's decoder ignores and the thinning reads first; the patch is confirmed
+//       read back through libavformat before any verdict. Graded per send against a test-side reading of each
+//       packet's first slice, not by picture count alone, which could not say which picture was dropped.
+// CONTROL: control_batch.sh 2026-10-21, reverted, video_decoder_content, renderer/video/video_decoder.cpp
+//       nonrefLeavesOutReferenced(): returning false -> "3 sub-layer(s) declared: a _N picture in TemporalId 0 is
+//       sent to be left out (95 of 95 wrong)"; `temporalId + 1 <= layers` -> "1 sub-layer(s) declared: every _N
+//       picture in the top sub-layer is sent to be left out (95 of 95 wrong)". Test-side, by hand: the raise
+//       written as 2 -> "the fixtures declare 1 and 2 sub-layers, not 1 and 3".
+// COVERAGE-ASSERT: each decode must send at least 20 _N packets -- red (0) with the recorder reading 2-byte
+//       lengths (test-side, by hand, 2026-10-21).
+void runSubLayerThinningCheck(Device& device) {
+    using wallpaperx::PictureSkip;
+    const std::string plain = asset("counter_opengop_hevc.mp4");
+    const std::filesystem::path raised =
+        std::filesystem::temp_directory_path() / ("wpx_sublayers_" + std::to_string(getpid()) + ".mp4");
+    {
+        std::ifstream in(plain, std::ios::binary);
+        std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const size_t box = bytes.find("hvcC");
+        if (box == std::string::npos || box + 4 + 22 >= bytes.size()) {
+            std::fprintf(stderr, "FAIL: sub-layer thinning: counter_opengop_hevc.mp4 holds no hvcC record to raise\n");
+            fail("the sub-layer fixture could not be built");
+            return;
+        }
+        auto& byte = reinterpret_cast<uint8_t&>(bytes[box + 4 + 21]);
+        byte = static_cast<uint8_t>((byte & ~0x38) | (3 << 3));
+        std::ofstream(raised, std::ios::binary).write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    }
+    struct Remove {
+        std::filesystem::path path;
+        ~Remove() { std::filesystem::remove(path); }
+    } remove{raised};
+    const int plainLayers = declaredSubLayers(plain);
+    const int raisedLayers = declaredSubLayers(raised.string());
+    if (plainLayers != 1 || raisedLayers != 3) {
+        std::fprintf(stderr, "FAIL: sub-layer thinning: the fixtures declare %d and %d sub-layers, not 1 and 3\n",
+                     plainLayers, raisedLayers);
+        fail("the sub-layer fixture is not what this check grades");
+        return;
+    }
+    for (const auto& [file, layers] : {std::pair{plain, 1}, std::pair{raised.string(), 3}}) {
+        const std::string who = "content, software: " + std::to_string(layers) + " sub-layer(s) declared";
+        const SkipDecode all = decodeSkipping(device, file, PictureSkip::Nothing);
+        g_hevcSends.clear();
+        g_recordHevcSends = true;
+        SkipDecode some;
+        try {
+            some = decodeSkipping(device, file, PictureSkip::Unreferenced);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "  decoding raised: %s\n", e.what());
+        }
+        g_recordHevcSends = false;
+        int nonReference = 0;
+        int wrong = 0;
+        for (const HevcSend& send : g_hevcSends) {
+            if (send.type < 0 || send.type > 14 || send.type % 2 != 0) continue;
+            ++nonReference;
+            const bool top = send.temporalId + 1 == layers;
+            const int expected = top ? AVDISCARD_NONREF : AVDISCARD_DEFAULT;
+            if (send.skipFrame != expected && wrong++ == 0) {
+                std::fprintf(stderr, "  first wrong send: NAL type %d, TemporalId %d, skip_frame %d (expected %d)\n",
+                             send.type, send.temporalId, send.skipFrame, expected);
+            }
+        }
+        std::printf("video_decoder_probe (%s): %d pictures, %d skipping unreferenced; %d _N packets sent\n", who.c_str(),
+                    all.pictures, some.pictures, nonReference);
+        check(nonReference >= 20, who + ": the decode sends at least 20 _N packets (" + std::to_string(nonReference) + ")");
+        check(wrong == 0, who + (layers == 1 ? ": every _N picture in the top sub-layer is sent to be left out"
+                                             : ": a _N picture in TemporalId 0 is sent to be left out") +
+                              " (" + std::to_string(wrong) + " of " + std::to_string(nonReference) + " wrong)");
+        if (layers == 1) {
+            check(some.pictures < all.pictures, who + ": skipping unreferenced pictures returns fewer (" +
+                                                    std::to_string(some.pictures) + " of " + std::to_string(all.pictures) + ")");
+        } else {
+            check(some.pictures == all.pictures, who + ": skipping unreferenced pictures returns every one (" +
+                                                     std::to_string(some.pictures) + " of " + std::to_string(all.pictures) + ")");
+        }
+    }
 }
 
 // Decodes `file` at `from` until `pictures` have been returned, then records every send while it decodes at
@@ -864,6 +1243,7 @@ void runHardwareChecks(Device& device) {
                 waitedAt(secondSubmit).c_str(), waitedAt(afterFailure).c_str());
     runPictureSkipChecks(device, "hardware", true);
     if (haveAssets({"counter_long.mp4"})) runThinnedReopenCheck(device);
+    if (haveAssets({"counter_jump_bf.ts"})) runThinnedJumpResumeCheck(device);
 }
 
 // ------------------------------------------------------------------------- //
@@ -1485,6 +1865,173 @@ void runThinnedReopenCheck(Device& device) {
                 label.c_str(), returned, firstAfter ? int{*firstAfter} : -1, thinnedAgain ? "yes" : "no");
 }
 
+// The counter a software picture carries, read from its luma plane; -1 for a device picture or one unreadable.
+int hostCounter(const DecodedFrame& frame) {
+    if (frame.storage() != DecodedFrame::Storage::HostPlanes) return -1;
+    const DecodedFrame::HostPlanes planes = frame.hostPlanes();
+    const VkRect2D visible = frame.visible();
+    const auto width = static_cast<int64_t>(visible.extent.width);
+    const auto height = static_cast<int64_t>(visible.extent.height);
+    return wallpaperx::testing::readCounter(
+        [&](int column, int row) {
+            const int64_t x = visible.offset.x + (2 * column + 1) * width / 16;
+            const int64_t y = visible.offset.y + (2 * row + 1) * height / 12;
+            return int{planes.data[0][y * planes.stride[0] + x]};
+        },
+        128, 60);
+}
+
+// S15.901 -- a software fallback while thinning, after the timestamps stopped rising.
+void runThinnedJumpResumeCheck(Device& device) {
+    using namespace std::chrono_literals;
+    const std::string label = "hardware, thinned resume past a timestamp jump";
+    // 30 a second, B pictures; pictures 0-59 then 1000-1059, whose timestamps start again where 0's did.
+    VideoDecoder decoder(device, asset("counter_jump_bf.ts"));
+    const std::array<std::chrono::nanoseconds, 1> spacings{std::chrono::nanoseconds(2s) / 30};
+    decoder.leaveUnshown(wallpaperx::NumberedGrids{wallpaperx::ShowGrids(decoder.timelineStart(), spacings), 7});
+    struct Disarm {
+        ~Disarm() {
+            g_externalOnThinned = false;
+            g_externalFired = false;
+        }
+    } disarm;
+
+    // GOAL: S15.901 -- a hardware-to-software fallback, while thinning, on a file whose timestamps stopped
+    //       rising after thinning began resumes in place: the first software picture is the one after the last
+    //       returned, not picture 0. False if the fallback restarts the file.
+    // WHY-THIS-SHAPE: the place is read from the picture itself (its drawn counter), since timestamps that went
+    //       back say nothing; the failure is armed 20 pictures past the jump and fires on a thinned packet, so
+    //       the decoder has thinned both before and after its timestamp record was lost. A fixture whose
+    //       timestamps rise throughout resumes by timestamp and would pass whatever the packet-place rules do.
+    // CONTROL: control_batch.sh 2026-10-20 (O2), reverted, video_decoder_hardware (NVIDIA),
+    //       renderer/video/video_decoder.cpp: seekToResume() with `byPacket` false -> "FAIL: ... resumes in
+    //       place, past the jump, not at picture 0 (counter 0, expected 1020-1059)". judgeGrid()'s place-recorded
+    //       condition made true stays green: a plain open numbers every packet, so the place is always recorded.
+    // COVERAGE-ASSERT: premises -- hardware before, the failure fired and reopened in software, pictures
+    //       thinned before and after the jump, 20 returned past it.
+    int returned = 0, sinceJump = 0, thinnedBefore = 0, thinnedAfter = 0, counterAfter = -1;
+    bool jumped = false, reopened = false;
+    std::optional<std::chrono::nanoseconds> lastAt;
+    VideoDecoder::Path pathBefore = VideoDecoder::Path::SoftwareCodec;
+    while (std::optional<DecodedFrame> frame = decoder.next(wallpaperx::PictureSkip::Nothing)) {
+        ++returned;
+        if (g_externalFired) {
+            reopened = true;
+            counterAfter = hostCounter(*frame);
+            break;
+        }
+        const std::optional<std::chrono::nanoseconds> at = frame->presentationTime();
+        if (lastAt && at && *at < *lastAt) jumped = true;
+        if (at) lastAt = at;
+        if (frame->thinnedUnder()) ++(jumped ? thinnedAfter : thinnedBefore);
+        pathBefore = decoder.path();
+        if (jumped && ++sinceJump == 20) g_externalOnThinned = true;
+    }
+    std::printf("video_decoder_probe (%s): %d pictures, %d thinned before the jump and %d after; %d past the jump "
+                "before the failure; first picture after it shows counter %d\n",
+                label.c_str(), returned, thinnedBefore, thinnedAfter, sinceJump, counterAfter);
+    if (pathBefore != VideoDecoder::Path::Hardware) {
+        std::printf("video_decoder_probe (%s): %s decodes this file in %s, so a hardware failure cannot be staged -- "
+                    "not answerable here\n",
+                    label.c_str(), device.info().gpuName.c_str(), pathName(pathBefore));
+        g_notVerified = true;
+        return;
+    }
+    check(jumped && sinceJump >= 20 && thinnedBefore > 0 && thinnedAfter > 0,
+          label + ": thinning began before the timestamps went back and went on after (premise)");
+    check(g_externalFired && reopened && decoder.path() == VideoDecoder::Path::SoftwareRefused,
+          label + ": the staged failure fired on a thinned packet and the stream reopened in software (premise)");
+    check(reopened && counterAfter >= 1020 && counterAfter < 1060,
+          label + ": the software fallback resumes in place, past the jump, not at picture 0 (counter " +
+              std::to_string(counterAfter) + ", expected 1020-1059)");
+}
+
+// S15.903 -- frame timestamps that are not their packets' stop decoder-side thinning.
+void runThinnedMismatchCheck(Device& device) {
+    using namespace std::chrono_literals;
+    using wallpaperx::NumberedGrids;
+    using wallpaperx::ShowGrids;
+    const std::string label = "content, thinning on moved timestamps";
+    const std::array<std::chrono::nanoseconds, 1> spacings{std::chrono::nanoseconds(1s) / 60};
+    struct Picture {
+        std::optional<std::chrono::nanoseconds> at;
+        std::chrono::nanoseconds duration{};
+        int counter = -1;
+    };
+    struct Decoded {
+        std::vector<Picture> pictures;
+        std::optional<ShowGrids> grid;
+    };
+    const auto decode = [&](const char* name, bool thinned) {
+        Decoded out;
+        VideoDecoder decoder(device, asset(name));
+        out.grid.emplace(decoder.timelineStart(), spacings);
+        if (thinned) decoder.leaveUnshown(NumberedGrids{*out.grid, 3});
+        while (std::optional<DecodedFrame> frame = decoder.next(wallpaperx::PictureSkip::Nothing)) {
+            out.pictures.push_back({frame->presentationTime(), frame->duration().value_or(std::chrono::nanoseconds(1s) / 120),
+                                    hostCounter(*frame)});
+        }
+        return out;
+    };
+
+    // Premise: the 60 a second grid thins this file's unmoved twin, so it is live on this encoding.
+    const Decoded plainBase = decode("counter_rate120.mp4", false);
+    const Decoded thinBase = decode("counter_rate120.mp4", true);
+    check(plainBase.pictures.size() == 480 && thinBase.pictures.size() + 50 <= plainBase.pictures.size(),
+          label + ": the grid thins the file with unmoved timestamps (premise; " + std::to_string(thinBase.pictures.size()) +
+              " of " + std::to_string(plainBase.pictures.size()) + " returned)");
+
+    // GOAL: S15.903 -- once decoded pictures' timestamps differ from their packets', the decoder stops leaving
+    //       pictures out by packet timestamp: every picture the screen's grid shows by the time it is returned
+    //       with is returned. False if one is skipped.
+    // WHY-THIS-SHAPE: graded against the file's own unthinned decode, by returned time, the time the pipeline
+    //       shows by; pictures are matched by their drawn counter, not by time, since leaving pictures out changes
+    //       which timestamps ffmpeg picks for the rest, so another picture can carry a missing one's. The fixture moves every other packet 1.5 pictures, so by packet time the grid would leave
+    //       out exactly the B pictures it shows by returned time; a fixture moving every timestamp alike keeps
+    //       frame and packet times equal and never trips the rule. The first 24 pictures are printed, not
+    //       graded: pictures already sent before the first mismatched one returns can be judged on the wrong
+    //       timeline (a known window, E10b's "item 8 can still miss one window").
+    // CONTROL: control_batch.sh 2026-10-20 (O2), reverted, video_decoder_content and its lavapipe twin,
+    //       renderer/video/video_decoder.cpp: `m_packetTimesHold = false` never set -> "FAIL: ... every picture
+    //       the grid shows by its returned time is returned (81 of 229 were not)".
+    // COVERAGE-ASSERT: at least 100 shown pictures compared, and the plain decode returns all 480.
+    const Decoded plain = decode("counter_rate120_moved.mp4", false);
+    const Decoded thinned = decode("counter_rate120_moved.mp4", true);
+    std::vector<int> returnedIds;
+    for (const Picture& p : thinned.pictures) returnedIds.push_back(p.counter);
+    std::sort(returnedIds.begin(), returnedIds.end());
+    size_t unreadable = 0;
+    for (const Picture& p : plain.pictures) unreadable += p.counter < 0 ? 1 : 0;
+    constexpr size_t kGradedFrom = 24;
+    size_t wanted = 0, missed = 0, missedEarly = 0;
+    for (size_t i = 0; i < plain.pictures.size(); ++i) {
+        const Picture& p = plain.pictures[i];
+        if (!p.at || !plain.grid->shows(*p.at, p.duration)) continue;
+        const bool found = std::binary_search(returnedIds.begin(), returnedIds.end(), p.counter);
+        if (i < kGradedFrom) {
+            if (!found) ++missedEarly;
+            continue;
+        }
+        ++wanted;
+        if (!found) {
+            ++missed;
+            if (missed <= 5) {
+                std::fprintf(stderr, "  picture %d at %lld us is shown by the grid but was not returned\n", p.counter,
+                             static_cast<long long>(p.at->count() / 1000));
+            }
+        }
+    }
+    std::printf("video_decoder_probe (%s): %zu pictures plain, %zu thinned; %zu shown compared, %zu missed, %zu "
+                "missed among the first %zu (not graded); unmoved twin %zu of %zu\n",
+                label.c_str(), plain.pictures.size(), thinned.pictures.size(), wanted, missed, missedEarly, kGradedFrom,
+                thinBase.pictures.size(), plainBase.pictures.size());
+    check(plain.pictures.size() == 480 && unreadable == 0 && wanted >= 100,
+          label + ": enough shown pictures were compared, each read by its drawn counter (" + std::to_string(wanted) +
+              " of " + std::to_string(plain.pictures.size()) + " decoded, " + std::to_string(unreadable) + " unreadable)");
+    check(missed == 0, label + ": every picture the grid shows by its returned time is returned (" +
+                           std::to_string(missed) + " of " + std::to_string(wanted) + " were not)");
+}
+
 void runContentChecks(Device& device) {
     if (!haveAssets({"h264_raw.h264", "audio_only.m4a"})) {
         g_notVerified = true;
@@ -1826,7 +2373,10 @@ void runContentChecks(Device& device) {
             g_notVerified = true;
         }
         runPictureSkipChecks(software, "content, software", false);
+        if (haveAssets({"counter_opengop_hevc.mp4"})) runSubLayerThinningCheck(software);
+        if (haveAssets({"counter_ps.h264"})) runLengthChangeChecks(software);
         if (haveAssets({"counter_long.mp4"})) runThinningTagChecks(software);
+        if (haveAssets({"counter_rate120.mp4", "counter_rate120_moved.mp4"})) runThinnedMismatchCheck(software);
     }
     g_hideVideoExtensions = false;
 }
@@ -1847,6 +2397,16 @@ extern "C" VkResult vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physic
     }
     if (!g_hideVideoExtensions) return real(physicalDevice, layerName, count, properties);
     return wallpaperx::testing::enumerateWithoutVideoExtensions(real, physicalDevice, layerName, count, properties);
+}
+
+extern "C" int av_read_frame(AVFormatContext* format, AVPacket* packet) {
+    static const auto real = reinterpret_cast<int (*)(AVFormatContext*, AVPacket*)>(dlsym(RTLD_NEXT, "av_read_frame"));
+    const int err = real(format, packet);
+    if (err >= 0 && g_unmarkChangePacket && av_packet_get_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, nullptr)) {
+        packet->pos = -1;
+        packet->dts = AV_NOPTS_VALUE;
+    }
+    return err;
 }
 
 extern "C" VkResult vkQueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
@@ -1983,6 +2543,18 @@ extern "C" int avcodec_send_packet(AVCodecContext* context, const AVPacket* pack
     if (g_recordSends && context != nullptr && packet != nullptr) {
         g_sends.push_back({context->skip_frame, (packet->flags & AV_PKT_FLAG_KEY) != 0});
         g_sendsIdr.push_back(holdsIdrSlice(*packet));
+    }
+    if (g_recordLayoutSends && context != nullptr && packet != nullptr && packet->data != nullptr) {
+        g_layoutSends.push_back({context->skip_frame, packet->pts, exactIdr(*packet, 4) || exactIdr(*packet, 2)});
+    }
+    if (g_recordHevcSends && context != nullptr && packet != nullptr && packet->data != nullptr) {
+        const auto slice = wallpaperx::testing::firstSlice(packet->data, static_cast<size_t>(packet->size),
+                                                           AV_CODEC_ID_HEVC, 4);
+        if (slice) {
+            g_hevcSends.push_back({context->skip_frame, slice->type, (packet->data[slice->offset + 1] & 7) - 1});
+        } else {
+            g_hevcSends.push_back({context->skip_frame, -1, -1});
+        }
     }
     return real(context, packet);
 }

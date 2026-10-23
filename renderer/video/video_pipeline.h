@@ -42,14 +42,19 @@ struct OffscreenTarget;
 // ordered against the decoder's next write of that image by the frame's semaphore. The blit
 // needs nothing beyond submission order: both batches go to the graphics queue, blit second.
 //
-// The first picture is decoded on the calling thread. From the second on, a stream the device
-// decodes is decoded on a thread of its own, a few pictures ahead (DecodeAhead), when the device's
-// queues are internally synchronised and the thread can be had; otherwise every picture is decoded
-// on the calling thread. Only takeReady(), decodeWithin() and leaveUnshown() set what that thread's
+// Pictures are decoded on a thread of its own, a few ahead (DecodeAhead), when the device's queues are
+// internally synchronised and the thread can be had: from the second picture on for a stream the device
+// decodes, and from the first, whatever the path, for a decoder whose start reads the file up to its
+// position first (VideoDecoder::startPending()). Such a stream stays on that thread if it then settles in
+// software. Every other picture is decoded on the calling thread. A start's read is unbounded by any drop
+// limit, and a call that waits for a picture -- renderNext(), decodeNext(), decodeWithin() -- holds the
+// calling thread, and every screen it draws, for the whole read, with or without the thread: a late start
+// in a large FLV or NUT file is a long hold. Only takeReady() leaves the calling thread free during it, and
+// only where the thread runs. Only takeReady(), decodeWithin() and leaveUnshown() set what that thread's
 // decodes skip.
 //
 // GPU thread only, destruction included. Must be destroyed before the Device. Destruction waits
-// for the decode thread to leave the decode call it is in.
+// for the decode thread to leave the decode call it is in; a start's read is given up at its next packet.
 class VideoPipeline {
 public:
     using Playback = PictureSource::Playback;
@@ -65,8 +70,9 @@ public:
         DecodeAhead::Ready ready;
     };
 
-    // Opens `file`; nothing is decoded until the first call, which shows the picture at `startAt`
-    // when one is given, as VideoDecoder's constructor describes. Throws what that constructor throws.
+    // Opens `file`; nothing is decoded before the first call, but by a decode thread started here for a start
+    // that reads the file first, as above. That call shows the picture at `startAt` when one is given, as
+    // VideoDecoder's constructor describes. Throws what that constructor throws.
     VideoPipeline(Device& device, const std::string& file, const std::string& shaderDir,
                   Playback playback = Playback::Once, std::optional<StreamPosition> startAt = std::nullopt,
                   DecodeHooks hooks = {});

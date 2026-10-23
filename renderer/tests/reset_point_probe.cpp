@@ -12,6 +12,7 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/mem.h>
 }
 
 #include <cstdint>
@@ -20,6 +21,7 @@ extern "C" {
 #include <filesystem>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -177,6 +179,98 @@ Counts gradeFile(const char* file, AVCodecID codec, int lengthSize) {
     return counts;
 }
 
+
+// A packet holding `bytes`, with `side` as AV_PKT_DATA_NEW_EXTRADATA when it is not empty.
+struct OwnedPacket {
+    AVPacket* packet = av_packet_alloc();
+    OwnedPacket(const std::vector<uint8_t>& bytes, const std::vector<uint8_t>& side) {
+        if (packet == nullptr || av_new_packet(packet, static_cast<int>(bytes.size())) < 0) return;
+        std::memcpy(packet->data, bytes.data(), bytes.size());
+        if (!side.empty()) {
+            auto* copy = static_cast<uint8_t*>(av_malloc(side.size()));
+            if (copy == nullptr) return;
+            std::memcpy(copy, side.data(), side.size());
+            if (av_packet_add_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, copy, side.size()) < 0) av_free(copy);
+        }
+    }
+    ~OwnedPacket() { av_packet_free(&packet); }
+    bool ok() const { return packet != nullptr && packet->data != nullptr; }
+};
+
+// GOAL: S15.926 (the readers' half) -- the NAL walkers take the length-prefix size from the extradata they are
+//       handed, so a NEW_EXTRADATA declaring 2-byte lengths reads 2-byte packets: resetsDecoder(), firstSlice()
+//       and beyondExtradata() on an avcC and an hvcC declaring 2; hevcSubLayers() reads the SPS's count; and
+//       changesExtradata() marks a same-size NEW_EXTRADATA one byte different, and not a byte-identical one.
+//       False if a walker assumes 4-byte lengths, or the comparison is by size or by presence.
+// WHY-THIS-SHAPE: hand-built bytes, because no encoder writes 2-byte lengths and the decoder-level half (the
+//       decoder adopting the side data, a rewind dropping it) needs a fixture this round did not build -- see
+//       docs/efficiency/G2b_report.md. Each 2-byte reading is paired with the same packet under a 4-byte header,
+//       which must not read, so a fixture whose bytes happened to parse either way could not pass.
+// CONTROL: control_batch.sh 2026-10-21, each alone, reverted, reset_point_detector, renderer/video/reset_point.cpp:
+//       lengthSize() returning 4 for avcC -> "avcC declaring 2-byte lengths: resetsDecoder() reads ..." (and the
+//       firstSlice and beyond lines); for hvcC -> "hvcC declaring 2-byte lengths: firstSlice() finds ...";
+//       changesExtradata() by size only -> "a same-size NEW_EXTRADATA with one byte changed ..."; by presence
+//       only -> "a byte-identical NEW_EXTRADATA does not change ..."; hevcSubLayers() reading unit[2] & 7 ->
+//       "... reads 3 sub-layers from the SPS (got 6)".
+void runLengthSizeChecks() {
+    using wallpaperx::testing::check;
+    auto avcC = [](uint8_t lengthByte) {
+        return std::vector<uint8_t>{1, 0x42, 0, 0x1e, lengthByte, 0xe1, 0, 4, 0x67, 0x42, 0, 0x1e, 1, 0, 2, 0x68, 0xce};
+    };
+    auto hvcC = [](uint8_t lengthByte) {
+        std::vector<uint8_t> record(23, 0);
+        record[0] = 1;
+        record[21] = lengthByte;  // numTemporalLayers 0: the count comes from the SPS
+        record[22] = 1;
+        const std::vector<uint8_t> sps = {0x21, 0, 1, 0, 3, 0x42, 0x01, 0x05};  // SPS, max_sub_layers_minus1 = 2
+        record.insert(record.end(), sps.begin(), sps.end());
+        return record;
+    };
+    AVCodecParameters h264{};
+    h264.codec_id = AV_CODEC_ID_H264;
+    AVCodecParameters hevc{};
+    hevc.codec_id = AV_CODEC_ID_HEVC;
+    const std::vector<uint8_t> avc2 = avcC(0xfd), avc4 = avcC(0xff), hvc2 = hvcC(0xc1), hvc4 = hvcC(0xc3);
+    auto header = [](const AVCodecParameters& stream, const std::vector<uint8_t>& extra) {
+        return wallpaperx::CodecHeader{&stream, extra.data(), extra.size()};
+    };
+
+    const OwnedPacket idr({0, 3, 0x65, 0x88, 0x84}, {});
+    const OwnedPacket newSps({0, 4, 0x67, 0x42, 0, 0x1f, 0, 3, 0x65, 0x88, 0x84}, {});
+    const OwnedPacket heldSps({0, 4, 0x67, 0x42, 0, 0x1e, 0, 3, 0x65, 0x88, 0x84}, {});
+    const OwnedPacket hevcSlice({0, 3, 0x00, 0x01, 0xaf}, {});
+    std::vector<uint8_t> changed = avc2;
+    changed[3] = 0x1f;
+    const OwnedPacket sideSame({0, 3, 0x65, 0x88, 0x84}, avc2);
+    const OwnedPacket sideChanged({0, 3, 0x65, 0x88, 0x84}, changed);
+    if (!idr.ok() || !newSps.ok() || !heldSps.ok() || !hevcSlice.ok() || !sideSame.ok() || !sideChanged.ok()) {
+        fail("the harness could not build its packets, which is not a verdict on the NAL readers");
+        return;
+    }
+    check(resetsDecoder(header(h264, avc2), *idr.packet),
+          "avcC declaring 2-byte lengths: resetsDecoder() reads a 2-byte-prefixed IDR as a reset point");
+    check(wallpaperx::firstSlice(header(h264, avc2), *idr.packet) == idr.packet->data + 2,
+          "avcC declaring 2-byte lengths: firstSlice() finds the slice after a 2-byte prefix");
+    check(!resetsDecoder(header(h264, avc4), *idr.packet),
+          "the same 2-byte packet under an avcC declaring 4 is not read as a reset point (the fixture discriminates)");
+    check(wallpaperx::beyondExtradata(header(h264, avc2), *newSps.packet),
+          "avcC declaring 2-byte lengths: an SPS the extradata does not hold is beyond it");
+    check(!wallpaperx::beyondExtradata(header(h264, avc2), *heldSps.packet),
+          "avcC declaring 2-byte lengths: the extradata's own SPS is not beyond it");
+    check(wallpaperx::firstSlice(header(hevc, hvc2), *hevcSlice.packet) == hevcSlice.packet->data + 2,
+          "hvcC declaring 2-byte lengths: firstSlice() finds the HEVC slice after a 2-byte prefix");
+    check(wallpaperx::firstSlice(header(hevc, hvc4), *hevcSlice.packet) == nullptr,
+          "the same 2-byte HEVC packet under an hvcC declaring 4 holds no readable slice (the fixture discriminates)");
+    check(wallpaperx::hevcSubLayers(header(hevc, hvc2)) == 3,
+          "hvcC with no declared count: hevcSubLayers() reads 3 sub-layers from the SPS (got " +
+              std::to_string(wallpaperx::hevcSubLayers(header(hevc, hvc2))) + ")");
+    check(!wallpaperx::changesExtradata(header(h264, avc2), *sideSame.packet),
+          "a byte-identical NEW_EXTRADATA does not change the extradata");
+    check(wallpaperx::changesExtradata(header(h264, avc2), *sideChanged.packet),
+          "a same-size NEW_EXTRADATA with one byte changed changes the extradata");
+    check(!wallpaperx::changesExtradata(header(h264, avc2), *idr.packet), "a packet with no NEW_EXTRADATA changes nothing");
+}
+
 }  // namespace
 
 // With no argument, the H.264 and HEVC fixtures, which are always generated; with `av1`, the AV1 one, which
@@ -235,6 +329,8 @@ int main(int argc, char** argv) {
             fail("a fixture lost the reset points or open keyframes the classifier is graded on");
         }
     }
+
+    if (!av1Entry) runLengthSizeChecks();
 
     const int failures = wallpaperx::testing::reportFailures("reset_point_probe");
     if (failures > 0) return 1;

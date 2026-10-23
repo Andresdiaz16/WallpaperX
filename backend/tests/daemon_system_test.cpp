@@ -4578,11 +4578,12 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
     //       the now asynchronous repair write).
     // WHY-THIS-SHAPE: the MTIME, sampled with no daemon running: a second save reproduces the
     //       first daemon's file byte for byte (measured: a byte comparison stayed green).
-    // CONTROL: the `if (repaired)` guard on `m_repair = ...` at the end of
+    // CONTROL: the `if (repaired)` guard on `m_repair = configToWriteLocked();` at the end of
     //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) deleted ->
     //       "FAIL: a daemon that restores entries needing no repair leaves the config file exactly
     //       as it found it", "the file's mtime moved ...", six unreadable-config lines beside it.
-    //       Via control_run.sh, 2026-09-29. Reverted.
+    //       Via control_run.sh, 2026-09-29. Reverted. Re-run 2026-10-20 (O1), control_batch.sh, --phase
+    //       '^configRestart$' -> this line and a /health persistence line; restored green.
     second.shutdown(SIGTERM);
     awaitNameRelease(names, "the phase after the config restart");
     std::error_code afterEc;

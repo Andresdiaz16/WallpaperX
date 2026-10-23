@@ -32,6 +32,7 @@
 #include "support/forked_child.h"
 #include "support/gpu_readback.h"
 #include "support/sanitizer_ignored_caller.h"
+#include "support/length_change_flv.h"
 #include "support/picture_counter.h"
 #include "support/reset_point_reference.h"
 #include "support/validation_grade.h"
@@ -110,6 +111,10 @@ bool g_hideVideoExtensions = false;
 // on the calling thread, with no thread decoding ahead outside that call.
 bool g_hideSynchronizedQueues = false;
 
+// Set by damaged-device-no-inline: strips VK_KHR_video_maintenance2 alone, so the Device decodes on the hardware
+// with ffmpeg's cached session parameters, the configuration E20's side-data guard is for.
+bool g_hideVideoMaintenance2 = false;
+
 // The decoder's own codec context is the one with `opaque` set; avformat_find_stream_info decodes
 // through the same entry points on contexts of its own, which must neither be failed nor counted.
 bool isDecodersContext(const AVCodecContext* context) { return context != nullptr && context->opaque != nullptr; }
@@ -153,6 +158,15 @@ int g_refuseFrom = 0;
 int g_refuseThrough = 0;
 // Pictures the decoder receives lose their timestamp.
 bool g_stripTimestamps = false;
+// av_hwframe_ctx_init fails this many more times for Vulkan images: ffmpeg refusing the device's images
+// inside the format callback of the first packet sent, on a device that still answers.
+int g_failFramesInit = 0;
+// The next device picture the decoder's hardware context allocates asks for a second one first, from
+// inside the decoder's own get_buffer2: the request ffmpeg makes for a stand-in reference. Counted when made.
+bool g_standInAtNextPicture = false;
+int g_standInsForced = 0;
+// Whether the last picture the decoder's context returned while g_recordPictures was set was a device one.
+bool g_lastReceivedDevice = false;
 
 // Packets sent to the decoder's context, pictures it returned and packets the demuxer read while
 // g_logTraffic is set, each with the number of seeks recorded in g_failingSeeks when it happened; a
@@ -190,6 +204,8 @@ void clearFailingCallConditions() {
     g_seekFailure = SeekFailure::None;
     g_refuseFrom = 0;
     g_refuseThrough = 0;
+    g_failFramesInit = 0;
+    g_standInAtNextPicture = false;
 }
 
 // What one call of a looping run did, counted while g_tallying is set.
@@ -213,8 +229,10 @@ bool g_destroyedUnderLeak = false;
 enum class LoopSeek { None, FailAll, FailFirst, FailTimestamps, LateFirst };
 LoopSeek g_loopSeek = LoopSeek::None;
 constexpr int kLateSeconds = 2;
-// av_read_frame hands out packets without a byte position.
+// av_read_frame hands out packets without a byte position; with g_clearDts also without a decode time.
 bool g_clearPositions = false;
+bool g_clearDts = false;
+int g_dtsCleared = 0;
 // avcodec_send_packet refuses every packet on the decoder's context.
 bool g_refuseAllPackets = false;
 int g_packetsRefused = 0;
@@ -236,7 +254,10 @@ constexpr const char* kVulkanCallNames[] = {WALLPAPERX_VULKAN_CALLS(WALLPAPERX_N
 #undef WALLPAPERX_NAME
 constexpr int kFirstWait = k_vkWaitForFences;
 
-bool g_countVulkan = false;
+// Per thread: a call's own Vulkan work runs on the calling thread, since the Device aborts on a GPU call from any
+// other; a decode thread's calls are ffmpeg's frame pool growing, and landed in a count whenever its timing fell
+// inside the call.
+thread_local bool g_countVulkan = false;
 std::array<int, kVulkanCallCount> g_vulkanCalls{};
 
 struct VulkanTally {
@@ -362,6 +383,38 @@ struct CodecRecord {
     int freedDuring = kOutsideCalls;
 };
 std::vector<CodecRecord> g_codecs;
+
+// Device codecs of the decoder's, open at once and opened in all, while g_countDeviceCodecs is set. When the second
+// opens -- the first opened by a decoder switch -- the next vkAllocateMemory returns g_allocationAtSwitch (unless
+// VK_SUCCESS), or with g_framesAtSwitch the next Vulkan frames init fails. Atomic: the decode thread opens codecs.
+std::atomic<bool> g_countDeviceCodecs{false};
+std::atomic<int> g_deviceCodecsLive{0};
+std::atomic<int> g_deviceCodecsMax{0};
+std::atomic<int> g_deviceCodecsOpened{0};
+std::atomic<VkResult> g_allocationAtSwitch{VK_SUCCESS};
+std::atomic<bool> g_allocationArmed{false};
+std::atomic<bool> g_allocationInjected{false};
+std::atomic<bool> g_framesAtSwitch{false};
+std::atomic<bool> g_framesArmed{false};
+std::atomic<int> g_deviceCodecsFreed{0};
+// With g_pictureAtSwitch the injected allocation is instead the first one a picture of the switch's decoder makes
+// (allocatePicture()'s path), never one of its setup.
+std::atomic<bool> g_pictureAtSwitch{false};
+std::atomic<bool> g_pictureArmed{false};
+// With g_bitstreamAtSwitch it is instead the first allocation after that decoder's first picture returned from
+// avcodec_default_get_buffer2: the slice's bitstream buffer, which no callback of the decoder's sees.
+std::atomic<bool> g_bitstreamAtSwitch{false};
+std::atomic<bool> g_bitstreamArmed{false};
+// Which device codec, counted in opening order, the injection is armed for: 1 is the constructor's, 2 a switch's.
+std::atomic<int> g_injectAtCodec{2};
+// Depth of avcodec_default_get_buffer2 calls in progress, and whether the injected allocation was inside one.
+std::atomic<int> g_inGetBuffer{0};
+std::atomic<bool> g_injectedInPicture{false};
+std::atomic<uint64_t> g_injectedSize{0};
+// When the decoder's first device codec reports EOF -- the end of its emptying at a switch -- the next fenced
+// submission is held and its wait refused: the switch's question goes unanswered.
+bool g_unanswerAtSwitch = false;
+bool g_unanswerFired = false;
 
 // Added to the next device picture avcodec_receive_frame returns on the decoder's context, once.
 int g_inflateWidth = 0;
@@ -737,9 +790,17 @@ void runResumeTimestampChecks(Device& device, const std::string& label) {
     //       shown" at all three. seekToResume()'s last arm -- the one with no seek, taken when the target is
     //       at the stream's start -- without its rewind(): the first point alone red, "call 2 showed 24 where
     //       1 was due ... 23 never shown", via control_batch.sh 2026-10-01.
+    //       This entry runs with the synchronised queues hidden (g_hideSynchronizedQueues), so it decodes on
+    //       the calling thread: with the decode thread on, the resume ran outside the measured call, which
+    //       counted 0 pictures and 0 seeks and left the bound 0 against 25. Re-run hidden 2026-10-23 (G3d),
+    //       RTX 3080 Ti, control_batch.sh, bytes restored: seek disabled -> "decoded 31 pictures, more than
+    //       the 25" and "292" at 291; `<` -> "call 2 showed 0 where 1 was due; 1 shown more than once"; last
+    //       arm without rewind() -> "call 2 showed 24 where 1 was due ... 23 never shown". The decode-thread
+    //       resume is graded by decode-thread-resume (S15.892) for order only, not this cost bound.
     // COVERAGE-ASSERT: the late point is at least four bounds in -- red with a keyframe every 100
     //       substituted, "321 pictures with a keyframe gap of 100" -- and each run asserts the failure
-    //       met device pictures and software took over.
+    //       met device pictures and software took over, and that the failing call decoded at least one
+    //       picture: red with this mode taken off the hidden list (test-side, by hand, 2026-10-23).
     if (late < 4 * bound) {
         std::fprintf(stderr, "FAIL: %s: %s: %d pictures with a keyframe gap of %d\n", label.c_str(), file, pictures,
                      reference->longestKeyframeGap);
@@ -752,7 +813,12 @@ void runResumeTimestampChecks(Device& device, const std::string& label) {
         if (!failureExercised(label, what, run)) continue;
         gradeSequence(label, what, run, *reference);
         checkSoftwareTookOver(label, what, run);
-        if (run.failing.picturesDecoded > bound) {
+        if (run.failing.picturesDecoded == 0) {
+            std::fprintf(stderr, "FAIL: %s: %s: the call that met the failure decoded no picture, so its cost was "
+                                 "not measured\n",
+                         label.c_str(), what.c_str());
+            fail("the resume after a hardware failure ran outside the call that measures it");
+        } else if (run.failing.picturesDecoded > bound) {
             std::fprintf(stderr,
                          "FAIL: %s: %s: the call that met the failure decoded %d pictures, more than the %d from a "
                          "keyframe through the picture after the last one shown\n",
@@ -1904,17 +1970,21 @@ void runBoundedDecodeChecks(Device& device, const std::string& label, bool onDev
 // WHY-THIS-SHAPE: started at 150 of counter_long.mp4, the 20 pictures after the first are returned with their
 //       timestamps stripped, leaving the resume a count and no timestamp; the next call meets a hardware
 //       failure. A count measured from the file's first packet shows picture 21 there. At 300, past the
-//       budget, the resume seek fails as well (a seek to packet 1 still succeeds); a resume taken for a start
-//       that has shown nothing gives up there and shows picture 0 as a new pass. 10 stripped at 300, so the
-//       stripped pictures end before the file does.
-// CONTROL: via control_batch.sh, 2026-10-01, each alone, reverted, renderer/video/video_decoder.cpp
-//       seekToResume(). S15.172: the re-run from the start's position (`if (!m_returned.lastTimestamp &&
-//       !byPacket && m_startedAfter)`) made `if (false)` -> "opened at picture 150, ...: after the hardware
-//       failure showed 21 22 23 (pass marks 000) where 150 151 152 was due". S15.179: that re-run also
-//       setting `m_returned.count = 0;` -> "opened at picture 300, ... its resume seek failing: after the
-//       hardware failure showed 0 1 2 (pass marks 000) where 300 301 302 was due".
-// COVERAGE-ASSERT: the injected failure was consumed and software drew the pictures after it, and in the
-//       S15.179 case a seek made after the failure failed.
+//       budget, a device that decoded after a part-way start reopens from the first packet without seeking, so
+//       the seek S15.179 needs is reached another way: a stand-in forced at the start's first picture sends it
+//       to software by seek (the device accepted nothing), and the device takes it back at the IDR at 312, from
+//       a seek, so packets are unnumbered; 3 pictures are then stripped and the hardware fails with the resume
+//       seek failing. A resume taken for a start that has shown nothing gives up there and shows picture 0.
+// CONTROL: via control_batch.sh, 2026-10-01, reverted, renderer/video/video_decoder.cpp seekToResume():
+//       S15.172: the re-run from the start's position (`if (!m_returned.lastTimestamp && !byPacket &&
+//       m_startedAfter)`) made `if (false)` -> "opened at picture 150, ...: after the hardware failure showed
+//       21 22 23 (pass marks 000) where 150 151 152 was due". S15.179, rewritten case, control_batch.sh 2026-10-20
+//       (G1), RTX 3080 Ti, reverted: that re-run also setting `m_returned.count = 0;` -> "... a stand-in at its first
+//       picture, 3 pictures without timestamps, then a hardware failure, its resume seek failing: after the hardware
+//       failure showed 0 1 2 (pass marks 000) where 300 301 302 was due"; green restored.
+// COVERAGE-ASSERT: the injected failure was consumed and software drew the pictures after it; in the S15.179
+//       case the stand-in was forced once, the picture before the strip came from the device, and a seek made
+//       after the failure failed.
 void runStartedFailureChecks(Device& device, const std::string& label) {
     if (!hardwareDecoderPresent(device, label)) return;
     const char* const file = "counter_long.mp4";
@@ -1924,53 +1994,68 @@ void runStartedFailureChecks(Device& device, const std::string& label) {
     const std::vector<int>& ids = reference->ids;
     struct Case {
         size_t start;
+        size_t stripFrom;  // the first call whose pictures lose their timestamps
         size_t stripped;
         bool failResumeSeek;
+        bool standInAtStart;
     };
-    for (const Case& c : {Case{150, 20, false}, Case{300, 10, true}}) {
-        if (c.start + 1 + c.stripped + 1 > ids.size() || c.start + kAfter > ids.size() ||
-            (c.failResumeSeek && c.start <= kCatchUpBudget)) {
+    for (const Case& c : {Case{150, 1, 20, false, false}, Case{300, 13, 3, true, true}}) {
+        if (c.start + c.stripFrom + c.stripped + kAfter > ids.size() || (c.failResumeSeek && c.start <= kCatchUpBudget)) {
             fail("counter_long.mp4 does not fit the start this check makes");
             continue;
         }
         const std::optional<wallpaperx::StreamPosition> position = positionAt(device, label, file, c.start, ids[c.start]);
         if (!position) continue;
-        const size_t failing = 1 + c.stripped;  // the call that meets the hardware failure
+        const size_t failing = c.stripFrom + c.stripped;  // the call that meets the hardware failure
         bool consumed = false;
         bool resumeSeekFailed = false;
+        bool deviceBeforeStrip = !c.standInAtStart;
         int hostBefore = 0;
         size_t seeksBefore = 0;
+        g_standInsForced = 0;
         // g_stripTimestamps and the seek failure apply inside a failing call only, which runFrom() opens.
-        const StartRun run = runFrom(device, asset(file), position, failing + kAfter, {}, [&](size_t call) {
-            if (call == 1) g_stripTimestamps = true;
-            if (call == failing) {
-                g_stripTimestamps = false;
-                hostBefore = g_hostPictures;
-                seeksBefore = g_failingSeeks.size();
-                g_receiveExternalRemaining = 1;
-                if (c.failResumeSeek) g_seekFailure = SeekFailure::AwayFromStart;
-            }
-            if (call == failing + 1) {
-                consumed = g_receiveExternalRemaining == 0;
-                resumeSeekFailed = std::any_of(g_failingSeeks.begin() + static_cast<long>(seeksBefore), g_failingSeeks.end(),
-                                               [](const SeekCall& seek) { return seek.result < 0; });
-                g_seekFailure = SeekFailure::None;
-            }
-        });
+        const StartRun run = runFrom(
+            device, asset(file), position, failing + kAfter,
+            [&] { g_standInAtNextPicture = c.standInAtStart; },
+            [&](size_t call) {
+                if (call == 1) g_standInAtNextPicture = false;
+                if (call == c.stripFrom) {
+                    if (c.standInAtStart) deviceBeforeStrip = g_lastReceivedDevice;
+                    g_stripTimestamps = true;
+                }
+                if (call == failing) {
+                    g_stripTimestamps = false;
+                    hostBefore = g_hostPictures;
+                    seeksBefore = g_failingSeeks.size();
+                    g_receiveExternalRemaining = 1;
+                    if (c.failResumeSeek) g_seekFailure = SeekFailure::AwayFromStart;
+                }
+                if (call == failing + 1) {
+                    consumed = g_receiveExternalRemaining == 0;
+                    resumeSeekFailed = std::any_of(g_failingSeeks.begin() + static_cast<long>(seeksBefore),
+                                                   g_failingSeeks.end(), [](const SeekCall& seek) { return seek.result < 0; });
+                    g_seekFailure = SeekFailure::None;
+                }
+            });
         const int hostAfter = run.hostPictures - hostBefore;
         const std::vector<int> due(ids.begin() + static_cast<long>(c.start), ids.begin() + static_cast<long>(c.start + kAfter));
         const size_t from = std::min(run.shown.size(), failing);
         const std::vector<int> after(run.shown.begin() + static_cast<long>(from), run.shown.end());
         std::string marks;
         for (size_t i = from; i < run.startsPass.size(); ++i) marks += run.startsPass[i] ? "1" : "0";
-        const std::string what = std::string(file) + " opened at picture " + std::to_string(c.start) + ", " +
+        const std::string what = std::string(file) + " opened at picture " + std::to_string(c.start) +
+                                 (c.standInAtStart ? ", a stand-in at its first picture" : "") + ", " +
                                  std::to_string(c.stripped) + " pictures without timestamps, then a hardware failure" +
                                  (c.failResumeSeek ? ", its resume seek failing" : "");
-        if (!run.threw.empty() || !consumed || hostAfter == 0 || (c.failResumeSeek && !resumeSeekFailed)) {
-            std::fprintf(stderr, "FAIL: %s: %s: %s; failure %s, %d host picture(s) after it; %s\n", label.c_str(),
-                         what.c_str(), run.threw.empty() ? "ran" : ("threw " + run.threw).c_str(),
+        const bool standInMet = !c.standInAtStart || g_standInsForced == 1;
+        if (!run.threw.empty() || !consumed || hostAfter == 0 || (c.failResumeSeek && !resumeSeekFailed) || !standInMet ||
+            !deviceBeforeStrip) {
+            std::fprintf(stderr, "FAIL: %s: %s: %s; failure %s, %d host picture(s) after it; %s; %d stand-in(s) forced; "
+                         "picture before the strip from the %s\n",
+                         label.c_str(), what.c_str(), run.threw.empty() ? "ran" : ("threw " + run.threw).c_str(),
                          consumed ? "consumed" : "never reached", hostAfter,
-                         resumeSeekFailed ? "a seek after it failed" : "no seek after it failed");
+                         resumeSeekFailed ? "a seek after it failed" : "no seek after it failed", g_standInsForced,
+                         deviceBeforeStrip ? "device" : "host");
             fail("the hardware failure after a start's untimestamped pictures was not exercised");
         } else if (after != due || marks.find('1') != std::string::npos) {
             std::fprintf(stderr, "FAIL: %s: %s: after the hardware failure showed %s (pass marks %s) where %s was due\n",
@@ -1980,6 +2065,832 @@ void runStartedFailureChecks(Device& device, const std::string& label) {
         }
         std::printf("%s: %s: showed %s\n", label.c_str(), what.c_str(), joinIds(run.shown).c_str());
     }
+}
+
+// GOAL: S15.920 -- a software reopen after a device failure keeps its position. When the device decoded after
+//       a part-way start it reads from the first packet, with no seek, and drops forward to the resume point;
+//       when the device refused at the start's first packet it seeks to the nearest keyframe and drops a few.
+//       Either way the first picture returned after the reopen is the resume picture.
+// WHY-THIS-SHAPE: counter_long.mp4 opened at 300 (past the catch-up budget, so reading from the first packet
+//       decodes about 300 pictures and a seek about 12 from the IDR at 288). Software pictures decoded are
+//       counted at the decoder: a pictures-shown check alone passes both ways, since both keep the position.
+//       The refusal is forced in av_hwframe_ctx_init, inside the first packet's format callback, so it reaches
+//       the path on any card with a decoder; the 10-bit file reaches it only where the device refuses 10-bit.
+// CONTROL: control_batch.sh 2026-10-20 (G1), RTX 3080 Ti, each alone, reverted, renderer/video/video_decoder.cpp
+//       reopenInSoftware(): `fromFirstPacket = false` -> "... 3 pictures on the device, then a hardware failure:
+//       decoded 20 picture(s) in software to reach 300, so it seeked where the device had decoded after a part-way
+//       start"; `fromFirstPacket = m_parameterSets != InExtradata` -> "... the device refusing its first packet:
+//       decoded 305 picture(s) in software to reach 300, so it read from the first packet where a seek was due".
+// COVERAGE-ASSERT: the failure or refusal was consumed; the decoded-then-failed case drew device pictures first.
+void runReopenPositionChecks(Device& device, const std::string& label) {
+    if (!hardwareDecoderPresent(device, label)) return;
+    const char* const file = "counter_long.mp4";
+    constexpr size_t kStart = 300;
+    constexpr size_t kOnDevice = 3;
+    const std::optional<CounterReference> reference = counterReference(label, file);
+    if (!reference) return;
+    const std::vector<int>& ids = reference->ids;
+    if (ids.size() < kStart + kOnDevice + kFollowing || kStart <= kCatchUpBudget) {
+        fail("counter_long.mp4 does not fit the starts this check makes");
+        return;
+    }
+    const std::optional<wallpaperx::StreamPosition> position = positionAt(device, label, file, kStart, ids[kStart]);
+    if (!position) return;
+    for (const bool refuseAtStart : {false, true}) {
+        const std::string what = std::string(file) + " opened at picture " + std::to_string(kStart) +
+                                 (refuseAtStart ? ", the device refusing its first packet"
+                                                : ", " + std::to_string(kOnDevice) + " pictures on the device, then a hardware failure");
+        int hostBefore = 0;
+        int deviceBefore = 0;
+        bool consumed = false;
+        const size_t failing = refuseAtStart ? 0 : kOnDevice;
+        const size_t calls = failing + kFollowing;
+        const StartRun run = runFrom(
+            device, asset(file), position, calls, [&] { if (refuseAtStart) g_failFramesInit = 1; },
+            [&](size_t call) {
+                if (call == 1 && refuseAtStart) consumed = g_failFramesInit == 0;
+                if (call == failing && !refuseAtStart) {
+                    hostBefore = g_hostPictures;
+                    deviceBefore = g_devicePictures;
+                    g_receiveExternalRemaining = 1;
+                }
+                if (call == failing + 1 && !refuseAtStart) consumed = g_receiveExternalRemaining == 0;
+            });
+        const int softwareDecoded = run.hostPictures - hostBefore;
+        const std::vector<int> due(ids.begin() + static_cast<long>(kStart), ids.begin() + static_cast<long>(kStart + calls));
+        std::printf("%s: %s: showed %s; %d picture(s) decoded in software for it, %d on the device before\n", label.c_str(),
+                    what.c_str(), joinIds(run.shown).c_str(), softwareDecoded, deviceBefore);
+        const bool premise = refuseAtStart ? run.devicePictures == 0 : deviceBefore > 0 && run.devicePictures == deviceBefore;
+        if (!run.threw.empty() || !consumed || !premise) {
+            std::fprintf(stderr, "FAIL: %s: %s: %s; %s; %d device picture(s) before\n", label.c_str(), what.c_str(),
+                         run.threw.empty() ? "ran" : ("threw " + run.threw).c_str(),
+                         consumed ? "consumed" : "never reached", deviceBefore);
+            fail("the device failure or refusal this reopen is graded on was not exercised");
+            continue;
+        }
+        if (run.shown != due) {
+            std::fprintf(stderr, "FAIL: %s: %s: showed %s where %s was due\n", label.c_str(), what.c_str(),
+                         joinIds(run.shown).c_str(), joinIds(due).c_str());
+            fail("a software reopen after a device failure keeps its position");
+        }
+        const bool fromFirstPacket = softwareDecoded > static_cast<int>(kCatchUpBudget);
+        if (fromFirstPacket == refuseAtStart) {
+            std::fprintf(stderr, "FAIL: %s: %s: decoded %d picture(s) in software to reach %zu, so it %s\n", label.c_str(),
+                         what.c_str(), softwareDecoded, kStart,
+                         fromFirstPacket ? "read from the first packet where a seek was due"
+                                         : "seeked where the device had decoded after a part-way start");
+            fail(refuseAtStart ? "a reopen after a refusal at the start's first packet seeks to the nearest keyframe"
+                               : "a reopen after the device decoded past a part-way start reads from the first packet");
+        }
+    }
+}
+
+// What a looping pipeline showed over `calls` calls from the file's start, and whether the last picture the
+// decoder received in each call -- the one shown -- came from the device.
+struct DamagedRun {
+    std::vector<int> shown;
+    std::vector<bool> device;
+    std::vector<bool> startsPass;
+    std::string threw;
+    bool exhausted = false;  // what was thrown was a ResourceExhausted
+};
+
+DamagedRun runDamaged(Device& device, const std::string& file, size_t calls) {
+    DamagedRun run;
+    struct Clear {
+        ~Clear() { g_recordPictures = false; }
+    } clear;
+    try {
+        OffscreenTargetManager targets(device);
+        const OffscreenTarget& target = targets.create(1, kTargetWidth, kTargetHeight);
+        g_recordPictures = true;
+        VideoPipeline pipeline(device, file, kShaderDir, VideoPipeline::Playback::Loop);
+        for (size_t call = 0; call < calls; ++call) {
+            g_lastReceivedDevice = false;
+            if (!pipeline.renderNext(targets, target)) break;
+            run.device.push_back(g_lastReceivedDevice);
+            run.startsPass.push_back(pipeline.timing().startsPass);
+            run.shown.push_back(wallpaperx::testing::counterFromBgra(
+                wallpaperx::testing::reclaimAndReadback(device, targets, target), target.width, target.height));
+        }
+    } catch (const wallpaperx::ResourceExhausted& e) {
+        run.threw = e.what();
+        run.exhausted = true;
+    } catch (const std::exception& e) {
+        run.threw = e.what();
+    }
+    return run;
+}
+
+// GOAL: S15.915 -- a damaged H.264 or HEVC file (a reference dropped, or a stream cut inside a group) never makes the
+//       hardware decoder misuse Vulkan, and every picture is shown once, by drawn counter, on both passes.
+//       S15.916 -- after the stand-in the stream returns to the device at the next IDR, nothing lost or repeated.
+//       S15.917 -- a healthy file starting inside a group (counter_cut_nonidr.mp4: non-IDR I at 48, IDR at 150;
+//       counter_cut_cra.mp4: HEVC CRA at 48, IDR at 180) is in software up to that IDR only, on every pass.
+//       S15.918 -- the third stand-in in a pass keeps the stream in software, later passes included; restart()
+//       re-arms the device otherwise. S15.919 -- after parameter sets beyond the extradata (counter_ps_gap.mp4, in
+//       band), a stand-in keeps the rest of that pass in software.
+// WHY-THIS-SHAPE: a fixture's stand-in must hold the pixels the encoder predicted from, or the counter cannot grade
+//       it: H.264 stand-ins copy the last reference (one reference picture, or the dropped one drawing it), HEVC's
+//       are flat grey (the dropped picture is grey). B pictures are what make the device misuse Vulkan; G1's files
+//       without them gave no message even unguarded. The Vulkan half is this entry's whole-run validation grade, so
+//       it cannot name the file; which decoder drew each picture is read at the decoder.
+// CONTROL: control_batch.sh, RTX 3080 Ti, each alone, reverted, green restored. renderer/video/video_decoder.cpp:
+//       allocatePicture() not refusing an H.264 stand-in -> "66 Vulkan validation warning(s)" (07238, 07265, 07239,
+//       07151, 07264, 07266, 01026); not refusing an HEVC one -> "16 Vulkan validation warning(s)" (07265, 07239);
+//       advanceHandBack() never handing back -> "counter_cut_nonidr.mp4: pass 1 after picture 48" and "counter_cut_cra.mp4: pass 1 after
+//       picture 48"; kStandInsPerPass 1 -> "counter_cut_cra.mp4: pass 1 after picture 48"; restart() clearing the
+//       hand-back -> "counter_ps_gap.mp4: pass 2 decoders SSS..." (deleting its re-arm line stays green here: these
+//       files end a pass already AwaitingReset; the switch-failure checks at S15.935 catch that one). The Emptying
+//       drain skipped -> "counter_gap.mp4: ... first difference at call 105"; kStandInsPerPass 4 -> "the device
+//       took the stream back 3 time(s) in pass 1, not 2"; restart() re-arming a stream that gave up -> "... stays
+//       in software, later passes included"; advanceHandBack() ignoring m_parameterSets -> "counter_ps_gap.mp4:
+//       pass 1 after picture 159". All re-run G3e 2026-10-23, decode thread off (damaged-device hides the queues).
+// COVERAGE-ASSERT: each pass shows the reference's full count; every fixture in the table is graded; on the device a
+//       file with a gap drew device pictures before it and host pictures after it.
+// Whether the driver, as this process lets the Device see it, offers VK_KHR_video_maintenance2 with its feature:
+// asked of the driver, not of the Device, so a Device that fails to enable it is graded against what it should do.
+bool inlineParametersOffered(const Device& device) {
+    uint32_t count = 0;
+    if (vkEnumerateDeviceExtensionProperties(device.physicalDevice(), nullptr, &count, nullptr) != VK_SUCCESS) return false;
+    std::vector<VkExtensionProperties> available(count);
+    vkEnumerateDeviceExtensionProperties(device.physicalDevice(), nullptr, &count, available.data());
+    available.resize(count);
+    if (std::none_of(available.begin(), available.end(), [](const VkExtensionProperties& e) {
+            return std::strcmp(e.extensionName, VK_KHR_VIDEO_MAINTENANCE_2_EXTENSION_NAME) == 0;
+        })) {
+        return false;
+    }
+    VkPhysicalDeviceVideoMaintenance2FeaturesKHR feature{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_MAINTENANCE_2_FEATURES_KHR};
+    VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    query.pNext = &feature;
+    vkGetPhysicalDeviceFeatures2(device.physicalDevice(), &query);
+    return feature.videoMaintenance2 == VK_TRUE;
+}
+
+void runDamagedChecks(Device& device, const std::string& label, bool onDevice, const char* only = nullptr) {
+    if (onDevice ? !hardwareDecoderPresent(device, label) : !videoExtensionsHidden(device, label)) return;
+    struct Fixture {
+        const char* file;
+        int firstGap;     // the first dropped picture's number
+        int handBackAt;   // the first picture the device takes back in pass 1 after the first gap; -1 for none
+        int stayFrom;     // with no hand-back: from this picture on pass 1 stays in software
+        bool deviceInPass2;
+        int firstSoftware = -1;  // the first picture shown from software; -1: the one after firstGap - 1;
+                                 // kNoneShown: none, the stand-ins fall before the first picture shown
+        bool samePass2 = false;  // pass 2 must show pass 1's decoder pattern
+    };
+    constexpr int kNoneShown = -2;
+    const Fixture fixtures[] = {{"counter_gap.mp4", 99, 120, -1, true},
+                                {"counter_gap_every.mp4", 10, -1, 70, false},
+                                {"counter_ps_gap.mp4", 159, -1, 159, true},
+                                {"counter_gap_bf.mp4", 96, 120, -1, true, 94, true},
+                                {"counter_cut_start.ts", 60, 60, -1, true, kNoneShown, true},
+                                {"counter_hevc_gap.mp4", 99, -1, 95, true, 95, true},
+                                {"counter_cut_nonidr.mp4", 48, 150, -1, true, 48, true},
+                                {"counter_cut_cra.mp4", 48, 180, -1, true, 48, true}};
+    // GOAL: S15.924/S15.931 -- counter_ps_gap.flv's parameter sets change at picture 120 through container side
+    //       data (NEW_EXTRADATA), and picture 159 is dropped. With or without inline parameters
+    //       (VK_KHR_video_maintenance2) the device draws 0-158 on every pass -- without them through a fresh device
+    //       decoder at 120 -- then software from the stand-in, every number right, no 07154/07155 (this entry's
+    //       validation grade). False if a pass after the first stays in software from its start.
+    // WHY-THIS-SHAPE: samePass2 makes pass 2 repeat pass 1's decoders picture by picture; deviceInPass2 alone
+    //       would pass a pass 2 that returned to the device only late. One row for both drivers: the switch makes
+    //       the weaker no-inline row of the earlier design wrong, not merely weaker.
+    // CONTROL: control_batch.sh 2026-10-22, RTX 3080 Ti, each alone, reverted, on damaged_device_no_inline,
+    //       renderer/video/video_decoder.cpp decode(): the side-data guard off -> "counter_ps_gap.flv: ran; 598 of
+    //       598 shown, first difference at call 121 (114 where 120 was due)" and "20 Vulkan validation warning(s)";
+    //       software instead of a fresh device decoder at 120, and (2026-10-23) renderer/video/reset_point.cpp
+    //       changesExtradata() returning false -> each "counter_ps_gap.flv: decoders DDD...(120 D)S...";
+    //       rewind() not resetting m_parameterSets, and advanceHandBack() waiting for packet 50 -> each
+    //       "counter_ps_gap.flv: pass 1 decoders ..., pass 2 decoders ...". restart() not re-arming the hand-back
+    //       stayed green (the pass-2 return does not go through it).
+    std::vector<Fixture> table(std::begin(fixtures), std::end(fixtures));
+    table.push_back(Fixture{"counter_ps_gap.flv", 159, -1, 159, true, -1, true});
+    if (only != nullptr) std::erase_if(table, [&](const Fixture& f) { return std::strcmp(f.file, only) != 0; });
+    if (onDevice) {
+        std::printf("%s: inline parameter sets %s, %s offered\n", label.c_str(), device.videoInlineParameters() ? "on" : "off",
+                    inlineParametersOffered(device) ? "VK_KHR_video_maintenance2" : "nothing");
+    }
+    int graded = 0;
+    for (const Fixture& f : table) {
+        const std::optional<CounterReference> reference = counterReference(label, f.file);
+        if (!reference) continue;
+        const std::vector<int>& ids = reference->ids;
+        const size_t n = ids.size();
+        const DamagedRun run = runDamaged(device, asset(f.file), 2 * n);
+        std::vector<int> due = ids;
+        due.insert(due.end(), ids.begin(), ids.end());
+        std::string kinds;
+        for (const bool d : run.device) kinds += d ? 'D' : 'S';
+        std::printf("%s: %s: %zu shown over two passes; decoders %s\n", label.c_str(), f.file, run.shown.size(), kinds.c_str());
+        if (!run.threw.empty() || run.shown != due || run.startsPass.size() != 2 * n || !run.startsPass[n]) {
+            size_t first = 0;
+            while (first < run.shown.size() && first < due.size() && run.shown[first] == due[first]) ++first;
+            std::fprintf(stderr, "FAIL: %s: %s: %s; %zu of %zu shown, first difference at call %zu (%d where %d was due)\n",
+                         label.c_str(), f.file, run.threw.empty() ? "ran" : ("threw " + run.threw).c_str(),
+                         run.shown.size(), due.size(), first + 1, first < run.shown.size() ? run.shown[first] : -1,
+                         first < due.size() ? due[first] : -1);
+            fail("a damaged file shows every picture once, in order, on each pass");
+            continue;
+        }
+        ++graded;
+        if (!onDevice) continue;
+        // Index of picture number `id` in a pass.
+        const auto at = [&](int id) {
+            return static_cast<size_t>(std::find(ids.begin(), ids.end(), id) - ids.begin());
+        };
+        if (f.firstSoftware == kNoneShown) {
+            if (std::find(run.device.begin(), run.device.end(), false) != run.device.end()) {
+                std::fprintf(stderr, "FAIL: %s: %s: decoders %s\n", label.c_str(), f.file, kinds.c_str());
+                fail("a stream cut inside a group shows every picture from the device, both passes");
+            }
+            continue;
+        }
+        const size_t gap = f.firstSoftware >= 0 ? at(f.firstSoftware) : at(f.firstGap - 1) + 1;
+        const bool deviceBefore = std::all_of(run.device.begin(), run.device.begin() + static_cast<long>(gap), [](bool d) { return d; });
+        const bool hostAfterGap = gap < n && !run.device[gap];
+        if (!deviceBefore || !hostAfterGap) {
+            std::fprintf(stderr, "FAIL: %s: %s: decoders %s\n", label.c_str(), f.file, kinds.c_str());
+            fail("the damaged file did not decode on the device up to its first gap and in software after it, so no "
+                 "stand-in was exercised");
+            continue;
+        }
+        // Pass 1 from the gap: software, then the device from handBackAt on; or software to the end.
+        bool pass1 = true;
+        for (size_t i = gap; i < n; ++i) {
+            if (f.handBackAt >= 0 && run.device[i] != (ids[i] >= f.handBackAt)) pass1 = false;
+            if (f.handBackAt < 0 && ids[i] >= f.stayFrom && run.device[i]) pass1 = false;
+        }
+        if (!pass1) {
+            const std::string where = f.handBackAt >= 0 ? "software until " + std::to_string(f.handBackAt) + ", the device from it"
+                                                        : "software from " + std::to_string(f.stayFrom) + " to the end";
+            std::fprintf(stderr, "FAIL: %s: %s: pass 1 after picture %d: decoders %s, where %s was due\n", label.c_str(),
+                         f.file, f.firstGap, kinds.substr(gap, n - gap).c_str(), where.c_str());
+            fail(f.handBackAt >= 0 ? "a stand-in sends the stream to software until the next IDR, and the device from it"
+                                   : "a stream that gave up, or sent sets beyond its extradata, stays in software");
+        }
+        if (f.samePass2 && !std::equal(run.device.begin(), run.device.begin() + static_cast<long>(n), run.device.begin() + static_cast<long>(n))) {
+            std::fprintf(stderr, "FAIL: %s: %s: pass 1 decoders %s, pass 2 decoders %s\n", label.c_str(), f.file,
+                         kinds.substr(0, n).c_str(), kinds.substr(n).c_str());
+            fail("each pass spends the same pictures in software");
+        }
+        const bool anyDevice2 = std::any_of(run.device.begin() + static_cast<long>(n), run.device.end(), [](bool d) { return d; });
+        if (anyDevice2 != f.deviceInPass2) {
+            std::fprintf(stderr, "FAIL: %s: %s: pass 2 decoders %s\n", label.c_str(), f.file, kinds.substr(n).c_str());
+            fail(f.deviceInPass2 ? "restart() re-arms the device for the next pass"
+                                 : "after the third stand-in in a pass the stream stays in software, later passes included");
+        }
+        // S15.918's count: on counter_gap_every.mp4 the device takes the stream back exactly twice in pass 1.
+        if (std::string(f.file) == "counter_gap_every.mp4") {
+            int backs = 0;
+            for (size_t i = 1; i < n; ++i) backs += run.device[i] && !run.device[i - 1] ? 1 : 0;
+            if (backs != 2) {
+                std::fprintf(stderr, "FAIL: %s: %s: the device took the stream back %d time(s) in pass 1, not 2: %s\n",
+                             label.c_str(), f.file, backs, kinds.substr(0, n).c_str());
+                fail("a stream returns to the device after its first two stand-ins of a pass, and not after the third");
+            }
+        }
+    }
+    if (!g_notVerified) check(graded == static_cast<int>(table.size()) && !table.empty(), "every damaged fixture this check is written for was graded");
+}
+
+// GOAL: S15.928 -- a file whose NAL length size changes at picture 120 (NEW_EXTRADATA, with new parameter sets)
+//       shows every picture, rightly numbered, on passes 2 and 3 as on pass 1: on the device with
+//       VK_KHR_video_maintenance2 (damaged-device), without it (damaged-device-no-inline), and in software
+//       (damaged-host). On the device every picture is the device's. False if a later pass loses, misnumbers or
+//       leaves the device for any picture.
+// WHY-THIS-SHAPE: the files are built at run time from counter_ps.h264 (support/length_change_flv.h), both
+//       directions, since only a 4-byte reader of 2-byte data misreads; three passes, because the loop back to
+//       packet 1 after a pass that adopted the change is what G2b's defect broke, and the second loop is where
+//       a per-pass leftover would first repeat. Graded by drawn counter against a plain libavcodec decode.
+// CONTROL: control_batch.sh 2026-10-22, RTX 3080 Ti, each alone, reverted, renderer/video/video_decoder.cpp:
+//       alignCodecExtradata() returning at once -> "length 4-then-2: pass 2 shows every picture" on damaged_device,
+//       damaged_device_no_inline and damaged_host; software instead of a fresh device decoder at a parameter-set
+//       change -> damaged_device_no_inline "length 4-then-2: every picture of every pass comes from the device".
+// COVERAGE-ASSERT: every pass compares the reference's full 300 pictures, and both files must be graded --
+//       red ("both length-change files were graded (0)") with the reference forced empty (test-side, by hand).
+void runLengthChangePipelineChecks(Device& device, const std::string& label, bool onDevice) {
+    if (!haveAsset("counter_ps.h264", label)) return;
+    int graded = 0;
+    for (const auto& [firstPrefix, secondPrefix] : {std::pair{4, 2}, std::pair{2, 4}}) {
+        const std::string name = std::to_string(firstPrefix) + "-then-" + std::to_string(secondPrefix);
+        const std::filesystem::path path = std::filesystem::temp_directory_path() /
+                                           ("wpx_pipeline_length_" + name + "_" + std::to_string(getpid()) + ".flv");
+        struct Remove {
+            std::filesystem::path path;
+            ~Remove() { std::filesystem::remove(path); }
+        } remove{path};
+        const std::string file = wallpaperx::testing::buildLengthChangeFlv(asset("counter_ps.h264"), path, firstPrefix,
+                                                                           secondPrefix);
+        std::string why;
+        const std::optional<CounterReference> reference =
+            file.empty() ? std::nullopt : wallpaperx::testing::decodeCounterReference(file, why);
+        if (!reference || reference->ids.size() != 300 ||
+            std::find(reference->ids.begin(), reference->ids.end(), -1) != reference->ids.end()) {
+            std::fprintf(stderr, "FAIL: %s: length %s: the harness could not build or read the fixture (%s)\n",
+                         label.c_str(), name.c_str(), why.c_str());
+            fail("the length-change fixture could not be built, which is not a verdict on the pipeline");
+            continue;
+        }
+        const std::vector<int>& ids = reference->ids;
+        const size_t n = ids.size();
+        const DamagedRun run = runDamaged(device, file, 3 * n);
+        std::string kinds;
+        for (const bool d : run.device) kinds += d ? 'D' : 'S';
+        std::printf("%s: length %s: %zu shown over three passes; decoders %s\n", label.c_str(), name.c_str(),
+                    run.shown.size(), kinds.c_str());
+        if (!run.threw.empty()) {
+            std::fprintf(stderr, "FAIL: %s: length %s: threw %s\n", label.c_str(), name.c_str(), run.threw.c_str());
+            fail("a length-change file plays three passes without raising");
+            continue;
+        }
+        for (size_t pass = 0; pass < 3; ++pass) {
+            const size_t from = std::min(pass * n, run.shown.size());
+            const size_t to = std::min(from + n, run.shown.size());
+            const std::vector<int> got(run.shown.begin() + static_cast<long>(from), run.shown.begin() + static_cast<long>(to));
+            size_t first = 0;
+            while (first < got.size() && got[first] == ids[first]) ++first;
+            check(got == ids, label + ": length " + name + ": pass " + std::to_string(pass + 1) +
+                                  " shows every picture, rightly numbered: " + std::to_string(got.size()) + " of 300, " +
+                                  "first difference at " + std::to_string(first) + " (" +
+                                  (first < got.size() ? std::to_string(got[first]) : std::string("none")) + " where " +
+                                  (first < n ? std::to_string(ids[first]) : std::string("none")) + " was due)");
+        }
+        if (onDevice) {
+            check(run.device.size() == 3 * n && std::all_of(run.device.begin(), run.device.end(), [](bool d) { return d; }),
+                  label + ": length " + name + ": every picture of every pass comes from the device: " + kinds);
+        }
+        ++graded;
+    }
+    check(graded == 2, label + ": both length-change files were graded (" + std::to_string(graded) + ")");
+}
+
+struct CountedRun {
+    DamagedRun run;
+    std::string kinds;
+    int opened;
+    int maxLive;
+    bool injected;
+};
+
+// runDamaged over `calls` pictures of `file`, counting the decoder's device codecs; `allocation` (unless VK_SUCCESS)
+// or `framesFail` is injected into the first device decoder a switch opens.
+// `atBitstream` moves it to the slice buffer allocated after the decoder's first picture; `atCodec` 1 moves it to the
+// constructor's decoder.
+CountedRun runCountingCodecs(Device& device, const std::string& file, size_t calls, VkResult allocation = VK_SUCCESS,
+                             bool framesFail = false, bool atPicture = false, bool atBitstream = false, int atCodec = 2) {
+    g_pictureAtSwitch = atPicture;
+    g_pictureArmed = false;
+    g_bitstreamAtSwitch = atBitstream;
+    g_bitstreamArmed = false;
+    g_injectAtCodec = atCodec;
+    g_injectedInPicture = false;
+    g_injectedSize = 0;
+    g_deviceCodecsLive = 0;
+    g_deviceCodecsMax = 0;
+    g_deviceCodecsOpened = 0;
+    g_allocationAtSwitch = allocation;
+    g_allocationInjected = false;
+    g_framesAtSwitch = framesFail;
+    g_framesArmed = false;
+    g_countDeviceCodecs = true;
+    struct Clear {
+        ~Clear() {
+            g_countDeviceCodecs = false;
+            g_allocationAtSwitch = VK_SUCCESS;
+            g_allocationArmed = false;
+            g_pictureAtSwitch = false;
+            g_pictureArmed = false;
+            g_bitstreamAtSwitch = false;
+            g_bitstreamArmed = false;
+            g_injectAtCodec = 2;
+            g_framesAtSwitch = false;
+            g_failFramesInit = 0;
+        }
+    } clear;
+    CountedRun counted{runDamaged(device, file, calls), {}, 0, 0, false};
+    for (const bool d : counted.run.device) counted.kinds += d ? 'D' : 'S';
+    counted.opened = g_deviceCodecsOpened;
+    counted.maxLive = g_deviceCodecsMax;
+    counted.injected = framesFail ? g_framesArmed && g_failFramesInit == 0 : g_allocationInjected.load();
+    return counted;
+}
+
+// The first pass index (0-2) whose pictures differ from `ids`, or -1 when all three passes show every one.
+int firstWrongPass(const DamagedRun& run, const std::vector<int>& ids) {
+    for (size_t pass = 0; pass < 3; ++pass) {
+        const size_t from = pass * ids.size();
+        if (run.shown.size() < from + ids.size() ||
+            !std::equal(ids.begin(), ids.end(), run.shown.begin() + static_cast<long>(from))) {
+            return static_cast<int>(pass);
+        }
+    }
+    return -1;
+}
+
+// GOAL: S15.933 -- a device whose driver offers VK_KHR_video_maintenance2 enables it, and a side-data
+//       parameter-set change at picture 120 then stays on that device decoder: one device codec over three
+//       passes, every picture the device's. S15.934 -- without the extension the change opens a fresh device
+//       decoder only after the old one is freed (never two open at once), pictures stay on the device, and a
+//       length-size-only change opens no new decoder. False otherwise.
+// WHY-THIS-SHAPE: codecs are counted at avcodec_open2/avcodec_free_context by interposer, the only place the
+//       order of free and open is visible from outside; the pictures alone would be right with two sessions
+//       open. The offered half asks the driver, not the Device, so a Device leaving it off is graded.
+// CONTROL: control_batch.sh 2026-10-22, RTX 3080 Ti, each alone, reverted: renderer/vulkan/device.cpp
+//       `inlineParameters = false` -> damaged_device "a driver offering VK_KHR_video_maintenance2 has it enabled";
+//       renderer/video/video_decoder.cpp the two `!m_device.videoInlineParameters()` guards dropped -> damaged_device
+//       "switch 4-then-2 stays on one device decoder ... (6 opened)"; switchDecoder() freeing the old codec after
+//       openDecoder() -> damaged_device_no_inline "never two device decoders open at once ... (6 opened, at most 2
+//       open)"; renderer/video/reset_point.cpp differInParameterSets() comparing the length byte unmasked ->
+//       "a length-size-only change opens no new decoder (6 device codecs opened)".
+void runSwitchChecks(Device& device, const std::string& label, bool inlineExpected) {
+    if (!haveAsset("counter_ps.h264", label)) return;
+    if (inlineExpected) {
+        if (!inlineParametersOffered(device)) {
+            std::printf("SKIP: %s: the driver does not offer VK_KHR_video_maintenance2; S15.933 is not graded here\n",
+                        label.c_str());
+            return;
+        }
+        check(device.videoInlineParameters(), label + ": a driver offering VK_KHR_video_maintenance2 has it enabled");
+    }
+    int graded = 0;
+    for (const bool same : {false, true}) {
+        if (inlineExpected && same) continue;
+        const std::string name = same ? "4-then-2, same parameter sets" : "4-then-2";
+        const std::filesystem::path path = std::filesystem::temp_directory_path() /
+                                           ("wpx_switch_" + std::to_string(same) + "_" + std::to_string(getpid()) + ".flv");
+        struct Remove {
+            std::filesystem::path path;
+            ~Remove() { std::filesystem::remove(path); }
+        } remove{path};
+        const std::string file = wallpaperx::testing::buildLengthChangeFlv(asset("counter_ps.h264"), path, 4, 2, same);
+        std::string why;
+        const std::optional<CounterReference> reference =
+            file.empty() ? std::nullopt : wallpaperx::testing::decodeCounterReference(file, why);
+        if (!reference || reference->ids.size() != 300) {
+            std::fprintf(stderr, "FAIL: %s: switch %s: the harness could not build or read the fixture (%s)\n",
+                         label.c_str(), name.c_str(), why.c_str());
+            fail("the switch fixture could not be built, which is not a verdict on the decoder");
+            continue;
+        }
+        const std::vector<int>& ids = reference->ids;
+        const CountedRun c = runCountingCodecs(device, file, 900);
+        std::printf("%s: switch %s: %d device codecs opened, at most %d open at once; decoders %s\n", label.c_str(),
+                    name.c_str(), c.opened, c.maxLive, c.kinds.c_str());
+        check(c.run.threw.empty() && firstWrongPass(c.run, ids) < 0 && c.kinds == std::string(900, 'D'),
+              label + ": switch " + name + ": three passes shown right, all on the device (threw '" + c.run.threw +
+                  "', first wrong pass " + std::to_string(firstWrongPass(c.run, ids) + 1) + ")");
+        if (inlineExpected) {
+            check(c.opened == 1, label + ": switch 4-then-2 stays on one device decoder with inline parameter sets (" +
+                                     std::to_string(c.opened) + " opened)");
+        } else if (same) {
+            check(c.opened == 1, label + ": a length-size-only change opens no new decoder (" + std::to_string(c.opened) +
+                                     " device codecs opened)");
+        } else {
+            // COVERAGE-ASSERT: at least one switch happened, or "never two at once" holds trivially.
+            check(c.opened >= 2 && c.maxLive == 1,
+                  label + ": never two device decoders open at once across a switch (" + std::to_string(c.opened) +
+                      " opened, at most " + std::to_string(c.maxLive) + " open)");
+        }
+        ++graded;
+    }
+    check(graded == (inlineExpected ? 1 : 2), label + ": every switch fixture was graded");
+}
+
+// GOAL: S15.935 (b), S15.936 -- at a switch on the GPU thread, a device that does not answer the question asked
+//       before the old device decoder is freed raises GpuFailure, and that decoder is not freed (ffmpeg's free
+//       would wait on its work without bound) and no new one is opened. False otherwise.
+// WHY-THIS-SHAPE: armed at the old codec's EOF that ends its emptying: switchDecoder() submits nothing between
+//       that and its question, so the held, refused batch is the question's. The pipeline outlives the catch, so
+//       frees are counted at the throw, not after its destructor -- which may free once the device answers again.
+// CONTROL: control_batch.sh 2026-10-22, RTX 3080 Ti, each alone, reverted, damaged_device_no_inline,
+//       renderer/video/video_decoder.cpp switchDecoder(): the question dropped -> "the old device decoder is not
+//       freed and no new one opened (1 freed, 2 opened)" and "exactly the switch's question was refused (0
+//       refused)"; its GpuFailure thrown as std::runtime_error -> "... at a switch raises GpuFailure".
+// COVERAGE-ASSERT: the arming fired, and exactly the switch's question was refused (one stalled wait).
+void runUnansweredSwitchChecks(Device& device, const std::string& label, const std::string& file) {
+    const std::string what = label + ": a device that no longer answers at a switch";
+    bool gpuFailure = false;
+    std::string threw;
+    int shown = 0;
+    int freedAtThrow = -1;
+    int openedAtThrow = -1;
+    int stalled = 0;
+    g_unanswerFired = false;
+    g_deviceCodecsLive = 0;
+    g_deviceCodecsOpened = 0;
+    g_deviceCodecsFreed = 0;
+    {
+        struct Clear {
+            ~Clear() {
+                g_unanswerAtSwitch = false;
+                g_stallHeld = false;
+                g_holdNextSubmission = false;
+                g_countDeviceCodecs = false;
+            }
+        } clear;
+        std::optional<OffscreenTargetManager> targets;
+        std::optional<VideoPipeline> pipeline;
+        try {
+            targets.emplace(device);
+            const OffscreenTarget& target = targets->create(1, kTargetWidth, kTargetHeight);
+            g_countDeviceCodecs = true;
+            pipeline.emplace(device, file, kShaderDir, VideoPipeline::Playback::Loop);
+            const int stalledBefore = g_stalledWaits;
+            g_unanswerAtSwitch = true;
+            try {
+                for (int call = 0; call < 300 && pipeline->renderNext(*targets, target); ++call) ++shown;
+            } catch (const wallpaperx::GpuFailure& e) {
+                gpuFailure = true;
+                threw = e.what();
+            } catch (const std::exception& e) {
+                threw = e.what();
+            }
+            freedAtThrow = g_deviceCodecsFreed;
+            openedAtThrow = g_deviceCodecsOpened;
+            stalled = g_stalledWaits - stalledBefore;
+        } catch (const std::exception& e) {
+            threw = std::string("setup: ") + e.what();
+        }
+        g_unanswerAtSwitch = false;
+        g_stallHeld = false;
+        g_holdNextSubmission = false;
+        g_heldFences.clear();
+        const auto retireBy = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!device.hasCompleted(device.lastSubmission()) && std::chrono::steady_clock::now() < retireBy) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        try {
+            pipeline.reset();
+            targets.reset();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "FAIL: %s: tearing down after the run threw: %s\n", what.c_str(), e.what());
+            fail("teardown after the unanswered switch threw");
+        }
+    }
+    std::printf("%s: fired %s, %d shown, threw '%s' (GpuFailure %s), device codecs at the throw: %d opened, %d freed; "
+                "%d wait(s) refused\n",
+                what.c_str(), g_unanswerFired ? "yes" : "no", shown, threw.c_str(), gpuFailure ? "yes" : "no",
+                openedAtThrow, freedAtThrow, stalled);
+    if (!device.hasCompleted(device.lastSubmission())) {
+        std::fprintf(stderr, "FAIL: %s: the held batch had not completed 5 s after the hold was let go\n", what.c_str());
+        fail("the harness could not retire the batch it held, so nothing after it in this child can be trusted");
+        return;
+    }
+    if (!g_unanswerFired) {
+        std::fprintf(stderr, "FAIL: %s: the old decoder's emptying never ended, so nothing was made to go unanswered\n",
+                     what.c_str());
+        fail("the unanswered-switch arming was not reached, which is not a verdict on the decoder");
+        return;
+    }
+    check(gpuFailure, what + " raises GpuFailure (threw '" + threw + "')");
+    check(freedAtThrow == 0 && openedAtThrow == 1,
+          what + ": the old device decoder is not freed and no new one opened (" + std::to_string(freedAtThrow) +
+              " freed, " + std::to_string(openedAtThrow) + " opened)");
+    check(stalled == 1, what + ": exactly the switch's question was refused (" + std::to_string(stalled) + " refused)");
+}
+
+// GOAL: S15.940 -- memory running out at a device decoder's picture or slice-buffer allocation is never swallowed:
+//       host memory on any decoder, and GPU memory on the constructor's, raise ResourceExhausted once ffmpeg returns,
+//       with every picture shown before it right; GPU memory on a switch's decoder sends only the rest of that pass
+//       to software. No Vulkan validation message follows (the entry's own oracle). False otherwise.
+// WHY-THIS-SHAPE: the slice buffer is armed as the first allocation after the decoder's first picture left
+//       avcodec_default_get_buffer2, and each case asserts where its injection landed (inside a picture or not), so
+//       a "bitstream" case cannot silently test a picture. Arming "the Nth vkAllocateMemory" instead would land
+//       wherever setup happened to end. ffmpeg's own host mallocs are not reachable from here (G2k).
+// CONTROL: control_batch.sh 2026-10-23, RTX 3080 Ti, each alone, restored, damaged_device_no_inline,
+//       renderer/video/video_decoder.cpp: failDecode() sending GPU memory out on any decoder to software -> "device
+//       memory out at the constructor's first picture raises ..." (and its slice buffer); outOfDeviceMemory() true
+//       for any failed allocation -> "host memory out at the switch's first picture raises ..."; both post-call
+//       `failedAllocation()` checks deleted -> "host memory out at the constructor's slice buffer raises ..." and
+//       "24 Vulkan validation warning(s)"; those deleted and allocatePicture() returning every error unclassified ->
+//       "host memory out at the constructor's first picture raises ...".
+// COVERAGE-ASSERT: each case must report its injection consumed at the site it names, or fails as the harness's.
+void runShortageAtDecodeChecks(Device& device, const std::string& label, const std::string& file,
+                               const std::vector<int>& ids) {
+    struct Case {
+        const char* name;
+        VkResult allocation;
+        int codec;
+        bool bitstream;
+        bool raises;
+    };
+    const std::string toSoftware = std::string(120, 'D') + std::string(180, 'S') + std::string(600, 'D');
+    int graded = 0;
+    for (const Case& k : {Case{"host memory out at the constructor's first picture", VK_ERROR_OUT_OF_HOST_MEMORY, 1,
+                               false, true},
+                          Case{"device memory out at the constructor's first picture", VK_ERROR_OUT_OF_DEVICE_MEMORY, 1,
+                               false, true},
+                          Case{"host memory out at the switch's first picture", VK_ERROR_OUT_OF_HOST_MEMORY, 2, false,
+                               true},
+                          Case{"host memory out at the constructor's slice buffer", VK_ERROR_OUT_OF_HOST_MEMORY, 1, true,
+                               true},
+                          Case{"device memory out at the constructor's slice buffer", VK_ERROR_OUT_OF_DEVICE_MEMORY, 1,
+                               true, true},
+                          Case{"host memory out at the switch's slice buffer", VK_ERROR_OUT_OF_HOST_MEMORY, 2, true, true},
+                          Case{"device memory out at the switch's slice buffer", VK_ERROR_OUT_OF_DEVICE_MEMORY, 2, true,
+                               false}}) {
+        const CountedRun c = runCountingCodecs(device, file, 900, k.allocation, false, !k.bitstream, k.bitstream, k.codec);
+        const bool inPicture = g_injectedInPicture.load();
+        std::printf("%s: %s: injected %s (%s a picture, %llu bytes), raised ResourceExhausted %s, threw '%s', %zu shown; "
+                    "decoders %s\n",
+                    label.c_str(), k.name, c.injected ? "yes" : "no", inPicture ? "inside" : "outside",
+                    static_cast<unsigned long long>(g_injectedSize.load()), c.run.exhausted ? "yes" : "no",
+                    c.run.threw.c_str(), c.run.shown.size(), c.kinds.c_str());
+        if (!c.injected || inPicture == k.bitstream) {
+            std::fprintf(stderr, "FAIL: %s: %s: the injection %s\n", label.c_str(), k.name,
+                         c.injected ? "landed at the wrong site" : "was never reached");
+            fail("a decode-time shortage injection did not land where its case says, which is not a verdict on the decoder");
+            continue;
+        }
+        ++graded;
+        if (k.raises) {
+            const bool shownRight = c.run.shown.size() <= ids.size() &&
+                                    std::equal(c.run.shown.begin(), c.run.shown.end(), ids.begin());
+            check(c.run.exhausted && shownRight,
+                  label + ": " + k.name + " raises ResourceExhausted, every picture before it right (threw '" +
+                      c.run.threw + "', " + std::to_string(c.run.shown.size()) + " shown, " +
+                      (shownRight ? "right" : "WRONG") + ")");
+        } else {
+            check(c.run.threw.empty() && firstWrongPass(c.run, ids) < 0 && c.kinds == toSoftware,
+                  label + ": " + k.name + ": software for the rest of pass 1 only, every picture right (threw '" +
+                      c.run.threw + "', first wrong pass " + std::to_string(firstWrongPass(c.run, ids) + 1) +
+                      "): " + c.kinds);
+        }
+    }
+    check(graded == 7, label + ": every decode-time shortage case was graded (" + std::to_string(graded) + " of 7)");
+}
+
+// GOAL: S15.930 -- a rewind proven to land on packet 1 leaves the stream's own extradata in effect, whatever the
+//       pass before it adopted: on the 4-then-2 length-change FLV, passes 2 and 3 show every picture right both
+//       when packets carry neither byte position nor decode time (rewind()'s seek branch, which the extradata map
+//       cannot place) and when every seek fails (its reopen branch). False otherwise.
+// WHY-THIS-SHAPE: on an unaltered file the landing itself already restores the stream's extradata, so the reset is
+//       invisible there (T13a's NUT attempt went green with it deleted); these are the two conditions under which
+//       G2k showed it is the one that counts. Positions and decode times are cleared in av_read_frame, and seeks
+//       refused in av_seek_frame, for the whole run.
+// CONTROL: control_batch.sh 2026-10-23, RTX 3080 Ti, each alone, restored, damaged_device_no_inline,
+//       renderer/video/video_decoder.cpp rewind(): the seek branch's `m_extradata.reset()` deleted -> "rewind with
+//       packets carrying no position or decode time: ... first wrong pass 2"; the reopen branch's deleted -> "rewind
+//       with every seek refused: ... first wrong pass 2".
+// COVERAGE-ASSERT: the stripped run must have cleared every pass's packets and reopened nothing (so the seek branch
+//       ran); the refused run must have refused seeks and reopened the container once per rewind.
+void runRewindResetChecks(Device& device, const std::string& label) {
+    if (!haveAsset("counter_ps.h264", label)) return;
+    const std::filesystem::path path =
+        std::filesystem::temp_directory_path() / ("wpx_rewind_reset_" + std::to_string(getpid()) + ".flv");
+    struct Remove {
+        std::filesystem::path path;
+        ~Remove() { std::filesystem::remove(path); }
+    } remove{path};
+    const std::string file = wallpaperx::testing::buildLengthChangeFlv(asset("counter_ps.h264"), path, 4, 2);
+    std::string why;
+    const std::optional<CounterReference> reference =
+        file.empty() ? std::nullopt : wallpaperx::testing::decodeCounterReference(file, why);
+    if (!reference || reference->ids.size() != 300) {
+        std::fprintf(stderr, "FAIL: %s: rewind reset: the harness could not build or read the fixture (%s)\n",
+                     label.c_str(), why.c_str());
+        fail("the rewind fixture could not be built, which is not a verdict on the decoder");
+        return;
+    }
+    const std::vector<int>& ids = reference->ids;
+    int graded = 0;
+    for (const bool stripTimes : {true, false}) {
+        const std::string what = label + ": rewind " +
+                                 (stripTimes ? "with packets carrying no position or decode time" : "with every seek refused");
+        struct Clear {
+            ~Clear() {
+                g_tallying = false;
+                g_loopSeek = LoopSeek::None;
+                g_clearPositions = false;
+                g_clearDts = false;
+            }
+        } clear;
+        g_tally = CallTally{};
+        g_dtsCleared = 0;
+        g_loopSeek = stripTimes ? LoopSeek::None : LoopSeek::FailAll;
+        g_clearPositions = stripTimes;
+        g_clearDts = stripTimes;
+        g_tallying = true;
+        const DamagedRun run = runDamaged(device, file, 900);
+        g_tallying = false;
+        int refused = 0;
+        for (const SeekCall& seek : g_tally.seeks) refused += seek.result < 0 ? 1 : 0;
+        const int wrong = firstWrongPass(run, ids);
+        std::printf("%s: %zu shown, threw '%s', first wrong pass %d; %zu seek(s), %d refused, %d container open(s), "
+                    "%d position(s) and %d decode time(s) cleared\n",
+                    what.c_str(), run.shown.size(), run.threw.c_str(), wrong + 1, g_tally.seeks.size(), refused,
+                    g_tally.containerOpens, g_tally.positionsCleared, g_dtsCleared);
+        const bool reached = stripTimes ? g_tally.positionsCleared >= 600 && g_dtsCleared >= 600 &&
+                                              g_tally.containerOpens == 1 && !g_tally.seeks.empty()
+                                        : refused >= 2 && g_tally.containerOpens >= 3;
+        if (!reached) {
+            std::fprintf(stderr, "FAIL: %s: the condition was not set up as the case needs (see the counts above)\n",
+                         what.c_str());
+            fail("a rewind case did not reach the rewind branch it is written for, which is not a verdict on the decoder");
+            continue;
+        }
+        ++graded;
+        check(run.threw.empty() && run.shown.size() == 900 && wrong < 0,
+              what + ": every picture of passes 1 to 3 right (threw '" + run.threw + "', " +
+                  std::to_string(run.shown.size()) + " shown, first wrong pass " + std::to_string(wrong + 1) + ")");
+    }
+    check(graded == 2, label + ": both rewind cases were graded (" + std::to_string(graded) + ")");
+}
+
+// GOAL: S15.935 -- a fresh device decoder that fails to open at a switch (device memory out at its first
+//       allocation, or its images' context failing with AVERROR_EXTERNAL) sends only the rest of that pass to
+//       software: pass 1 is the device's up to 120 and software after, passes 2 and 3 all the device's, every
+//       picture right. False otherwise.
+// WHY-THIS-SHAPE: injected in the probe's vkAllocateMemory / av_hwframe_ctx_init interposers, armed when the
+//       second device codec opens -- the switch's -- so the constructor's decoder, whose failures keep their old
+//       meaning, is never hit. A per-picture D/S pattern, not a count, so a pass 2 late to the device is red.
+// CONTROL: control_batch.sh 2026-10-22, RTX 3080 Ti, reverted, damaged_device_no_inline,
+//       renderer/video/video_decoder.cpp refuseAfterFailure() not setting NextPass -> "device memory out at the
+//       switch: software for the rest of pass 1 only ...: D x120 then S x780", and the same for "the switch's
+//       images context failing". Both injections land in ffmpeg's session/frames setup (choose()'s path); the
+//       picture case below is the one that reaches outOfDeviceMemory() through allocatePicture(). Also red
+//       (2026-10-23), on both lines and the picture and slice-buffer cases: restart() not re-arming the hand-back.
+// COVERAGE-ASSERT: each run must report its injection consumed, or it fails as the harness's.
+void runSwitchFailureChecks(Device& device, const std::string& label) {
+    if (!haveAsset("counter_ps.h264", label)) return;
+    const std::filesystem::path path =
+        std::filesystem::temp_directory_path() / ("wpx_switch_fail_" + std::to_string(getpid()) + ".flv");
+    struct Remove {
+        std::filesystem::path path;
+        ~Remove() { std::filesystem::remove(path); }
+    } remove{path};
+    const std::string file = wallpaperx::testing::buildLengthChangeFlv(asset("counter_ps.h264"), path, 4, 2);
+    std::string why;
+    const std::optional<CounterReference> reference =
+        file.empty() ? std::nullopt : wallpaperx::testing::decodeCounterReference(file, why);
+    if (!reference || reference->ids.size() != 300) {
+        std::fprintf(stderr, "FAIL: %s: switch failure: the harness could not build or read the fixture (%s)\n",
+                     label.c_str(), why.c_str());
+        fail("the switch-failure fixture could not be built, which is not a verdict on the decoder");
+        return;
+    }
+    const std::vector<int>& ids = reference->ids;
+    const std::string expected = std::string(120, 'D') + std::string(180, 'S') + std::string(600, 'D');
+    struct Case {
+        const char* name;
+        VkResult allocation;
+        bool frames;
+        bool picture;
+    };
+    // GOAL: S15.935 (c) -- device memory running out at an ordinary picture allocation of the switch's decoder, after
+    //       its setup succeeded, is classified as the device's (failDecode() through outOfDeviceMemory()): the
+    //       rest of pass 1 in software, passes 2 and 3 on the device, nothing raised. False if it is read as host
+    //       memory or as a decode error.
+    // WHY-THIS-SHAPE: the first two cases fail in ffmpeg's setup, choose()'s path, which never consults the
+    //       classification; failing "the Nth allocation" by count would land wherever setup happens to end. So the
+    //       injection is armed in avcodec_default_get_buffer2 -- allocatePicture()'s own call -- and re-armed when a
+    //       pooled picture allocated nothing, so it can only fire inside a picture allocation.
+    // CONTROL: control_batch.sh 2026-10-23, RTX 3080 Ti, each alone, restored, damaged_device_no_inline,
+    //       renderer/video/video_decoder.cpp: allocatePicture() handing failDecode() EINVAL instead of its error, and
+    //       allocatePicture() returning every error unclassified with decode()'s two failedAllocation() tests off ->
+    //       both "device memory out at a picture of the switch's decoder: software for the rest of pass 1 only ...".
+    //       The unclassified return alone stays green: decode()'s failedAllocation() test after the call catches it.
+    for (const Case& k : {Case{"device memory out at the switch", VK_ERROR_OUT_OF_DEVICE_MEMORY, false, false},
+                          Case{"the switch's images context failing", VK_SUCCESS, true, false},
+                          Case{"device memory out at a picture of the switch's decoder", VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                               false, true}}) {
+        const CountedRun c = runCountingCodecs(device, file, 900, k.allocation, k.frames, k.picture);
+        std::printf("%s: %s: injected %s; decoders %s\n", label.c_str(), k.name, c.injected ? "yes" : "no",
+                    c.kinds.c_str());
+        if (!c.injected) {
+            std::fprintf(stderr, "FAIL: %s: %s: the injection was never reached\n", label.c_str(), k.name);
+            fail("the switch-failure injection was not reached, which is not a verdict on the decoder");
+            continue;
+        }
+        check(c.run.threw.empty() && firstWrongPass(c.run, ids) < 0,
+              label + ": " + k.name + ": three passes shown right without raising (threw '" + c.run.threw +
+                  "', first wrong pass " + std::to_string(firstWrongPass(c.run, ids) + 1) + ")");
+        check(c.kinds == expected, label + ": " + k.name + ": software for the rest of pass 1 only, passes 2 and 3 "
+                                           "on the device: " + c.kinds);
+    }
+    // GOAL: S15.935 (a) -- host memory running out in the switch's decoder setup is raised as ResourceExhausted, not
+    //       sent to software for the pass. False otherwise.
+    // WHY-THIS-SHAPE: the same injection site as the device-memory case, so the two differ only in the VkResult
+    //       and the check grades the classification, not where the failure lands.
+    // CONTROL: control_batch.sh 2026-10-22, RTX 3080 Ti, each alone, reverted, damaged_device_no_inline,
+    //       renderer/video/video_decoder.cpp: choose()'s `raisesShortage(failedAllocation())` line deleted, and
+    //       outOfDeviceMemory() true for any failed allocation -> both "host memory out at the switch raises
+    //       ResourceExhausted (threw '' ...)".
+    const CountedRun host = runCountingCodecs(device, file, 900, VK_ERROR_OUT_OF_HOST_MEMORY);
+    std::printf("%s: host memory out at the switch: injected %s, raised ResourceExhausted %s, threw '%s'; decoders %s\n",
+                label.c_str(), host.injected ? "yes" : "no", host.run.exhausted ? "yes" : "no", host.run.threw.c_str(),
+                host.kinds.c_str());
+    if (!host.injected) {
+        std::fprintf(stderr, "FAIL: %s: host memory out at the switch: the injection was never reached\n", label.c_str());
+        fail("the host-memory injection was not reached, which is not a verdict on the decoder");
+    } else {
+        check(host.run.exhausted, label + ": host memory out at the switch raises ResourceExhausted (threw '" +
+                                      host.run.threw + "'; decoders " + host.kinds + ")");
+    }
+    runShortageAtDecodeChecks(device, label, file, ids);
+    runUnansweredSwitchChecks(device, label, file);
 }
 
 // GOAL: S15.173 -- a position past the end of the file -- the old position of a file since replaced in place
@@ -2410,12 +3321,13 @@ void runOpenGopStartChecks(Device& device, const std::string& label, bool onDevi
             // WHY-THIS-SHAPE: read from the packets the decoder was sent; the pictures are right either way,
             //       and a start at the open keyframe shows itself only as validation messages, which this
             //       entry's grade counts but cannot attribute.
-            // CONTROL: via control_batch.sh, 2026-09-30, reverted, renderer/video/video_decoder.cpp
+            // CONTROL: via control_batch.sh, 2026-10-23 (G3d), RTX 3080 Ti, reverted, renderer/video/video_decoder.cpp
             //       scanWindow() taking the container's keyframe flag for resetsDecoder() -> on all three
             //       device entries "the first packet sent to the decoder was packet 45 (picture 48, a non-IDR
-            //       I picture), which does not reset the decoder" (a CRA for HEVC), and the validation grade
-            //       red again: 52, 8 and 52 warnings. renderer/video/reset_point.cpp hevcUnit() also accepting
-            //       a CRA -> the same line, and 8 warnings, on start-at-device-open-gop-hevc.
+            //       I picture), which does not reset the decoder" (a CRA for HEVC), beside "0 device and 53 host
+            //       picture(s)": allocatePicture()'s missing-reference test now sends such a start to software,
+            //       so the validation grade stays quiet. renderer/video/reset_point.cpp hevcUnit() also accepting
+            //       a CRA -> the same line on start-at-device-open-gop-hevc.
             // COVERAGE-ASSERT: the keyframe a seek to the picture lands on must be an open keyframe, so a
             //       start from it would have been the open-GOP case; red with the point moved to picture 30
             //       (test-side, by hand, 2026-09-30): "the keyframe shown last before the picture is packet 0
@@ -3593,17 +4505,15 @@ void runRetireWaitChecks(Device& device, const std::string& label, const SizeCha
     //       Grading the outcome alone (every picture once) passed the blocking fallback: it waited, then played.
     //       The fallback call's waits are graded before anything that needs the hold to have survived it: a
     //       wait ends the hold, and a check that first demanded a running batch reported that instead.
-    // CONTROL: renderer/video/video_decoder.cpp, each reverted. reopenInSoftware() calling closeDecoder()
-    //       instead of retireDecoder(): all three streams, "the fallback call 29 made 2 wait(s), 1 on the held
-    //       batch" (call 31 for both AV1 streams), and the end-of-stream and stalled-teardown cases red beside
-    //       it, via control_batch.sh 2026-09-30. releaseRetiredCodec() without its hasCompleted() poll: "the
-    //       hardware codec was freed in call 30, while its last reader was still running" (call 32 for AV1).
-    //       next() without its first releaseRetiredCodec(): "the hardware codec was never freed by call 33,
-    //       the first after its last reader completed" (35 for AV1); the end-of-stream cases stayed green.
-    //       releaseRetiredCodec() waiting on the retired codec's last reader when it has not completed, via
-    //       control_batch.sh 2026-10-15, reverted (RTX) -> "FAIL: ... counter_shrink_grow.hevc, the fallback with a batch held: waits on the
-    //       playback path, as above", beside "the hardware codec was freed in call 30, while its last reader
-    //       was still running".
+    // CONTROL: renderer/video/video_decoder.cpp, each reverted, via control_batch.sh 2026-10-23 (G3d), RTX 3080
+    //       Ti, bytes restored. reopenInSoftware() calling closeDecoder() instead of retireDecoder(): "the
+    //       fallback call 29 made 2 wait(s), 1 on the held batch", end-of-stream case red beside it.
+    //       releaseRetiredCodec() without its lastReader hasCompleted() test (the probe test kept), and without
+    //       both: "the hardware codec was freed in call 29, while its last reader was still running".
+    //       decode() without its top-of-call releaseRetiredCodec() stays GREEN: the one before it returns a
+    //       picture frees the codec in the same call. Without both: "never freed by call 33, the first after its
+    //       last reader completed" (35 for counter_tiny.obu). releaseRetiredCodec() waiting on the last reader
+    //       when it has not completed: "the fallback call 29 made 1 wait(s), 1 on the held batch".
     // COVERAGE-ASSERT: the fallback call follows device pictures and began with the batch held, and the
     //       Device still reports it unfinished after that call. "Held" needs the interposer's record as well
     //       as the Device's answer: with the hold never applied, asking the Device alone passed the first
@@ -3887,6 +4797,122 @@ void runStalledTeardownChecks(Device& device, const std::string& label, const Si
         std::fprintf(stderr, "FAIL: %s: %s: every image pool was freed before teardown\n", label.c_str(), what.c_str());
         fail("no image pool was alive at teardown, so what a stalled teardown leaks was not graded");
     }
+}
+
+// GOAL: S15.936, the retired decoder -- a hardware codec retired at a fallback while the device does not answer
+//       is never freed during playback, no call hangs or waits on the playback path, and closing with the device
+//       still silent frees nothing and records the leak. False if it is freed unanswered, waited for, or freed at
+//       close. Chosen: the device stays silent from the fallback to the close, so the leak, not a later free.
+// WHY-THIS-SHAPE: the silence starts at the fallback call itself: the decoder sends its probe while retiring the
+//       codec, so silencing the device after the fallback (the old shape) only met a probe already answered.
+//       The next fenced submission is held before every call; the decoder-only harness submits nothing else, so
+//       the fallback's probe is the one held, and any wait on it is told VK_TIMEOUT at once (a stopped GPU).
+// CONTROL: control_batch.sh 2026-10-23, RTX 3080 Ti, each restored (renderer/video/video_decoder.cpp):
+//       releaseRetiredCodec() without `|| !m_device.hasCompleted(*sent)` -> "... is never freed during playback
+//       and makes no wait (0 wait(s), 3 of 3 later calls returned, freed in call 29)", the close check red too;
+//       closeDecoder()'s leak branch freeing the retired codec -> "closing with the device still silent frees
+//       nothing (codec freed at teardown)".
+// COVERAGE-ASSERT: no call before the fallback made a fenced submission, the fallback's one was held and still
+//       running after the playback calls, and device pictures came before the fallback. Not controlled.
+void runUnansweredRetiredChecks(Device& device, const std::string& label, const SizeChangeFixture& fixture) {
+    if (!declinedHere(device, label, fixture)) return;
+    const std::string what = std::string(fixture.file) + ", a retired hardware codec with the device not answering";
+    constexpr int kPlaybackCalls = 3;
+    std::string stopped;
+    std::string threw;
+    std::optional<size_t> fallback;
+    int devicePictures = 0;
+    bool probeHeld = false;
+    bool stillHeld = false;
+    int playbackWaits = 0;
+    int playbackRefused = 0;
+    int returnedAfter = 0;
+    try {
+        RetireHarness harness(device, asset(fixture.file));
+        g_stallHeld = true;
+        for (size_t n = 0; n < 400 && !fallback; ++n) {
+            g_holdNextSubmission = true;
+            const DirectCall call = harness.call();
+            g_holdNextSubmission = false;
+            if (call.openedSoftware) {
+                fallback = harness.calls.size() - 1;
+                probeHeld = g_heldFences.size() == 1;
+            } else if (!g_heldFences.empty()) {
+                stopped = "call " + std::to_string(n + 1) + " made a fenced submission before any fallback";
+                break;
+            } else if (!call.returned) {
+                stopped = "the stream ended on the device after " + std::to_string(n) + " pictures";
+                break;
+            }
+        }
+        if (!fallback && stopped.empty()) stopped = "no fallback in 400 calls";
+        if (fallback) {
+            devicePictures = devicePicturesBefore(harness, *fallback);
+            playbackWaits = harness.calls.back().waits;
+            const int before = g_stalledWaits;
+            for (int i = 0; i < kPlaybackCalls; ++i) {
+                const DirectCall call = harness.call();
+                playbackWaits += call.waits;
+                returnedAfter += call.returned ? 1 : 0;
+            }
+            playbackRefused = g_stalledWaits - before;
+            stillHeld = !g_heldFences.empty() && !device.hasCompleted(device.lastSubmission());
+            g_holdNextSubmission = true;
+            static_cast<void>(harness.destroy());
+            g_holdNextSubmission = false;
+        }
+        g_stallHeld = false;
+    } catch (const std::exception& e) {
+        threw = e.what();
+    }
+    g_holdNextSubmission = false;
+    g_stallHeld = false;
+    g_heldFences.clear();
+    const auto retireBy = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!device.hasCompleted(device.lastSubmission()) && std::chrono::steady_clock::now() < retireBy) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!device.hasCompleted(device.lastSubmission())) {
+        std::fprintf(stderr, "FAIL: %s: %s: the held batch had not completed 5 s after the hold was let go\n",
+                     label.c_str(), what.c_str());
+        fail("the harness could not retire the batch it held, so nothing after it in this child can be trusted");
+        return;
+    }
+    const CodecRecord* hardware = RetireHarness::hardwareCodec();
+    std::printf("%s: %s: fallback at call %s, its probe %s; %d call(s) after it returned %d picture(s), %d wait(s), "
+                "%d refused; hardware codec %s\n",
+                label.c_str(), what.c_str(), fallback ? std::to_string(*fallback + 1).c_str() : stopped.c_str(),
+                probeHeld ? "held" : "not held", kPlaybackCalls, returnedAfter, playbackWaits, playbackRefused,
+                codecFate(hardware).c_str());
+    if (!threw.empty()) {
+        std::fprintf(stderr, "FAIL: %s: %s: threw: %s\n", label.c_str(), what.c_str(), threw.c_str());
+        fail("the unanswered retired-codec run threw");
+        return;
+    }
+    if (!fallback || !probeHeld || !stillHeld || hardware == nullptr) {
+        std::fprintf(stderr, "FAIL: %s: %s: the retirement probe was not held through playback (%s; probe %s, %s "
+                             "after the playback calls)\n",
+                     label.c_str(), what.c_str(), fallback ? "fallback reached" : stopped.c_str(),
+                     probeHeld ? "held" : "not held", stillHeld ? "still running" : "complete");
+        fail("the silent device was not in place at the retirement, which is not a verdict on the decoder");
+        return;
+    }
+    if (devicePictures == 0) {
+        std::printf("%s: %s: nothing was decoded on the device before the fallback -- not answerable\n",
+                    label.c_str(), what.c_str());
+        g_notVerified = true;
+        return;
+    }
+    const bool freedInPlayback = hardware->freed && hardware->freedDuring != kDestroying;
+    check(!freedInPlayback && playbackWaits == 0 && returnedAfter == kPlaybackCalls,
+          label + ": " + what + ": the retired codec is never freed during playback and makes no wait (" +
+              std::to_string(playbackWaits) + " wait(s), " + std::to_string(returnedAfter) + " of " +
+              std::to_string(kPlaybackCalls) + " later calls returned, " +
+              (freedInPlayback ? "freed in call " + std::to_string(hardware->freedDuring + 1) : "not freed") + ")");
+    check(!hardware->freed,
+          label + ": " + what + ": closing with the device still silent frees nothing (codec " + codecFate(hardware) +
+              ")");
+    if (!hardware->freed) g_watchDeviceDestroy = true;
 }
 
 void runUnansweredProbeTeardownChecks(Device& device, const std::string& label) {
@@ -4273,12 +5299,18 @@ void runSteadyChecks(Device& device, const std::string& label, bool onDevice) {
     //       one a slow GPU forced: FrameConverter's host path waits when two uploads are still in
     //       flight, and counting across an undrained queue would grade the scheduler. The first calls
     //       are left out because the Device's fence and command buffer pool grows to its most batches.
+    //       Counted on the calling thread only (g_countVulkan is thread_local): the decode thread's calls are
+    //       ffmpeg's frame pool growing, now seen through the decoder's vkAllocateMemory wrapper, and a process-wide
+    //       flag counted one whenever it fell inside a call -- "318 steady calls made vkAllocateMemory x1".
     // CONTROL: renderer/video/video_pipeline.cpp, each reverted. Both mutations moved with the split and
     //       were re-run at their new homes 2026-09-15, on the host path; the device and Lavapipe runs were
     //       not repeated this round. Device::waitForSubmissions() after the render, now in draw(): "318
     //       steady calls made vkWaitForFences x318". The stage rebuilt on every call, now in decodeNext():
     //       "318 steady calls made vkCreateImage x1272, vkCreateImageView x1272, vkCreateBuffer x636,
-    //       vkCreateSampler x318, ... vkWaitForFences x317".
+    //       vkCreateSampler x318, ... vkWaitForFences x317". Re-run 2026-10-23 (T14), RTX 3080 Ti, device path,
+    //       control_batch.sh, restored: waitForSubmissions() after the render in draw() -> "318 steady calls made
+    //       vkWaitForFences x249"; a fence created and destroyed in draw() -> "vkCreateFence x318". Test-side, the
+    //       flag made process-wide again: 5 of 6 runs "318 steady calls made vkAllocateMemory x1"; per thread, 8 of 8 green.
     // COVERAGE-ASSERT: the first call, which builds the stage, must be seen creating -- red with
     //       counting never switched on, "the first call was seen making none" -- and the wait counter
     //       proven wired by waitCounterIsWired(); and 300 calls counted, red on the 20-picture fixture,
@@ -6362,9 +7394,9 @@ void runNoDecodeThreadChecks(Device& device, const std::string& label, bool soft
     //       a Device that DOES share its queues (an MPEG-2 file, which has no Vulkan decoder), then plays
     //       an H.264 file on the same Device and requires a thread there, so the instrument is shown able
     //       to see one.
-    // CONTROL: via control_batch.sh, 2026-10-19, RTX 3080 Ti, bytes restored: decodeAheadIfSafe() without its
-    //       software-path test (renderer/video/video_pipeline.cpp) -> software entry "counter_onekey_m2.ts: a decode
-    //       thread ran (31 decodes through it, 30 pictures received off the calling thread)". Without its
+    // CONTROL: via control_batch.sh, 2026-10-23, RTX 3080 Ti, bytes restored: decodeAheadIfSafe()'s `eligible` made
+    //       true (renderer/video/video_pipeline.cpp) -> software entry "counter_onekey_m2.ts: a decode
+    //       thread ran (32 decodes through it, 32 pictures received off the calling thread)". Without its
     //       queue-sharing test instead -> hidden entry "the child died by signal 6 (Aborted)": the decoder's own
     //       assertMayDecodeHere() pin aborts the first off-thread decode, so this check's message is never
     //       reached there; the forked child is what turns that into a verdict.
@@ -6527,8 +7559,8 @@ void runCompletedOffThreadChecks(Device& device, const std::string& label) {
     //       batch's fence unsignalled, as for a GPU still running it. A batch submitted after it finishes and
     //       is retired on the GPU thread first, which is what moves the watermark an off-thread answer reads;
     //       asking with nothing retired would pass with a watermark that ignores what is still pending.
-    // CONTROL: via control_batch.sh, 2026-10-19, RTX 3080 Ti, bytes restored, each red alone: hasCompleted()'s
-    //       off-thread `return false` made `return true`, and retireCompleted() setting the watermark to the
+    // CONTROL: via control_batch.sh, 2026-10-23, RTX 3080 Ti, bytes restored, each red alone: hasCompleted()'s
+    //       off-thread branch answering `true` before its marker test, and retireCompleted() setting the watermark to the
     //       newest serial whatever is pending (renderer/vulkan/device.cpp) -> "answered true off the GPU thread
     //       for a batch the GPU has not finished".
     // COVERAGE-ASSERT: once the batch is let go and the GPU thread has seen it finish, the off-thread
@@ -6788,6 +7820,316 @@ std::optional<ThreadedPlay> playThreaded(Device& device, const std::string& labe
     return std::nullopt;
 }
 
+// ------------------------------------------------------------------------- //
+// The read before an FLV start, on the decode thread
+// ------------------------------------------------------------------------- //
+
+// While g_countStartReads is set, av_read_frame calls are counted by the thread making them; the decode
+// thread's reads may be slowed, and its g_startReadFailAt-th read may return g_startReadFailErr instead.
+std::atomic<bool> g_countStartReads{false};
+std::atomic<int> g_startReadsGpu{0};
+std::atomic<int> g_startReadsThread{0};
+std::atomic<int> g_startReadDelayMs{0};
+std::atomic<int> g_startReadFailAt{0};
+std::atomic<int> g_startReadFailErr{0};
+std::atomic<bool> g_startReadFailed{false};
+
+void resetStartReads() {
+    g_startReadsGpu = 0;
+    g_startReadsThread = 0;
+    g_startReadDelayMs = 0;
+    g_startReadFailAt = 0;
+    g_startReadFailErr = 0;
+    g_startReadFailed = false;
+}
+
+struct StartReadsEnd {
+    ~StartReadsEnd() {
+        g_countStartReads = false;
+        resetStartReads();
+    }
+};
+
+constexpr const char* kStartReadFixture = "counter_ps_gap.flv";
+
+// The pictures shown by takeReady() rounds from a pipeline opened at `start`; throws what the pipeline threw.
+std::vector<int> takeShown(Device& device, VideoPipeline& pipeline, const std::string& label, size_t count) {
+    OffscreenTargetManager targets(device);
+    const OffscreenTarget& target = targets.create(1, kTargetWidth, kTargetHeight);
+    std::vector<int> shown;
+    for (size_t i = 0; i < count; ++i) {
+        const std::optional<VideoPipeline::Decode> answer = takeWhenReady(pipeline, wallpaperx::PictureSkip::Nothing, label);
+        if (answer != VideoPipeline::Decode::Decoded) break;
+        pipeline.convert();
+        pipeline.draw(targets, target, wallpaperx::Placement{});
+        shown.push_back(wallpaperx::testing::counterFromBgra(
+            wallpaperx::testing::reclaimAndReadback(device, targets, target), target.width, target.height));
+    }
+    return shown;
+}
+
+// Whether `shown` is `count` pictures of the stream, consecutive and in order, from any point.
+bool consecutiveInStream(const std::vector<int>& shown, const std::vector<int>& ids, size_t count) {
+    if (shown.size() != count) return false;
+    const auto at = std::find(ids.begin(), ids.end(), shown.front());
+    return at != ids.end() && static_cast<size_t>(ids.end() - at) >= count && std::equal(shown.begin(), shown.end(), at);
+}
+
+void runStartReadChecks(Device& device, const std::string& label) {
+    if (!hardwareDecoderPresent(device, label) || !queuesShared(device, label)) return;
+    const std::optional<CounterReference> reference = counterReference(label, kStartReadFixture);
+    if (!reference) return;
+    const std::vector<int>& ids = reference->ids;
+    // Far enough in that the read before it is long, and past the parameter-set change at 120.
+    const size_t start = ids.size() >= 40 ? ids.size() - 20 : 0;
+    if (start < 200) {
+        std::fprintf(stderr, "FAIL: %s: %s has %zu pictures, too few for a long read before a start\n", label.c_str(),
+                     kStartReadFixture, ids.size());
+        fail("the start-read fixture is too short");
+        return;
+    }
+    const std::optional<wallpaperx::StreamPosition> position =
+        positionAt(device, label, kStartReadFixture, start, ids[start]);
+    if (!position) return;
+    const std::vector<int> due(ids.begin() + static_cast<std::ptrdiff_t>(start),
+                               ids.begin() + static_cast<std::ptrdiff_t>(start + kFollowing));
+    const std::string where = std::string(kStartReadFixture) + " opened at picture " + std::to_string(ids[start]);
+
+    // GOAL: S15.937 -- an FLV start part way in reads the file before the start on the decode thread: the
+    //       calling thread's takeReady() makes no read and does not wait for it, and the pictures from the start
+    //       are the start's own, in order. False if the read runs on the calling thread while a thread exists.
+    // WHY-THIS-SHAPE: the decode thread is held at a test-owned gate from before its first step, so a
+    //       takeReady() that answers Pending with the gate shut provably did not wait; reads are counted by the
+    //       thread that makes them, in av_read_frame, so "not on the calling thread" is counted, not timed. A
+    //       watchdog opens the gate after 5 s so a blocking takeReady() is reported, never hung on.
+    // CONTROL: via control_batch.sh, 2026-10-22, RTX 3080 Ti, bytes restored: renderer/video/video_pipeline.cpp
+    //       decodeAheadIfSafe() without `|| decoder.startPending()` -> "the start's read ran on the calling thread:
+    //       281 packet(s) read inside takeReady(), 0 on the decode thread".
+    // COVERAGE-ASSERT: the decode thread itself made at least half as many reads as the start's position.
+    {
+        resetThreadWatch();
+        resetStartReads();
+        const StartReadsEnd reads;
+        std::vector<int> shown;
+        std::string threw;
+        bool watchdogOpened = false;
+        std::optional<VideoPipeline::Decode> first;
+        try {
+            setGate(true);
+            auto pipeline = std::make_unique<VideoPipeline>(device, asset(kStartReadFixture), kShaderDir,
+                                                            VideoPipeline::Playback::Loop, position, watchedHooks());
+            const ThreadWatchEnd end;
+            g_countStartReads = true;
+            bool returned = false;
+            {
+                std::jthread watchdog([&returned, &watchdogOpened] {
+                    std::unique_lock<std::mutex> lock(g_threadMutex);
+                    if (g_threadChanged.wait_for(lock, std::chrono::seconds(5), [&returned] { return returned; })) {
+                        return;
+                    }
+                    watchdogOpened = true;
+                    g_gateClosed = false;
+                    g_threadChanged.notify_all();
+                });
+                struct Returned {
+                    bool& flag;
+                    ~Returned() {
+                        {
+                            std::lock_guard<std::mutex> lock(g_threadMutex);
+                            flag = true;
+                        }
+                        g_threadChanged.notify_all();
+                    }
+                } mark{returned};
+                first = pipeline->takeReady(wallpaperx::PictureSkip::Nothing);
+            }
+            setGate(false);
+            if (first == VideoPipeline::Decode::Pending) shown = takeShown(device, *pipeline, label, kFollowing);
+        } catch (const std::exception& e) {
+            threw = e.what();
+        }
+        if (g_startReadsGpu.load() != 0) {
+            std::fprintf(stderr, "FAIL: %s: %s: the start's read ran on the calling thread: %d packet(s) read inside "
+                                 "takeReady(), %d on the decode thread\n",
+                         label.c_str(), where.c_str(), g_startReadsGpu.load(), g_startReadsThread.load());
+            fail("the read before an FLV start ran on the calling thread while a decode thread could exist");
+        } else if (watchdogOpened || first != VideoPipeline::Decode::Pending) {
+            std::fprintf(stderr, "FAIL: %s: %s: the first takeReady() with the decode thread held answered %d%s\n",
+                         label.c_str(), where.c_str(), static_cast<int>(first.value_or(VideoPipeline::Decode::Pending)),
+                         watchdogOpened ? ", only after the watchdog released the thread" : "");
+            fail("takeReady() waited for the read before an FLV start");
+        } else if (!threw.empty() || shown != due) {
+            std::fprintf(stderr, "FAIL: %s: %s: showed %s where %s was due%s%s\n", label.c_str(), where.c_str(),
+                         joinIds(shown).c_str(), joinIds(due).c_str(), threw.empty() ? "" : "; threw: ", threw.c_str());
+            fail("the pictures from an FLV start read on the decode thread were not the start's");
+        } else if (g_startReadsThread.load() < static_cast<int>(start / 2)) {
+            std::fprintf(stderr, "FAIL: %s: %s: the decode thread read only %d packet(s)\n", label.c_str(),
+                         where.c_str(), g_startReadsThread.load());
+            fail("the decode thread did not make the read before the start, so nothing here graded it");
+        } else {
+            std::printf("%s: %s: takeReady() answered Pending with the thread held; 0 reads on the calling thread, %d "
+                        "on the decode thread; showed %s\n",
+                        label.c_str(), where.c_str(), g_startReadsThread.load(), joinIds(shown).c_str());
+        }
+    }
+
+    // GOAL: S15.939 -- a read error before the start position does not refuse the wallpaper: playback goes on,
+    //       showing the stream's own pictures in order. Out of memory in the same read is still raised as
+    //       ResourceExhausted.
+    // WHY-THIS-SHAPE: the error is injected at the decode thread's 150th read, inside the read before the start
+    //       (position 280) and after the parameter-set change at 120, so a start that proceeds can still be
+    //       graded picture by picture; injecting before 120 would make a right start depend on what the map
+    //       missed, which is not this goal. One-shot, so only the read before the start meets it.
+    // CONTROL: via control_batch.sh, 2026-10-22, RTX 3080 Ti, bytes restored, renderer/video/video_decoder.cpp
+    //       mapExtradataUpTo(): any error thrown (throwFileFailure) instead of ending the map -> "a read error before
+    //       the start refused the wallpaper ... threw 'VideoDecoder: reading before the start (Input/output error)";
+    //       its ENOMEM line deleted -> "out of memory in the read before the start was not raised (showed 0 1 2 3 4".
+    // COVERAGE-ASSERT: the injection was consumed in each case.
+    // GOAL: S15.941 -- after the I/O error, whose damage (read 150) comes after the file's only extradata change
+    //       (picture 120), the start lands at the position: every picture from it to the end of the file, and the
+    //       whole next pass, right. The completed read's start is the block above. False if it begins at picture 0.
+    // WHY-THIS-SHAPE: graded through the next pass, not only kFollowing pictures, because the map left short by the
+    //       error must not mislead the following pass either; "consecutive from anywhere" (S15.939's own grade)
+    //       passed the start-over at picture 0.
+    // CONTROL: control_batch.sh 2026-10-23, RTX 3080 Ti, restored, video_pipeline_decode_thread_start_read,
+    //       renderer/video/video_decoder.cpp mapExtradataUpTo() never setting `assumedThrough` -> "an I/O error at
+    //       read 150: did not land at the position: showed 0 1 2 3 4, ... first difference at 0".
+    const std::vector<int> throughNextPass = [&] {
+        std::vector<int> v(ids.begin() + static_cast<std::ptrdiff_t>(start), ids.end());
+        v.insert(v.end(), ids.begin(), ids.end());
+        return v;
+    }();
+    for (const int err : {AVERROR(EIO), AVERROR(ENOMEM)}) {
+        const bool memory = err == AVERROR(ENOMEM);
+        const std::string what = where + (memory ? ", out of memory" : ", an I/O error") + " at read 150";
+        resetThreadWatch();
+        resetStartReads();
+        const StartReadsEnd reads;
+        g_startReadFailAt = 150;
+        g_startReadFailErr = err;
+        g_countStartReads = true;
+        std::vector<int> shown;
+        std::string threw;
+        bool exhausted = false;
+        try {
+            VideoPipeline pipeline(device, asset(kStartReadFixture), kShaderDir, VideoPipeline::Playback::Loop,
+                                   position, watchedHooks());
+            const ThreadWatchEnd end;
+            shown = takeShown(device, pipeline, label, memory ? kFollowing : throughNextPass.size());
+        } catch (const wallpaperx::ResourceExhausted& e) {
+            threw = e.what();
+            exhausted = true;
+        } catch (const std::exception& e) {
+            threw = e.what();
+        }
+        if (!g_startReadFailed.load()) {
+            std::fprintf(stderr, "FAIL: %s: %s: the injection was never reached (%d reads on the decode thread)\n",
+                         label.c_str(), what.c_str(), g_startReadsThread.load());
+            fail("the injected read failure never reached the read before the start");
+        } else if (memory && !exhausted) {
+            std::fprintf(stderr, "FAIL: %s: %s: out of memory in the read before the start was not raised (showed %s; "
+                                 "threw '%s')\n",
+                         label.c_str(), what.c_str(), joinIds(shown).c_str(), threw.c_str());
+            fail("out of memory in the read before an FLV start was not raised");
+        } else if (!memory && (!threw.empty() || shown.size() < kFollowing ||
+                               !consecutiveInStream(std::vector<int>(shown.begin(), shown.begin() + kFollowing), ids,
+                                                    kFollowing))) {
+            std::fprintf(stderr, "FAIL: %s: %s: a read error before the start refused the wallpaper or broke the "
+                                 "start: showed %s where %s was due; threw '%s'\n",
+                         label.c_str(), what.c_str(), joinIds(shown).c_str(), joinIds(due).c_str(), threw.c_str());
+            fail("a read error before an FLV start refused the wallpaper");
+        } else if (memory) {
+            std::printf("%s: %s: raised ResourceExhausted: %s\n", label.c_str(), what.c_str(), threw.c_str());
+        } else if (shown != throughNextPass) {
+            size_t first = 0;
+            while (first < shown.size() && shown[first] == throughNextPass[first]) ++first;
+            std::fprintf(stderr, "FAIL: %s: %s: did not land at the position: showed %s, %zu of %zu, first difference "
+                                 "at %zu, where %s was due\n",
+                         label.c_str(), what.c_str(),
+                         joinIds(std::vector<int>(shown.begin(), shown.begin() + std::min<size_t>(shown.size(), 5))).c_str(),
+                         shown.size(), throughNextPass.size(), first, joinIds(due).c_str());
+            fail("a start whose read failed after the last extradata change did not land at its position");
+        } else {
+            std::printf("%s: %s: not refused; landed at the position, %zu pictures right through the next pass\n",
+                        label.c_str(), what.c_str(), shown.size());
+        }
+    }
+
+    // GOAL: S15.938 -- destroying the pipeline during that read stops it promptly, well under the 10 s stop
+    //       bound, leaves no decode thread running and no Device marked as having one.
+    // WHY-THIS-SHAPE: the decode thread's reads are slowed to 10 ms each, in the probe's av_read_frame, so the
+    //       read before the start takes about 2.8 s and destruction provably lands inside it (20 reads made).
+    //       Asserting "no read after the destructor began" would be a scheduler assertion, so the check is that
+    //       fewer than half of the reads still due were made, and destruction took under 1 s: a read that
+    //       ignores the stop makes all of them and takes over 2 s. Last in the entry, because a control that
+    //       abandons the thread leaves it reading.
+    // CONTROL: via control_batch.sh, 2026-10-22, RTX 3080 Ti, bytes restored: renderer/video/video_decoder.cpp
+    //       mapExtradataUpTo()'s stop check made `false &&` -> "made 261 more read(s) of the 259 still due and took
+    //       2644.3 ms"; renderer/video/decode_ahead.cpp kStopBound made 1 ms -> "left the decode thread running
+    //       (thread still running, Device marked: yes)".
+    // COVERAGE-ASSERT: at least 100 reads were still due when destruction began.
+    {
+        resetThreadWatch();
+        resetStartReads();
+        const StartReadsEnd reads;
+        {
+            std::lock_guard<std::mutex> lock(g_threadMutex);
+            g_decodeThreadGone = false;
+        }
+        if (wallpaperx::Device::threadLeftRunning()) {
+            std::printf("%s: a thread was already left running in this process -- not answerable\n", label.c_str());
+            g_notVerified = true;
+            return;
+        }
+        g_startReadDelayMs = 10;
+        g_countStartReads = true;
+        std::unique_ptr<VideoPipeline> pipeline;
+        try {
+            pipeline = std::make_unique<VideoPipeline>(device, asset(kStartReadFixture), kShaderDir,
+                                                       VideoPipeline::Playback::Loop, position, watchedHooks());
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "FAIL: %s: %s: opening the pipeline threw: %s\n", label.c_str(), where.c_str(), e.what());
+            fail("a pipeline opened at an FLV position threw");
+            return;
+        }
+        if (!waitThread(label, "the decode thread never made 20 reads of the read before the start",
+                        [] { return g_startReadsThread.load() >= 20; })) {
+            return;
+        }
+        const int before = g_startReadsThread.load();
+        const auto began = std::chrono::steady_clock::now();
+        pipeline.reset();
+        const auto took = std::chrono::steady_clock::now() - began;
+        const int after = g_startReadsThread.load() - before;
+        const int due = static_cast<int>(start) - before;
+        bool gone = false;
+        {
+            std::lock_guard<std::mutex> lock(g_threadMutex);
+            gone = g_decodeThreadGone;
+        }
+        const double ms = std::chrono::duration<double, std::milli>(took).count();
+        if (due < 100) {
+            std::fprintf(stderr, "FAIL: %s: %s: only %d reads were still due when destruction began\n", label.c_str(),
+                         where.c_str(), due);
+            fail("destruction did not land inside a long read, so the stop was not exercised");
+        } else if (!gone || wallpaperx::Device::threadLeftRunning()) {
+            std::fprintf(stderr, "FAIL: %s: %s: destruction during the start's read left the decode thread running "
+                                 "(thread %s, Device marked: %s)\n",
+                         label.c_str(), where.c_str(), gone ? "exited" : "still running",
+                         wallpaperx::Device::threadLeftRunning() ? "yes" : "no");
+            fail("destroying a pipeline during the read before an FLV start left its thread running");
+        } else if (after * 2 >= due || took >= std::chrono::seconds(1)) {
+            std::fprintf(stderr, "FAIL: %s: %s: destruction during the start's read made %d more read(s) of the %d "
+                                 "still due and took %.1f ms\n",
+                         label.c_str(), where.c_str(), after, due, ms);
+            fail("destroying a pipeline did not stop the read before an FLV start");
+        } else {
+            std::printf("%s: %s: destroyed after %d reads: %d more read(s) of %d due, %.2f ms, thread exited\n",
+                        label.c_str(), where.c_str(), before, after, due, ms);
+        }
+    }
+}
+
 void runThreadedResumeChecks(Device& device, const std::string& label) {
     if (!hardwareDecoderPresent(device, label) || !queuesShared(device, label)) return;
     const std::optional<CounterReference> full = counterReference(label, "counter_long.mp4");
@@ -6928,14 +8270,16 @@ extern "C" VkResult vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physic
                                                          uint32_t* count, VkExtensionProperties* properties) {
     static const auto real =
         realSymbol<wallpaperx::testing::EnumerateDeviceExtensionsFn>("vkEnumerateDeviceExtensionProperties");
-    if (g_hideSynchronizedQueues && layerName == nullptr) {
+    if ((g_hideSynchronizedQueues || g_hideVideoMaintenance2) && layerName == nullptr) {
         uint32_t all = 0;
         if (const VkResult r = real(physicalDevice, nullptr, &all, nullptr); r != VK_SUCCESS) return r;
         std::vector<VkExtensionProperties> kept(all);
         if (const VkResult r = real(physicalDevice, nullptr, &all, kept.data()); r < 0) return r;
         kept.resize(all);
         std::erase_if(kept, [](const VkExtensionProperties& e) {
-            return std::strcmp(e.extensionName, VK_KHR_INTERNALLY_SYNCHRONIZED_QUEUES_EXTENSION_NAME) == 0 ||
+            return (g_hideSynchronizedQueues &&
+                    std::strcmp(e.extensionName, VK_KHR_INTERNALLY_SYNCHRONIZED_QUEUES_EXTENSION_NAME) == 0) ||
+                   (g_hideVideoMaintenance2 && std::strcmp(e.extensionName, VK_KHR_VIDEO_MAINTENANCE_2_EXTENSION_NAME) == 0) ||
                    (g_hideVideoExtensions && std::strncmp(e.extensionName, "VK_KHR_video", 12) == 0);
         });
         if (properties == nullptr) {
@@ -6963,9 +8307,6 @@ WALLPAPERX_COUNTED(vkCreateImageView,
                    (VkDevice d, const VkImageViewCreateInfo* i, const VkAllocationCallbacks* a, VkImageView* o),
                    (d, i, a, o))
 WALLPAPERX_COUNTED(vkCreateBuffer, (VkDevice d, const VkBufferCreateInfo* i, const VkAllocationCallbacks* a, VkBuffer* o),
-                   (d, i, a, o))
-WALLPAPERX_COUNTED(vkAllocateMemory,
-                   (VkDevice d, const VkMemoryAllocateInfo* i, const VkAllocationCallbacks* a, VkDeviceMemory* o),
                    (d, i, a, o))
 WALLPAPERX_COUNTED(vkCreateFence, (VkDevice d, const VkFenceCreateInfo* i, const VkAllocationCallbacks* a, VkFence* o),
                    (d, i, a, o))
@@ -7008,6 +8349,21 @@ WALLPAPERX_COUNTED(vkWaitSemaphores, (VkDevice d, const VkSemaphoreWaitInfo* i, 
 WALLPAPERX_COUNTED(vkQueueWaitIdle, (VkQueue q), (q))
 WALLPAPERX_COUNTED(vkDeviceWaitIdle, (VkDevice d), (d))
 #undef WALLPAPERX_COUNTED
+
+extern "C" VkResult vkAllocateMemory(VkDevice d, const VkMemoryAllocateInfo* i, const VkAllocationCallbacks* a,
+                                     VkDeviceMemory* o) {
+    static const auto real =
+        realSymbol<VkResult (*)(VkDevice, const VkMemoryAllocateInfo*, const VkAllocationCallbacks*, VkDeviceMemory*)>(
+            "vkAllocateMemory");
+    if (g_countVulkan) ++g_vulkanCalls[k_vkAllocateMemory];
+    if (g_allocationArmed.exchange(false)) {
+        g_injectedInPicture = g_inGetBuffer.load() > 0;
+        g_injectedSize = i->allocationSize;
+        g_allocationInjected = true;
+        return g_allocationAtSwitch.load();
+    }
+    return real(d, i, a, o);
+}
 
 namespace {
 bool isHeld(VkFence fence) { return std::find(g_heldFences.begin(), g_heldFences.end(), fence) != g_heldFences.end(); }
@@ -7102,6 +8458,10 @@ extern "C" void vkGetDeviceQueue(VkDevice device, uint32_t family, uint32_t inde
 extern "C" int av_hwframe_ctx_init(AVBufferRef* ref) {
     static const auto real = realSymbol<int (*)(AVBufferRef*)>("av_hwframe_ctx_init");
     auto* frames = reinterpret_cast<AVHWFramesContext*>(ref->data);
+    if (g_failFramesInit > 0 && frames->format == AV_PIX_FMT_VULKAN) {
+        --g_failFramesInit;
+        return AVERROR_EXTERNAL;
+    }
     if (g_trackPools && frames->format == AV_PIX_FMT_VULKAN && frames->free != &onPoolFreed) {
         PoolRecord pool;
         pool.width = frames->width;
@@ -7150,6 +8510,13 @@ extern "C" int avcodec_receive_frame(AVCodecContext* context, AVFrame* frame) {
         g_holdReleasedAtReceive = true;
     }
     const int err = real(context, frame);
+    if (err == AVERROR_EOF && decoders && g_unanswerAtSwitch && context->hw_device_ctx != nullptr &&
+        g_deviceCodecsOpened.load() == 1) {
+        g_unanswerAtSwitch = false;
+        g_unanswerFired = true;
+        g_holdNextSubmission = true;
+        g_stallHeld = true;
+    }
     if (err == 0 && decoders && (g_inflateWidth != 0 || g_inflateHeight != 0) && frame->format == AV_PIX_FMT_VULKAN) {
         frame->width += g_inflateWidth;
         frame->height += g_inflateHeight;
@@ -7177,6 +8544,7 @@ extern "C" int avcodec_receive_frame(AVCodecContext* context, AVFrame* frame) {
         if (frame->format != AV_PIX_FMT_VULKAN) ++g_onThreadHost;
     }
     if (err == 0 && decoders && g_recordPictures) {
+        g_lastReceivedDevice = frame->format == AV_PIX_FMT_VULKAN;
         ++(frame->format == AV_PIX_FMT_VULKAN ? g_devicePictures : g_hostPictures);
         if (g_inFailingCall) ++g_failingPictures;
     }
@@ -7187,8 +8555,57 @@ extern "C" int avcodec_receive_frame(AVCodecContext* context, AVFrame* frame) {
     return err;
 }
 
+// Reached from the decoder's get_buffer2 for the picture it allocates first; the nested call through the
+// same callback is the second request of one packet, which is how ffmpeg asks for a stand-in.
+extern "C" int avcodec_default_get_buffer2(AVCodecContext* context, AVFrame* frame, int flags) {
+    static const auto real = realSymbol<int (*)(AVCodecContext*, AVFrame*, int)>("avcodec_default_get_buffer2");
+    if (g_standInAtNextPicture && isDecodersContext(context) && context->hw_frames_ctx != nullptr &&
+        context->get_buffer2 != nullptr) {
+        g_standInAtNextPicture = false;
+        AVFrame* standIn = av_frame_alloc();
+        if (standIn != nullptr) {
+            standIn->width = frame->width;
+            standIn->height = frame->height;
+            standIn->format = frame->format;
+            if (context->get_buffer2(context, standIn, flags) >= 0) av_frame_unref(standIn);
+            av_frame_free(&standIn);
+            ++g_standInsForced;
+        }
+    }
+    const bool inject = isDecodersContext(context) && context->hw_frames_ctx != nullptr && g_pictureArmed.exchange(false);
+    const bool afterPicture =
+        isDecodersContext(context) && context->hw_frames_ctx != nullptr && g_bitstreamArmed.exchange(false);
+    if (inject) g_allocationArmed = true;
+    ++g_inGetBuffer;
+    const int err = real(context, frame, flags);
+    --g_inGetBuffer;
+    // A picture served from the pool allocated nothing: the next picture carries the injection instead.
+    if (inject && g_allocationArmed.exchange(false)) g_pictureArmed = true;
+    if (afterPicture) g_allocationArmed = true;
+    return err;
+}
+
 extern "C" int av_read_frame(AVFormatContext* format, AVPacket* packet) {
     static const auto real = realSymbol<int (*)(AVFormatContext*, AVPacket*)>("av_read_frame");
+    if (g_countStartReads.load()) {
+        const pid_t tid = gettid();
+        if (tid == g_gpuTid.load()) {
+            ++g_startReadsGpu;
+        } else if (tid == g_decodeTid.load()) {
+            const int n = ++g_startReadsThread;
+            {
+                std::lock_guard<std::mutex> lock(g_threadMutex);
+            }
+            g_threadChanged.notify_all();
+            if (n == g_startReadFailAt.load()) {
+                g_startReadFailed = true;
+                return g_startReadFailErr.load();
+            }
+            if (const int delay = g_startReadDelayMs.load(); delay > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+            }
+        }
+    }
     const int err = real(format, packet);
     if (err >= 0 && g_inFailingCall && g_seekAwaitingPacket >= 0 && packet->stream_index == g_seekAwaitingStream &&
         static_cast<size_t>(g_seekAwaitingPacket) < g_failingSeeks.size()) {
@@ -7201,6 +8618,10 @@ extern "C" int av_read_frame(AVFormatContext* format, AVPacket* packet) {
     if (err >= 0 && g_clearPositions && packet->pos >= 0) {
         packet->pos = -1;
         if (g_tallying) ++g_tally.positionsCleared;
+    }
+    if (err >= 0 && g_clearDts && packet->dts != AV_NOPTS_VALUE) {
+        packet->dts = AV_NOPTS_VALUE;
+        ++g_dtsCleared;
     }
     return err;
 }
@@ -7237,6 +8658,21 @@ extern "C" int avcodec_open2(AVCodecContext* context, const AVCodec* codec, AVDi
     if (err >= 0 && g_trackCodecs && isDecodersContext(context)) {
         g_codecs.push_back(CodecRecord{context, context->hw_device_ctx != nullptr, g_poolCall});
     }
+    if (err >= 0 && g_countDeviceCodecs && isDecodersContext(context) && context->hw_device_ctx != nullptr) {
+        const int live = ++g_deviceCodecsLive;
+        int seen = g_deviceCodecsMax.load();
+        while (live > seen && !g_deviceCodecsMax.compare_exchange_weak(seen, live)) {
+        }
+        if (++g_deviceCodecsOpened == g_injectAtCodec.load()) {
+            if (g_allocationAtSwitch.load() != VK_SUCCESS) {
+                (g_bitstreamAtSwitch ? g_bitstreamArmed : g_pictureAtSwitch ? g_pictureArmed : g_allocationArmed) = true;
+            }
+            if (g_framesAtSwitch) {
+                g_failFramesInit = 1;
+                g_framesArmed = true;
+            }
+        }
+    }
     return err;
 }
 
@@ -7244,6 +8680,10 @@ extern "C" int avcodec_open2(AVCodecContext* context, const AVCodec* codec, AVDi
 // context belongs to that context's record.
 extern "C" void avcodec_free_context(AVCodecContext** context) {
     static const auto real = realSymbol<void (*)(AVCodecContext**)>("avcodec_free_context");
+    if (g_countDeviceCodecs && context != nullptr && isDecodersContext(*context) && (*context)->hw_device_ctx != nullptr) {
+        --g_deviceCodecsLive;
+        ++g_deviceCodecsFreed;
+    }
     if (g_trackCodecs && context != nullptr && *context != nullptr) {
         for (CodecRecord& codec : g_codecs) {
             if (codec.context != *context || codec.freed) continue;
@@ -7525,6 +8965,7 @@ int runGraded(const std::string& label, bool hideVideoExtensions, const std::fun
             clearFailingCallConditions();
             clearLoopConditions();
             g_clearPositions = false;
+            g_clearDts = false;
             g_countVulkan = false;
             g_heldFences.clear();
             oracle.detach();
@@ -7654,14 +9095,14 @@ int main(int argc, char** argv) {
         "sequence-device",   "sequence-host", "resume-timestamps", "resume-no-timestamps", "resume-late-seek",
         "resume-end",        "resume-seek-failure", "resume-drop-count", "shape", "shape-device",
         "steady-device",     "steady-host",   "loop-device",       "loop-host",  "loop-cost-device",
-        "loop-cost-host",    "loop-resume",   "release-device",    "retire-device",
+        "loop-cost-host",    "loop-resume",   "release-device",    "retire-device", "retire-unanswered",
         "halves-device",     "halves-host",   "timing-device",     "timing-host",       "start-at-device",
         "start-at-device-ts", "start-at-host", "start-at-device-open-gop", "start-at-device-open-gop-hevc",
         "start-at-device-open-gop-mp4", "start-at-host-open-gop", "start-at-device-budget", "start-at-device-av1",
         "bounded-decode-device", "bounded-decode-host", "decode-thread-depth", "decode-thread-pending",
         "decode-thread-failure", "decode-thread-catch-up", "decode-thread-hidden", "decode-thread-software",
-        "decode-thread-alloc", "decode-thread-left-running", "decode-thread-pools", "decode-thread-resume", "device-completed-off-thread",
-        "device-queue-flags"};
+        "decode-thread-alloc", "decode-thread-left-running", "decode-thread-pools", "decode-thread-resume", "decode-thread-start-read", "device-completed-off-thread",
+        "device-queue-flags", "damaged-device", "damaged-device-no-inline", "damaged-host"};
     if (std::find(modes.begin(), modes.end(), mode) == modes.end()) {
         std::fprintf(stderr, "usage: %s <mode>, one of:", argv[0]);
         for (const std::string& m : modes) std::fprintf(stderr, " %s", m.c_str());
@@ -7685,10 +9126,21 @@ int main(int argc, char** argv) {
     //       listed above; with it, all nine green. Production controls re-run under it: both
     //       releaseIdleFramesContexts() calls removed (renderer/video/video_decoder.cpp) -> shape_device "pool 1
     //       of 2 (320x240) was freed only when the pipeline was destroyed"; held via control_batch.sh.
-    g_hideSynchronizedQueues = mode == "resume-late-seek" || mode == "resume-end" || mode == "resume-seek-failure" ||
+    // resume-no-timestamps, with the thread on: 3 runs in 80 "hardware failing after 5 picture(s): the injected
+    //       hardware failure was never consumed", HEAD and working tree alike; hidden: 0 in 200. Its S13.60
+    //       control re-run hidden, renderer/video/video_decoder.cpp admit() `==` made `>=` -> "after 17 ... 1 shown
+    //       more than once" and the same after 40, via control_batch.sh 2026-10-22.
+    // resume-timestamps, with the thread on: its failing call counted 0 pictures and 0 seeks, so its cost bound
+    //       could not fail; off this list by hand (test-side, 2026-10-23) -> "the call that met the failure
+    //       decoded no picture, so its cost was not measured" at all three points.
+    g_hideSynchronizedQueues = mode == "resume-timestamps" || mode == "resume-no-timestamps" ||
+                               mode == "resume-late-seek" || mode == "resume-end" ||
+                               mode == "resume-seek-failure" ||
                                mode == "resume-drop-count" || mode == "shape-device" || mode == "loop-device" ||
                                mode == "loop-cost-device" || mode == "loop-resume" || mode == "start-at-device" ||
-                               mode == "decode-thread-hidden";
+                               mode == "decode-thread-hidden" || mode == "damaged-device" ||
+                               mode == "damaged-device-no-inline";
+    g_hideVideoMaintenance2 = mode == "damaged-device-no-inline";
 
     g_recordQueues = mode == "device-queue-flags";
     if (mode == "decode-thread-left-running") {
@@ -7703,6 +9155,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (mode == "shape-device" || mode == "loop-device" || mode == "release-device" || mode == "retire-device" ||
+        mode == "retire-unanswered" ||
         mode == "decode-thread-hidden" || mode == "decode-thread-software" || mode == "decode-thread-alloc" ||
         mode == "decode-thread-pools") {
         std::vector<std::pair<std::string, std::function<void(Device&)>>> cases;
@@ -7733,6 +9186,12 @@ int main(int argc, char** argv) {
                                [label](Device& device) { runRefusedTeardownChecks(device, label); });
             cases.emplace_back("counter_resize.h264, device not answering at teardown",
                                [label](Device& device) { runUnansweredProbeTeardownChecks(device, label); });
+        } else if (mode == "retire-unanswered") {
+            for (const SizeChangeFixture& fixture : kSizeChangeFixtures) {
+                if (std::string(fixture.file) != "counter_shrink_grow.hevc") continue;
+                cases.emplace_back(std::string(fixture.file) + ", retired codec not answered",
+                                   [&fixture, label](Device& device) { runUnansweredRetiredChecks(device, label, fixture); });
+            }
         } else if (mode == "decode-thread-hidden" || mode == "decode-thread-software") {
             const bool software = mode == "decode-thread-software";
             cases.emplace_back(software ? "a stream decoded in software" : "queues not shared",
@@ -7775,13 +9234,14 @@ int main(int argc, char** argv) {
     return runGraded(label, mode == "sequence-host" || mode == "shape" || mode == "steady-host" || mode == "loop-host" ||
                                 mode == "loop-cost-host" || mode == "halves-host" || mode == "timing-host" ||
                                 mode == "start-at-host" || mode == "start-at-host-open-gop" ||
-                                mode == "bounded-decode-host",
+                                mode == "bounded-decode-host" || mode == "damaged-host",
                      [&](Device& device) {
                          if (mode == "decode-thread-depth") runDecodeDepthChecks(device, label);
                          if (mode == "decode-thread-pending") runDecodePendingChecks(device, label);
                          if (mode == "decode-thread-failure") runDecodeFailureChecks(device, label);
                          if (mode == "decode-thread-catch-up") runDecodeCatchUpChecks(device, label);
                          if (mode == "decode-thread-resume") runThreadedResumeChecks(device, label);
+                         if (mode == "decode-thread-start-read") runStartReadChecks(device, label);
                          if (mode == "device-completed-off-thread") runCompletedOffThreadChecks(device, label);
                          if (mode == "device-queue-flags") runQueueFlagChecks(device, label);
                          if (mode == "bounded-decode-device") runBoundedDecodeChecks(device, label, /*onDevice=*/true);
@@ -7826,12 +9286,13 @@ int main(int argc, char** argv) {
                          //       entry's validation grade, over the two transport-stream starting points.
                          // WHY-THIS-SHAPE: an entry of its own so a failure here names the case: a
                          //       transport stream's seeks land on non-keyframes, an MP4's never do.
-                         // CONTROL: via control_batch.sh, 2026-09-30, RTX 3080 Ti, reverted: scanWindow() in
-                         //       renderer/video/video_decoder.cpp taking every packet as a reset point, so the
-                         //       start decodes from the non-keyframe its seek landed on -> "58 Vulkan validation
-                         //       warning(s)", beside "the first packet sent to the decoder was packet 39
-                         //       (picture 38, not a keyframe)". A device start depends only on the reset-point
-                         //       test, never on next()'s skip to a keyframe.
+                         // CONTROL: via control_batch.sh, 2026-10-23 (G3d), RTX 3080 Ti, reverted, in
+                         //       renderer/video/video_decoder.cpp: scanWindow() taking every packet as a reset
+                         //       point alone -> "the first packet sent to the decoder was packet 39 (picture 38,
+                         //       not a keyframe)" but no warning, as allocatePicture()'s missing-reference test
+                         //       sends the start to software ("0 device and 22 host"); with that test also
+                         //       made `&& false` -> "58 Vulkan validation warning(s)". A device start depends
+                         //       only on the reset-point test, never on next()'s skip to a keyframe.
                          if (mode == "start-at-device-ts") {
                              runStartAtChecks(device, label, true, StartPoints::TransportStream);
                          }
@@ -7847,10 +9308,12 @@ int main(int argc, char** argv) {
                          // WHY-THIS-SHAPE: one entry per codec for the transport streams and one for MP4,
                          //       whose index seeks land on the open keyframe directly; S15.161's device check
                          //       makes each run prove an open keyframe stood where the seek lands.
-                         // CONTROL: via control_batch.sh, 2026-09-30, RTX 3080 Ti, reverted: scanWindow() in
-                         //       renderer/video/video_decoder.cpp taking the container's keyframe flag for
-                         //       resetsDecoder() -> "52 Vulkan validation warning(s)" on the H.264 transport
-                         //       stream, 8 on HEVC's, 52 on the MP4 entry.
+                         // CONTROL: via control_batch.sh, 2026-10-23 (G3d), RTX 3080 Ti, reverted, in
+                         //       renderer/video/video_decoder.cpp: scanWindow() taking the container's keyframe
+                         //       flag for resetsDecoder(), with allocatePicture()'s missing-reference test made
+                         //       `&& false` -> "52 Vulkan validation warning(s)" on the H.264 transport stream, 8
+                         //       on HEVC's, 52 on the MP4 entry. The scanWindow() break alone leaves no warning:
+                         //       that test sends the start to software (S15.161's check goes red instead).
                          if (mode == "start-at-device-open-gop") runOpenGopStartChecks(device, label, true, "counter_opengop.ts");
                          if (mode == "start-at-device-open-gop-hevc") {
                              runOpenGopStartChecks(device, label, true, "counter_opengop_hevc.ts");
@@ -7860,6 +9323,26 @@ int main(int argc, char** argv) {
                              runOpenGopStartChecks(device, label, true, "counter_opengop_hevc.mp4");
                          }
                          if (mode == "start-at-device-budget") runBudgetChecks(device, label);
+                         if (mode == "damaged-device") {
+                             runDamagedChecks(device, label, /*onDevice=*/true);
+                             runLengthChangePipelineChecks(device, label, /*onDevice=*/true);
+                             runSwitchChecks(device, label, /*inlineExpected=*/true);
+                             runReopenPositionChecks(device, label);
+                         }
+                         if (mode == "damaged-host") {
+                             runDamagedChecks(device, label, /*onDevice=*/false);
+                             runLengthChangePipelineChecks(device, label, /*onDevice=*/false);
+                         }
+                         if (mode == "damaged-device-no-inline") {
+                             // COVERAGE-ASSERT: the hide reached the Device, or the row below grades the inline path.
+                             check(!device.videoInlineParameters() && !inlineParametersOffered(device),
+                                   "VK_KHR_video_maintenance2 was hidden from the Device");
+                             runDamagedChecks(device, label, /*onDevice=*/true, "counter_ps_gap.flv");
+                             runLengthChangePipelineChecks(device, label, /*onDevice=*/true);
+                             runSwitchChecks(device, label, /*inlineExpected=*/false);
+                             runSwitchFailureChecks(device, label);
+                             runRewindResetChecks(device, label);
+                         }
                          if (mode == "start-at-device-av1") runAv1StartChecks(device, label);
                          if (mode == "start-at-host-open-gop") {
                              for (const char* file : {"counter_opengop.ts", "counter_opengop_hevc.ts", "counter_opengop.mp4",

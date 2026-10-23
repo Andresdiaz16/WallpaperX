@@ -121,7 +121,8 @@ using SteadyTime = std::chrono::steady_clock::time_point;
 // above 120 on a 144, 165 or 240 Hz screen is played slower than its author meant. The ceiling reads a
 // longer gap in the timestamps as a discontinuity rather than a pause, so a timestamp jump cannot
 // freeze a wallpaper.
-constexpr std::chrono::nanoseconds kMinPictureInterval{1'000'000'000 / 120};
+constexpr int kPictureRateCap = 120;
+constexpr std::chrono::nanoseconds kMinPictureInterval{1'000'000'000 / kPictureRateCap};
 constexpr std::chrono::nanoseconds kMaxPictureInterval = std::chrono::seconds(5);
 // For a picture neither the file nor its stream gives a duration.
 constexpr std::chrono::nanoseconds kFallbackPictureInterval{1'000'000'000 / 30};
@@ -155,6 +156,36 @@ std::chrono::nanoseconds atSpeed(std::chrono::nanoseconds span, double speed) {
 // The file's own time between two pictures a screen drawing `rate` a second shows at `speed`.
 std::chrono::nanoseconds showSpacing(double rate, double speed) {
     return std::chrono::nanoseconds(std::llround(1e9 * speed / rate));
+}
+
+// Whether displays at `spacings`, their grids laid from one origin, ask for pictures closer than
+// `cap`, the spacing of kPictureRateCap a second, more often than the floor under the due times can
+// make up: as many points a second as the cap's grid has, or more, that are not all on it. Counted
+// over one second on screen. The floor would then hold each picture back further than the last, and
+// the file would play slow. Points under kSamePoint apart are one: grids of nested rates drift a
+// nanosecond a point from rounding their spacings.
+bool overflowsCap(std::span<const std::chrono::nanoseconds> spacings, std::chrono::nanoseconds cap) {
+    constexpr int64_t kSamePoint = 1000;
+    const auto onGrid = [](int64_t at, int64_t step) {
+        const int64_t past = at % step;
+        return std::min(past, step - past) < kSamePoint;
+    };
+    const int64_t second = cap.count() * kPictureRateCap - kSamePoint;
+    int points = 0;
+    bool offCap = false;
+    for (size_t i = 0; i < spacings.size(); ++i) {
+        const int64_t step = spacings[i].count();
+        for (int64_t k = 0; k * step < second; ++k) {
+            const int64_t at = k * step;
+            if (std::any_of(spacings.begin(), spacings.begin() + static_cast<std::ptrdiff_t>(i),
+                            [&](std::chrono::nanoseconds earlier) { return onGrid(at, earlier.count()); })) {
+                continue;
+            }
+            ++points;
+            offCap = offCap || !onGrid(at, cap.count());
+        }
+    }
+    return offCap && points >= kPictureRateCap;
 }
 
 // How long `picture` holds the screen at `speed`. Floored again after dividing: the due times are
@@ -3347,8 +3378,8 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(uint64_t sessio
         return std::nullopt;
     }
     session.idleSince.reset();
-    // A picture no playing screen's rate shows is passed over, unconverted, and left undecoded where
-    // nothing references it; each screen draws only those its own rate shows.
+    // A picture no playing screen draws is passed over, unconverted, and left undecoded where nothing
+    // references it; each screen draws only those its own rate shows, or under the cap those below.
     static_assert(kMaxMonitors <= ShowGrids::kMaxSpacings);
     std::array<std::chrono::nanoseconds, kMaxMonitors> spacingsHeld{};
     size_t spacingCount = 0;
@@ -3356,7 +3387,31 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(uint64_t sessio
         if (screen.playing) spacingsHeld[spacingCount++] = screen.spacing;
     }
     const std::span<const std::chrono::nanoseconds> spacings(spacingsHeld.data(), spacingCount);
-    session.decodeLoad.thinUnder(spacings);
+    // Screens whose grids together ask for more than the cap keep only the cap's own grid, so the file
+    // is thinned rather than slowed, and each screen draws the one of those nearest each of its
+    // refreshes: a moment on its own cadence, laid from the steady clock's epoch, falls after half a
+    // floor past the picture before's due time, and no later than half a floor past this one's. The
+    // pictures' due times are a floor apart or more, so every such moment picks one picture, and a
+    // screen at the cap draws them all.
+    const std::chrono::nanoseconds capSpacing = showSpacing(kPictureRateCap, speed);
+    std::optional<Session::CapVerdict>& verdict = session.capVerdict;
+    if (!verdict || verdict->cap != capSpacing ||
+        !std::ranges::equal(spacings, std::span(verdict->spacings.data(), verdict->count))) {
+        verdict = Session::CapVerdict{spacingsHeld, spacingCount, capSpacing, overflowsCap(spacings, capSpacing)};
+    }
+    const bool overCap = verdict->over;
+    const std::span<const std::chrono::nanoseconds> kept = overCap ? std::span(&capSpacing, 1) : spacings;
+    const auto drawsUnderCap = [&](const Screen& screen, const Session::Waiting& waiting) {
+        const int64_t period = std::max<int64_t>(atSpeed(screen.spacing, speed).count(), 1);
+        const auto refreshes = [&](SteadyTime due) {
+            return (due + kMinPictureInterval / 2).time_since_epoch().count() / period;
+        };
+        return refreshes(waiting.planned().due) > refreshes(waiting.previous.due);
+    };
+    const auto draws = [&](const Screen& screen, const Session::Waiting& waiting) {
+        return overCap ? drawsUnderCap(screen, waiting) : session.pipeline->shows({&screen.spacing, 1});
+    };
+    session.decodeLoad.thinUnder(kept);
     // One decode's sample: the decoder's own time for the picture, on whichever thread it ran, against
     // the time on screen at this round's speed. None for a picture that starts a pass while nothing is
     // skipped: its decode holds the loop's seek and key picture, paid once a pass. Skipping, it may be
@@ -3385,7 +3440,7 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(uint64_t sessio
         // Inside the try, so it is withdrawn before the failure path frees the session it names.
         const std::shared_ptr<const std::string> line = session.blame->line.load();
         const PlayingBlame working(*line);
-        session.pipeline->leaveUnshown(spacings, session.decodeLoad.thinningNumber());
+        session.pipeline->leaveUnshown(kept, session.decodeLoad.thinningNumber());
         // A decode that is still dropping pictures on the way to its own gets the next round: the picture
         // on screen stays, and the rounds between let every other screen and request have the GPU.
         if (resuming) {
@@ -3459,7 +3514,11 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(uint64_t sessio
             // the same way, but whenever it is due and with no hold: it was never to be drawn.
             for (bool dropped = false;; dropped = true) {
                 const PictureTiming held = session.pipeline->timing();
-                const bool unshown = !held.startsPass && !session.pipeline->shows(spacings);
+                const bool unshown =
+                    !held.startsPass && (!session.pipeline->shows(kept) ||
+                                         (overCap && std::none_of(screens.begin(), screens.end(), [&](const Screen& s) {
+                                              return s.playing && drawsUnderCap(s, *waiting);
+                                          })));
                 if (!unshown && (!pace.timesPicture || held.startsPass ||
                                  waiting->planned().timeline + intervalAtSpeed(held, speed) > now)) {
                     waiting->catchingUpSince.reset();
@@ -3525,9 +3584,9 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(uint64_t sessio
         bool drew = false;
         for (const Screen& screen : screens) {
             if (!screen.playing) continue;
-            // Keeps its picture through those its own rate does not show: the loop above kept every
-            // picture some screen shows.
-            if (waiting != nullptr && !timing.startsPass && !session.pipeline->shows({&screen.spacing, 1})) continue;
+            // Keeps its picture through those it does not draw: the loop above kept every picture some
+            // screen draws.
+            if (waiting != nullptr && !timing.startsPass && !draws(screen, *waiting)) continue;
             drawing = screen.monitorId;
             const OffscreenTarget* target = nullptr;
             {

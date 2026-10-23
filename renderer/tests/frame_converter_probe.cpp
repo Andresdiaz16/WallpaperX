@@ -168,6 +168,7 @@ const char* pathName(VideoDecoder::Path path) {
         case VideoDecoder::Path::SoftwareNoDecoder: return "SoftwareNoDecoder";
         case VideoDecoder::Path::SoftwareCodec: return "SoftwareCodec";
         case VideoDecoder::Path::SoftwareRefused: return "SoftwareRefused";
+        case VideoDecoder::Path::SoftwareMissingReference: return "SoftwareMissingReference";
     }
     return "?";
 }
