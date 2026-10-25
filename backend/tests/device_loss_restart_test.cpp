@@ -14,11 +14,14 @@
 
 #include "daemon/crash_record.h"
 #include "daemon/dbus_service.h"
+#include "daemon/resume_record.h"
 
+#include "support/picture_counter.h"
 #include "support/test_image.h"
 #include "tests/client/daemon_client.h"
 #include "tests/client/scratch_dir.h"
 #include "tests/name_watcher.h"
+#include "tests/served_pixels.h"
 #include "tests/spawned_daemon.h"
 #include "tests/test_phase.h"
 #include "tests/test_report.h"
@@ -325,7 +328,8 @@ bool checkLostExit(const SpawnedDaemon& daemon, int exitCode, const std::string&
     //       ended ...", and the stalled-output loss phases' "ends within" (20 shown, the tool's
     //       limit). (c) The signal thread made to count its wake only with an outside signal
     //       (`reasonRecorded = received != kWakeSignal && ...`) -> as (b) less the "says the device
-    //       was lost" lines: 17.
+    //       was lost" lines: 17. (c) re-run 2026-10-24 via control_batch.sh on staticLossAndRestart:
+    //       "exits on its own", "exits with status 75" and "reports its stop as the device-loss one".
     const bool designed =
         checkStatus(daemon, exitCode, kExitDeviceLost, phase + ": a daemon whose device was lost exits with status 75");
     if (!designed) {
@@ -339,7 +343,7 @@ bool checkLostExit(const SpawnedDaemon& daemon, int exitCode, const std::string&
     // CONTROL: backend/daemon/main.cpp printing "stopped cleanly" whatever the exit status (an
     //       unconditional line ahead of the status-dependent one) -> the check below red for the
     //       still and all three video rounds, and nothing else. Observed 2026-09-24 via
-    //       control_run.sh; reverted.
+    //       control_run.sh; reverted. Re-run 2026-10-24 via control_batch.sh on staticLossAndRestart.
     check(out.find(kCleanStop) == std::string::npos,
           (phase + ": a device-loss stop does not report itself as a clean one").c_str());
     // GOAL: the log of a device-loss stop names no signal. The stop is carried out by waking the
@@ -787,15 +791,19 @@ void checkStuckLossStop(NameWatcher& names, const std::string& still, OutsideSig
     //       them deterministic. The wedge line is waited for before the verdict, so a stop that was
     //       never stuck is reported NOT VERIFIED rather than graded as this one.
     // CONTROL: in backend/daemon/main.cpp via control_run.sh, observed 2026-09-26 on NVIDIA,
-    //       reverted. (a) The signal thread's deadline exit made `_Exit(1)` and armTeardown's alarm
-    //       removed, so only that path can end the stop -> "exits with status 75" red in both
-    //       phases, alone. (b) onTeardownDeadline's DeviceLost branch (`exitNow(kExitDeviceLost,
-    //       ...)`) removed and the signal thread's wait made 60 s, so only the alarm can end it, by
-    //       SIGALRM -> the same two lines, with the unfinished-render phase's status line, which
-    //       the alarm also ends. (c) The second-signal handler armed whatever woke the signal
-    //       thread (its second `if (outside)` made `if (true)`) -> "not taken for a second ask",
-    //       alone; both 75 lines stay green, as a forced exit keeps 75. (d) Both paths disabled ->
-    //       "still ends" and "exits with status 75" red in both phases, alone. The stalled-output
+    //       reverted. (a) The signal thread's deadline exit (`exitCutShort("...shutdown blocked...")`)
+    //       made `std::_Exit(1)` and armTeardown's `::alarm` removed, so only that path can end the stop ->
+    //       "exits with status 75" red in both phases, alone; re-run 2026-10-24 on stuckLossStop/noSignal
+    //       (exit code 1). (b) onTeardownDeadline's exit for a stop with a status of its own (its
+    //       `|| cutShortStatus()`) dropped and the signal thread's wait made 60 s, so only the alarm can
+    //       end it, by SIGALRM -> re-run 2026-10-24 via control_batch.sh on stuckLossStop/noSignal:
+    //       "FAIL: stuck device-loss stop: exits with status 75" (exit code -1, signal 14), restored
+    //       green. (c) The second-signal handler armed whatever woke the signal
+    //       thread (`if (outside || planned)` made `if (true)`, installing forceExitOnSecondSignal) -> "not
+    //       taken for a second ask", alone; both 75 lines stay green, as a forced exit keeps 75; re-run
+    //       2026-10-24 on stuckLossStop/oneSigtermWhenStuck. (d) Both paths disabled (that exit made `return;`,
+    //       the alarm removed) -> "still ends" and "exits with status 75" red in both phases, alone; re-run
+    //       2026-10-24 on stuckLossStop/noSignal (exit code -1: the harness killed it). The stalled-output
     //       phases depend on neither deadline and stayed green under all four.
     const bool designed = checkStatus(daemon, exitCode, kExitDeviceLost, phase + ": exits with status 75");
     if (!designed) {
@@ -817,8 +825,8 @@ void checkStuckLossStop(NameWatcher& names, const std::string& still, OutsideSig
 //       each" is not a question for the scheduler. A render after the signals shows the daemon is
 //       still serving, not merely alive.
 // CONTROL: in backend/daemon/main.cpp via control_run.sh, observed 2026-09-24, reverted. (a) An
-//       outside SIGUSR1 taken for a stop again (`received != kWakeSignal &&` dropped from the
-//       watcher's reason test) -> "answered with a line", "still running", "still draws", "the
+//       outside SIGUSR1 taken for a stop again (the watcher's `if (received != kWakeSignal)` made
+//       unconditional; re-run 2026-10-23 via control_batch.sh) -> "answered with a line", "still running", "still draws", "the
 //       stop is reported as the SIGTERM's" and "exactly one line" red; the exit-0 and "stops
 //       cleanly" lines stay green, because the SIGUSR1 stop itself exits 0 -- the defect. (b) The
 //       "ignoring" line's fprintf duplicated -> "exactly one line per outside SIGUSR1", alone;
@@ -1038,11 +1046,12 @@ enum class OneStalled {
 // CONTROL: via control_run.sh 2026-09-26 on NVIDIA, all reverted. (a) logpump::release() in
 //       backend/daemon/log_pump.cpp given an hour instead of kExitFlush, the flush main()'s return
 //       waits on -> the three "ends within" lines red; every status line stays green, since the
-//       alarm still exits 0 or 75. (b) The same with `g_finalStatus.store(exitStatus);` deleted in
-//       backend/daemon/main.cpp -> also "exits 0, not by SIGALRM" and the SIGUSR1 phase's "exits
-//       0". (c) The log writer never installed (main()'s `logpump::install()` skipped) -> both
+//       alarm still exits 0 or 75. (b) The same with main's `settle(...)` of its final status dropped
+//       in backend/daemon/main.cpp -> also "exits 0, not by SIGALRM" and the SIGUSR1 phase's "exits
+//       0": re-run 2026-10-24 via control_batch.sh on both phases, exit code 80 (the alarm's status for a
+//       user's stop with nothing settled), not a SIGALRM death. (c) The log writer never installed (main()'s `logpump::install()` skipped) -> both
 //       stops' "ends within" and all three "still answered" lines, with the loss phase's "still
-//       answers GetStatus".
+//       answers GetStatus" (re-run 2026-10-24 via control_batch.sh on all three phases).
 void checkOneStreamStalled(NameWatcher& names, const std::string& blue, OneStalled stall) {
     const bool onStdout = stall == OneStalled::StdoutThenSigterm;
     const bool lose = stall == OneStalled::StderrThenDeviceLoss;
@@ -1436,7 +1445,7 @@ enum class StalledEnd {
 // GOAL: S14.12 -- with stdout and stderr on one destination nobody reads (pipe, stream socket,
 //       suspended terminal), SIGTERM ends the daemon with status 0 within 2 s, under the 3 s
 //       teardown deadline; and a second SIGTERM on a stop wedged in its teardown ends it within
-//       1 s, with status 1. False if either end waits on the destination.
+//       1 s, with status 80. False if either end waits on the destination.
 // GOAL: S14.13 -- in the same layout, with a watched video playing so the render thread has a
 //       line to write, a device loss ends the daemon with status 75 within 2.5 s of the shim's
 //       failed submission (<trigger>.fired). False if the loss's stop waits on any log line.
@@ -1449,10 +1458,10 @@ enum class StalledEnd {
 // CONTROL: via control_run.sh on NVIDIA, each on all three destinations, all reverted.
 //       Observed 2026-09-26: (a) logpump::release() in backend/daemon/log_pump.cpp given an
 //       hour -> the SIGTERM and loss "ends within" lines; statuses stay 0 and 75, the alarm's.
-//       (b) As (a) with `g_finalStatus.store(exitStatus);` deleted in backend/daemon/main.cpp ->
-//       also the SIGTERM "exits 0" lines. (c) flushBeforeExit()'s flush in backend/daemon/main.cpp,
-//       which every forced exit runs, given an hour -> the three second-SIGTERM "within 1 s" lines,
-//       alone. Observed 2026-09-25: (d) the log writer never installed -> the SIGTERM lines and
+//       (b) As (a) with main's `settle(...)` of its final status dropped in backend/daemon/main.cpp ->
+//       also the SIGTERM "exits 0" lines (re-run 2026-10-24 on all three: exit code 80). (c)
+//       flushBeforeExit()'s flush in backend/daemon/main.cpp, which every forced exit runs, given an
+//       hour -> the three second-SIGTERM "within 1 s" lines, alone (re-run 2026-10-24 on all three). Observed 2026-09-25: (d) the log writer never installed -> the SIGTERM lines and
 //       "the video is still drawn", and the second-SIGTERM phases NOT VERIFIED: the main thread
 //       was in write(), not the wedge; 2026-09-26 its red list ran past the tool's 20 lines and
 //       showed these phases' SIGTERM lines among them.
@@ -1584,11 +1593,18 @@ void checkStalledEnd(NameWatcher& names, const std::string& blue, Destination de
                                : wedged ? ": a second SIGTERM ends a wedged stop within 1 s"
                                         : ": SIGTERM ends the daemon within 2 s, under the 3 s teardown deadline";
     check(ended.has_value(), (phase + within).c_str());
-    // CONTROL: backend/daemon/main.cpp:84, forceExitOnSecondSignal's `exitNow(failureStatus() + 1, ...)`,
-    //       control_batch 2026-10-15, device_loss_restart_lavapipe '^stalledEnd/pipe/secondSigterm$' -> "FAIL:
-    //       stalled pipe, second SIGTERM: exits 1", alone; restored, green.
-    if (!daemon.timedOut()) checkStalledStatus(daemon, home, exitCode, lose ? kExitDeviceLost : wedged ? 1 : 0,
-                                  phase + (lose ? ": exits with status 75" : wedged ? ": exits 1" : ": exits 0"));
+    // GOAL: S15.948 (second SIGTERM) -- a user's stop a second ask cuts short exits 80, which the unit does not
+    //       restart; not 1, which Restart=on-failure would.
+    // CONTROL: cutShortStatus()'s `if (reason == StopReason::Signal) return kExitStopCutShort;` deleted
+    //       (backend/daemon/main.cpp) -> "FAIL: stalled pipe, second SIGTERM: exits 80 ..." red, alone (exit 1).
+    //       control_batch.sh 2026-10-23 and again 2026-10-24, NVIDIA, --phase '^stalledEnd/pipe/secondSigterm$';
+    //       reverted, green again.
+    if (!daemon.timedOut()) {
+        checkStalledStatus(daemon, home, exitCode, lose ? kExitDeviceLost : wedged ? 80 : 0,
+                           phase + (lose     ? ": exits with status 75"
+                                    : wedged ? ": exits 80, a user's stop cut short, which the unit does not restart"
+                                             : ": exits 0"));
+    }
     std::printf("device_loss_restart_test: %s: %zu bytes filled, %s, exit code %d, signal %d\n", phase.c_str(),
                 daemon.stallBytes(),
                 ended ? ("ended " + std::to_string(seconds(*ended)) + " s after the last provocation").c_str()
@@ -1610,8 +1626,9 @@ void checkStalledEnd(NameWatcher& names, const std::string& blue, Destination de
 // CONTROL: via control_run.sh on NVIDIA, each on all three destinations, reverted, observed
 //       2026-09-26. The log writer never installed (backend/daemon/main.cpp's `logpump::install()`
 //       skipped) -> GetStatus, SetWallpaper and SIGTERM lines red: the daemon took its name and
-//       then stopped on its first line. logpump::release() in backend/daemon/log_pump.cpp given
-//       an hour -> the SIGTERM line; with `g_finalStatus.store` also deleted, "exits 0" too.
+//       then stopped on its first line (re-run 2026-10-24 via control_batch.sh on all three). logpump::release() in backend/daemon/log_pump.cpp given
+//       an hour -> the SIGTERM line; with main's final `settle(...)` also dropped, "exits 0" too (re-run
+//       2026-10-24 via control_batch.sh on all three: exit code 80).
 void checkStartedStalled(NameWatcher& names, const std::string& blue, Destination dest) {
     constexpr const char* kGoals = "S14.25 (a daemon started with its output already full serves and stops)";
     const std::string phase = std::string("full ") + describe(dest) + " from the start";
@@ -1717,7 +1734,7 @@ void checkClosedAtLaunch(NameWatcher& names, const std::string& blue, SpawnedDae
 // CONTROL: in backend/daemon/main.cpp via control_run.sh, observed 2026-09-26 on NVIDIA,
 //       reverted: the startup `std::signal(SIGALRM, SIG_IGN)` made `std::signal(SIGALRM,
 //       onTeardownDeadline)` -> "still draws", "still running", "exits 0" and "stops cleanly" red,
-//       alone.
+//       alone. Re-run 2026-10-24 via control_batch.sh.
 void checkOutsideAlarmIgnored(NameWatcher& names, const std::string& blue, const std::string& red) {
     constexpr const char* kGoals = "S14.15 (an outside SIGALRM does not end a serving daemon)";
     const std::string phase = "outside SIGALRM";
@@ -1913,9 +1930,9 @@ std::vector<pid_t> threadsIn(pid_t pid, long number) {
 //       before the exit began, and pass without any flush. A resume more than 200 ms after SIGTERM,
 //       or /proc looked at less often than every 50 ms, is NOT VERIFIED.
 // CONTROL: in backend/daemon/main.cpp, the signal thread's `catch (...)` made to write its line
-//       with writeErrNow and `_Exit` without exitNow()'s flush -> "the lines queued before the
-//       failure, then its own line, reach the destination" red, alone. Observed 2026-09-25 via
-//       control_run.sh on NVIDIA; reverted. By hand, reverted: the shim's variable misspelt -> NOT
+//       with writeErrNow and `std::_Exit(failureStatus())` in place of exitCutShort's flush -> "the
+//       lines queued before the failure, then its own line, reach the destination" red, alone.
+//       Re-run 2026-10-24 via control_batch.sh on NVIDIA; reverted. By hand, reverted: the shim's variable misspelt -> NOT
 //       VERIFIED "the stop was an ordinary one", no FAIL.
 void checkShutdownWatchFailureFlushes(NameWatcher& names) {
     constexpr const char* kGoals = "S14.31 (the signal thread's failure exit delivers what is queued)";
@@ -1986,9 +2003,9 @@ void checkShutdownWatchFailureFlushes(NameWatcher& names) {
     const bool delivered = failedAt != after.end() && queued == expectedMarkers(0, 1);
     check(delivered, (phase + ": the lines queued before the failure, then its own line, reach the destination").c_str());
     if (!delivered) std::fprintf(stderr, "  seen: %s\n", joined(after, 20).c_str());
-    // CONTROL: backend/daemon/main.cpp:343, the shutdown-watch failure's `exitNow(failureStatus() + 1, ...)`,
-    //       control_batch 2026-10-15, device_loss_restart_lavapipe '^shutdownWatchFailureFlushes$' -> "FAIL:
-    //       stalled pipe, the signal thread fails: exits 1", alone; restored, green.
+    // CONTROL: backend/daemon/main.cpp, the shutdown-watch failure's exitCutShort(...) made
+    //       `exitNow(failureStatus() + 1, ...)` -> "FAIL: stalled pipe, the signal thread fails: exits 1", alone;
+    //       control_batch.sh 2026-10-24 on NVIDIA, --phase shutdownWatchFailureFlushes; restored, green.
     checkStalledStatus(daemon, home, exitCode, 1, phase + ": exits 1");
 }
 
@@ -2437,30 +2454,30 @@ void checkDecodeThreadStuckAtSigterm(NameWatcher& names) {
     const std::string out = daemon.output();
     std::printf("device_loss_restart_test: %s: ended %.2f s after SIGTERM, exit code %d\n", phase.c_str(), took,
                 exitCode);
-    // Two deadlines of kTeardownDeadline end this stop and race: the shutdown watch's exitNow (status 1) and
-    // the SIGALRM handler, which dies of SIGALRM. Either is a legal end; which one is the scheduler's choice.
+    // Two deadlines of kTeardownDeadline end this stop and race: the shutdown watch's exitNow and the SIGALRM
+    // handler's. Either is a legal end; which one is the scheduler's choice. A user's stop exits 80 from both.
     const bool watchExit = out.find("wallpaperx-daemon: shutdown blocked, exiting now") != std::string::npos;
     const bool alarmExit = out.find("wallpaperx-daemon: teardown deadline passed, exiting now") != std::string::npos;
     // CONTROL: kTeardownDeadline 3 s -> 12 s (backend/daemon/main.cpp) -> "FAIL: decode thread stuck at
-    //       SIGTERM: ends within the 3 s shutdown deadline, not the 10 s stop bound", and the next and the
-    //       exit-status lines red too (the 10 s bound then passes and the stop ends cleanly).
+    //       SIGTERM: ends within the 3 s shutdown deadline, not the 10 s stop bound", and the next line red too
+    //       (the 10 s bound then passes and the stop ends cleanly).
     check(!daemon.timedOut() && took < 5.0,
           (phase + ": ends within the 3 s shutdown deadline, not the 10 s stop bound").c_str());
-    // CONTROL: exitNow()'s and onTeardownDeadline()'s flushBeforeExit(...) dropped (backend/daemon/main.cpp) ->
+    // CONTROL: exitNow()'s, exitCutShort()'s and onTeardownDeadline()'s flushBeforeExit(...) dropped
+    //       (backend/daemon/main.cpp; re-run 2026-10-24) ->
     //       "FAIL: ...: a deadline's exit is the one taken, and its line reaches the log". Lines queued earlier
     //       (the SIGTERM line) still arrived under that break -- the log writer had written them already -- so
     //       no check here claims the queue's flush.
     check(watchExit || alarmExit, (phase + ": a deadline's exit is the one taken, and its line reaches the log").c_str());
-    // CONTROL: the kTeardownDeadline break above -> "exits 1" red (exit 0); the crash-record break below ->
-    //       "dies of the teardown alarm" red (it died of SIGSEGV).
-    if (daemon.exitedNormally()) {
-        checkStatus(daemon, exitCode, 1, phase + ": exits 1, the blocked stop's status");
-    } else {
-        check(daemon.termSignal() == SIGALRM && alarmExit,
-              (phase + ": a stop that dies of a signal dies of the teardown alarm, after saying so").c_str());
-    }
-    // CONTROL: exitNow()'s std::_Exit made std::exit, and onTeardownDeadline() ending by std::exit
-    //       (backend/daemon/main.cpp) -> "FAIL: ...: no static destructor runs under the stuck thread".
+    // GOAL: S15.948 -- a user's stop the deadline cuts short exits 80 (RestartPreventExitStatus), from either
+    //       deadline: not 1 and not SIGALRM, which Restart=on-failure would restart.
+    // CONTROL: cutShortStatus()'s `if (reason == StopReason::Signal) return kExitStopCutShort;` deleted
+    //       (backend/daemon/main.cpp) -> this line red (exit code -1, died of SIGALRM). control_batch.sh 2026-10-23
+    //       and again 2026-10-24, NVIDIA, --phase decodeThreadStuckAtSigterm; reverted, green again.
+    checkStatus(daemon, exitCode, 80, phase + ": exits 80, a user's stop cut short, which the unit does not restart");
+    // CONTROL: the std::_Exit in exitNow(), exitCutShort() and onTeardownDeadline() made std::exit
+    //       (backend/daemon/main.cpp) -> "FAIL: ...: no static destructor runs under the stuck thread", alone;
+    //       re-run 2026-10-24 via control_batch.sh.
     check(out.find("wedge_shim: written after main returned") == std::string::npos,
           (phase + ": no static destructor runs under the stuck thread (the process ends through _Exit)").c_str());
     // CONTROL: none held. manager.endPlayingRecord() deleted and both deadline exits ending by raise(SIGSEGV)
@@ -2471,8 +2488,1002 @@ void checkDecodeThreadStuckAtSigterm(NameWatcher& names) {
     check(!blamed, (phase + ": no crash record names the video").c_str());
 }
 
+// The frame number drawn into the counter fixture's picture `frame` holds; nothing, with `why`, when this
+// host cannot read the frame back.
+std::optional<int> counterIn(const wallpaperx::testing::Frame& frame, std::string& why) {
+    const std::vector<unsigned char> pixels = wallpaperx::testing::readServedBgra(wallpaperx::testing::layoutOf(frame), why);
+    if (pixels.empty()) return std::nullopt;
+    const int counter = wallpaperx::testing::counterFromBgra(pixels, frame.width, frame.height);
+    if (counter < 0) {
+        why = "no frame number could be read from the served picture";
+        return std::nullopt;
+    }
+    return counter;
+}
+
+// When a spawned daemon's restart is due at the earliest: `started` is taken before the spawn, so it is
+// never later than the daemon's own clock start.
+struct RestartTime {
+    Clock::time_point started;
+    Clock::duration after;
+};
+
+// How long a daemon that broke off a call is given to be reaped: past its 3 s teardown deadline.
+constexpr auto kStopWait = std::chrono::seconds(5);
+
+// The counter video playing on `screen`, shown, with one picture fetched through `holder` into `held`:
+// the screen is seen. False, reported, when setup did not get there.
+//
+// GOAL: S15.942 -- the daemon does not restart before its restart time, however long nothing is held.
+// WHY-THIS-SHAPE: until a picture is held no screen is seen, so a correct daemon restarts on schedule once
+//       setup outlasts the restart time (a slow or sanitized host). Only a daemon gone before that time is a
+//       defect; one gone after it is this host's setup being slow, reported as not verified. The exit is
+//       waited for (bounded) rather than looked at once: the daemon leaves the bus before it is reaped, so an
+//       instant look would file its restart as a setup fault. One rule for every planned-restart phase.
+// CONTROL: PlannedRestart built with `at = now` and `due = at`, ignoring the quiet period (backend/daemon/
+//       wallpaper_manager.cpp) -> "FAIL: planned restart: the daemon does not restart before its restart
+//       time". control_batch.sh 2026-10-23, NVIDIA, --phase plannedRestart; reverted, green again.
+bool playHeld(NameWatcher& names, SpawnedDaemon& daemon, sdbus::IProxy& proxy, sdbus::IProxy& holder,
+              FrameReadyLog& frames, const char* goals, const std::string& phase, const std::string& screen,
+              RestartTime restart, std::optional<wallpaperx::testing::Frame>& held) {
+    if (!cameUp(names, daemon, goals, phase)) return false;
+    std::string why;
+    try {
+        wallpaperx::testing::setMonitorOutput(proxy, kMonitorVideo, screen, std::chrono::seconds(5));
+        wallpaperx::testing::setOutputVisible(proxy, screen, true, std::chrono::seconds(5));
+        if (setWallpaper(proxy, "video", WALLPAPERX_COUNTER_VIDEO, kMonitorVideo) && frames.waitAtLeast(kMonitorVideo, 3)) {
+            held.emplace(wallpaperx::testing::getFrame(holder, kMonitorVideo, {.timeout = kPromptCall}));
+        } else {
+            why = "this host never played the counter fixture";
+        }
+    } catch (const std::exception& e) {
+        why = e.what();
+    }
+    // Held: only a daemon already gone counts. Not held: one about to go is waited for.
+    const Clock::time_point from = Clock::now();
+    const std::optional<Clock::duration> ended =
+        endedWithin(daemon.pid(), from, held ? Clock::duration::zero() : Clock::duration(kStopWait));
+    if (held && !ended) return true;
+    if (ended) {
+        // Seen ended by `from` + *ended; it may have gone earlier, which only makes it earlier still.
+        const bool early = from + *ended - restart.started < restart.after;
+        check(!early, (phase + ": the daemon does not restart before its restart time").c_str());
+        if (!early) {
+            notVerified(goals, phase + ": setup took longer than the restart time here, and the daemon restarted on "
+                                       "schedule before a picture was held (" + howEnded(daemon.pid()) + ")");
+        }
+    } else {
+        setupFailed(daemon, goals, phase + ": " + why);
+    }
+    return false;
+}
+
+// GOAL: S15.942, S15.944 (same file) -- a daemon past its restart time keeps running while a screen is
+//       seen (a consumer holds its picture and it has not reported itself undrawn); once that screen reports
+//       it is not drawn, the daemon exits with status 79, saying it is planned and blaming no wallpaper; the
+//       next start shows the same picture of the video, with the monitor's settings, and removes the record.
+// WHY-THIS-SHAPE: the monitor is paused before it is hidden, so neither run moves the video on after the
+//       picture read: the restarted daemon's first picture is the only one it draws, and reading it cannot
+//       race the clock. The restart and quiet times are a few seconds through the daemon's own options, the
+//       seam a test has on a spawned process. The restart time runs from the daemon's start, and nothing is
+//       held until setup ends, so a daemon gone during setup is graded by when it went (see playHeld).
+// CONTROL: per check below; all via control_batch.sh 2026-10-23 on NVIDIA, --phase plannedRestart, one
+//       break each, bytes restored and the phase green again after each.
+void checkPlannedRestart(NameWatcher& names) {
+    constexpr const char* kGoals = "S15.942/S15.944 (the planned restart waits for no screen seen, exits 79, resumes)";
+    using wallpaperx::testing::Frame;
+    const std::string clip = WALLPAPERX_COUNTER_VIDEO;
+    std::error_code ec;
+    if (!fs::exists(clip, ec)) {
+        notVerified(kGoals, "the counter fixture " + clip + " was not built");
+        return;
+    }
+    Home home("planned_restart");
+    if (!home.ok()) {
+        notVerified(kGoals, "a scratch HOME could not be created under the temp directory");
+        return;
+    }
+    constexpr int kExitPlannedRestart = 79;
+    constexpr auto kRestartAfter = std::chrono::seconds(6);
+    const std::string screen = "DP-7";
+    std::vector<std::string> args = kDaemonArgs;
+    args.insert(args.end(), {"--restart-after", std::to_string(kRestartAfter.count()), "--restart-quiet", "1"});
+
+    if (!nameFree(names, "the planned-restart phase")) return;
+    std::optional<int> before;
+    {
+        FrameReadyLog frames;
+        auto proxy = subscribeFrameReady(frames);
+        const Clock::time_point started = Clock::now();
+        SpawnedDaemon daemon(home.env(false), SpawnedDaemon::Stdout::Captured, {}, 0, args);
+        // Held, as the plugin holds the picture it shows: what makes the screen seen.
+        std::optional<Frame> held;
+        if (!playHeld(names, daemon, *proxy, *proxy, frames, kGoals, "planned restart", screen, {started, kRestartAfter},
+                      held)) {
+            return;
+        }
+        std::this_thread::sleep_until(started + kRestartAfter + std::chrono::seconds(3));
+        // CONTROL: anyScreenSeenLocked() made to return false (backend/daemon/wallpaper_manager.cpp) -> this
+        //       line red: the daemon left at its restart time with the picture held.
+        check(!hasEnded(daemon.pid()), "planned restart: a daemon past its restart time keeps running while a screen is seen");
+
+        // The next picture is held before the last is given back, as the plugin does, so the monitor is never
+        // left unheld here: an unheld gap longer than the quiet period would be a correct restart mid-step.
+        std::string why;
+        try {
+            wallpaperx::testing::setMonitorPause(*proxy, kMonitorVideo, "always_paused", std::chrono::seconds(5));
+            const Frame next = wallpaperx::testing::getFrame(*proxy, kMonitorVideo, {.timeout = kPromptCall});
+            wallpaperx::testing::releaseFrame(*proxy, kMonitorVideo, *held, kPromptCall);
+            held.emplace(next);
+            before = counterIn(*held, why);
+            wallpaperx::testing::setOutputVisible(*proxy, screen, false, std::chrono::seconds(5));
+        } catch (const std::exception& e) {
+            check(false, (std::string("planned restart: the daemon answers while a screen is seen: ") + e.what()).c_str());
+            return;
+        }
+        if (!before) notVerified(kGoals, "the picture before the restart could not be read: " + why);
+
+        const Clock::time_point hidden = Clock::now();
+        const std::optional<Clock::duration> ended = endedWithin(daemon.pid(), hidden, std::chrono::seconds(15));
+        // CONTROL: planRestart's `if (now < due) return due;` made `return due;` (backend/daemon/
+        //       wallpaper_manager.cpp), so it is never due -> this line red after the 15 s bound.
+        check(ended.has_value(), "planned restart: the daemon exits once no screen is seen");
+        if (!ended) return;
+        std::printf("device_loss_restart_test: planned restart %lld ms after the screen was hidden\n",
+                    static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(*ended).count()));
+        const int exitCode = daemon.waitForExit();
+        // CONTROL: chosenStatus()'s PlannedRestart/RestartCommitted case returning kExitDeviceLost (backend/daemon/
+        //       main.cpp) -> this line red (exit 75), with the "says" line below, whose second half keys on status 79.
+        //       Re-run 2026-10-24 via control_batch.sh, NVIDIA, --phase plannedRestart; reverted, green again.
+        checkStatus(daemon, exitCode, kExitPlannedRestart, "planned restart: the exit status is 79");
+        const std::string out = daemon.output();
+        // CONTROL: onPlannedRestart's "planned restart: no screen is in view" printf deleted (backend/daemon/
+        //       main.cpp) -> this line red, alone.
+        check(out.find("planned restart: no screen is in view") != std::string::npos &&
+                  out.find("stopped for a planned restart, exit status 79") != std::string::npos,
+              "planned restart: the daemon says the restart is planned");
+        // CONTROL: planRestart's writeResumeRecord(...) call replaced by an empty string (backend/daemon/
+        //       wallpaper_manager.cpp) -> this line red, with the "same picture" line after the restart.
+        check(fs::exists(wallpaperx::resumeRecordPath(home.stateDir()), ec),
+              "planned restart: the record of where the video stood is left for the next start");
+    }
+    // Not controlled for this phase: deleting manager.endPlayingRecord() from main's orderly stop (backend/
+    //       daemon/main.cpp) left it green, as only a fatal signal records a death and this stop is orderly. Kept
+    //       as a guard; its own controls are on the device-loss phases.
+    checkNothingBlamed(home, "planned restart", true);
+
+    if (!nameFree(names, "the start after the planned restart")) return;
+    FrameReadyLog frames;
+    auto proxy = subscribeFrameReady(frames);
+    SpawnedDaemon daemon(home.env(false), SpawnedDaemon::Stdout::Captured, {}, 0, kDaemonArgs);
+    if (!cameUp(names, daemon, kGoals, "the start after the planned restart")) return;
+    const bool drew = frames.waitAtLeast(kMonitorVideo, 1);
+    // CONTROL: service.renderRestored() deleted from main (backend/daemon/main.cpp) -> this line red.
+    check(drew, "planned restart: the next start draws the video with no client asking");
+    if (drew && before) {
+        std::string why;
+        std::optional<int> after;
+        try {
+            const Frame frame = wallpaperx::testing::getFrame(*proxy, kMonitorVideo, {.timeout = kPromptCall});
+            after = counterIn(frame, why);
+            wallpaperx::testing::releaseFrame(*proxy, kMonitorVideo, frame, kPromptCall);
+        } catch (const std::exception& e) {
+            why = e.what();
+        }
+        if (!after) {
+            notVerified(kGoals, "the picture after the restart could not be read: " + why);
+        } else {
+            std::printf("device_loss_restart_test: frame %d before the planned restart, %d after\n", *before, *after);
+            // COVERAGE-ASSERT: at frame 0 the comparison below would pass for a daemon that ignores the record.
+            //       Not controlled: no production break leaves the paused video at frame 0 after three frames.
+            check(*before > 0, "planned restart: the video stood past its first picture (the premise)");
+            // CONTROL: restoreSaved()'s `resumes.insert_or_assign(...)` deleted (backend/daemon/
+            //       wallpaper_manager.cpp), so the record is read and ignored -> this line red.
+            check(*after == *before, "planned restart: the next start shows the picture the last run showed");
+        }
+    }
+    const StatusReply status = getStatus(*proxy, std::chrono::seconds(10));
+    const nlohmann::json* entry = wallpaperStatus(status, std::to_string(kMonitorVideo));
+    const nlohmann::json& json = status.json();
+    const nlohmann::json::json_pointer pauseMode("/pause/" + std::to_string(kMonitorVideo) + "/mode");
+    const bool paused = json.is_object() && json.contains(pauseMode) && json.at(pauseMode) == "always_paused";
+    // CONTROL: the config writer's `row[kKeyPause] = ...` made `if (false)` (backend/daemon/config_store.cpp)
+    //       -> this line red.
+    check(entry != nullptr && !entry->contains("last_error") && paused,
+          "planned restart: the monitor comes back with its pause setting and no error");
+    if (entry != nullptr) std::printf("device_loss_restart_test: status after the restart: %s\n", entry->dump().c_str());
+    // CONTROL: manager.forgetResumeRecord() deleted from main (backend/daemon/main.cpp) -> this line red, alone.
+    check(!fs::exists(wallpaperx::resumeRecordPath(home.stateDir()), ec),
+          "planned restart: the next start removes the record it resumed from");
+    // A diagnostic guard, not controlled: the line is printed only when opening at the saved picture fails
+    // with a file or shortage fault, and no one-line break produces that here without also failing the
+    // "same picture" check above, which carries this property.
+    check(daemon.output().find("could not resume where it stood") == std::string::npos,
+          "planned restart: the next start does not give the position up");
+    const int stopExit = daemon.shutdown(SIGTERM);
+    checkStatus(daemon, stopExit, 0, "planned restart: the next start exits 0 on SIGTERM");
+}
+
+constexpr int kExitPlanned = 79;
+
+// home.env() with the restart-hold shim preloaded and `extra` set.
+std::vector<std::string> shimEnv(const Home& home, const std::vector<std::string>& extra) {
+    std::vector<std::string> env = home.env(false);
+    const char* inherited = std::getenv("LD_PRELOAD");
+    std::string preload = WALLPAPERX_RESTART_HOLD_SHIM;
+    if (inherited != nullptr && *inherited != '\0') preload = std::string(inherited) + ":" + preload;
+    env.push_back("LD_PRELOAD=" + preload);
+    env.insert(env.end(), extra.begin(), extra.end());
+    return env;
+}
+
+enum class LastHold { Released, ConsumerLeft };
+
+// GOAL: S15.943 -- a planned restart that is due while a paused, visible screen's picture is held happens
+//       within the quiet period plus one clock round of that last picture being given back (ReleaseBuffer, or
+//       the holding client leaving the bus), with nothing else happening in the daemon.
+// WHY-THIS-SHAPE: paused, so no frame, decode or idle release (30 s when paused) wakes the clock in the
+//       window; the release is the only event. The bound is 2.5 s (quiet 1 s), timed to the daemon's
+//       "planned restart:" line, the decision: timed to the exit it would include the teardown, which the
+//       daemon may take 3 s over. A daemon that waits for an unrelated wake sits out the whole 10 s look. The restart time is passed with the picture held first,
+//       so the restart is due at the moment of the release rather than becoming due on a timer.
+// CONTROL: re-run 2026-10-23 on the decision timing, via control_batch.sh on NVIDIA, each reverted and green
+//       again: `if (unheld) wakeClock();` deleted from releaseBuffer -> the Released variant's 2.5 s line red;
+//       the same deleted from forgetHeldBuffers -> the ConsumerLeft variant's line red (backend/daemon/
+//       wallpaper_manager.cpp). Both printed "no restart decided 10 s after the last picture was given back".
+void checkReleaseWakesRestart(NameWatcher& names, LastHold how) {
+    constexpr const char* kGoals = "S15.943 (giving back the last held picture lets a due planned restart happen)";
+    const std::string phase = how == LastHold::Released ? "release wakes restart" : "consumer leaving wakes restart";
+    if (std::error_code ec; !fs::exists(WALLPAPERX_COUNTER_VIDEO, ec)) {
+        notVerified(kGoals, std::string("the counter fixture ") + WALLPAPERX_COUNTER_VIDEO + " was not built");
+        return;
+    }
+    Home home("restart_wake");
+    if (!home.ok()) {
+        notVerified(kGoals, "a scratch HOME could not be created under the temp directory");
+        return;
+    }
+    constexpr auto kRestartAfter = std::chrono::seconds(4);
+    constexpr auto kBound = std::chrono::milliseconds(2500);
+    std::vector<std::string> args = kDaemonArgs;
+    args.insert(args.end(), {"--restart-after", std::to_string(kRestartAfter.count()), "--restart-quiet", "1"});
+    if (!nameFree(names, phase)) return;
+
+    FrameReadyLog frames;
+    auto proxy = subscribeFrameReady(frames);
+    // The consumer: a connection of its own, so leaving the bus is closing it.
+    std::unique_ptr<sdbus::IConnection> consumerBus = sdbus::createSessionBusConnection();
+    std::unique_ptr<sdbus::IProxy> consumer = sdbus::createProxy(*consumerBus, sdbus::ServiceName{DbusService::kBusName},
+                                                                 sdbus::ObjectPath{DbusService::kObjectPath});
+    const Clock::time_point started = Clock::now();
+    SpawnedDaemon daemon(home.env(false), SpawnedDaemon::Stdout::Captured, {}, 0, args);
+    std::optional<wallpaperx::testing::Frame> held;
+    if (!playHeld(names, daemon, *proxy, *consumer, frames, kGoals, phase, "DP-4", {started, kRestartAfter}, held)) return;
+    try {
+        wallpaperx::testing::setMonitorPause(*proxy, kMonitorVideo, "always_paused", std::chrono::seconds(5));
+    } catch (const std::exception& e) {
+        setupFailed(daemon, kGoals, phase + ": the monitor could not be paused: " + e.what());
+        return;
+    }
+    std::this_thread::sleep_until(started + kRestartAfter + std::chrono::seconds(2));
+    // Graded with its controls by the plannedRestart phase; here only what the timing below stands on.
+    if (hasEnded(daemon.pid())) {
+        check(false, (phase + ": the daemon keeps running while its picture is held (the premise)").c_str());
+        return;
+    }
+
+    const Clock::time_point given = Clock::now();
+    try {
+        if (how == LastHold::Released) {
+            wallpaperx::testing::releaseFrame(*consumer, kMonitorVideo, *held, kPromptCall);
+        } else {
+            consumer.reset();
+            consumerBus.reset();
+        }
+    } catch (const std::exception& e) {
+        check(false, (phase + ": the daemon takes the picture back: " + e.what()).c_str());
+        return;
+    }
+    // The decision, not the exit: the stop's teardown after it is the daemon's own (bounded at 3 s).
+    const bool decided = daemon.waitForOutput("wallpaperx-daemon: planned restart: no screen is in view", std::chrono::seconds(10));
+    const Clock::duration took = Clock::now() - given;
+    const long long tookMs = std::chrono::duration_cast<std::chrono::milliseconds>(took).count();
+    if (decided) {
+        std::printf("device_loss_restart_test: %s: restart decided %lld ms after the last picture was given back\n",
+                    phase.c_str(), tookMs);
+    } else {
+        std::printf("device_loss_restart_test: %s: no restart decided 10 s after the last picture was given back (%s)\n",
+                    phase.c_str(), hasEnded(daemon.pid()) ? howEnded(daemon.pid()).c_str() : "still running");
+    }
+    check(decided && took < kBound,
+          (phase + ": a due planned restart happens within the quiet period plus a clock round (2.5 s)").c_str());
+    if (!decided) {
+        daemon.shutdown(SIGTERM);
+        return;
+    }
+    checkStatus(daemon, daemon.waitForExit(), kExitPlanned, phase + ": the exit is the planned restart's, status 79");
+}
+
+// GOAL: S15.944 -- after a planned restart, a video whose file was replaced at the same path (same bytes and
+//       modification time, new inode) and one whose file was only touched (modification time moved) each start
+//       at their first picture, not at the picture the last run showed.
+// WHY-THIS-SHAPE: both screens are hidden unpaused, so each session is released 5 s later (the idle release)
+//       and the record's identity has to come from the release; the files change at 7 s and the restart is at
+//       10 s (the quiet period). Pause is copied into the config between the runs from a monitor that has only
+//       that setting, so the next start draws one picture and reading it cannot race playback; a paused first
+//       run would hold its sessions for 30 s instead. The record's points are checked present first, and the
+//       videos played 2 s and read past frame 0, or "first picture" would pass for a record that saved nothing.
+// CONTROL: via control_batch.sh 2026-10-23 on NVIDIA, each reverted and green again (backend/daemon/
+//       wallpaper_manager.cpp): planRestart storing fileIdentityOf(state.path) for a released screen, and
+//       videoSessionLocked's `released->file == file` dropped -> each turned both lines below red (frames 51
+//       and 68 shown before, 68 and 68 after). Played only 3 frames, the first break had stayed green.
+//       The first re-run 2026-10-24 as planRestart's `stand(...)` for a released screen given
+//       fileIdentityOf(state.path) in place of releasedAt->file -> both lines red, the same frames; restored green.
+void checkChangedFileRestart(NameWatcher& names) {
+    constexpr const char* kGoals = "S15.944 (a replaced or touched file starts at its first picture after a planned restart)";
+    const std::string phase = "changed file";
+    std::error_code ec;
+    if (!fs::exists(WALLPAPERX_COUNTER_VIDEO, ec)) {
+        notVerified(kGoals, std::string("the counter fixture ") + WALLPAPERX_COUNTER_VIDEO + " was not built");
+        return;
+    }
+    Home home("restart_changed");
+    if (!home.ok()) {
+        notVerified(kGoals, "a scratch HOME could not be created under the temp directory");
+        return;
+    }
+    struct Screen {
+        int32_t monitorId;
+        std::string output;
+        fs::path file;
+        const char* how;
+    };
+    const std::vector<Screen> screens{{kMonitorRed, "DP-5", home.root() / "replaced.mp4", "a replaced file"},
+                                      {kMonitorVideo, "DP-6", home.root() / "touched.mp4", "a touched file"}};
+    for (const Screen& s : screens) {
+        if (!fs::copy_file(WALLPAPERX_COUNTER_VIDEO, s.file, ec) || ec) {
+            harnessFailure(phase + ": the fixture could not be copied to " + s.file.string());
+            return;
+        }
+    }
+    std::vector<std::string> args = kDaemonArgs;
+    args.insert(args.end(), {"--restart-after", "2", "--restart-quiet", "10"});
+    if (!nameFree(names, phase)) return;
+    {
+        FrameReadyLog frames;
+        auto proxy = subscribeFrameReady(frames);
+        SpawnedDaemon daemon(home.env(false), SpawnedDaemon::Stdout::Captured, {}, 0, args);
+        if (!cameUp(names, daemon, kGoals, phase)) return;
+        std::vector<wallpaperx::testing::Frame> held;
+        std::string why;
+        try {
+            for (const Screen& s : screens) {
+                wallpaperx::testing::setMonitorOutput(*proxy, s.monitorId, s.output, std::chrono::seconds(5));
+                wallpaperx::testing::setOutputVisible(*proxy, s.output, true, std::chrono::seconds(5));
+                if (!setWallpaper(*proxy, "video", s.file.string(), s.monitorId)) why = "a video was refused";
+            }
+            for (const Screen& s : screens) {
+                if (why.empty() && !frames.waitAtLeast(s.monitorId, 3)) why = "this host never played the fixture";
+            }
+            // Played on, collected as a consumer does, so the position saved is well past the first picture.
+            for (const auto until = Clock::now() + std::chrono::seconds(2); why.empty() && Clock::now() < until;) {
+                for (const Screen& s : screens) (void)collectPicture(*proxy, s.monitorId);
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            for (const Screen& s : screens) {
+                if (!why.empty()) break;
+                held.push_back(wallpaperx::testing::getFrame(*proxy, s.monitorId, {.timeout = kPromptCall}));
+                std::string unread;
+                const std::optional<int> counter = counterIn(held.back(), unread);
+                if (!counter || *counter <= 0) why = "no picture past the first was read for " + std::string(s.how) + unread;
+                if (counter) std::printf("device_loss_restart_test: %s: %s showed frame %d before hiding\n", phase.c_str(), s.how, *counter);
+            }
+            wallpaperx::testing::setMonitorPause(*proxy, kMonitorTrigger, "always_paused", std::chrono::seconds(5));
+            if (why.empty()) {
+                for (const Screen& s : screens) wallpaperx::testing::setOutputVisible(*proxy, s.output, false, std::chrono::seconds(5));
+            }
+        } catch (const std::exception& e) {
+            why = e.what();
+        }
+        const Clock::time_point hidden = Clock::now();
+        if (!why.empty() || hasEnded(daemon.pid())) {
+            setupFailed(daemon, kGoals, phase + ": the videos were not brought on screen and hidden: " +
+                                            (why.empty() ? "the daemon ended (" + howEnded(daemon.pid()) + ")" : why));
+            return;
+        }
+        std::this_thread::sleep_until(hidden + std::chrono::seconds(7));
+        if (hasEnded(daemon.pid())) {
+            notVerified(kGoals, phase + ": the daemon restarted before the files could be changed (" +
+                                    howEnded(daemon.pid()) + ")");
+            return;
+        }
+        struct stat before {};
+        struct stat after {};
+        const fs::path replaced = screens[0].file;
+        const fs::path fresh = replaced.string() + ".new";
+        bool changed = ::stat(replaced.c_str(), &before) == 0 && fs::copy_file(WALLPAPERX_COUNTER_VIDEO, fresh, ec) && !ec;
+        if (changed) {
+            const timespec times[2] = {{0, UTIME_OMIT}, before.st_mtim};
+            changed = ::utimensat(AT_FDCWD, fresh.c_str(), times, 0) == 0 && ::rename(fresh.c_str(), replaced.c_str()) == 0 &&
+                      ::stat(replaced.c_str(), &after) == 0 && after.st_ino != before.st_ino &&
+                      after.st_size == before.st_size;
+        }
+        struct stat touched {};
+        if (changed && ::stat(screens[1].file.c_str(), &touched) == 0) {
+            timespec later = touched.st_mtim;
+            later.tv_sec += 2;
+            const timespec times[2] = {{0, UTIME_OMIT}, later};
+            changed = ::utimensat(AT_FDCWD, screens[1].file.c_str(), times, 0) == 0;
+        } else {
+            changed = false;
+        }
+        if (!changed) {
+            harnessFailure(phase + ": the files could not be replaced and touched");
+            daemon.shutdown(SIGTERM);
+            return;
+        }
+        const std::optional<Clock::duration> ended = endedWithin(daemon.pid(), hidden, std::chrono::seconds(20));
+        if (!ended) {
+            notVerified(kGoals, phase + ": the planned restart did not happen (graded by plannedRestart)");
+            daemon.shutdown(SIGTERM);
+            return;
+        }
+        if (const int code = daemon.waitForExit(); !daemon.exitedNormally() || code != kExitPlanned) {
+            notVerified(kGoals, phase + ": the daemon ended with " + std::to_string(code) + ", not the planned restart");
+            return;
+        }
+    }
+    // COVERAGE-ASSERT: a record without these screens would make "first picture" pass for any daemon.
+    const std::vector<wallpaperx::ResumePoint> points = wallpaperx::readResumeRecord(home.stateDir());
+    for (const Screen& s : screens) {
+        const auto point = std::find_if(points.begin(), points.end(),
+                                        [&s](const wallpaperx::ResumePoint& p) { return p.monitorId == s.monitorId; });
+        if (point == points.end() || point->position <= 0) {
+            notVerified(kGoals, phase + ": the record saved no position past the start for " + s.how);
+            return;
+        }
+    }
+    // The pause the daemon itself wrote for kMonitorTrigger, copied to the two video monitors.
+    {
+        nlohmann::json config;
+        {
+            std::ifstream in(home.configFile());
+            config = nlohmann::json::parse(in, nullptr, false);
+        }
+        nlohmann::json pause;
+        if (config.is_object() && config.contains("monitors") && config["monitors"].is_array()) {
+            for (const nlohmann::json& row : config["monitors"]) {
+                if (row.value("monitor_id", -1) == kMonitorTrigger && row.contains("pause")) pause = row["pause"];
+            }
+            for (nlohmann::json& row : config["monitors"]) {
+                const int id = row.value("monitor_id", -1);
+                if (!pause.is_null() && (id == kMonitorRed || id == kMonitorVideo)) row["pause"] = pause;
+            }
+        }
+        std::ofstream out(home.configFile(), std::ios::trunc);
+        out << config.dump();
+        if (pause.is_null() || !out) {
+            harnessFailure(phase + ": the config could not be given the pause setting");
+            return;
+        }
+    }
+
+    if (!nameFree(names, phase + " restart")) return;
+    FrameReadyLog frames;
+    auto proxy = subscribeFrameReady(frames);
+    SpawnedDaemon daemon(home.env(false), SpawnedDaemon::Stdout::Captured, {}, 0, kDaemonArgs);
+    if (!cameUp(names, daemon, kGoals, phase + " restart")) return;
+    const StatusReply status = getStatus(*proxy, std::chrono::seconds(10));
+    for (const Screen& s : screens) {
+        const nlohmann::json::json_pointer mode("/pause/" + std::to_string(s.monitorId) + "/mode");
+        if (!status.json().is_object() || !status.json().contains(mode) || status.json().at(mode) != "always_paused") {
+            notVerified(kGoals, phase + ": the next start did not come back paused for " + s.how);
+            continue;
+        }
+        std::string why;
+        std::optional<int> counter;
+        if (frames.waitAtLeast(s.monitorId, 1)) {
+            try {
+                const wallpaperx::testing::Frame frame = wallpaperx::testing::getFrame(*proxy, s.monitorId, {.timeout = kPromptCall});
+                counter = counterIn(frame, why);
+                wallpaperx::testing::releaseFrame(*proxy, s.monitorId, frame, kPromptCall);
+            } catch (const std::exception& e) {
+                why = e.what();
+            }
+        } else {
+            why = "it was never drawn";
+        }
+        if (!counter) {
+            notVerified(kGoals, phase + ": the picture for " + s.how + " could not be read: " + why);
+            continue;
+        }
+        std::printf("device_loss_restart_test: %s: %s shows frame %d after the restart\n", phase.c_str(), s.how, *counter);
+        check(*counter == 0, (phase + ": " + s.how + " starts at its first picture after a planned restart").c_str());
+    }
+    checkStatus(daemon, daemon.shutdown(SIGTERM), 0, phase + ": the next start exits 0 on SIGTERM");
+}
+
+// The restart time of the phases run with restartArgs().
+constexpr auto kRestartAfterShim = std::chrono::seconds(4);
+
+// The planned restart run up to its exit, preloaded with the shim and `extra`: a video held on a visible
+// screen, then the screen hidden. The daemon is left with the restart under way; `hidden` is when.
+bool hideForRestart(NameWatcher& names, SpawnedDaemon& daemon, FrameReadyLog& frames, sdbus::IProxy& proxy,
+                    const char* goals, const std::string& phase, Clock::time_point started, Clock::time_point& hidden) {
+    std::optional<wallpaperx::testing::Frame> held;
+    if (!playHeld(names, daemon, proxy, proxy, frames, goals, phase, "DP-3", {started, kRestartAfterShim}, held)) {
+        return false;
+    }
+    try {
+        wallpaperx::testing::setOutputVisible(proxy, "DP-3", false, std::chrono::seconds(5));
+    } catch (const std::exception& e) {
+        setupFailed(daemon, goals, phase + ": the screen could not be hidden: " + e.what());
+        return false;
+    }
+    hidden = Clock::now();
+    return true;
+}
+
+std::vector<std::string> restartArgs() {
+    std::vector<std::string> args = kDaemonArgs;
+    args.insert(args.end(), {"--restart-after", std::to_string(kRestartAfterShim.count()), "--restart-quiet", "1"});
+    return args;
+}
+
+// GOAL: S15.945 -- a resume record that cannot be written does not cancel the planned restart: it still
+//       happens, with status 79, says the videos will start from their first picture, and leaves no record.
+// WHY-THIS-SHAPE: the shim fails the rename onto resume.json, the last step of the write, so the attempt is
+//       real and its own cleanup runs. The shim's fault is confirmed from the daemon's reason line, so a
+//       shim that never fired cannot pass as a write that succeeded.
+// CONTROL: planRestart returning right after logging the failed write (backend/daemon/wallpaper_manager.cpp)
+//       -> "the planned restart still happens" red. Via control_batch.sh 2026-10-23 on NVIDIA; reverted.
+void checkRecordWriteFails(NameWatcher& names) {
+    constexpr const char* kGoals = "S15.945 (a failed resume-record write does not cancel the planned restart)";
+    const std::string phase = "record write fails";
+    Home home("restart_write_fails");
+    if (!home.ok()) {
+        notVerified(kGoals, "a scratch HOME could not be created under the temp directory");
+        return;
+    }
+    if (!nameFree(names, phase)) return;
+    FrameReadyLog frames;
+    auto proxy = subscribeFrameReady(frames);
+    const Clock::time_point started = Clock::now();
+    SpawnedDaemon daemon(shimEnv(home, {"WALLPAPERX_TEST_RESUME_RENAME_FAIL=1"}), SpawnedDaemon::Stdout::Captured, {}, 0,
+                         restartArgs());
+    Clock::time_point hidden;
+    if (!hideForRestart(names, daemon, frames, *proxy, kGoals, phase, started, hidden)) return;
+    const std::optional<Clock::duration> ended = endedWithin(daemon.pid(), hidden, std::chrono::seconds(15));
+    check(ended.has_value(), (phase + ": the planned restart still happens (within 15 s of the screen going)").c_str());
+    if (!ended) {
+        daemon.shutdown(SIGTERM);
+        return;
+    }
+    const int exitCode = daemon.waitForExit();
+    const std::string out = daemon.output();
+    if (out.find("could not replace") == std::string::npos) {
+        harnessFailure(phase + ": the shim never failed the record's rename -- check that " +
+                       WALLPAPERX_RESTART_HOLD_SHIM + " loads");
+        return;
+    }
+    checkStatus(daemon, exitCode, kExitPlanned, phase + ": the exit status is 79");
+    check(out.find("will start from their first picture after the planned restart") != std::string::npos,
+          (phase + ": the daemon says the videos will start from their first picture").c_str());
+    std::error_code ec;
+    const fs::path record = wallpaperx::resumeRecordPath(home.stateDir());
+    check(!fs::exists(record, ec) && !fs::exists(record.string() + ".tmp", ec),
+          (phase + ": no record or half-written record is left").c_str());
+}
+
+enum class StopAt { BeforeClaim, BeforeWake, AfterWake, AfterJoin };
+
+constexpr const char* kListensDuringRestart =
+    ": the signal thread unblocks the stop signals during a planned restart, before its deadline wait";
+
+// True when the shim saw the signal thread start its deadline wait (watchwaiting) and never saw it unblock
+// the stop signals (unblocked-watch): a daemon that cannot hear a stop during the restart. The shim creates
+// unblocked-watch first in that thread's program order, and it is read second here, so a daemon that did
+// unblock never shows this. Neither file says nothing about the daemon: the shim, or the wake, did not run.
+bool watchSkippedUnblock(const fs::path& holdDir) {
+    std::error_code ec;
+    if (!fs::exists(holdDir / "watchwaiting", ec)) return false;
+    return !fs::exists(holdDir / "unblocked-watch", ec);
+}
+
+// GOAL: S15.946 -- an outside stop landing in a planned restart wins at each point: after the record is written but
+//       before the restart is claimed, after the claim but before the signal thread is woken (it is still in
+//       sigwait), and after the wake (it is no longer waiting). Each ends with exit 0 -- which the unit does not
+//       restart -- and no resume record left for a later start to resume from. One signal per point (SIGINT,
+//       SIGTERM, SIGHUP in that order), as the daemon handles the three as one set.
+//       S15.949 -- the same for a SIGTERM sent once the signal-watch thread is joined (AfterJoin): exit 0, not 79.
+// WHY-THIS-SHAPE: a SIGTERM sent at a moment of the test's choosing would land at one of these points by luck;
+//       the shim holds a thread at the chosen one (the render worker; main, just past its join of the signal
+//       thread, for AfterJoin) until the test, having sent the signal and seen it taken, releases it. The record is
+//       confirmed on disk at the hold, or "no record left" would pass for a restart that never wrote one. After the
+//       wake the signal is sent once the shim saw SIGTERM unblocked, or without that when the wait runs out, so a
+//       daemon that never unblocks it is graded rather than waited on. A signal not seen taken while held makes
+//       the point unverified, not green: it may have landed at another point. The hold spends the daemon's 3 s
+//       teardown deadline, so all waits share 1 s from the hold, and an exit the deadline made is not graded as 0.
+// CONTROL: via control_batch.sh on NVIDIA, each reverted and green again. backend/daemon/main.cpp, re-run
+//       2026-10-24: cancelPlannedRestart's compare-exchange made a load that leaves the reason PlannedRestart ->
+//       "exits 0" red between the claim and the wake and after it (exit 79); its unlink removed -> "no resume
+//       record" red at both. The signal thread's call to it after sigwait removed -> both lines red
+//       between the claim and the wake (re-run 2026-10-24: exit 79). `outside || planned` made `outside` -> after the wake, only the
+//       kListensDuringRestart line red, alone (2026-10-24; exit statuses are not reached: a SIGHUP left
+//       blocked would land in onStopAfterSignalThread after the join and still exit 0). backend/daemon/wallpaper_manager.cpp, re-run
+//       2026-10-24: `if (!keep) removeResumeRecord` deleted -> "no resume record" red before the claim. Added 2026-10-23 (backend/daemon/
+//       main.cpp), each via control_batch.sh on NVIDIA, reverted, green again: the onPlannedRestart hook's `return reason !=
+//       StopReason::Signal;` made `return true;` -> "no resume record" red before the claim; ~ShutdownWatch's
+//       PlannedRestart unblock deleted -> "exits 0", "no resume record" and "called off" red after the join (exit 79);
+//       onStopAfterSignalThread's exitNow(0, ...) made exitNow(1, ...) -> "exits 0" red after the join.
+void checkStopDuringRestart(NameWatcher& names, StopAt at) {
+    const bool joined = at == StopAt::AfterJoin;
+    const char* goals = joined ? "S15.949 (a stop after the signal thread is joined still calls the restart off)"
+                               : "S15.946 (an outside stop during a planned restart wins: exit 0, no record)";
+    const char* point = at == StopAt::BeforeClaim  ? "claim"
+                        : at == StopAt::BeforeWake ? "wake"
+                        : at == StopAt::AfterWake  ? "afterwake"
+                                                   : "joined";
+    const std::string phase = std::string("stop during restart (") +
+                              (at == StopAt::BeforeClaim  ? "before the claim"
+                               : at == StopAt::BeforeWake ? "between the claim and the wake"
+                               : at == StopAt::AfterWake  ? "after the wake"
+                                                          : "after the signal thread is joined") +
+                              ")";
+    Home home("restart_stop");
+    if (!home.ok()) {
+        notVerified(goals, "a scratch HOME could not be created under the temp directory");
+        return;
+    }
+    const fs::path holdDir = home.root() / "hold";
+    std::error_code ec;
+    if (!fs::create_directories(holdDir, ec)) {
+        harnessFailure(phase + ": the hold directory could not be created");
+        return;
+    }
+    if (!nameFree(names, phase)) return;
+    FrameReadyLog frames;
+    auto proxy = subscribeFrameReady(frames);
+    const Clock::time_point started = Clock::now();
+    SpawnedDaemon daemon(shimEnv(home, {std::string("WALLPAPERX_TEST_RESTART_HOLD=") + point,
+                                        "WALLPAPERX_TEST_RESTART_HOLD_DIR=" + holdDir.string()}),
+                         SpawnedDaemon::Stdout::Captured, {}, 0, restartArgs());
+    Clock::time_point hidden;
+    if (!hideForRestart(names, daemon, frames, *proxy, goals, phase, started, hidden)) return;
+    if (fs::exists(holdDir / "held", ec)) {
+        notVerified(goals, phase + ": the restart was under way before the screen was hidden");
+        fs::create_directories(holdDir / "release", ec);
+        daemon.waitForExit();
+        return;
+    }
+    bool held = false;
+    for (const auto until = hidden + std::chrono::seconds(15); !held && Clock::now() < until && !hasEnded(daemon.pid());) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        held = fs::exists(holdDir / "held", ec);
+    }
+    const Clock::time_point heldAt = Clock::now();
+    const auto release = [&] {
+        if (!fs::create_directories(holdDir / "release", ec)) harnessFailure(phase + ": the shim could not be released");
+    };
+    if (!held) {
+        harnessFailure(phase + ": the shim never held the restart at '" + point + "' (" +
+                       (hasEnded(daemon.pid()) ? howEnded(daemon.pid()) : std::string("still running")) + ")");
+        release();
+        daemon.shutdown(SIGTERM);
+        return;
+    }
+    if (!fs::exists(wallpaperx::resumeRecordPath(home.stateDir()), ec)) {
+        harnessFailure(phase + ": no resume record was on disk at the held point, so its removal cannot be graded");
+        release();
+        daemon.waitForExit();
+        return;
+    }
+    // Every wait below shares this, so the hold always leaves 2 s of the daemon's 3 s teardown deadline.
+    const Clock::time_point budget = heldAt + std::chrono::seconds(1);
+    const auto remaining = [&] { return std::max(Clock::duration::zero(), budget - Clock::now()); };
+    if (at == StopAt::AfterWake) {
+        bool unblocked = false;
+        bool skipped = false;
+        while (!unblocked && !skipped && Clock::now() < budget) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            skipped = watchSkippedUnblock(holdDir);
+            unblocked = !skipped && fs::exists(holdDir / "unblocked-watch", ec);
+        }
+        // GOAL: S15.946 after the wake -- the signal thread, no longer in sigwait, still lets a stop in: it
+        //       unblocks SIGINT/SIGTERM/SIGHUP before it waits out the teardown deadline.
+        // WHY-THIS-SHAPE: graded on the order of two shim markers on that one thread, not on a timeout: "not
+        //       unblocked within 1 s" alone could be a slow thread, and is only printed. Grading the SIGHUP's
+        //       exit instead is vacuous: a stop left blocked lands after the join and still exits 0.
+        // CONTROL: `if (outside || planned)` made `if (outside)` (backend/daemon/main.cpp) -> this line red;
+        //       see the CONTROL block above checkStopDuringRestart.
+        check(!skipped, (phase + kListensDuringRestart).c_str());
+        if (skipped) {
+            release();
+            if (!endedWithin(daemon.pid(), Clock::now(), std::chrono::seconds(10))) daemon.shutdown(SIGKILL);
+            daemon.waitForExit();
+            return;
+        }
+        if (!unblocked) std::printf("device_loss_restart_test: %s: the stop signals were not unblocked while held\n", phase.c_str());
+    }
+    if (joined && daemon.output().find("wallpaperx-daemon: planned restart: no screen is in view") == std::string::npos) {
+        harnessFailure(phase + ": the hold was reached without the planned restart having been claimed");
+        release();
+        daemon.waitForExit();
+        return;
+    }
+    const int signo = at == StopAt::BeforeClaim ? SIGINT : at == StopAt::AfterWake ? SIGHUP : SIGTERM;
+    ::kill(daemon.pid(), signo);
+    // After the join every thread left blocks the stop, so it is only taken once released.
+    if (!joined) {
+        const char* taken = at == StopAt::AfterWake ? "the planned restart is called off" : kSignalLine;
+        if (!daemon.waitForOutput(taken, remaining())) {
+            notVerified(goals, phase + ": the daemon did not say '" + taken + "' while held, so the stop may not have "
+                                       "landed at the named point");
+            release();
+            if (!endedWithin(daemon.pid(), Clock::now(), std::chrono::seconds(10))) daemon.shutdown(SIGKILL);
+            daemon.waitForExit();
+            return;
+        }
+    }
+    const long long heldMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - heldAt).count();
+    release();
+    const std::optional<Clock::duration> ended = endedWithin(daemon.pid(), Clock::now(), std::chrono::seconds(10));
+    check(ended.has_value(), (phase + ": the daemon ends").c_str());
+    if (!ended) {
+        daemon.shutdown(SIGKILL);
+        return;
+    }
+    const int exitCode = daemon.waitForExit();
+    const std::string out = daemon.output();
+    std::printf("device_loss_restart_test: %s: held %lld ms, exit code %d, signal %d\n", phase.c_str(), heldMs, exitCode,
+                daemon.termSignal());
+    const bool deadline = out.find("wallpaperx-daemon: teardown deadline passed") != std::string::npos ||
+                          out.find("wallpaperx-daemon: shutdown blocked") != std::string::npos;
+    const bool recordGone = !fs::exists(wallpaperx::resumeRecordPath(home.stateDir()), ec);
+    if (deadline) {
+        // The hold, not the daemon, used the teardown budget. Before the join the stop was seen taken, so it is
+        // still the user's, cut short: 80 (S15.948). After the join it was still pending when the alarm came.
+        // Not controlled: no run here has reached this branch (holds of 0-7 ms).
+        notVerified(goals, phase + ": the hold used " + std::to_string(heldMs) +
+                               " ms and the daemon's 3 s teardown deadline ended the stop, so exit 0 cannot be graded");
+        if (!joined) {
+            checkStatus(daemon, exitCode, 80, phase + ": a stop the deadline cut short exits 80, which the unit does not restart");
+            check(recordGone, (phase + ": no resume record is left for a later start").c_str());
+        }
+        return;
+    }
+    checkStatus(daemon, exitCode, 0, phase + ": exits 0, which the unit does not restart");
+    check(recordGone, (phase + ": no resume record is left for a later start").c_str());
+    // After the join, exit 0 without the handler's line would be some other path's 0. Red under the unblock break above.
+    if (joined) {
+        check(out.find("the planned restart is called off") != std::string::npos,
+              (phase + ": the stop is handled as calling the restart off").c_str());
+    }
+}
+
+enum class CutShortAt { WatchFlush, AlarmFlush, AfterSettle, WhilePublishing, AfterCommit };
+
+// GOAL: S15.950 -- a user's stop that lands while a cut-short exit flushes its log (the signal thread's
+//       deadline exit: WatchFlush; the teardown alarm's: AlarmFlush) ends 80 with no resume record; one
+//       after main settled the restart's 79, ended by the alarm while the stop's own exit flush is held
+//       (AfterSettle), ends 0 with no record; one cut short while the render worker holds a just-published
+//       record, before its claim (WhilePublishing), ends 80 with no record.
+//       AfterCommit (INFERRED from R4's compare-exchange): a stop handled after the alarm's exit committed
+//       to the restart changes nothing -- 79, record kept, and no "called off" line claiming it did.
+// WHY-THIS-SHAPE: each race window is a few ms wide, so a signal timed by the test would land in it by
+//       luck. restart_hold_shim holds the exit at the named point (the flush's poll, or _Exit) and the test
+//       sends the stop into it and sees it taken before releasing. WatchFlush holds every other thread's
+//       exit flush for good, or the alarm, firing ms later, would end the process first. AfterSettle never
+//       releases: an exit 0 is graded only while the held flush has not run out (exitexpired), as the held
+//       handler's own exit is 0 too. Each phase checks it ended through the exit it stages, or reports it
+//       not verified.
+// CONTROL: run 2026-10-24 via control_batch.sh on NVIDIA, one per phase, each observed red, reverted and
+//       green again (backend/daemon/main.cpp): see the check lines below.
+void checkStopCutShortInRestart(NameWatcher& names, CutShortAt at) {
+    constexpr const char* kGoals = "S15.950 (a user's stop during a cut-short or settled exit is not restarted)";
+    const char* restartPoint = at == CutShortAt::WatchFlush        ? "afterwake"
+                               : at == CutShortAt::AfterSettle     ? "final"
+                               : at == CutShortAt::WhilePublishing ? "claim"
+                                                                   : "unblock";
+    const char* exitMode = at == CutShortAt::WatchFlush    ? "watch"
+                           : at == CutShortAt::AlarmFlush  ? "alarm"
+                           : at == CutShortAt::AfterSettle ? "first"
+                           : at == CutShortAt::AfterCommit ? "exit"
+                                                           : "";
+    const std::string phase = std::string("stop cut short in a restart (") +
+                              (at == CutShortAt::WatchFlush        ? "during the signal thread's deadline-exit flush"
+                               : at == CutShortAt::AlarmFlush      ? "during the alarm's exit flush"
+                               : at == CutShortAt::AfterSettle     ? "after settle, ended by the alarm"
+                               : at == CutShortAt::WhilePublishing ? "while the record is published"
+                                                                   : "after the alarm's exit committed") +
+                              ")";
+    Home home("restart_cut");
+    if (!home.ok()) {
+        notVerified(kGoals, "a scratch HOME could not be created under the temp directory");
+        return;
+    }
+    const fs::path holdDir = home.root() / "hold";
+    std::error_code ec;
+    if (!fs::create_directories(holdDir, ec)) {
+        harnessFailure(phase + ": the hold directory could not be created");
+        return;
+    }
+    if (!nameFree(names, phase)) return;
+    FrameReadyLog frames;
+    auto proxy = subscribeFrameReady(frames);
+    const Clock::time_point started = Clock::now();
+    std::vector<std::string> extra{std::string("WALLPAPERX_TEST_RESTART_HOLD=") + restartPoint,
+                                   "WALLPAPERX_TEST_RESTART_HOLD_DIR=" + holdDir.string()};
+    if (*exitMode != '\0') extra.push_back(std::string("WALLPAPERX_TEST_EXIT_HOLD=") + exitMode);
+    SpawnedDaemon daemon(shimEnv(home, extra), SpawnedDaemon::Stdout::Captured, {}, 0, restartArgs());
+    const auto exists = [&](const char* name) { return fs::exists(holdDir / name, ec); };
+    const auto waitFile = [&](const char* name, Clock::duration limit) {
+        for (const auto until = Clock::now() + limit; Clock::now() < until && !hasEnded(daemon.pid());) {
+            if (exists(name)) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return exists(name);
+    };
+    // Releases every hold and ends the daemon.
+    const auto endDaemon = [&] {
+        for (const char* file : {"release", "exitrelease", "exitrelease-other"}) fs::create_directories(holdDir / file, ec);
+        if (!endedWithin(daemon.pid(), Clock::now(), std::chrono::seconds(12))) daemon.shutdown(SIGKILL);
+        daemon.waitForExit();
+    };
+    // For a phase that cannot be graded.
+    const auto abandon = [&](const std::string& why, bool harness) {
+        if (harness) {
+            harnessFailure(phase + ": " + why);
+        } else {
+            notVerified(kGoals, phase + ": " + why);
+        }
+        endDaemon();
+    };
+    // GOAL: S15.946/S15.950 -- the signal thread unblocks the stop signals during a planned restart, so a
+    //       user's stop is heard while the restart's exit is under way.
+    // WHY-THIS-SHAPE: a daemon that never unblocks them never reaches the 'unblock' hold and never takes the
+    //       stop, which these phases otherwise report as a harness fault or NOT VERIFIED. The shim's markers
+    //       (watchSkippedUnblock) tell that daemon apart from a shim that did not run, which leaves neither.
+    // CONTROL: `if (outside || planned)` made `if (outside)` (backend/daemon/main.cpp) -> this line red, alone,
+    //       in watchFlush, alarmFlush, afterSettle and afterCommit (2026-10-24, control_batch.sh, restored green;
+    //       whilePublishing's stop is sent before the wake, so the break does not reach it). By hand, reverted:
+    //       alarmFlush's hold point misspelt -> "FAIL (harness): ... never held the restart at ..." and no FAIL.
+    const auto heardDuringRestart = [&] {
+        if (!watchSkippedUnblock(holdDir)) return true;
+        check(false, (phase + kListensDuringRestart).c_str());
+        endDaemon();
+        return false;
+    };
+    Clock::time_point hidden;
+    if (!hideForRestart(names, daemon, frames, *proxy, kGoals, phase, started, hidden)) return;
+    if (exists("held")) {
+        abandon("the restart was under way before the screen was hidden", false);
+        return;
+    }
+    if (!waitFile("held", std::chrono::seconds(15))) {
+        if (!heardDuringRestart()) return;
+        abandon(std::string("the shim never held the restart at '") + restartPoint + "' (" +
+                    (hasEnded(daemon.pid()) ? howEnded(daemon.pid()) : std::string("still running")) + ")",
+                true);
+        return;
+    }
+    const fs::path record = wallpaperx::resumeRecordPath(home.stateDir());
+    if (!fs::exists(record, ec)) {
+        abandon("no resume record was on disk at the held point, so its removal cannot be graded", true);
+        return;
+    }
+    // The exit the phase stages: held for WatchFlush, AlarmFlush and AfterCommit before the stop is sent.
+    if (at == CutShortAt::WatchFlush || at == CutShortAt::AlarmFlush || at == CutShortAt::AfterCommit) {
+        const char* marker = at == CutShortAt::WatchFlush ? "exitheld-watch" : "exitheld";
+        if (!waitFile(marker, std::chrono::seconds(8))) {
+            abandon(std::string("the staged exit was never held (no ") + marker + ")", true);
+            return;
+        }
+        if (at != CutShortAt::WatchFlush && exists("exitheld-watch")) {
+            abandon("the alarm landed on the signal thread, so it cannot be told from that thread's own exit", false);
+            return;
+        }
+    }
+    if (at == CutShortAt::AfterSettle &&
+        !daemon.waitForOutput("stopped for a planned restart, exit status 79", std::chrono::seconds(1))) {
+        abandon("main was held without having settled the planned restart's 79", true);
+        return;
+    }
+    if (!heardDuringRestart()) return;
+    const Clock::time_point sent = Clock::now();
+    ::kill(daemon.pid(), at == CutShortAt::WhilePublishing ? SIGINT : SIGTERM);
+    // Seen taken while held, or the stop may have landed elsewhere.
+    bool taken = false;
+    switch (at) {
+        case CutShortAt::WatchFlush:
+        case CutShortAt::AlarmFlush: taken = daemon.waitForOutput("the planned restart is called off", std::chrono::seconds(2)); break;
+        case CutShortAt::AfterSettle: taken = waitFile("exitheld", std::chrono::seconds(2)); break;
+        case CutShortAt::WhilePublishing: taken = daemon.waitForOutput(kSignalLine, std::chrono::seconds(2)); break;
+        case CutShortAt::AfterCommit: taken = waitFile("interrupted", std::chrono::seconds(2)); break;
+    }
+    if (!taken) {
+        abandon("the stop was not seen taken while the daemon was held", false);
+        return;
+    }
+    // AfterSettle and WhilePublishing are never released: the alarm or the deadline must end them.
+    if (at != CutShortAt::AfterSettle && at != CutShortAt::WhilePublishing) {
+        if (!fs::create_directories(holdDir / "exitrelease", ec)) {
+            abandon("the shim could not be released", true);
+            return;
+        }
+    }
+    const std::optional<Clock::duration> ended = endedWithin(daemon.pid(), sent, std::chrono::seconds(9));
+    if (!ended) {
+        abandon("the daemon did not end within 9 s of the stop", true);
+        return;
+    }
+    const int exitCode = daemon.waitForExit();
+    const std::string out = daemon.output();
+    const bool recordGone = !fs::exists(record, ec);
+    std::printf("device_loss_restart_test: %s: ended %lld ms after the stop, exit code %d, signal %d, record %s\n",
+                phase.c_str(), static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(*ended).count()),
+                exitCode, daemon.termSignal(), recordGone ? "gone" : "on disk");
+    const bool watchExit = out.find("wallpaperx-daemon: shutdown blocked") != std::string::npos;
+    const bool alarmExit = out.find("wallpaperx-daemon: teardown deadline passed") != std::string::npos;
+    const bool stagedExit = at == CutShortAt::WatchFlush        ? watchExit
+                            : at == CutShortAt::AlarmFlush      ? alarmExit
+                            : at == CutShortAt::WhilePublishing ? watchExit || alarmExit
+                                                                : true;
+    if (!stagedExit) {
+        notVerified(kGoals, phase + ": the exit this phase stages was not logged, so another exit ended the stop");
+        return;
+    }
+    if (at == CutShortAt::AfterSettle && exists("exitexpired")) {
+        notVerified(kGoals, phase + ": the held flush ran out before the alarm ended the process");
+        return;
+    }
+    switch (at) {
+        case CutShortAt::WatchFlush:
+            // CONTROL: exitCutShort reading failureStatus() before its flush -> this line red (exit 79, record gone).
+            checkStatus(daemon, exitCode, 80, phase + ": exits 80, a user's stop cut short, which the unit does not restart");
+            check(recordGone, (phase + ": no resume record is left").c_str());
+            break;
+        case CutShortAt::AlarmFlush:
+            // CONTROL: onTeardownDeadline reading failureStatus() before its flush, not after the commit -> red (exit 79).
+            checkStatus(daemon, exitCode, 80, phase + ": exits 80, a user's stop cut short, which the unit does not restart");
+            check(recordGone, (phase + ": no resume record is left").c_str());
+            break;
+        case CutShortAt::AfterSettle:
+            // CONTROL: failureStatus() returning `settled` without the called-off-79 -> 0 branch -> red (exit 79).
+            checkStatus(daemon, exitCode, 0, phase + ": the alarm exits 0 for a restart the user called off");
+            check(recordGone, (phase + ": no resume record is left").c_str());
+            break;
+        case CutShortAt::WhilePublishing:
+            checkStatus(daemon, exitCode, 80, phase + ": exits 80, a user's stop cut short, which the unit does not restart");
+            // CONTROL: commitToExit's unlink of the record deleted -> this line red (exit still 80, record on disk).
+            check(recordGone, (phase + ": the record published as the stop was cut short is removed").c_str());
+            break;
+        case CutShortAt::AfterCommit:
+            // CONTROL: commitToExit's compare-exchange to RestartCommitted deleted -> the record line red (the
+            //       late stop's cancel won and removed it). The 79 stays: _Exit's status was read before the stop.
+            checkStatus(daemon, exitCode, kExitPlanned, phase + ": exits 79, the restart already committed");
+            check(!recordGone && out.find("the planned restart is called off") == std::string::npos,
+                  (phase + ": a stop after the commit neither removes the record nor logs the restart called off").c_str());
+            break;
+    }
+}
+
 void runLossAndStallPhases(NameWatcher& names, const std::string& blue, const std::string& red) {
     using wallpaperx::testing::phaseSelected;
+    if (phaseSelected("stopCutShort/watchFlush")) checkStopCutShortInRestart(names, CutShortAt::WatchFlush);
+    if (phaseSelected("stopCutShort/alarmFlush")) checkStopCutShortInRestart(names, CutShortAt::AlarmFlush);
+    if (phaseSelected("stopCutShort/afterSettle")) checkStopCutShortInRestart(names, CutShortAt::AfterSettle);
+    if (phaseSelected("stopCutShort/whilePublishing")) checkStopCutShortInRestart(names, CutShortAt::WhilePublishing);
+    if (phaseSelected("stopCutShort/afterCommit")) checkStopCutShortInRestart(names, CutShortAt::AfterCommit);
+    if (phaseSelected("plannedRestart")) checkPlannedRestart(names);
+    if (phaseSelected("releaseWakesRestart/released")) checkReleaseWakesRestart(names, LastHold::Released);
+    if (phaseSelected("releaseWakesRestart/consumerLeft")) checkReleaseWakesRestart(names, LastHold::ConsumerLeft);
+    if (phaseSelected("changedFileRestart")) checkChangedFileRestart(names);
+    if (phaseSelected("restartRecordUnwritable")) checkRecordWriteFails(names);
+    if (phaseSelected("stopDuringRestart/beforeClaim")) checkStopDuringRestart(names, StopAt::BeforeClaim);
+    if (phaseSelected("stopDuringRestart/beforeWake")) checkStopDuringRestart(names, StopAt::BeforeWake);
+    if (phaseSelected("stopDuringRestart/afterWake")) checkStopDuringRestart(names, StopAt::AfterWake);
+    if (phaseSelected("stopDuringRestart/afterJoin")) checkStopDuringRestart(names, StopAt::AfterJoin);
     if (phaseSelected("decodeThreadLeftRunning")) checkDecodeThreadLeftRunning(names, blue);
     if (phaseSelected("decodeThreadStuckAtSigterm")) checkDecodeThreadStuckAtSigterm(names);
     if (phaseSelected("staticLossAndRestart")) checkStaticLossAndRestart(names, blue, red);

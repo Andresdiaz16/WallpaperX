@@ -17,9 +17,17 @@ Type=exec
 ExecStart=@WALLPAPERX_DAEMON_EXEC_START@
 # Load-bearing: brings the daemon back from every exit it did not choose -- a crash, the bus
 # dropping its connection, and status 75, which it exits with when the GPU device is lost.
-# A stop (SIGTERM, SIGINT, SIGHUP) exits 0 and is not restarted.
+# A stop (SIGTERM, SIGINT, SIGHUP) is not restarted, even one that lands during a planned
+# restart: it exits 0, or 80 when its teardown was cut short. One arriving after the GPU device
+# was lost, or after a failure, leaves that exit's status and its restart as they are.
 Restart=on-failure
 RestartSec=3
+RestartPreventExitStatus=80
+# Status 79 is the daemon's planned restart every few hours, to shed memory the GPU driver never
+# frees: logged as a success, and restarted all the same. It comes at most once per run of hours,
+# so it cannot reach the start limit above.
+SuccessExitStatus=79
+RestartForceExitStatus=79
 # Above the daemon's own 3 s deadline, which ends a stop even when its teardown is stuck.
 TimeoutStopSec=10
 

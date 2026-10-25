@@ -5935,12 +5935,13 @@ void runBufferReleaseWireChecks(const wallpaperx::WallpaperManager::Config& conf
     //       as `nullptr`, so a departure drops claims but publishes nothing -> "FAIL: a
     //       consumer leaving the bus re-announces the monitor's committed frame", printing
     //       "generation 7 was never announced a second time after the consumer left", while the
-    //       ring check below stayed green. Observed 2026-09-14. Reverted.
+    //       ring check below stayed green. Observed 2026-09-14, re-run 2026-10-24 via control_batch.sh. Reverted.
     // CONTROL, the other leg: `std::erase_if(state.holds, ...)` in WallpaperManager::forgetHeldBuffers
     //       replaced by a `std::count_if` that
     //       reports the monitor without dropping the claim -> "FAIL: the departed consumer's
     //       images are really back in the ring", printing the NoFreeImage the surviving
-    //       consumer was answered, while the announcement check stayed green. Reverted.
+    //       consumer was answered, while the announcement check stayed green. Re-run 2026-10-24 via
+    //       control_batch.sh (the count kept only to skip monitors it held nothing on). Reverted.
     wallpaperx::testing::setWallpaper(*bob, "static", imagePath, kMonitorReleaseWire);
     if (!signals.wait(kMonitorReleaseWire, generation + 1)) {
         std::fprintf(stderr, "  no FrameReady for generation %llu arrived, so the departure checks had no "
@@ -8982,7 +8983,8 @@ void runHandoverReleaseChecks(const wallpaperx::WallpaperManager::Config& config
     // CONTROL: in WallpaperManager::releaseBuffer (backend/daemon/wallpaper_manager.cpp), (a) `handover
     //       == 0 ||` deleted -> "FAIL: a release naming hand-over 0 is refused and changes nothing
     //       (accepted, ...)"; (b) `|| handover > m_lastHandover` deleted -> "FAIL: a release naming a
-    //       hand-over not yet made is refused and changes nothing".
+    //       hand-over not yet made is refused and changes nothing (accepted, no claim)". Each alone,
+    //       re-run 2026-10-24 via control_batch.sh, reverted.
     const InProcessReply b = exportClosed(manager, kMonitor, "handover.b");
     const uint64_t nb = handoverOf(b.handle);
     const HoldView beforeRefusal = holdOf(manager, kMonitor, "handover.b");

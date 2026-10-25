@@ -165,6 +165,9 @@ std::optional<std::chrono::steady_clock::time_point> RenderWorker::runClock() {
                          m_clockFailures);
             m_clockFailures = 0;
         }
+        // Asked every round because a round follows every change that can make it due.
+        const auto restartDue = m_manager.planRestart(std::chrono::steady_clock::now());
+        if (restartDue && (!round.nextDue || *restartDue < *round.nextDue)) return restartDue;
         return round.nextDue;
     } catch (const std::exception& e) {
         // The first of an episode only: the hundredth identical line says nothing the first did not.

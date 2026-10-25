@@ -525,6 +525,17 @@ public:
     // adjusting a layout; past it the memory goes back.
     static constexpr std::chrono::seconds kStillKeptFor{30};
 
+    // How long the daemon runs before it restarts itself, at the first moment no screen is seen. What
+    // it sheds is host memory the GPU driver takes on every queue submission and never gives back,
+    // which only the end of the process returns: the device can be rebuilt, but an instance built
+    // again in one process runs out of static TLS after a few dozen.
+    static constexpr std::chrono::hours kRestartAfter{4};
+
+    // How long no screen must have been seen before that restart. A screen comes back unseen for a
+    // moment far more often than for this long, and the restart leaves a few seconds with no daemon,
+    // which someone returning inside them would see as the plugin saying it is not running.
+    static constexpr std::chrono::seconds kRestartQuiet{60};
+
     // The longest a Config may set any of the waits above to.
     static constexpr std::chrono::hours kMaxTiming{24};
 
@@ -566,6 +577,18 @@ public:
         std::chrono::steady_clock::duration refusalLogInterval = kRefusalLogInterval;
         std::chrono::steady_clock::duration cleanPlayAfter = kCleanPlayAfter;
         std::chrono::steady_clock::duration stillKeptFor = kStillKeptFor;
+
+        // The planned restart: after `restartAfter` from construction, once no screen has been seen for
+        // `restartQuiet`, planRestart() records where each video stands and calls onPlannedRestart. Off
+        // when restartAfter is empty, which is the default for configFile's reason: production opts in.
+        // Both bounded as the waits above are.
+        std::optional<std::chrono::steady_clock::duration> restartAfter;
+        std::chrono::steady_clock::duration restartQuiet = kRestartQuiet;
+        // Asks for the stop, on the render worker's thread with no lock of this manager's held. Must not
+        // block; the stop it starts is the caller's. Returns whether the resume record may stay, which
+        // is whether the next start is a restart of this run; false removes it. Called again only
+        // after it throws.
+        std::function<bool()> onPlannedRestart;
 
         // Handed to the Device: runs the moment a GPU call first answers VK_ERROR_DEVICE_LOST, on
         // whichever thread made it, usually with the GPU lock held: the stop starts while the job
@@ -733,6 +756,19 @@ public:
     // destruction does it too.
     void endPlayingRecord();
 
+    // Removes the record of where videos stood that restoreSaved() read, so a start after this run
+    // does not resume from it. Call once, after the bus name is held: it is the running daemon's.
+    void forgetResumeRecord();
+
+    // Whether the planned restart is due: Config::restartAfter has passed and no screen has been seen
+    // for Config::restartQuiet. A screen is seen while a consumer holds one of its monitor's images and
+    // it has not reported itself undrawn -- see setOutputVisible(). When due, writes the resume record
+    // and calls Config::onPlannedRestart, after which this answers nothing again; a failure before that
+    // call has returned is asked about again after Config::restartQuiet. Otherwise returns when
+    // to ask again, or nothing while only a change of what is seen can make it due: the caller is woken
+    // for those. Render worker thread only; never throws.
+    std::optional<std::chrono::steady_clock::time_point> planRestart(std::chrono::steady_clock::time_point now) noexcept;
+
     // Writes a save still waiting for later changes to join it, bounded by the write deadline.
     // Call as the stop starts, for endPlayingRecord()'s reason; destruction does it too.
     void flushConfig() noexcept;
@@ -837,12 +873,16 @@ public:
     // the freed image has to be published, or a consumer refused for want of one never learns it
     // may ask again. A monitor can be in both: a redraw at a new size is owed while the frame it
     // replaces is still served.
+    //
+    // Wakes the clock when this leaves a monitor held by nobody, which can make planRestart() due.
+    // Only then: a playing video's pictures are released one per frame while the next is held.
     std::vector<int> releaseBuffer(const std::string& client, int monitorId, uint64_t bufferId, uint64_t handover,
                                    std::vector<FrameAvailable>* announce = nullptr);
 
     // The same for every image on every monitor, because `client` left the bus. Without it a
     // consumer that crashed holding a frame would keep that image out of the ring forever --
-    // and plasmashell restarts are routine, while this daemon does not.
+    // and plasmashell restarts are routine, while this daemon does not. Wakes the clock as
+    // releaseBuffer() does.
     std::vector<int> forgetHeldBuffers(const std::string& client, std::vector<FrameAvailable>* announce = nullptr);
 
     // Takes back the hand-over exportCurrentFrame() recorded for `handle`, because its reply never
@@ -992,6 +1032,17 @@ private:
     // closing a session can give back -- memory, a decoder, a descriptor.
     enum class Fault { File, Daemon, Shortage };
 
+    // What a path named when a session opened it, so a screen asking for the same path later joins
+    // that session only while the path still names those bytes: a file rewritten in place must not
+    // be shown from a decoder opened on what it held before.
+    struct FileIdentity {
+        uint64_t device = 0;
+        uint64_t inode = 0;
+        int64_t size = 0;
+        int64_t modifiedNs = 0;
+        bool operator==(const FileIdentity&) const = default;
+    };
+
     struct MonitorState {
         std::string type;
         std::string path;
@@ -1112,9 +1163,11 @@ private:
         // Where the wallpaper `forSeq` names stood when this monitor left its session keeping its
         // picture, so the session that replaces it starts on the picture that stayed on screen. Held
         // here because the session is gone; spent by the next session this monitor opens or joins.
+        // `file` is the session's: a position means nothing in other bytes, whatever the path names now.
         struct ReleasedAt {
             uint64_t forSeq = 0;
             StreamPosition shown;
+            std::optional<FileIdentity> file;
         };
         std::optional<ReleasedAt> releasedAt;
 
@@ -1195,17 +1248,6 @@ private:
         // Where the picture on that screen lies in the file, once known: the position it joined or
         // was opened at, then each picture its session draws there.
         std::optional<StreamPosition> shown;
-    };
-
-    // What a path named when a session opened it, so a screen asking for the same path later joins
-    // that session only while the path still names those bytes: a file rewritten in place must not
-    // be shown from a decoder opened on what it held before.
-    struct FileIdentity {
-        uint64_t device = 0;
-        uint64_t inode = 0;
-        int64_t size = 0;
-        int64_t modifiedNs = 0;
-        bool operator==(const FileIdentity&) const = default;
     };
 
     // Publishes the frame just drawn into `target` laid out as `drawnWith`, returning its generation,
@@ -1368,6 +1410,10 @@ private:
     // Whether the screen bound to this monitor is being drawn, which is true of one that has never
     // said otherwise. Caller must hold m_stateMutex.
     bool screenDrawnLocked(int monitorId) const;
+
+    // Whether any monitor's picture may be in front of someone: a consumer holds one of its images and
+    // its screen has not reported itself undrawn. Caller must hold m_stateMutex.
+    bool anyScreenSeenLocked() const;
 
     // Records that a hand-over delivered to `client` collected this monitor's newest picture, which
     // is what makes it watched, and returns handoverDelivered()'s answer. Nothing for an unnamed
@@ -1573,6 +1619,15 @@ private:
     // Written and read before the event loop starts.
     std::vector<PlayingVideo> m_startingVideos;
     PlayingRecord m_playing;
+
+    // The planned restart while it is still to come; empty when it is off or has been asked for.
+    // `unseenSince` is when planRestart() first found no screen seen, nothing while one is. Render
+    // worker thread only.
+    struct PlannedRestart {
+        std::chrono::steady_clock::time_point at;
+        std::optional<std::chrono::steady_clock::time_point> unseenSince;
+    };
+    std::optional<PlannedRestart> m_plannedRestart;
 
     // A copy of the pre-repair file exists. Written by preserveUnreadableConfig(), read by
     // writeRepairedConfig(); both run before the event loop.

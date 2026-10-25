@@ -1561,7 +1561,8 @@ void checkHandoverRelease(sdbus::IProxy& proxy, FrameReadyLog& signals, const st
     //       `handover == 0 ||` term deleted -> "FAIL: a release naming hand-over 0 is refused
     //       InvalidArgs and changes nothing (answered '', still held: yes)"; (b) the `|| handover >
     //       m_lastHandover` term deleted -> "FAIL: a release naming a hand-over not yet made is refused
-    //       InvalidArgs and changes nothing (answered '', still held: no)".
+    //       InvalidArgs and changes nothing (answered '', still held: no)". Both re-run 2026-10-24 via
+    //       control_batch.sh, NVIDIA, --phase handoverRelease: the same lines; restored green.
     {
         const Frame held = getFrame(*reader, kMonitor);
         const std::string zero = wallpaperx::testing::errorNameFrom(
@@ -2439,7 +2440,12 @@ bool primeTeardownWedge(sdbus::IProxy& proxy, const std::string& clip, std::stri
 //       having to be killed", "still running 30.0 s after its bus was destroyed ...", alone; the
 //       escalation phase below stayed green. Observed 2026-09-26 via control_run.sh on NVIDIA.
 //       Re-run 2026-10-08 with armBeforeHttp moved before the name claim, --phase
-//       stuckTeardownIsBounded: the same line alone, 30.1 s. Reverted.
+//       stuckTeardownIsBounded: the same line alone, 30.1 s. Reverted. S15.948 (a failed stop keeps
+//       SIGALRM, so it is restarted): cutShortStatus() also returning kExitStopCutShort for
+//       StopReason::Failed (backend/daemon/main.cpp) -> "FAIL: the stuck teardown is ended by the
+//       alarm the unwind armed" ("exit code 80"). control_batch.sh 2026-10-23, NVIDIA; reverted.
+//       Re-run 2026-10-24, --phase stuckTeardownIsBounded: the same line ("exit code 80, signal 0"
+//       after 3.0 s); restored green.
 // COVERAGE-ASSERT: the wedge's own line must be in the output, or NOT VERIFIED: an unstuck stop
 //       exits promptly and would read green.
 void checkStuckTeardownIsBounded(const std::string& validationEnv, const std::string& clip, const Check& check) {
@@ -2520,11 +2526,13 @@ void checkStuckTeardownIsBounded(const std::string& validationEnv, const std::st
 // WHY-THIS-SHAPE: the same wedge, since an ordinary stop is gone before a second signal can land.
 //       The message AND the elapsed time are asserted, and the deadline's line absent: without
 //       the handler the process still exits, at the deadline.
-// CONTROL: the block installing forceExitOnSecondSignal deleted from backend/daemon/main.cpp ->
-//       "FAIL: the daemon says that a second signal is what ended it" and "FAIL: the second signal
-//       ends the daemon promptly rather than at the deadline"; which 3 s deadline then wins is a
-//       race, so "the stop ends on the second signal rather than on the teardown deadline" is red
-//       only sometimes (three red 2026-09-26 via control_run.sh on NVIDIA). Reverted.
+// CONTROL: the signal thread's `if (outside || planned) { handleShutdownSignals(...);
+//       pthread_sigmask(SIG_UNBLOCK, ...); }` block deleted from backend/daemon/main.cpp, so no
+//       second-signal handler is installed -> "FAIL: the daemon says that a second signal is what
+//       ended it" and "FAIL: the second signal ends the daemon promptly rather than at the deadline";
+//       which 3 s deadline then wins is a race, so "the stop ends on the second signal rather than on
+//       the teardown deadline" is red only sometimes. control_batch.sh 2026-10-24, NVIDIA, --phase
+//       secondSignalEndsAStuckStop: all three red ("exit code 80"); reverted, green again.
 // COVERAGE-ASSERT: the wedge's own line must be in the output, or NOT VERIFIED.
 void checkSecondSignalEndsAStuckStop(const std::string& validationEnv, const std::string& clip,
                                      const Check& check) {
@@ -2822,9 +2830,14 @@ void checkWatchdogEndsAStuckStopWritingNothing(const std::string& validationEnv,
     const bool onTime = elapsed >= 2.5 && elapsed < 4.5;
     check(onTime, "a stop wedged in the manager's teardown ends at the three-second deadline");
     if (!onTime) std::fprintf(stderr, "  it ended %.1f s after SIGTERM\n", elapsed);
-    const bool forced = output.find("stopped cleanly") == std::string::npos &&
-                        (exitCode == 1 || (!daemon.exitedNormally() && daemon.termSignal() == SIGALRM));
-    check(forced, "and it is the deadline that ended it, not a clean stop");
+    // GOAL: S15.948 -- the deadline ended it, and since the stop was the user's it exits 80, which the unit's
+    //       RestartPreventExitStatus keeps down; 1 or SIGALRM would be restarted by Restart=on-failure.
+    // CONTROL: cutShortStatus()'s `if (reason == StopReason::Signal) return kExitStopCutShort;` deleted
+    //       (backend/daemon/main.cpp) -> this line red ("exit code -1, signal 14": SIGALRM). control_batch.sh
+    //       2026-10-23 and again 2026-10-24, NVIDIA, --phase watchdogEndsAStuckStopWritingNothing; the
+    //       same line both times; reverted, green again.
+    const bool forced = output.find("stopped cleanly") == std::string::npos && daemon.exitedNormally() && exitCode == 80;
+    check(forced, "and it is the deadline that ended it, with status 80 for a user's stop cut short");
     if (!forced) {
         std::fprintf(stderr, "  exit code %d, signal %d\n", exitCode, daemon.termSignal());
     }
@@ -2870,10 +2883,11 @@ bool awaitAlarmArmed(const SpawnedDaemon& daemon, Clock::time_point& before, Clo
 //       more than 200 ms after the earliest the alarm could have fired is NOT VERIFIED, since the
 //       flush may have given up by then. On the bus-loss path because a signal-driven stop also
 //       arms the signal thread's own 3 s deadline, which races the alarm.
-// CONTROL: in backend/daemon/main.cpp, `flushBeforeExit(kLine);` deleted from onTeardownDeadline's
-//       last branch -> "the lines queued before the teardown alarm, then its own line, reach the
-//       destination" red, alone. Observed 2026-09-25 via control_run.sh on NVIDIA; reverted. By
-//       hand, reverted: the resume moved 300 ms later -> NOT VERIFIED, no FAIL.
+// CONTROL: in backend/daemon/main.cpp, onTeardownDeadline's opening `flushBeforeExit(...)` (the
+//       queue, then kLine unless a status is settled) deleted -> "the lines queued before the
+//       teardown alarm, then its own line, reach the destination" red, alone. control_batch.sh
+//       2026-10-24, NVIDIA, --phase alarmDeliversQueuedLines; reverted, green again. By hand
+//       2026-09-25, reverted: the resume moved 300 ms later -> NOT VERIFIED, no FAIL.
 void checkAlarmDeliversQueuedLines(const std::string& validationEnv, const std::string& clip, const Check& check) {
     constexpr const char* kGoal = "S14.30 (a stop the teardown alarm ends delivers what was queued, and says so)";
     std::error_code ec;
@@ -3358,13 +3372,12 @@ constexpr const char* kUsageLine = "usage: wallpaperx-daemon [--config-port <por
 // WHY-THIS-SHAPE: the real binary, main() being the only parser. "Started nothing" is the bus name
 //       never taken; the reason is matched per case, since a parser refusing everything prints the
 //       same usage.
-// CONTROL: each in parseArguments (backend/daemon/main.cpp), each reverted.
-//       (a) `portGiven ||` deleted -> "FAIL: --config-port 5 --config-port 6 is refused",
-//       printing "exit -1 (still running after 5 s, took the bus name: yes)". (b) `|| port >
-//       65535` deleted -> "FAIL: --config-port 65536 is refused", printing "exit -1 ...".
-//       (c) `end != value.data() + value.size() ||` deleted -> "FAIL: --config-port 1x is
-//       refused". (d) the unknown-argument branch made to `continue` -> "FAIL: --bogus is
-//       refused" and "FAIL: --config-port=5 is refused". Observed 2026-09-23.
+// CONTROL: each in parseArguments (backend/daemon/main.cpp), each reverted, via control_batch.sh
+//       2026-10-23. (a) `!given.insert(arg).second ||` deleted -> "FAIL: --config-port 5
+//       --config-port 6 is refused". (b) `|| number > high` deleted -> "FAIL: --config-port 65536
+//       is refused". (c) `end != value.data() + value.size() ||` deleted -> "FAIL: --config-port 1x
+//       is refused". (d) the unknown-argument branch made to `continue` -> "FAIL: --bogus is
+//       refused" and "FAIL: --config-port=5 is refused".
 void checkCommandLine(NameWatcher& names, const std::string& validationEnv, const Check& check) {
     struct Case {
         std::vector<std::string> args;
@@ -5747,9 +5760,11 @@ void checkStoppableOnAnyConfigFile(NameWatcher& names, const std::string& valida
     //       (backend/daemon/config_store.cpp) -> "FAIL: with a named pipe at config.json, the
     //       daemon says why it refused the file" (the 2 s load deadline still frees it). (b) that
     //       plus `kLoadDeadline` 3600 s (backend/daemon/wallpaper_manager.cpp) -> "FAIL: ... the
-    //       daemon reaches the bus" and "FAIL: ... the daemon exits 0" ("exit code 1"): the
-    //       teardown deadline in backend/daemon/main.cpp still ends it, so stoppability rests on
-    //       three mechanisms and no single mutation reddens the "without being killed" checks.
+    //       daemon reaches the bus" and "FAIL: ... the daemon exits 0" ("a named pipe: exit code
+    //       80", the user's stop cut short by "shutdown blocked"; control_batch.sh 2026-10-24,
+    //       --phase stoppableOnAnyConfigFile, restored green): the teardown deadline in
+    //       backend/daemon/main.cpp still ends it, so stoppability rests on three mechanisms and
+    //       no single mutation reddens the "without being killed" checks.
     // COVERAGE-ASSERT: every case exercised or reported unstageable, against the table's size.
     const std::vector<ConfigFileCase> cases{
         {"a named pipe",
@@ -6111,13 +6126,14 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
     //       g_stopReason.load() == StopReason::None` made `enter = true`, so main enters the loop
     //       whatever the watcher recorded -> "FAIL: a daemon signalled before its event loop began
     //       exits 0" and "FAIL: ... still runs its destructor chain"; "exits without having to be
-    //       killed" stays green, since the teardown deadline ends it with exit 1. The same break
+    //       killed" stays green, since the teardown deadline ends it with exit 80. The same break
     //       reddens the SIGINT and SIGHUP phases' exit and destructor lines, which signal as soon
     //       as the name appears and land in this window by accident, and the config-repair phase's
     //       exit; the SIGTERM phase, which does work first, stays green. Observed 2026-09-24 via
     //       control_run.sh, those seven lines. Reverted. Re-run with the serving-line witness
-    //       2026-10-08 via control_run.sh, --phase shutdownDuringStartup: "exits 0" (exit code 1)
-    //       and "still runs its destructor chain" red, caught on attempt 1 of 12. Reverted.
+    //       2026-10-08 via control_run.sh, --phase shutdownDuringStartup: "exits 0" and "still runs
+    //       its destructor chain" red, caught on attempt 1 of 12. Reverted. Re-run 2026-10-24 via
+    //       control_batch.sh: the same two lines, "exit code 80" after "shutdown blocked"; restored green.
     // CONTROL: test-side, by hand 2026-10-08: logPumpUnproven() made to return a reason always ->
     //       every attempt inconclusive, "NOT VERIFIED -- ... (the last: its log writer may still have
     //       held output: ...)", no FAIL line and nothing graded. Restored. A real held state, via
@@ -6555,8 +6571,10 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
     // CONTROL: `.detach()` in ConfigWriter::startLocked() (backend/daemon/config_writer.cpp)
     //       replaced by storing the thread in the writer and joining it in ~ConfigWriter ->
     //       "FAIL: a daemon with a config write it can never finish still exits 0 on SIGTERM"
-    //       ("exit code 1") and "FAIL: it leaves through main() rather than through the teardown
-    //       watchdog". The worker loops forever by design, so that mutation blocks EVERY
+    //       ("exit code 80") and "FAIL: it leaves through main() rather than through the teardown watchdog"
+    //       (the alarm's "teardown deadline passed"): re-run 2026-10-24 via control_batch.sh, --phase
+    //       stalledConfigWrite, restored green. The worker loops forever by
+    //       design, so that mutation blocks EVERY
     //       teardown: ten other shutdown checks in this file went red with it, which is the sense
     //       in which abandoning this thread is load-bearing rather than incidental. Note what
     //       stayed green: "still exits on SIGTERM" above, because the forced path is still a
@@ -6566,6 +6584,11 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
     //       backend/daemon/main.cpp raised to an hour, so nothing forces the process out at all -> "FAIL: a
     //       daemon with a config write it can never finish still exits on SIGTERM", printing
     //       "exited normally 0, timed out 1, signal 0" -- it had to be SIGKILLed. Reverted.
+    //       The watchdog line check takes either deadline's line: `::sleep(10)` in ~ShutdownWatch
+    //       (backend/daemon/main.cpp) before `finished`, and the signal thread's wait made 60 s, so only
+    //       the alarm ends the stop ("teardown deadline passed") -> "FAIL: it leaves through main() rather
+    //       than through the teardown watchdog" and the exit-0 line (exit code 80), control_batch.sh
+    //       2026-10-24, --phase stalledConfigWrite; restored green.
     const int exitCode = daemon.shutdown(SIGTERM);
     const std::string output = daemon.output();
     const bool stopped = daemon.exitedNormally() && !daemon.timedOut();
@@ -6582,7 +6605,8 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
         check(exitCode == 0, "a daemon with a config write it can never finish still exits 0 on SIGTERM");
         if (exitCode != 0) std::fprintf(stderr, "  exit code %d\n", exitCode);
     }
-    check(output.find("shutdown blocked") == std::string::npos,
+    check(output.find("shutdown blocked") == std::string::npos &&
+              output.find("teardown deadline passed") == std::string::npos,
           "it leaves through main() rather than through the teardown watchdog");
     awaitNameRelease(names, "the phase after the stalled-write phase");
 }
@@ -6928,14 +6952,16 @@ int main(int argc, char** argv) {
             //       manager's Restart=on-failure does not bring back a daemon a user stopped.
             //       And the signal the daemon wakes its own signal thread with is not a stop
             //       signal, so the wake never lands in the second-signal handler a stop arms.
-            // CONTROL: in backend/daemon/main.cpp, via control_run.sh on NVIDIA, reverted. main's
-            //       final status set on `!= StopReason::None` instead of `== StopReason::DeviceLost`
-            //       -> this line, the SIGINT and SIGHUP exit-0 lines and every other phase's exit-0
-            //       and destructor-chain lines red (30 FAILs, observed 2026-09-26, the first 20 of
-            //       them shown by the tool). Observed 2026-09-24:
-            //       ~ShutdownWatch's wake sent as SIGTERM instead of kWakeSignal -> 18 FAILs of
-            //       the same kind, this line first: the wake lands in the handler the stop armed and
-            //       exits 1. kWakeSignal itself made SIGTERM -> the user's SIGTERM is then a wake
+            // CONTROL: in backend/daemon/main.cpp, reverted. main's final status made
+            //       `g_stopReason != StopReason::None ? chosenStatus().value_or(kExitDeviceLost) : 0`
+            //       (every stop treated as a chosen one) -> this line and "FAIL: the daemon runs its
+            //       destructor chain" red (control_batch.sh 2026-10-24, NVIDIA, --phase primaryDaemon;
+            //       restored green; on 2026-09-26 the whole entry gave 30 FAILs).
+            //       ~ShutdownWatch's wake sent as SIGTERM, and before `finished` is set so the signal
+            //       thread is still waiting for it (sent after, as the real wake is, it went red in only 2
+            //       of 4 runs: the thread had often left) -> the same two lines red ("asked again, exiting
+            //       now": the wake lands in the second-signal handler, exit 80) in 5 of 5 runs, control_batch.sh
+            //       2026-10-24, restored green. kWakeSignal itself made SIGTERM -> the user's SIGTERM is then a wake
             //       with no reason recorded and is ignored, so every SIGTERM stop hangs: 28 FAILs,
             //       this line and the other exit-0 and destructor-chain lines, before ctest's 600 s
             //       timeout ended the run.
@@ -6970,14 +6996,19 @@ int main(int argc, char** argv) {
             //       teardown that genuinely wedges, which needs a filesystem this harness can
             //       hang on demand.
             // CONTROL: `kTeardownDeadline` in backend/daemon/main.cpp set to 0 seconds, so every stop takes
-            //       the forced path -> "FAIL: the daemon leaves through main() rather than
-            //       through the teardown watchdog", "FAIL: the daemon exits 0 on SIGTERM"
-            //       ("exit code 1") and "FAIL: the daemon runs its destructor chain on the way
-            //       out", with every other phase's exit-0 check beside them. A zero deadline is also
-            //       alarm(0), which arms nothing, so the wedged connection-loss phase's "still ends"
-            //       line goes red with them (39 FAILs, observed 2026-09-26 via control_run.sh, the
-            //       first 20 shown by the tool). Reverted.
-            const bool leftThroughMain = daemonOutput.find("shutdown blocked") == std::string::npos;
+            //       the forced path ("shutdown blocked", a user's stop cut short, so status 80) ->
+            //       "FAIL: the daemon leaves through main() rather than through the teardown
+            //       watchdog", "FAIL: the daemon exits 0 on SIGTERM" and "FAIL: the daemon runs its
+            //       destructor chain on the way out" (control_batch.sh 2026-10-24, NVIDIA, --phase
+            //       primaryDaemon; restored green). A zero deadline is also alarm(0), which arms
+            //       nothing, so on the whole entry the wedged connection-loss phase's "still ends"
+            //       line goes red with them (39 FAILs, observed 2026-09-26). Reverted. The alarm's line
+            //       is rejected too: `::sleep(10)` in ~ShutdownWatch before `finished` and the signal
+            //       thread's wait made 60 s, so only the alarm ends the stop ("teardown deadline passed",
+            //       no "shutdown blocked") -> this line red, with the exit-0 and destructor-chain lines
+            //       (control_batch.sh 2026-10-24, NVIDIA, --phase primaryDaemon; restored green).
+            const bool leftThroughMain = daemonOutput.find("shutdown blocked") == std::string::npos &&
+                                         daemonOutput.find("teardown deadline passed") == std::string::npos;
             check(leftThroughMain, "the daemon leaves through main() rather than through the teardown watchdog");
             check(names.waitFor(false), "the bus name is released once the daemon exits");
         }

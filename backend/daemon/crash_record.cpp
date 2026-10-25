@@ -4,6 +4,7 @@
 
 #include "log_escape.h"
 #include "log_pump.h"
+#include "record_file.h"
 
 #include <nlohmann/json.hpp>
 
@@ -163,31 +164,6 @@ bool readString(const nlohmann::json& object, const char* key, std::string& out)
     return true;
 }
 
-// The whole of a record this daemon could have written, or nothing: a file larger than `maxBytes`
-// or not regular is not one of ours.
-std::string readRecordFile(const std::filesystem::path& file, off_t maxBytes) {
-    const int fd = ::open(file.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) return {};
-
-    std::string text;
-    struct stat info {};
-    if (::fstat(fd, &info) == 0 && S_ISREG(info.st_mode) && info.st_size <= maxBytes) {
-        char buffer[4096];
-        for (;;) {
-            const ssize_t n = ::read(fd, buffer, sizeof(buffer));
-            if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) break;
-            text.append(buffer, static_cast<size_t>(n));
-            if (text.size() > static_cast<size_t>(maxBytes)) {
-                text.clear();
-                break;
-            }
-        }
-    }
-    ::close(fd);
-    return text;
-}
-
 // Created with its directory when that is missing, truncated when it exists. -1 on failure.
 int createRecordFile(const std::filesystem::path& file) {
     constexpr int kFlags = O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW;
@@ -198,17 +174,6 @@ int createRecordFile(const std::filesystem::path& file) {
         if (!ec) fd = ::open(file.c_str(), kFlags, 0644);
     }
     return fd;
-}
-
-bool writeAll(int fd, const std::string& text) {
-    size_t written = 0;
-    while (written < text.size()) {
-        const ssize_t n = ::write(fd, text.data() + written, text.size() - written);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) return false;
-        written += static_cast<size_t>(n);
-    }
-    return true;
 }
 
 constexpr const char* kKeyVideos = "videos";

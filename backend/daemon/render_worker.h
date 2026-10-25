@@ -26,7 +26,8 @@ class WallpaperManager;
 // The video clock runs here too, as a round of WallpaperManager::advanceVideo() after every job
 // and whenever the manager's next due time comes. So one job at most runs between two rounds and
 // one round between two jobs: a hand-over waits for at most one round of pictures, and a picture
-// for at most one job.
+// for at most one job. Each round also asks WallpaperManager::planRestart(), whose time is folded
+// into the next wake.
 class RenderWorker {
 public:
     // Called on the worker thread after each committed frame, a video's pictures included, so it

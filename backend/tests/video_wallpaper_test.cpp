@@ -5202,7 +5202,7 @@ void runDepartureChecks(const WallpaperManager::Config& config, const std::strin
     //       gpuLock(m_gpuMutex);` added at the top of forgetHeldBuffers() -> "FAIL: a consumer
     //       leaving the bus is dealt with at once, without waiting for the render worker to finish a
     //       video open", after the five-second deadline; the gate was then released and the phase
-    //       finished normally. Reverted.
+    //       finished normally. Re-run 2026-10-24 via control_batch.sh. Reverted.
     wallpaperx::testing::nameScreen(manager, kMonitorDeparture, screenOf(kMonitorDeparture));
     manager.requestWallpaper("video", onePicture, kMonitorDeparture);
     g_decodeGate.arm(CallGate::Mode::Hold);
@@ -7133,7 +7133,7 @@ void runHandoverLogChecks(const WallpaperManager::Config& config, const std::str
             // CONTROL: backend/daemon/wallpaper_manager.cpp, `std::erase_if(state.served, departed);`
             //       deleted from forgetHeldBuffers() -> "FAIL: a consumer leaving the bus frees its
             //       slot at once, so the next consumer is named on its first picture", printing "the
-            //       newcomer was silent". Reverted.
+            //       newcomer was silent". Re-run 2026-10-24 via control_batch.sh. Reverted.
             {
                 const std::vector<int> owed = manager.forgetHeldBuffers(names[0], nullptr);
                 reportUnless(owed.empty(),
@@ -10266,7 +10266,8 @@ void runResumeChecks(const WallpaperManager::Config& base, const std::string& co
     //       resumes on the picture it stopped on, then its successor", printing "stopped on 13 (generation
     //       14), then showed 0 and 1", the hidden and hand-over halves below red the same way, and the three
     //       S15.155 lines (a fresh open seeks nothing); releaseVideoSessionLocked() never recording
-    //       `releasedAt` -> the same six lines (that one re-run 2026-10-18, NVIDIA).
+    //       `releasedAt` -> the same six lines. Both re-run 2026-10-24 on NVIDIA and Lavapipe, each alone, with
+    //       those quotes; on Lavapipe two of the three S15.155 lines.
     // GOAL: S15.155 -- a resume runs under no crash record: at the seek back and at the packets its
     //       catch-up decodes after it, no record for this monitor is on disk, so a death there is not
     //       a quarantine at the next start (resumeBlame grades that it is counted as a playing death).
@@ -10320,7 +10321,7 @@ void runResumeChecks(const WallpaperManager::Config& base, const std::string& co
     // GOAL: S15.151's hidden half -- a video whose screen was reported not drawn, and whose session was
     //       released at the unwatched delay, resumes on the picture it stopped on when the screen is drawn
     //       again, then its successor.
-    // CONTROL: the two S15.151 breaks above, re-run 2026-10-16 -> "FAIL: a video whose hidden session was released resumes on
+    // CONTROL: the two S15.151 breaks above, re-run 2026-10-24 -> "FAIL: a video whose hidden session was released resumes on
     //       the picture it stopped on, then its successor", printing "stopped on 1 (generation 16), then
     //       showed 0 and 1". Reverted.
     {
@@ -10380,7 +10381,7 @@ void runResumeChecks(const WallpaperManager::Config& base, const std::string& co
     // WHY-THIS-SHAPE: the still opens no session, so nothing between spends the recorded position; only the
     //       wallpaper it was recorded for decides whether it is used. Read while the screen is hidden, from
     //       the render the new wallpaper owes, which no clock round has moved on.
-    // CONTROL: via control_batch.sh, --phase '^resume$', re-run 2026-10-18, NVIDIA, the
+    // CONTROL: via control_batch.sh, --phase '^resume$', re-run 2026-10-24, NVIDIA, the
     //       `releasedAt->forSeq == wallpaperSeq` term dropped from videoSessionLocked()
     //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a video set again after a still starts at its first
     //       picture, not where the old one stood", printing "stopped on 28; the video set again showed 28",
@@ -10612,9 +10613,9 @@ void runResumeFallbackChecks(const WallpaperManager::Config& base, const std::st
     //       again would make the recorded position another wallpaper's and prove nothing.
     // CONTROL: via control_run.sh, --phase '^resumeFallback$', re-run 2026-10-08 on NVIDIA, reverted: in
     //       videoSessionLocked() (backend/daemon/wallpaper_manager.cpp) `it->second.releasedAt.reset();` moved to
-    //       after a successful open -> both lines red (re-run 2026-10-18, T2, with the reset deleted outright:
-    //       the seek-no-more line red), "then showed 40 and 41" -- the old position, where 0 was
-    //       due -- and "1 far seek(s) at the re-render". Reverted.
+    //       after a successful open -> both lines red, alone (re-run 2026-10-24, NVIDIA, control_batch.sh; with
+    //       the reset deleted outright, both lines and the S15.417 catch-up lines below), "then showed 40 and
+    //       41" -- the old position, where 0 was due -- and "1 far seek(s) at the re-render". Reverted.
     // COVERAGE-ASSERT: both opens were failed and the screen went blank before the re-render.
     frozen = playThenRelease();
     if (!frozen) return;
@@ -11078,9 +11079,9 @@ void runResumeCatchUpChecks(const WallpaperManager::Config& base, const std::str
     // WHY-THIS-SHAPE: the screen is hidden again inside the first packet of the slowed catch-up, so the
     //       session is released holding no picture of its own; a release that recorded only a picture the
     //       session drew records nothing, and the video starts again from its first picture.
-    // CONTROL: via control_batch.sh, --phase '^resumeCatchUp$', re-run 2026-10-16, NVIDIA at half speed, reverted:
+    // CONTROL: via control_batch.sh, --phase '^resumeCatchUp$', re-run 2026-10-24, NVIDIA, alone, reverted:
     //       releaseVideoSessionLocked() (backend/daemon/wallpaper_manager.cpp) treating only Undrawn as having
-    //       drawn nothing, so a CatchingUp session records its pipeline's (empty) shown position -> "FAIL: a video
+    //       drawn nothing, so a CatchingUp session records its pipeline's (empty) shownPosition() -> "FAIL: a video
     //       released while it catches up resumes, next time, on the picture it stopped on, then its successor",
     //       "stopped on 9 (generation 10), then showed 0 and 1".
     // COVERAGE-ASSERT: no new generation appeared between the two releases, so the catch-up was cut short.
@@ -11684,7 +11685,8 @@ void runSharedReleaseChecks(const WallpaperManager::Config& base, const std::str
     //       (backend/daemon/wallpaper_manager.cpp): advanceSessionLocked's `playing` made
     //       `anyIn(Playing) && !anyIn(Stopped)` -> "...not released while one of its screens plays";
     //       `paused = paused || pausedLocked(...)` made `paused = pausedLocked(...)` -> "...kept past the idle
-    //       delay"; releaseVideoSessionLocked() recording only the first member -> "...every screen".
+    //       delay"; releaseVideoSessionLocked() recording only the first member -> "...every screen" (re-run
+    //       2026-10-24 on NVIDIA and Lavapipe, alone).
     if (!share(released, kPlays, kHidden)) {
         check(false, "two screens share a decoder before the release checks");
         return;
@@ -12017,13 +12019,31 @@ void runPauseRejoinChecks(const WallpaperManager::Config& base) {
     // GOAL: S15.868 -- a release records each screen's own picture: the screen resumed first reopens on
     //       its own picture, not the other screen's. S15.866 -- the other, still paused and released, joins
     //       the resumed screen's decoder when it is redrawn: no decoder opened, the resumed one's picture.
-    // WHY-THIS-SHAPE: the screen read for S15.868 is not the session's first, so a release that recorded
-    //       the first screen's picture for all would reopen it ten pictures off.
-    // CONTROL: control_batch.sh 2026-10-18, phase pauseRejoin, both entries, each alone, reverted
-    //       (backend/daemon/wallpaper_manager.cpp): releaseVideoSessionLocked() recording the first member's
-    //       picture for every member -> "...reopens on its own picture"; videoSessionLocked()'s join exception
-    //       for a screen with a picture of its own reduced to `keepsPicture && startAt` -> "...joins the
-    //       resumed screen's decoder".
+    // WHY-THIS-SHAPE: the S15.865 redraw above leaves kPaused in a session of its own, and a release of two
+    //       one-screen sessions cannot mix their pictures; so kPlays plays once more, which folds kPaused back
+    //       in behind it, and pauses ten pictures on. kPaused is then not the session's first, so a release
+    //       that recorded the first screen's picture for all would reopen it ten pictures off.
+    // CONTROL: control_batch.sh 2026-10-24, phase pauseRejoin, reverted (backend/daemon/wallpaper_manager.cpp):
+    //       releaseVideoSessionLocked() recording the first member's picture for every member -> "...reopens
+    //       on its own picture", "own 49, the other's 69; reopened on 69", alone, NVIDIA and Lavapipe (green
+    //       before the fold was added); never recording `releasedAt` -> the same line, "reopened on 0";
+    //       videoSessionLocked()'s join exception reduced to `keepsPicture && startAt` -> "...joins the resumed
+    //       screen's decoder", with the later speed-change premise, NVIDIA and Lavapipe.
+    // COVERAGE-ASSERT: the fold premise reads one decoder open, kPaused still on its own picture, and kPlays
+    //       on another, so the release is of one shared session holding two different pictures.
+    manager.setMonitorPause(kPlays, "play");
+    const bool refolded = showsOf(kPlays, 10) && liveCount(counterClip) == 1;
+    manager.setMonitorPause(kPlays, "always_paused");
+    const std::optional<int> sharedOther = counterOn(kPlays);
+    const std::optional<int> pausedStill = counterOn(kPaused);
+    if (!refolded || !sharedOther || pausedStill != ownPicture || withinOne(sharedOther, ownPicture)) {
+        check(false, "kPlays playing again folds kPaused back into its decoder, and both pause on different pictures "
+                     "(the premise)");
+        std::fprintf(stderr, "  %s; kPaused on %s (own %s), kPlays on %s\n",
+                     refolded ? "folded" : "not folded within 5 s", text(pausedStill).c_str(), text(ownPicture).c_str(),
+                     text(sharedOther).c_str());
+        return;
+    }
     const auto t1 = std::chrono::steady_clock::now();
     manager.advanceVideo(t1);
     manager.advanceVideo(t1 + config.pausedSessionRelease + std::chrono::milliseconds(500));
@@ -12045,7 +12065,7 @@ void runPauseRejoinChecks(const WallpaperManager::Config& base) {
     });
     reportUnless(reopenedAt && withinOne(reopenedAt, ownPicture) && g_files.opens(counterClip) == 1,
                  "a screen resumed after its shared decoder's release reopens on its own picture",
-                 "own " + text(ownPicture) + ", the other's " + text(otherPicture) + "; reopened on " +
+                 "own " + text(ownPicture) + ", the other's " + text(sharedOther) + "; reopened on " +
                      (reopenedAt ? text(reopenedAt) : reopenDrawn ? "nothing readable (" + reason + ")" : std::string("nothing within 5 s")) +
                      ", " + std::to_string(g_files.opens(counterClip)) + " open(s)");
     if (!reopenedAt || !showsOf(kPaused, 3)) {
@@ -12375,7 +12395,8 @@ void runSharedFailureChecks(const WallpaperManager::Config& base, const std::str
     //       submit, so the session is closed for everyone (the premise reads no file left open).
     // CONTROL: control_batch.sh 2026-10-18, phase sharedFailure, both entries, each reverted, in
     //       closeFailedVideoSessionLocked() (backend/daemon/wallpaper_manager.cpp): the others' `releasedAt`
-    //       not recorded -> "...the playing screen resumes from its own picture"; `if (failure.gpuFault)` made
+    //       not recorded -> "...the playing screen resumes from its own picture" ("its own 13, the failing
+    //       screen's 3, resumed on 1"; re-run 2026-10-24 on both, with S15.870's and S15.871's lines); `if (failure.gpuFault)` made
     //       `if (true)` -> "...leaves the playing screen its picture and no error".
     {
         PhaseGrade grade("the shared-failure phase (a failed render pass)");
@@ -12425,7 +12446,7 @@ void runSharedFailureChecks(const WallpaperManager::Config& base, const std::str
     // CONTROL: control_batch.sh 2026-10-18, phase sharedFailure, both entries, each reverted
     //       (backend/daemon/wallpaper_manager.cpp): advanceSessionLocked()'s `hit` made true for every screen
     //       -> "...the paused screen keeps its picture and records no error"; closeFailedVideoSessionLocked()
-    //       not recording the others' `releasedAt` -> "...plays on from its own picture".
+    //       not recording the others' `releasedAt` -> "...plays on from its own picture" (re-run 2026-10-24).
     {
         PhaseGrade grade("the shared-failure phase (a paused screen through a decode failure)");
         SharedCounterRig rig(config, watchedCopy(counterClip, "shared_failure_paused.mp4"), *order);
@@ -12478,7 +12499,7 @@ void runSharedFailureChecks(const WallpaperManager::Config& base, const std::str
     //       (backend/daemon/wallpaper_manager.cpp): advanceSessionLocked()'s `drawing ? screen.monitorId ==
     //       *drawing` made `drawing ? true` -> "...the screen drawn before it keeps that round's picture and no
     //       error"; closeFailedVideoSessionLocked() not recording the others' `releasedAt` -> "and it resumes
-    //       from that round's picture".
+    //       from that round's picture" (re-run 2026-10-24).
     {
         PhaseGrade grade("the shared-failure phase (a later screen's draw)");
         SharedCounterRig rig(config, watchedCopy(counterClip, "shared_failure_draw.mp4"), *order);

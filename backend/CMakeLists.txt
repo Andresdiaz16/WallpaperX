@@ -130,7 +130,9 @@ add_library(wallpaperx-daemon-lib STATIC
     daemon/kept_rows.cpp
     daemon/http_server.cpp
     daemon/log_pump.cpp
+    daemon/record_file.cpp
     daemon/render_worker.cpp
+    daemon/resume_record.cpp
     daemon/wallpaper_manager.cpp
     daemon/wallpaper_properties.cpp
 )
@@ -1267,6 +1269,12 @@ wallpaperx_add_test(NAME device_lost_shim COMMAND ${_wx_asan_preload} $<TARGET_F
 # no-tsan: preloading an uninstrumented library into a sanitized binary is untried.
 set_tests_properties(device_lost_shim PROPERTIES LABELS "novulkan;no-tsan" SKIP_RETURN_CODE 77)
 
+# The planned-restart phases: a resume record that cannot be written, and the restart held at a chosen
+# point for an outside stop to land in. Test-only; inert unless the test sets its variables.
+add_library(wallpaperx-test-restart-hold-shim SHARED tests/restart_hold_shim.cpp)
+target_link_libraries(wallpaperx-test-restart-hold-shim PRIVATE ${CMAKE_DL_LIBS})
+set_target_properties(wallpaperx-test-restart-hold-shim PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+
 # The real daemon losing its device, exiting 75, and being started again on the same HOME.
 add_executable(wallpaperx-device-loss-restart-test tests/device_loss_restart_test.cpp)
 target_link_libraries(wallpaperx-device-loss-restart-test PRIVATE wallpaperx-daemon-lib)
@@ -1276,9 +1284,21 @@ target_compile_definitions(wallpaperx-device-loss-restart-test PRIVATE
     WALLPAPERX_DAEMON_BINARY="$<TARGET_FILE:wallpaperx-daemon>"
     WALLPAPERX_DEVICE_LOST_SHIM="$<TARGET_FILE:wallpaperx-test-device-lost-shim>"
     WALLPAPERX_WEDGE_SHIM="$<TARGET_FILE:wallpaperx-test-wedge-shim>"
+    WALLPAPERX_RESTART_HOLD_SHIM="$<TARGET_FILE:wallpaperx-test-restart-hold-shim>"
     WALLPAPERX_VIDEO_ASSET_DIR="${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}")
 add_dependencies(wallpaperx-device-loss-restart-test wallpaperx-daemon wallpaperx-test-device-lost-shim
-                 wallpaperx-test-wedge-shim)
+                 wallpaperx-test-wedge-shim wallpaperx-test-restart-hold-shim)
+# The planned-restart phase reads which picture a served frame is: the renderer's counter fixture, and
+# the GL importer for an opaque-fd frame, as video_wallpaper_test does.
+target_compile_definitions(wallpaperx-device-loss-restart-test PRIVATE
+    WALLPAPERX_COUNTER_VIDEO="${CMAKE_CURRENT_BINARY_DIR}/renderer/video_assets/counter_long.mp4")
+if(TARGET wallpaperx-video-fixtures)
+    add_dependencies(wallpaperx-device-loss-restart-test wallpaperx-video-fixtures)
+endif()
+if(WALLPAPERX_HAVE_FRAME_IMPORT)
+    target_link_libraries(wallpaperx-device-loss-restart-test PRIVATE wallpaperx-frame-import)
+    target_compile_definitions(wallpaperx-device-loss-restart-test PRIVATE WALLPAPERX_HAVE_FRAME_IMPORT=1)
+endif()
 
 # The install: runs `cmake --install` on this build tree into scratch prefixes and starts the copy.
 find_program(SYSTEMD_ANALYZE_EXECUTABLE systemd-analyze)

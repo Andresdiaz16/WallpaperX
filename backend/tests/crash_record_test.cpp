@@ -15,6 +15,7 @@
 
 #include "daemon/crash_record.h"
 #include "daemon/log_pump.h"
+#include "daemon/resume_record.h"
 
 #include "support/forked_child.h"
 #include "tests/client/scratch_dir.h"
@@ -23,6 +24,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -1040,8 +1042,9 @@ void writeText(const std::filesystem::path& file, const std::string& text) {
 //       between a stray file and a wallpaper the user cannot set.
 // CONTROL: in backend/daemon/crash_record.cpp, `root.at(kKeyMonitorId) != monitorId` dropped
 //       from readCrashRecord's rejection list -> "FAIL: a record naming another monitor is not
-//       read as this one's"; O_NOFOLLOW dropped from the same function's open -> "FAIL: a
-//       symlink in place of a record is not followed". Both reverted. Via control_batch.sh
+//       read as this one's"; O_NOFOLLOW dropped from the open in readRecordFile
+//       (backend/daemon/record_file.cpp, shared with the resume record's reader) -> "FAIL: a
+//       symlink in place of a record is not followed", alone; re-run 2026-10-24. Both reverted. Via control_batch.sh
 //       2026-10-14, each alone in readCrashRecord unless named, reverted: the no-newline return
 //       deleted -> "no line terminator"; the path term made always-true -> "a record with no path";
 //       kMaxRecordBytes 64 KiB -> 1 MiB -> "far larger"; crashRecordPath's empty-directory return
@@ -1107,8 +1110,8 @@ void runOnDiskChecks() {
     if (ec) {
         notVerified("the symlink guard", "this filesystem would not create a symlink");
     } else {
-        // The planted target names monitor 7, so a followed symlink is asked for 7 -- the id
-        // check must not be what rejects it.
+        // The target is rewritten to name monitor 8, the id asked for, so a followed symlink would
+        // pass the id check -- the id check must not be what rejects it.
         writeText(dir / "record-target.json", "{\"monitor_id\":8,\"type\":\"static\",\"path\":\"/p.png\"}\n");
         check(!readCrashRecord(dir, 8).has_value(), "a symlink in place of a record is not followed");
     }
@@ -1529,6 +1532,95 @@ void runPlayingRecordRules() {
 
 }  // namespace
 
+// GOAL: S15.947 -- the resume-record reader drops an entry holding any number its field cannot hold
+//       (a monitor_id outside 0..INT_MAX, a negative device, a size above INT64_MAX) and keeps the valid
+//       entries beside it, with their values.
+// WHY-THIS-SHAPE: one planted file, each entry under its own path, so which entries came back names which
+//       guard held. Each bad value is one that a plain get<T>() narrows to something valid (4294967297 and
+//       -4294967295 to monitor 1), so a missing guard shows as an entry kept, not as garbage.
+// CONTROL: per check below, in readNumber / readResumeRecord (backend/daemon/resume_record.cpp), via
+//       control_batch.sh 2026-10-23, each alone, reverted.
+// COVERAGE-ASSERT: the valid entry must come back with every value, so a reader that drops everything fails.
+void runResumeRecordRanges() {
+    constexpr const char* kGoals = "S15.947 (the resume-record reader's ranges)";
+    ScratchDir scratch("resumeranges");
+    if (!scratch.ok()) {
+        notVerified(kGoals, "no scratch state directory could be created");
+        return;
+    }
+    const auto entry = [](const std::string& path, nlohmann::json monitor, nlohmann::json device, nlohmann::json size) {
+        return nlohmann::json{{"monitor_id", std::move(monitor)}, {"path", path},       {"device", std::move(device)},
+                              {"inode", 7},                        {"size", std::move(size)}, {"modified_ns", 9},
+                              {"position", 11}};
+    };
+    nlohmann::json points = nlohmann::json::array();
+    points.push_back(entry("/valid", 2, 5, 13));
+    points.push_back(entry("/monitor-wraps-up", uint64_t{4294967297}, 5, 13));
+    points.push_back(entry("/monitor-wraps-down", int64_t{-4294967295}, 5, 13));
+    points.push_back(entry("/monitor-negative", -1, 5, 13));
+    points.push_back(entry("/device-negative", 2, -1, 13));
+    points.push_back(entry("/size-past-int64", 2, 5, uint64_t{18446744073709551615u}));
+    writeText(wallpaperx::resumeRecordPath(scratch.path()), nlohmann::json{{"points", points}}.dump());
+
+    const std::vector<wallpaperx::ResumePoint> read = wallpaperx::readResumeRecord(scratch.path());
+    const auto kept = [&read](const char* path) {
+        return std::any_of(read.begin(), read.end(), [path](const wallpaperx::ResumePoint& p) { return p.path == path; });
+    };
+    const auto valid = std::find_if(read.begin(), read.end(), [](const wallpaperx::ResumePoint& p) { return p.path == "/valid"; });
+    // CONTROL: `point.monitorId < 0` made `point.monitorId >= 0`, which drops every valid entry -> this
+    //       line red, with the negative-monitor line (that break keeps -1).
+    check(valid != read.end() && valid->monitorId == 2 && valid->device == 5 && valid->inode == 7 && valid->size == 13 &&
+              valid->modifiedNs == 9 && valid->position == 11,
+          "resume record: a valid entry beside bad ones is kept, with its values");
+    // CONTROL: the unsigned branch's `value > max` test deleted -> this line red, with the size line.
+    check(!kept("/monitor-wraps-up"), "resume record: monitor_id 4294967297 is not read as another monitor");
+    // CONTROL: the signed branch's `value < min || value > max` test deleted -> this line red.
+    check(!kept("/monitor-wraps-down"), "resume record: monitor_id -4294967295 is not read as another monitor");
+    // CONTROL: `|| point.monitorId < 0` deleted from readResumeRecord -> this line red, alone.
+    check(!kept("/monitor-negative"), "resume record: a negative monitor_id is dropped");
+    // CONTROL: the `if constexpr (std::is_unsigned_v<T>)` branch's `return false` made to read get<int64_t>()
+    //       narrowed -> this line red, alone.
+    check(!kept("/device-negative"), "resume record: a negative device is dropped");
+    // CONTROL: the unsigned-max break above -> this line red.
+    check(!kept("/size-past-int64"), "resume record: a size above INT64_MAX is dropped");
+}
+
+// GOAL: S15.947's neighbour, INFERRED from S13.19's symlink case -- the resume-record reader does not
+//       follow a symlink planted at resume.json: it reads no entries, even when the target is a valid record.
+// WHY-THIS-SHAPE: the same bytes are read first as a regular file at that path, so an empty read under
+//       the symlink is the link being refused, not content the reader would have dropped anyway.
+// CONTROL: O_NOFOLLOW dropped from readRecordFile's open (backend/daemon/record_file.cpp) -> "FAIL: resume
+//       record: a symlink in place of the record is not followed", alone; control_batch.sh 2026-10-24, reverted.
+// COVERAGE-ASSERT: the premise line is red if the planted record does not read as one entry
+//       (test-side, 2026-10-24: the entry's monitor_id made -1 -> the premise line red, and the phase stops).
+void runResumeRecordSymlink() {
+    constexpr const char* kGoals = "the resume-record reader's symlink guard";
+    ScratchDir scratch("resumesymlink");
+    if (!scratch.ok()) {
+        notVerified(kGoals, "no scratch state directory could be created");
+        return;
+    }
+    const std::filesystem::path record = wallpaperx::resumeRecordPath(scratch.path());
+    const std::filesystem::path target = scratch.path() / "resume-target.json";
+    const nlohmann::json point{{"monitor_id", 2}, {"path", "/valid"}, {"device", 5},    {"inode", 7},
+                               {"size", 13},      {"modified_ns", 9}, {"position", 11}};
+    const std::string text = nlohmann::json{{"points", nlohmann::json::array({point})}}.dump();
+    writeText(record, text);
+    const bool readsAsFile = wallpaperx::readResumeRecord(scratch.path()).size() == 1;
+    check(readsAsFile, "resume record: the planted record, as a regular file, is read as one entry (the premise)");
+    if (!readsAsFile) return;
+    std::error_code ec;
+    std::filesystem::remove(record, ec);
+    writeText(target, text);
+    if (!ec) std::filesystem::create_symlink(target, record, ec);
+    if (ec) {
+        notVerified(kGoals, "the planted record could not be replaced by a symlink: " + ec.message());
+        return;
+    }
+    check(wallpaperx::readResumeRecord(scratch.path()).empty(),
+          "resume record: a symlink in place of the record is not followed");
+}
+
 int main() {
     wallpaperx::testing::g_testName = "crash_record_test";
 
@@ -1558,6 +1650,8 @@ int main() {
         if (phaseSelected("playingNamesNothing")) runPlayingNamesNothingChecks();
         if (phaseSelected("playingBothBlamed")) runPlayingBothBlamedChecks();
         if (phaseSelected("playingRecordRules")) runPlayingRecordRules();
+        if (phaseSelected("resumeRecordRanges")) runResumeRecordRanges();
+        if (phaseSelected("resumeRecordSymlink")) runResumeRecordSymlink();
     } catch (const std::exception& e) {
         harnessFailure(std::string("the run ended in an unhandled exception: ") + e.what());
     }

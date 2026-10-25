@@ -15,6 +15,11 @@ class StreamPosition {
 public:
     bool operator==(const StreamPosition&) const = default;
 
+    // For a record that outlives the process, so the next one opens the same file there. A value read
+    // back is only as good as the file being unchanged, which the record's keeper checks.
+    int64_t stored() const { return m_timestamp; }
+    static StreamPosition fromStored(int64_t stored) { return StreamPosition(stored); }
+
 private:
     friend class VideoDecoder;
     explicit StreamPosition(int64_t timestamp) : m_timestamp(timestamp) {}

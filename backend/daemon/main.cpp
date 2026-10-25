@@ -5,6 +5,7 @@
 #include "ffmpeg_log.h"
 #include "http_server.h"
 #include "log_pump.h"
+#include "resume_record.h"
 #include "wallpaper_manager.h"
 #include "vulkan/device.h"
 
@@ -13,6 +14,7 @@
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
@@ -21,6 +23,7 @@
 #include <exception>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string_view>
 #include <system_error>
 #include <thread>
@@ -34,18 +37,62 @@ namespace {
 // spends it too. Must exceed the config writer's 2 s deadline.
 constexpr std::chrono::seconds kTeardownDeadline{3};
 
-// Why the daemon is stopping. The first to arrive stands. Failed: startup or the bus loop threw.
-enum class StopReason { None, Signal, DeviceLost, Failed };
+// Why the daemon is stopping. The first to arrive stands, except that an outside stop turns a
+// planned restart into Signal: the restart is only the daemon's preference. Failed: startup or the
+// bus loop threw. RestartCommitted: a planned restart an exit already under way has made final.
+enum class StopReason { None, Signal, DeviceLost, PlannedRestart, RestartCommitted, Failed };
 
-// Written only under main's LoopGate mutex, which pairs it with whether the event loop was
-// entered. At namespace scope and lock-free because signal handlers read it, the SIGALRM one
-// possibly after main has returned.
+// Written under main's LoopGate mutex, which pairs it with whether the event loop was entered --
+// except by cancelPlannedRestart() and commitToExit(), whose moves out of a planned restart leave
+// that pairing alone. At namespace scope and lock-free because signal handlers read it, the SIGALRM
+// one possibly after main has returned.
 std::atomic<StopReason> g_stopReason{StopReason::None};
 static_assert(std::atomic<StopReason>::is_always_lock_free);
 
 // EX_TEMPFAIL: a later start can succeed, which is what the service manager's restart is for.
 // Any nonzero status restarts it under Restart=on-failure; this one tells the loss apart.
 constexpr int kExitDeviceLost = EX_TEMPFAIL;
+
+// The restart the daemon plans for itself (WallpaperManager::kRestartAfter). Nonzero so Restart=on-failure
+// brings it back, and outside both the sysexits range and systemd's own codes, so the journal names it
+// as nothing else.
+constexpr int kExitPlannedRestart = 79;
+
+// A stop the user asked for that did not end cleanly: its teardown hit the deadline, a second ask
+// cut it short, or it threw. Not 1, which a crash shares, so the unit can refuse to restart it.
+constexpr int kExitStopCutShort = 80;
+
+// The status of a stop the daemon chose for itself, kept whatever cuts that stop short; nothing for any other.
+std::optional<int> chosenStatus(StopReason reason = g_stopReason.load()) {
+    switch (reason) {
+        case StopReason::DeviceLost: return kExitDeviceLost;
+        case StopReason::PlannedRestart:
+        case StopReason::RestartCommitted: return kExitPlannedRestart;
+        default: return std::nullopt;
+    }
+}
+
+// The status of a stop that did not get as far as settling one; nothing for one that failed, which
+// is restarted as a crash is.
+std::optional<int> cutShortStatus() {
+    const StopReason reason = g_stopReason.load();
+    if (reason == StopReason::Signal) return kExitStopCutShort;
+    return chosenStatus(reason);
+}
+
+// The resume record's path, spelled out for cancelPlannedRestart() to remove from a handler. Set
+// before the signal thread starts; empty when there is no state directory.
+char g_resumeRecord[PATH_MAX] = {};
+
+// Turns a planned restart into an outside stop: it exits as any other does, and is not restarted.
+// Its record goes too, so no later start resumes from where this one stood. False when there was
+// no planned restart left to call off. Async-signal-safe.
+bool cancelPlannedRestart() noexcept {
+    StopReason planned = StopReason::PlannedRestart;
+    if (!g_stopReason.compare_exchange_strong(planned, StopReason::Signal)) return false;
+    if (g_resumeRecord[0] != '\0') ::unlink(g_resumeRecord);
+    return true;
+}
 
 // Wakes the signal thread for a stop decided inside the process. A number of its own that is
 // never unblocked, so a late wake cannot land in forceExitOnSecondSignal as a user's second ask.
@@ -62,11 +109,14 @@ int settle(int status) {
 }
 
 // For a stop cut short. One that got as far as its final lines keeps the status it settled on. A
-// lost device keeps its status: its teardown is the one most likely to block, on a driver that
-// will never answer.
+// chosen stop keeps its status: a lost device's teardown is the one most likely to block, on a
+// driver that will never answer, and either must still be restarted. A user's must not be.
+// A settled restart the user then called off ends as onStopAfterSignalThread ends it.
 int failureStatus() {
-    if (const int settled = g_finalStatus.load(); settled >= 0) return settled;
-    return g_stopReason.load() == StopReason::DeviceLost ? kExitDeviceLost : 1;
+    if (const int settled = g_finalStatus.load(); settled >= 0) {
+        return settled == kExitPlannedRestart && g_stopReason.load() == StopReason::Signal ? 0 : settled;
+    }
+    return cutShortStatus().value_or(1);
 }
 
 // For every exit that skips the rest of teardown: what is queued goes first, when it can in time;
@@ -88,18 +138,63 @@ bool threadLeftRunning() {
     std::_Exit(status);
 }
 
-// Lets a second SIGINT/SIGTERM end a stop that is stuck.
-void forceExitOnSecondSignal(int) {
-    exitNow(failureStatus(), "wallpaperx-daemon: asked again, exiting now\n");
+// For an exit that cuts teardown short, after its flush -- a stop handled during that can still call
+// the restart off -- and right before it reads failureStatus(). No stop is handled on this thread
+// from here, and one on another loses the compare-exchange to cancelPlannedRestart() or wins it,
+// so a restart is never called off and still taken. A user's stop leaves no resume record, even
+// one the render worker was still writing when the stop was cut short. Async-signal-safe.
+void commitToExit() noexcept {
+    sigset_t stops;
+    sigemptyset(&stops);
+    for (const int sig : {SIGINT, SIGTERM, SIGHUP}) sigaddset(&stops, sig);
+    pthread_sigmask(SIG_BLOCK, &stops, nullptr);
+    StopReason planned = StopReason::PlannedRestart;
+    g_stopReason.compare_exchange_strong(planned, StopReason::RestartCommitted);
+    if (g_stopReason.load() == StopReason::Signal && g_resumeRecord[0] != '\0') ::unlink(g_resumeRecord);
 }
 
-// The teardown alarm. Any stop that neither settled nor lost the device dies of the SIGALRM itself,
-// as a supervisor expects of an abandoned teardown.
+[[noreturn]] void exitCutShort(std::string_view line) noexcept {
+    flushBeforeExit(line);
+    commitToExit();
+    std::_Exit(failureStatus());
+}
+
+// Lets a second SIGINT/SIGTERM end a stop that is stuck.
+void forceExitOnSecondSignal(int) {
+    exitCutShort("wallpaperx-daemon: asked again, exiting now\n");
+}
+
+void handleShutdownSignals(void (*handler)(int)) noexcept {
+    struct sigaction action {};
+    action.sa_handler = handler;
+    sigemptyset(&action.sa_mask);
+    for (const int sig : {SIGINT, SIGTERM, SIGHUP}) sigaddset(&action.sa_mask, sig);
+    for (const int sig : {SIGINT, SIGTERM, SIGHUP}) sigaction(sig, &action, nullptr);
+}
+
+// The first outside stop during a planned restart, which the signal thread is no longer waiting
+// for. It overrides the restart; any after it is a second ask.
+void onStopDuringPlannedRestart(int) {
+    if (!cancelPlannedRestart()) return;  // an exit already committed to the restart
+    wallpaperx::logpump::writeErrNow("wallpaperx-daemon: asked to stop, so the planned restart is called off\n");
+    handleShutdownSignals(forceExitOnSecondSignal);
+}
+
+// A stop during a planned restart, once the signal thread is joined: what is left of teardown has
+// nothing observable to finish, so it ends here rather than let main settle the restart's status.
+void onStopAfterSignalThread(int) {
+    cancelPlannedRestart();
+    if (g_stopReason.load() != StopReason::Signal) return;
+    exitNow(0, "wallpaperx-daemon: asked to stop, so the planned restart is called off\n");
+}
+
+// The teardown alarm. A failed stop dies of the SIGALRM itself, as a supervisor expects of an
+// abandoned teardown.
 void onTeardownDeadline(int sig) {
-    if (g_finalStatus.load() >= 0) exitNow(failureStatus());
     constexpr std::string_view kLine = "wallpaperx-daemon: teardown deadline passed, exiting now\n";
-    if (g_stopReason.load() == StopReason::DeviceLost) exitNow(kExitDeviceLost, kLine);
-    flushBeforeExit(kLine);
+    flushBeforeExit(g_finalStatus.load() >= 0 ? std::string_view{} : kLine);
+    commitToExit();
+    if (g_finalStatus.load() >= 0 || cutShortStatus()) std::_Exit(failureStatus());
     std::signal(sig, SIG_DFL);
     ::raise(sig);  // delivered as the handler returns
 }
@@ -118,44 +213,64 @@ void armTeardown(bool& armed) {
 }
 
 constexpr char kUsage[] =
-    "usage: wallpaperx-daemon [--config-port <port>]\n"
-    "  --config-port <port>  serve the loopback config server on <port> instead of %d; 0 lets\n"
-    "                        the kernel choose and the daemon reports what it bound. For tests:\n"
-    "                        the desktop plugin only ever asks %d.\n";
+    "usage: wallpaperx-daemon [--config-port <port>] [--restart-after <seconds>] [--restart-quiet <seconds>]\n"
+    "  --config-port <port>       serve the loopback config server on <port> instead of %d; 0 lets\n"
+    "                             the kernel choose and the daemon reports what it bound. For tests:\n"
+    "                             the desktop plugin only ever asks %d.\n"
+    "  --restart-after <seconds>  restart after this long rather than %lld, once no screen has been\n"
+    "                             seen for --restart-quiet (%lld unless given); each 1 to %lld.\n";
 
 struct Options {
     int configPort = wallpaperx::HttpServer::kDefaultPort;
+    std::chrono::seconds restartAfter = wallpaperx::WallpaperManager::kRestartAfter;
+    std::chrono::seconds restartQuiet = wallpaperx::WallpaperManager::kRestartQuiet;
 };
+
+constexpr long long kMaxTimingSeconds = std::chrono::seconds(wallpaperx::WallpaperManager::kMaxTiming).count();
 
 // Strict: an option this daemon does not know is refused, never ignored, so a mistyped one cannot
 // start a daemon that silently does something else.
 std::optional<Options> parseArguments(int argc, char** argv, bool& help) {
     Options options;
-    bool portGiven = false;
+    std::set<std::string_view> given;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (arg == "--help" || arg == "-h") {
             help = true;
             return options;
         }
-        if (arg != "--config-port") {
+        long long low = 0;
+        long long high = 0;
+        const char* unit = "port";
+        if (arg == "--config-port") {
+            high = 65535;
+        } else if (arg == "--restart-after" || arg == "--restart-quiet") {
+            low = 1;
+            high = kMaxTimingSeconds;
+            unit = "number of seconds";
+        } else {
             std::fprintf(stderr, "wallpaperx-daemon: unknown argument '%s'\n", argv[i]);
             return std::nullopt;
         }
-        if (portGiven || i + 1 >= argc) {
-            std::fprintf(stderr, "wallpaperx-daemon: --config-port takes one port, given once\n");
+        if (!given.insert(arg).second || i + 1 >= argc) {
+            std::fprintf(stderr, "wallpaperx-daemon: %s takes one %s, given once\n", argv[i], unit);
             return std::nullopt;
         }
         const std::string_view value = argv[++i];
-        int port = -1;
-        const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), port);
-        if (ec != std::errc() || end != value.data() + value.size() || port < 0 || port > 65535) {
-            std::fprintf(stderr, "wallpaperx-daemon: --config-port needs a port from 0 to 65535, got '%s'\n",
-                         argv[i]);
+        long long number = -1;
+        const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), number);
+        if (ec != std::errc() || end != value.data() + value.size() || number < low || number > high) {
+            std::fprintf(stderr, "wallpaperx-daemon: %s needs a %s from %lld to %lld, got '%s'\n", argv[i - 1], unit,
+                         low, high, argv[i]);
             return std::nullopt;
         }
-        options.configPort = port;
-        portGiven = true;
+        if (arg == "--config-port") {
+            options.configPort = static_cast<int>(number);
+        } else if (arg == "--restart-after") {
+            options.restartAfter = std::chrono::seconds(number);
+        } else {
+            options.restartQuiet = std::chrono::seconds(number);
+        }
     }
     return options;
 }
@@ -170,7 +285,9 @@ int serve(int argc, char** argv) {
     const std::optional<Options> options = parseArguments(argc, argv, help);
     if (!options || help) {
         std::fprintf(help ? stdout : stderr, kUsage, wallpaperx::HttpServer::kDefaultPort,
-                     wallpaperx::HttpServer::kDefaultPort);
+                     wallpaperx::HttpServer::kDefaultPort,
+                     static_cast<long long>(std::chrono::seconds(wallpaperx::WallpaperManager::kRestartAfter).count()),
+                     static_cast<long long>(wallpaperx::WallpaperManager::kRestartQuiet.count()), kMaxTimingSeconds);
         return help ? 0 : 2;
     }
 
@@ -213,10 +330,17 @@ int serve(int argc, char** argv) {
             std::fprintf(stderr, "wallpaperx-daemon: no usable XDG_CONFIG_HOME or HOME; "
                                  "wallpapers will not survive a restart\n");
         }
+        config.restartAfter = options->restartAfter;
+        config.restartQuiet = options->restartQuiet;
         config.stateDir = wallpaperx::defaultStateDir();
         if (config.stateDir.empty()) {
             std::fprintf(stderr, "wallpaperx-daemon: no usable XDG_STATE_HOME or HOME; "
                                  "a wallpaper that crashes the daemon will be applied again on restart\n");
+        }
+        // One too long to fit is one the record could not have been written at either.
+        if (const std::string record = wallpaperx::resumeRecordPath(config.stateDir).string();
+            record.size() < sizeof(g_resumeRecord)) {
+            std::memcpy(g_resumeRecord, record.c_str(), record.size() + 1);
         }
 
         auto connection = sdbus::createSessionBusConnection();
@@ -264,6 +388,7 @@ int serve(int argc, char** argv) {
             std::thread thread;
             Teardown& teardown;
             bool& teardownArmed;
+            const sigset_t& stopSignals;
             ~ShutdownWatch() {
                 if (!thread.joinable()) return;
                 // Covers the tail -- the bus connection, then static destruction. A stop that
@@ -278,6 +403,13 @@ int serve(int argc, char** argv) {
                 // `finished`, and this wake stays pending, blocked, for good.
                 pthread_kill(thread.native_handle(), kWakeSignal);
                 thread.join();
+                // Every thread left blocks the stop signals, so a stop from here to the exit would
+                // otherwise stay pending and the restart go ahead. One already pending lands now.
+                // Only the restart: no other stop's outcome can change by now.
+                if (g_stopReason.load() == StopReason::PlannedRestart) {
+                    handleShutdownSignals(onStopAfterSignalThread);
+                    pthread_sigmask(SIG_UNBLOCK, &stopSignals, nullptr);
+                }
             }
         } shutdownWatch{std::thread([&connection, &watchSignals, &shutdownSignals, &teardown, &loopGate] {
             // Guarded because this is a bare thread, where an escaping exception is
@@ -293,15 +425,16 @@ int serve(int argc, char** argv) {
                         std::lock_guard<std::mutex> lock(teardown.mutex);
                         if (teardown.finished) return;
                     }
-                    // onDeviceLost records a reason before its wake, and ~ShutdownWatch sets
+                    // onDeviceLost and onPlannedRestart record a reason before their wake, and ~ShutdownWatch sets
                     // `finished` (checked above) before its own, so a wake with neither came from
                     // outside. A real wake racing it is not lost: it either merged into this one,
                     // its reason or `finished` already recorded, or is still pending.
                     bool reasonRecorded = false;
                     {
                         std::lock_guard<std::mutex> lock(loopGate.mutex);
-                        if (received != kWakeSignal && g_stopReason.load() == StopReason::None) {
-                            g_stopReason.store(StopReason::Signal);
+                        if (received != kWakeSignal) {
+                            if (g_stopReason.load() == StopReason::None) g_stopReason.store(StopReason::Signal);
+                            cancelPlannedRestart();
                         }
                         reasonRecorded = g_stopReason.load() != StopReason::None;
                         inLoop = loopGate.entered;
@@ -310,8 +443,8 @@ int serve(int argc, char** argv) {
                     std::fprintf(stderr, "wallpaperx-daemon: ignoring %s, which nothing in the daemon sent\n",
                                  strsignal(received));
                 }
-                // An outside signal is reported even when a lost device got its reason in first;
-                // the device's own wake needs no line, as the loss announced itself.
+                // An outside signal is reported even when a chosen stop got its reason in first; the
+                // daemon's own wake needs no line, as the loss or the restart announced itself.
                 const bool outside = received != kWakeSignal;
                 if (outside) std::printf("wallpaperx-daemon: %s received, shutting down\n", strsignal(received));
                 // Caught on its own: a loop that will not leave still has the deadline below
@@ -324,16 +457,13 @@ int serve(int argc, char** argv) {
                     std::fprintf(stderr, "wallpaperx-daemon: could not stop the bus loop\n");
                 }
 
-                // Unblocked here, not earlier: until now these have to reach the sigwait above.
-                // Only when one of them woke this thread, so the next really is a second ask. A
-                // stop the daemon began itself is bounded by the deadline alone.
-                if (outside) {
-                    struct sigaction forced {};
-                    forced.sa_handler = forceExitOnSecondSignal;
-                    sigemptyset(&forced.sa_mask);
-                    sigaction(SIGINT, &forced, nullptr);
-                    sigaction(SIGTERM, &forced, nullptr);
-                    sigaction(SIGHUP, &forced, nullptr);
+                // Unblocked here, not earlier: until now these have to reach the sigwait above, and
+                // only on this thread until it is joined (~ShutdownWatch takes over from there). After
+                // an outside one the next really is a second ask. A planned restart still yields to the
+                // first; a lost device's stop is bounded by the deadline alone.
+                const bool planned = g_stopReason.load() == StopReason::PlannedRestart;
+                if (outside || planned) {
+                    handleShutdownSignals(outside ? forceExitOnSecondSignal : onStopDuringPlannedRestart);
                     pthread_sigmask(SIG_UNBLOCK, &shutdownSignals, nullptr);
                 }
 
@@ -346,12 +476,12 @@ int serve(int argc, char** argv) {
                     return;
                 }
                 // Not stdio, whose locks the thread this is escaping from may hold.
-                exitNow(failureStatus(), "wallpaperx-daemon: shutdown blocked, exiting now\n");
+                exitCutShort("wallpaperx-daemon: shutdown blocked, exiting now\n");
             } catch (...) {
                 // The deadline went with the stack it was on, so nothing bounds this stop now.
-                exitNow(failureStatus(), "wallpaperx-daemon: shutdown watch failed, exiting now\n");
+                exitCutShort("wallpaperx-daemon: shutdown watch failed, exiting now\n");
             }
-        }), teardown, teardownArmed};
+        }), teardown, teardownArmed, shutdownSignals};
 
         // Hands the stop to the signal thread, which can already carry one out from any point in
         // startup and bounds it with the deadline. Called by the Device, on the thread that saw
@@ -368,6 +498,29 @@ int serve(int argc, char** argv) {
             pthread_kill(shutdownWatch.thread.native_handle(), kWakeSignal);
             std::fprintf(stderr, "wallpaperx-daemon: the GPU device was lost; exiting with status %d so the "
                                  "service manager restarts the daemon\n", kExitDeviceLost);
+        };
+        // The same hand-over, for the restart the manager plans (WallpaperManager::planRestart). Called on
+        // the render worker's thread once the record of where each video stands is on disk. Again after a
+        // throw, so everything past the claim is safe to repeat. Another stop already under way keeps
+        // the record unless it is the user's, the one stop the service manager does not restart.
+        config.onPlannedRestart = [&loopGate, &shutdownWatch] {
+            {
+                std::lock_guard<std::mutex> lock(loopGate.mutex);
+                const StopReason reason = g_stopReason.load();
+                if (reason != StopReason::None && reason != StopReason::PlannedRestart) {
+                    return reason != StopReason::Signal;
+                }
+                g_stopReason.store(StopReason::PlannedRestart);
+            }
+            // Before the wake, so it comes ahead of what the stop it starts logs.
+            std::printf("wallpaperx-daemon: planned restart: no screen is in view, so exiting with status %d for "
+                        "the service manager to start the daemon again\n", kExitPlannedRestart);
+            std::fflush(stdout);
+            // Whatever is applied from here on is not what ends this process, so a stop the deadline
+            // cuts short refuses nothing on the next start.
+            wallpaperx::stopBlamingWallpapers();
+            pthread_kill(shutdownWatch.thread.native_handle(), kWakeSignal);
+            return true;
         };
         // Constructed after the watcher: this reads the config file, and a signal arriving
         // during that read must be able to stop the daemon.
@@ -404,6 +557,8 @@ int serve(int argc, char** argv) {
             manager.writeRepairedConfig();
             // Only now, for the same reason: it replaces the record the running daemon keeps.
             manager.recordStartingVideos();
+            // Read by restoreSaved() already; a start after this run must not resume from it.
+            manager.forgetResumeRecord();
             service.renderRestored();
         }
 
@@ -459,10 +614,13 @@ int serve(int argc, char** argv) {
         return status;
     }
 
-    // Final by now: a stop is recorded before the loop can be left, and the first one stands.
-    const int exitStatus = settle(g_stopReason.load() == StopReason::DeviceLost ? kExitDeviceLost : 0);
+    // Final by now: a stop is recorded before the loop can be left, and the signal thread has been
+    // joined. A stop that calls off the restart from here on exits on its own.
+    const int exitStatus = settle(chosenStatus().value_or(0));
     if (exitStatus == 0) {
         std::printf("wallpaperx-daemon: stopped cleanly\n");
+    } else if (exitStatus == kExitPlannedRestart) {
+        std::printf("wallpaperx-daemon: stopped for a planned restart, exit status %d\n", exitStatus);
     } else {
         std::printf("wallpaperx-daemon: stopped after losing the GPU device, exit status %d\n", exitStatus);
     }

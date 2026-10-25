@@ -8,6 +8,7 @@
 #include "kept_rows.h"
 #include "log_escape.h"
 #include "renderers/static_renderer.h"
+#include "resume_record.h"
 #include "video/video_pipeline.h"
 #include "vulkan/device.h"
 #include "wallpaper_file.h"
@@ -239,6 +240,8 @@ WallpaperManager::Config withCheckedTiming(WallpaperManager::Config config) {
     check(config.refusalLogInterval, "refusalLogInterval");
     check(config.cleanPlayAfter, "cleanPlayAfter");
     check(config.stillKeptFor, "stillKeptFor");
+    if (config.restartAfter) check(*config.restartAfter, "restartAfter");
+    check(config.restartQuiet, "restartQuiet");
     return config;
 }
 
@@ -257,6 +260,9 @@ WallpaperManager::WallpaperManager(Config config)
       m_store(m_config.configFile),
       m_writer(m_store),
       m_playing(m_config.stateDir),
+      m_plannedRestart(m_config.restartAfter ? std::optional(PlannedRestart{std::chrono::steady_clock::now() +
+                                                                            *m_config.restartAfter})
+                                             : std::nullopt),
       m_audio(std::make_unique<AudioOutput>(
           [](const std::string& line) {
               std::fprintf(stderr, "wallpaperx-daemon: %s\n", sanitizeForLog(line, 1024, LogFraming::Bare).c_str());
@@ -391,6 +397,95 @@ void WallpaperManager::recordStartingVideos() {
 }
 
 void WallpaperManager::endPlayingRecord() { m_playing.end(); }
+
+void WallpaperManager::forgetResumeRecord() { removeResumeRecord(m_config.stateDir); }
+
+bool WallpaperManager::anyScreenSeenLocked() const {
+    // Holds, not a frame or a wallpaper: a monitor nobody has collected from, like one whose screen has
+    // gone with its consumer, is in front of nobody and must not hold the restart off for ever.
+    for (const auto& [monitorId, state] : m_monitors) {
+        if (!state.holds.empty() && screenDrawnLocked(monitorId)) return true;
+    }
+    return false;
+}
+
+std::optional<SteadyTime> WallpaperManager::planRestart(SteadyTime now) noexcept {
+    if (!m_plannedRestart) return std::nullopt;
+    try {
+        {
+            std::lock_guard<std::mutex> stateLock(m_stateMutex);
+            if (anyScreenSeenLocked()) {
+                m_plannedRestart->unseenSince.reset();
+                return std::nullopt;
+            }
+        }
+        if (!m_plannedRestart->unseenSince) m_plannedRestart->unseenSince = now;
+        const SteadyTime due = std::max(m_plannedRestart->at, *m_plannedRestart->unseenSince + m_config.restartQuiet);
+        if (now < due) return due;
+
+        // Where each screen's video stands: the picture its session shows there, or the one it was
+        // released at, each with the identity of the bytes it was decoded from, which the path may no
+        // longer name. A position without one cannot be checked on resuming, so it is not kept.
+        std::vector<ResumePoint> points;
+        const auto stand = [&points](int monitorId, const std::string& path, StreamPosition at,
+                                     const std::optional<FileIdentity>& file) {
+            if (!file) return;
+            points.push_back(ResumePoint{monitorId, path, file->device, file->inode, file->size, file->modifiedNs,
+                                         at.stored()});
+        };
+        {
+            std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
+            std::lock_guard<std::mutex> stateLock(m_stateMutex);
+            // Asked again under both locks: a hand-over between the two acquisitions would otherwise go unseen.
+            if (anyScreenSeenLocked()) {
+                m_plannedRestart->unseenSince.reset();
+                return std::nullopt;
+            }
+            for (const auto& [monitorId, state] : m_monitors) {
+                if (drawableType(state.type) != Drawable::Clip) continue;
+                if (const VideoSessionRef ref = videoSessionOfLocked(monitorId); ref.session != nullptr) {
+                    for (const VideoSession::Member& member : ref.session->members) {
+                        if (member.monitorId != monitorId || member.wallpaperSeq != state.wallpaperSeq || !member.shown) continue;
+                        stand(monitorId, state.path, *member.shown, ref.session->file);
+                    }
+                } else if (state.releasedAt && state.releasedAt->forSeq == state.wallpaperSeq) {
+                    stand(monitorId, state.path, state.releasedAt->shown, state.releasedAt->file);
+                }
+            }
+        }
+
+        // Outside the locks, which a stalled disk would hold up. A record that could not be written costs
+        // each video its place, never the restart: the memory it frees is the reason for it.
+        try {
+            const std::string why = m_config.stateDir.empty() ? std::string() : writeResumeRecord(m_config.stateDir, points);
+            if (!why.empty()) {
+                std::fprintf(stderr, "wallpaperx-daemon: the videos will start from their first picture after the "
+                                     "planned restart: %s\n", sanitizeForLog(why, 1024).c_str());
+            }
+        } catch (...) {
+            std::fprintf(stderr, "wallpaperx-daemon: the videos will start from their first picture after the "
+                                 "planned restart: the record of where they stand could not be written\n");
+        }
+        // Written before the stop is asked for, so the stop never races the write; taken back when the
+        // stop under way is one whose next start must not resume from it.
+        bool keep = false;
+        try {
+            keep = m_config.onPlannedRestart && m_config.onPlannedRestart();
+        } catch (...) {
+            removeResumeRecord(m_config.stateDir);
+            throw;
+        }
+        if (!keep) removeResumeRecord(m_config.stateDir);
+        m_plannedRestart.reset();
+        return std::nullopt;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: the planned restart could not be prepared, asking again later: %s\n",
+                     sanitizeForLog(e.what(), 1024).c_str());
+    } catch (...) {
+        std::fprintf(stderr, "wallpaperx-daemon: the planned restart could not be prepared, asking again later\n");
+    }
+    return now + m_config.restartQuiet;
+}
 
 bool WallpaperManager::liveHolds(int monitorId) const {
     // The same rule LiveWallpapers::holds applies, asked directly of the map. Kept apart
@@ -823,38 +918,46 @@ std::vector<int> WallpaperManager::releaseBuffer(const std::string& client, int 
                                                  uint64_t handover, std::vector<FrameAvailable>* announce) {
     requireValidMonitorId(monitorId);
 
-    std::lock_guard<std::mutex> stateLock(m_stateMutex);
-    // Refused rather than read as "everything": a number past the latest would end claims on
-    // hand-overs not yet made, which is the release this numbering exists to make impossible.
-    if (handover == 0 || handover > m_lastHandover) {
-        throw InvalidRequest("hand-over " + std::to_string(handover) + " has not been made");
-    }
-    auto it = m_monitors.find(monitorId);
-    if (it == m_monitors.end()) return {};
-
-    if (!releaseHandoversLocked(it->second, client, bufferId, handover)) return {};
-
     std::vector<int> toRender;
-    reportFreedImageLocked(monitorId, it->second, toRender, announce);
+    bool unheld = false;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        // Refused rather than read as "everything": a number past the latest would end claims on
+        // hand-overs not yet made, which is the release this numbering exists to make impossible.
+        if (handover == 0 || handover > m_lastHandover) {
+            throw InvalidRequest("hand-over " + std::to_string(handover) + " has not been made");
+        }
+        auto it = m_monitors.find(monitorId);
+        if (it == m_monitors.end()) return {};
+
+        if (!releaseHandoversLocked(it->second, client, bufferId, handover)) return {};
+        unheld = it->second.holds.empty();
+        reportFreedImageLocked(monitorId, it->second, toRender, announce);
+    }
+    if (unheld) wakeClock();
     return toRender;
 }
 
 std::vector<int> WallpaperManager::forgetHeldBuffers(const std::string& client, std::vector<FrameAvailable>* announce) {
     std::vector<int> toRender;
-
-    std::lock_guard<std::mutex> stateLock(m_stateMutex);
-    m_descriptorRefusals.erase(client);
-    for (auto& [monitorId, state] : m_monitors) {
-        // Whether or not it held anything: a consumer that left is neither refused nor reading, and
-        // its name would otherwise hold a slot the next consumer needs to be named by.
-        const auto departed = [&client](const ConsumerReport& report) { return report.client == client; };
-        std::erase_if(state.refusalsReported, departed);
-        std::erase_if(state.served, departed);
-        const size_t before = state.holds.size();
-        std::erase_if(state.holds, [&client](const BufferHold& hold) { return hold.client == client; });
-        if (state.holds.size() == before) continue;
-        reportFreedImageLocked(monitorId, state, toRender, announce);
+    bool unheld = false;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        m_descriptorRefusals.erase(client);
+        for (auto& [monitorId, state] : m_monitors) {
+            // Whether or not it held anything: a consumer that left is neither refused nor reading, and
+            // its name would otherwise hold a slot the next consumer needs to be named by.
+            const auto departed = [&client](const ConsumerReport& report) { return report.client == client; };
+            std::erase_if(state.refusalsReported, departed);
+            std::erase_if(state.served, departed);
+            const size_t before = state.holds.size();
+            std::erase_if(state.holds, [&client](const BufferHold& hold) { return hold.client == client; });
+            if (state.holds.size() == before) continue;
+            unheld = unheld || state.holds.empty();
+            reportFreedImageLocked(monitorId, state, toRender, announce);
+        }
     }
+    if (unheld) wakeClock();
     return toRender;
 }
 
@@ -1885,6 +1988,12 @@ std::vector<int> WallpaperManager::restoreSaved() {
     }
     const std::optional<PlayingHistory> played = readPlayingRecord(m_config.stateDir);
 
+    // Where the videos stood when the last run stopped for its planned restart.
+    std::map<int, ResumePoint> resumes;
+    for (ResumePoint& point : readResumeRecord(m_config.stateDir)) {
+        resumes.insert_or_assign(point.monitorId, std::move(point));
+    }
+
     // One refusal whatever the evidence, so the user reads one kind of message and undoes it one
     // way. Nothing is owed: status must not report a render in progress for one that will not be
     // started.
@@ -2147,6 +2256,19 @@ std::vector<int> WallpaperManager::restoreSaved() {
         }
     }
 
+    // The session the first render opens starts at the picture the last run showed, if the path still
+    // names the bytes it was shown from. Not for a video refused above: nothing may decode it.
+    for (const auto& [monitorId, resume] : resumes) {
+        const auto it = m_monitors.find(monitorId);
+        if (it == m_monitors.end() || it->second.quarantined || drawableType(it->second.type) != Drawable::Clip ||
+            it->second.path != resume.path) {
+            continue;
+        }
+        it->second.releasedAt =
+            MonitorState::ReleasedAt{it->second.wallpaperSeq, StreamPosition::fromStored(resume.position),
+                                     FileIdentity{resume.device, resume.inode, resume.size, resume.modifiedNs}};
+    }
+
     if (displacedNames > 0) {
         // Same correction as the entry counter below: a name this build could bind displaces a
         // later row carrying the same name for an id it cannot, so the earlier row wins there.
@@ -2279,7 +2401,7 @@ void WallpaperManager::releaseVideoSessionLocked(uint64_t sessionId) {
             MonitorState& state = it->second;
             state.releasedAt.reset();
             if (member.shown && state.wallpaperSeq == member.wallpaperSeq) {
-                state.releasedAt = MonitorState::ReleasedAt{state.wallpaperSeq, *member.shown};
+                state.releasedAt = MonitorState::ReleasedAt{state.wallpaperSeq, *member.shown, session->second.file};
             }
         }
     }
@@ -2316,7 +2438,7 @@ std::vector<WallpaperManager::VideoSessionMember> WallpaperManager::closeFailedV
             }
             state->second.releasedAt.reset();
             if (member.shown && !atPosition) {
-                state->second.releasedAt = MonitorState::ReleasedAt{member.wallpaperSeq, *member.shown};
+                state->second.releasedAt = MonitorState::ReleasedAt{member.wallpaperSeq, *member.shown, session.file};
             }
         }
     }
@@ -2343,7 +2465,7 @@ void WallpaperManager::leaveVideoSessionLocked(int monitorId, bool keepPosition)
         if (it != m_monitors.end()) {
             it->second.releasedAt.reset();
             if (left.shown && it->second.wallpaperSeq == left.wallpaperSeq) {
-                it->second.releasedAt = MonitorState::ReleasedAt{left.wallpaperSeq, *left.shown};
+                it->second.releasedAt = MonitorState::ReleasedAt{left.wallpaperSeq, *left.shown, ref.session->file};
             }
         }
     }
@@ -2648,15 +2770,13 @@ WallpaperManager::VideoSession& WallpaperManager::videoSessionLocked(int monitor
     }
 
     // Spent by this attempt whether or not it opens, so a failure never repeats at the same position.
-    std::optional<StreamPosition> startAt;
+    std::optional<MonitorState::ReleasedAt> released;
     double speed = 1.0;
     {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
         const auto it = m_monitors.find(monitorId);
         if (it != m_monitors.end()) {
-            if (it->second.releasedAt && it->second.releasedAt->forSeq == wallpaperSeq) {
-                startAt = it->second.releasedAt->shown;
-            }
+            if (it->second.releasedAt && it->second.releasedAt->forSeq == wallpaperSeq) released = it->second.releasedAt;
             it->second.releasedAt.reset();
             speed = playbackSpeed(it->second.properties);
         }
@@ -2665,6 +2785,9 @@ WallpaperManager::VideoSession& WallpaperManager::videoSessionLocked(int monitor
     // A screen joins whatever has this file open at its speed, except that one with a picture of its
     // own to keep joins only where another screen plays, and takes that session's picture.
     const std::optional<FileIdentity> file = fileIdentityOf(path);
+    // Only in the bytes it was shown from: in a file replaced since, it would land anywhere.
+    std::optional<StreamPosition> startAt;
+    if (released && file && released->file == file) startAt = released->shown;
     if (file) {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
         for (auto& [id, session] : m_videoSessions) {
@@ -3287,7 +3410,9 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(uint64_t sessio
                 if (speedOf(member) == speed) return false;
                 MonitorState& state = *stateOf(member);
                 state.releasedAt.reset();
-                if (member.shown) state.releasedAt = MonitorState::ReleasedAt{member.wallpaperSeq, *member.shown};
+                if (member.shown) {
+                    state.releasedAt = MonitorState::ReleasedAt{member.wallpaperSeq, *member.shown, session.file};
+                }
                 state.cleanPlay.lastShown.reset();
                 return true;
             });

@@ -313,6 +313,19 @@ void checkUnit(const fs::path& unit, const fs::path& expectedExec) {
     const std::optional<std::string> restart = onlyValue(keys, "Restart");
     check(restart.value_or("") == "on-failure", "the installed unit keeps Restart=on-failure");
 
+    // GOAL: S15.948 -- the unit does not restart status 80, a user's stop whose teardown was cut short,
+    //       which Restart=on-failure alone would.
+    // WHY-THIS-SHAPE: every RestartPreventExitStatus line, split on whitespace as systemd lists them, so 80
+    //       beside other codes or on a line of its own both count.
+    // CONTROL: `RestartPreventExitStatus=80` made `=81` in backend/packaging/wallpaperx-daemon.service.in ->
+    //       this line red, alone. control_batch.sh 2026-10-23; reverted, green again.
+    bool prevents80 = false;
+    for (auto [it, end] = keys.equal_range("RestartPreventExitStatus"); it != end; ++it) {
+        std::istringstream codes(it->second);
+        for (std::string code; codes >> code;) prevents80 = prevents80 || code == "80";
+    }
+    check(prevents80, "the installed unit does not restart status 80 (RestartPreventExitStatus=80)");
+
     // GOAL: S14.7 -- systemd can reach the unit's start limit, so a daemon that dies at every
     //       start is eventually given up on. False when StartLimitBurst restarts, RestartSec
     //       apart, take longer than StartLimitIntervalSec: systemd's own default of 5 in 10 s
