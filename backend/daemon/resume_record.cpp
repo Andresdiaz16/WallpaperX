@@ -6,14 +6,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include <cerrno>
-#include <cstring>
-#include <limits>
 #include <system_error>
-#include <type_traits>
-
-#include <fcntl.h>
-#include <unistd.h>
 
 namespace wallpaperx {
 namespace {
@@ -29,28 +22,6 @@ constexpr const char* kKeyPosition = "position";
 
 // A point per monitor, each a path and a few numbers: far below this.
 constexpr off_t kMaxRecordBytes = 256 * 1024;
-
-// Only a value T holds exactly: nlohmann's get<T>() would narrow anything else unchecked.
-template <typename T>
-bool readNumber(const nlohmann::json& object, const char* key, T& out) {
-    if (!object.contains(key)) return false;
-    const nlohmann::json& field = object.at(key);
-    if (field.is_number_unsigned()) {
-        const uint64_t value = field.get<uint64_t>();
-        if (value > static_cast<uint64_t>(std::numeric_limits<T>::max())) return false;
-        out = static_cast<T>(value);
-        return true;
-    }
-    if constexpr (std::is_unsigned_v<T>) {
-        return false;
-    } else {
-        if (!field.is_number_integer()) return false;
-        const int64_t value = field.get<int64_t>();
-        if (value < std::numeric_limits<T>::min() || value > std::numeric_limits<T>::max()) return false;
-        out = static_cast<T>(value);
-        return true;
-    }
-}
 
 }  // namespace
 
@@ -78,23 +49,7 @@ std::string writeResumeRecord(const std::filesystem::path& stateDir, const std::
     const std::string text =
         nlohmann::json{{kKeyPoints, std::move(list)}}.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) + "\n";
 
-    std::error_code ec;
-    std::filesystem::create_directories(stateDir, ec);
-    const std::filesystem::path temporary = file.string() + ".tmp";
-    const int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
-    if (fd < 0) return std::string("could not create ") + temporary.string() + ": " + std::strerror(errno);
-    const bool written = writeAll(fd, text);
-    const int writeError = errno;
-    if (::close(fd) != 0 || !written) {
-        ::unlink(temporary.c_str());
-        return std::string("could not write ") + temporary.string() + ": " + std::strerror(written ? errno : writeError);
-    }
-    if (::rename(temporary.c_str(), file.c_str()) != 0) {
-        const int renameError = errno;
-        ::unlink(temporary.c_str());
-        return std::string("could not replace ") + file.string() + ": " + std::strerror(renameError);
-    }
-    return {};
+    return replaceRecordFile(file, text);
 }
 
 std::vector<ResumePoint> readResumeRecord(const std::filesystem::path& stateDir) {

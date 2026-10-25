@@ -95,6 +95,7 @@ VideoPipeline::Decode VideoPipeline::accept(DecodeAhead::Item item) {
 void VideoPipeline::hold(PictureSource::Picture picture) {
     m_timing = picture.timing;
     m_deepest = picture.deepest;
+    m_softwareFromSetup = picture.softwareFromSetup;
     m_unconverted = std::move(picture.frame);
 }
 
@@ -137,6 +138,12 @@ bool VideoPipeline::shows(std::span<const std::chrono::nanoseconds> spacings) co
     const PictureTiming& picture = timing();
     if (!picture.presentation || !picture.duration || spacings.empty()) return true;
     return ShowGrids(m_origin, spacings).shows(*picture.presentation, *picture.duration);
+}
+
+bool VideoPipeline::shownFromSoftware() const {
+    // The stage is the one the last picture drawn was converted into: draw() converts before it shows.
+    if (!m_stage) throw std::logic_error("VideoPipeline::shownFromSoftware: no picture has been drawn");
+    return m_stage->converter.picture().storage == DecodedFrame::Storage::HostPlanes;
 }
 
 VideoPipeline::PictureTiming VideoPipeline::timing() const {

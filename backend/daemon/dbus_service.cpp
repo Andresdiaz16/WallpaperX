@@ -133,6 +133,7 @@ DbusService::DbusService(sdbus::IConnection& connection, WallpaperManager& manag
     watchClientExits();
     // Last, so a constructor that throws leaves the writer no pointer to this object.
     m_manager.onConfigWritten([this] { announcePersistenceChanged(); });
+    m_manager.onProcessorDecodingChanged([this] { announceProcessorDecodingChanged(); });
 }
 
 void DbusService::watchClientExits() {
@@ -232,6 +233,7 @@ DbusService::~DbusService() {
     // The bus watch and the writer's notice go first: both reach into this object, and must stop
     // firing before anything else is torn down.
     m_manager.onConfigWritten({});
+    m_manager.onProcessorDecodingChanged({});
     m_busWatch.reset();
     m_worker.stop();
 }
@@ -380,11 +382,16 @@ void DbusService::registerVTable() {
             // No parameters: GetStatus's `persistence` may have changed, because a config write
             // returned. Apart from ConfigChanged, which has every consumer read /config again and
             // would do so for each step of a slider; a write changes nothing /config answers.
-            sdbus::registerSignal("PersistenceChanged"))
+            sdbus::registerSignal("PersistenceChanged"),
+            // No parameters, for PersistenceChanged's reason: a wallpaper's processor_decoding in GetStatus
+            // may have changed -- its file's scan ended, or its first picture was drawn.
+            sdbus::registerSignal("ProcessorDecodingChanged"))
         .forInterface(std::string(kInterface));
 }
 
 void DbusService::restoreSaved() { m_restored = m_manager.restoreSaved(); }
+
+void DbusService::startRestoredScans() { m_manager.startRestoredScans(m_restored); }
 
 void DbusService::renderRestored() {
     for (const int monitorId : m_restored) m_worker.post(monitorId);
@@ -421,6 +428,16 @@ void DbusService::announcePersistenceChanged() noexcept {
     } catch (const std::exception& e) {
         // A consumer shows the old persistence health until the next write returns.
         std::fprintf(stderr, "wallpaperx-daemon: failed to emit PersistenceChanged: %s\n", e.what());
+    } catch (...) {
+    }
+}
+
+void DbusService::announceProcessorDecodingChanged() noexcept {
+    try {
+        m_object->emitSignal("ProcessorDecodingChanged").onInterface(kInterface);
+    } catch (const std::exception& e) {
+        // A consumer shows the old answer until it next reads GetStatus.
+        std::fprintf(stderr, "wallpaperx-daemon: failed to emit ProcessorDecodingChanged: %s\n", e.what());
     } catch (...) {
     }
 }
@@ -983,6 +1000,7 @@ std::string DbusService::getStatus() {
         // Whether GetFrame's sync_fds carries anything. A consumer seeing an empty array
         // otherwise cannot tell "this daemon produces none" from "this frame had none".
         gpuJson["frame_sync"] = gpu.frameSync ? "semaphore" : "none";
+        gpuJson["video_inline_parameters"] = gpu.videoInlineParameters;
     }
     status["gpu"] = std::move(gpuJson);
 
@@ -1062,6 +1080,11 @@ std::string DbusService::getStatus() {
         // recently. A stopped wallpaper reads identically in every other field.
         entry["screen_visible"] = monitor.screenVisible;
         entry["watched"] = monitor.watched;
+        // A video's only: whether parts of it are decoded by the processor, and why.
+        if (monitor.processorDecoding) {
+            entry["processor_decoding"] = {{"state", toString(monitor.processorDecoding->state)},
+                                           {"reasons", monitor.processorDecoding->reasons}};
+        }
         wallpapers[std::to_string(monitorId)] = std::move(entry);
     }
     status["wallpapers"] = wallpapers;

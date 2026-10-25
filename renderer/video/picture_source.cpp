@@ -56,7 +56,7 @@ PictureSource::Step PictureSource::next(std::optional<uint32_t> dropLimit, Pictu
     PictureTiming timing{frame->presentationTime(), frame->duration(), startsPass, frame->skip(),
                          passEnded, frame->keptThrough(), frame->readSince(), std::exchange(m_spent, {}),
                          frame->thinnedUnder()};
-    return Picture{std::move(*frame), timing, m_decoder.deepestSkip()};
+    return Picture{std::move(*frame), timing, m_decoder.deepestSkip(), m_decoder.softwareFromSetup()};
 }
 
 }

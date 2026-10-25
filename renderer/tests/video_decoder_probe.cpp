@@ -1280,7 +1280,8 @@ void runRefusedChecks(Device& device) {
     // CONTROL (paths): control_batch.sh 2026-10-15, reverted, video_decoder_refused (RTX), renderer/video/video_decoder.cpp:
     //       attachHardwareFrames()'s unnamed-refusal branch setting SoftwareCodec -> "FAIL: 10-bit H.264 did not
     //       report Path::SoftwareRefused"; openDecoder()'s unadvertised-codec branch setting SoftwareRefused ->
-    //       "FAIL: MPEG-4 Part 2 did not report Path::SoftwareCodec". decode() discarding every picture not on
+    //       "FAIL: MPEG-4 Part 2 did not report Path::SoftwareCodec". Both re-run 2026-10-24 (G5) as each site's
+    //       refuse() given the other path, the same lines; restored. decode() discarding every picture not on
     //       the device -> "FAIL: the refused stream produced no frames at all" and "FAIL: the unsupported-codec
     //       stream produced no frames at all" (the same break reddens the frame lines of no-decoder and
     //       refused-after-setup). The "produced a frame on the device" lines have no break: a host frame claimed
@@ -1356,10 +1357,10 @@ void runNoDecoderChecks(Device& device) {
     //       reached in continuous integration is not a state the shipping path is graded in --
     //       and this entry runs on the real GPU, where the stripped device otherwise behaves
     //       exactly as it does in production.
-    // CONTROL: renderer/video/video_decoder.cpp, openDecoder()'s
-    //       `if (m_device.info().videoDecodeOps == 0) m_path = Path::SoftwareNoDecoder;` changed
-    //       to Path::SoftwareCodec. Observed: "FAIL: a device with no decode queue did not report
-    //       Path::SoftwareNoDecoder". Reverted.
+    // CONTROL: renderer/video/video_decoder.cpp, openDecoder()'s `refuse(Path::SoftwareNoDecoder)`
+    //       (under `videoDecodeOps == 0`) changed to Path::SoftwareCodec. Observed: "FAIL: a device with
+    //       no decode queue did not report Path::SoftwareNoDecoder". Re-run 2026-10-24 (G5) on the
+    //       refuse() form via control_batch.sh, the same line; restored.
     check(device.info().videoDecodeOps == 0,
           "the video extensions were not stripped, so 'no decoder at all' was never exercised");
     check(device.videoDecodeFamilies().empty(), "a decode family survived having the video extensions stripped");
@@ -1449,7 +1450,9 @@ void runClassifierChecks(Device& device, bool deviceStops) {
     //       still answers raised GpuFailure". Both reverted.
     //       Re-run 2026-10-19 (T7), `if (false)` at av_hwframe_ctx_init's refusal, deviceHealthy() now routed
     //       through deviceAnswers(): held, the fault entry's line. The SoftwareCodec and `if (true)` breaks
-    //       re-run 2026-10-19 (T7b) on the refusal entry: each held, its line.
+    //       re-run 2026-10-19 (T7b) on the refusal entry: each held, its line. The SoftwareCodec break re-run
+    //       2026-10-24 (G5), as `refuse(Path::SoftwareCodec)` in place of refuseAfterFailure() there: the same
+    //       line; restored.
     g_failNextFramesInit = true;
     g_deviceLost = deviceStops;
 

@@ -559,6 +559,9 @@ int serve(int argc, char** argv) {
             manager.recordStartingVideos();
             // Read by restoreSaved() already; a start after this run must not resume from it.
             manager.forgetResumeRecord();
+            // Only now: a scan rewrites the running daemon's scan record. Before the renders, so the first
+            // picture each draws is the one the check records.
+            service.startRestoredScans();
             service.renderRestored();
         }
 

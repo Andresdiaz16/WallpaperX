@@ -2,6 +2,8 @@
 
 #include "reset_point.h"
 
+#include "nal_bits.h"
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavcodec/codec_par.h>
@@ -22,21 +24,16 @@ using Verdict = std::optional<bool>;
 
 Verdict h264Unit(const uint8_t* unit, size_t size) {
     if (size < 1) return std::nullopt;
-    const int type = unit[0] & 0x1f;
-    if (type < 1 || type > 5) return std::nullopt;
-    return type == 5;
+    const int type = h264Type(unit);
+    if (type < h264::kSlice || type > h264::kIdr) return std::nullopt;
+    return type == h264::kIdr;
 }
-
-// nuh_layer_id of a unit of two bytes or more.
-int hevcLayer(const uint8_t* unit) { return ((unit[0] & 1) << 5) | (unit[1] >> 3); }
 
 Verdict hevcUnit(const uint8_t* unit, size_t size) {
     if (size < 2) return std::nullopt;
-    const int type = (unit[0] >> 1) & 0x3f;
-    if (type >= 32 || hevcLayer(unit) != 0) return std::nullopt;
-    constexpr int kIdrWithLeading = 19;
-    constexpr int kIdrNoLeading = 20;
-    return type == kIdrWithLeading || type == kIdrNoLeading;
+    const int type = hevcType(unit);
+    if (type >= hevc::kVps || hevcLayer(unit) != 0) return std::nullopt;
+    return hevc::isIdr(type);
 }
 
 Verdict sliceUnit(AVCodecID codec, const uint8_t* unit, size_t size) {
@@ -156,12 +153,12 @@ std::optional<Unit> firstSliceUnit(const CodecHeader& header, const AVPacket& pa
 bool isParameterSet(AVCodecID codec, const uint8_t* unit, size_t size) {
     if (codec == AV_CODEC_ID_H264) {
         if (size < 1) return false;
-        const int type = unit[0] & 0x1f;
-        return type == 7 || type == 8;
+        const int type = h264Type(unit);
+        return type == h264::kSps || type == h264::kPps;
     }
     if (size < 2 || hevcLayer(unit) != 0) return false;
-    const int type = (unit[0] >> 1) & 0x3f;
-    return type >= 32 && type <= 34;
+    const int type = hevcType(unit);
+    return type >= hevc::kVps && type <= hevc::kPps;
 }
 
 bool readLeb128(const uint8_t* data, size_t size, size_t& at, uint64_t& value) {
@@ -201,6 +198,45 @@ bool av1TemporalUnit(const uint8_t* data, size_t size) {
         at += length;
     }
     return false;
+}
+
+// Whether an SEI unit carries a recovery point, or may: one that cannot be read through says nothing.
+bool h264RecoveryPoint(const uint8_t* unit, size_t size) {
+    constexpr uint32_t kRecoveryPoint = 6;
+    NalBits bits(unit, size, 1, size);
+    // Past the last message only the stop bit and its padding are left.
+    while (bits.bitsLeft() > 8) {
+        const auto extended = [&] {
+            uint32_t value = 0;
+            uint32_t byte = 0;
+            do {
+                byte = bits.u(8);
+                value += byte;
+            } while (byte == 0xff && bits.ok());
+            return value;
+        };
+        const uint32_t type = extended();
+        const uint32_t payload = extended();
+        if (!bits.ok() || type == kRecoveryPoint || size_t{payload} * 8 > bits.bitsLeft()) return true;
+        bits.skip(size_t{payload} * 8);
+    }
+    return false;
+}
+
+// Whether ffmpeg could start outputting pictures at an H.264 unit, or at its picture: see neverShownBeforeReset().
+bool h264UnitMayShow(const uint8_t* unit, size_t size) {
+    if (size < 1) return false;
+    constexpr int kLastPartition = 4;
+    const int type = h264Type(unit);
+    if (type == h264::kSei) return h264RecoveryPoint(unit, size);
+    if (type == h264::kIdr || (type > h264::kSlice && type <= kLastPartition)) return true;
+    if (type != h264::kSlice) return false;
+    NalBits bits(unit, size, 1, 16);
+    bits.ue();  // first_mb_in_slice
+    const uint32_t sliceType = bits.ue() % 5;
+    constexpr uint32_t kI = 2;
+    constexpr uint32_t kSI = 4;
+    return !bits.ok() || sliceType == kI || sliceType == kSI;
 }
 
 }  // namespace
@@ -243,7 +279,7 @@ uint8_t hevcSubLayers(const CodecHeader& header) {
     // The SPS NAL header is two bytes; the first payload byte holds the count, unescaped.
     uint8_t layers = 0;
     eachHeaderUnit(AV_CODEC_ID_HEVC, header.extradata, header.size, [&](const uint8_t* unit, size_t size) {
-        if (size >= 3 && ((unit[0] >> 1) & 0x3f) == 33) layers = static_cast<uint8_t>(((unit[2] >> 1) & 7) + 1);
+        if (size >= 3 && hevcType(unit) == hevc::kSps) layers = static_cast<uint8_t>(((unit[2] >> 1) & 7) + 1);
         return layers != 0;
     });
     return layers;
@@ -301,6 +337,33 @@ bool beyondExtradata(const CodecHeader& header, const AVPacket& packet) {
         return false;
     });
     return read && beyond;
+}
+
+bool eachPacketUnit(const CodecHeader& header, const AVPacket& packet, const NalUnit& unit) {
+    const AVCodecID codec = header.stream->codec_id;
+    if (codec != AV_CODEC_ID_H264 && codec != AV_CODEC_ID_HEVC) return false;
+    const std::optional<int> prefix = lengthSize(header);
+    if (!prefix || packet.data == nullptr || packet.size <= 0) return false;
+    return eachUnit(packet.data, static_cast<size_t>(packet.size), *prefix, unit);
+}
+
+bool eachExtradataUnit(const CodecHeader& header, const NalUnit& unit) {
+    const AVCodecID codec = header.stream->codec_id;
+    if (codec != AV_CODEC_ID_H264 && codec != AV_CODEC_ID_HEVC) return false;
+    if (header.extradata == nullptr) return true;
+    return eachHeaderUnit(codec, header.extradata, header.size, unit);
+}
+
+bool neverShownBeforeReset(const CodecHeader& header, const AVPacket& packet) {
+    if (header.stream->codec_id != AV_CODEC_ID_H264 || packet.data == nullptr || packet.size <= 0) return false;
+    const std::optional<int> prefix = lengthSize(header);
+    if (!prefix || beyondExtradata(header, packet)) return false;
+    bool shows = false;
+    const bool read = eachUnit(packet.data, static_cast<size_t>(packet.size), *prefix, [&](const uint8_t* unit, size_t size) {
+        shows = h264UnitMayShow(unit, size);
+        return shows;
+    });
+    return read && !shows;
 }
 
 }

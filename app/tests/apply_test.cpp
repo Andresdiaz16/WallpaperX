@@ -2283,6 +2283,113 @@ void frameRateNotice() {
                .arg(done).arg(statusHeld).arg(atDone).arg(blanked).arg(rig.applier->frameRateNotice()));
 }
 
+void processorNotice() {
+    constexpr const char* goals = "S15.951";
+    Rig rig;
+    if (!build(rig, goals, QStringLiteral("processor"))) {
+        return;
+    }
+    const bool applied = rig.apply() && rig.applier->applyState() == Progress::Done;
+    const QList<FakeCall> set = rig.sent("SetWallpaperWithProperties");
+    if (!applied || set.isEmpty() || !quiet(rig) || !rig.applier->processorNotice().isEmpty()) {
+        harnessFailure(std::string(goals) + ": ocean was not applied to DP-1 with no notice shown to start from");
+        return;
+    }
+    const int monitorId = set.last().args.value(2).toInt();
+    const QString asset = set.last().args.value(1).toString();
+    // The approved sentences, written out here rather than taken from the app.
+    const QString parts = QStringLiteral(
+        "Parts of this video can't be played by your graphics card, so WallpaperX will use the processor for them, which "
+        "costs more power. Re-saving the video with a video editor usually fixes this.");
+    const QString all = QStringLiteral(
+        "Your graphics card can't decode this video, so WallpaperX will use the processor for all of it, which costs "
+        "more power.");
+
+    // What the view's label is given: the notice read at each processorNoticeChanged, which is the only time the QML
+    // binding reads it again.
+    QStringList told;
+    const auto watch = QObject::connect(rig.applier.get(), &ApplyController::processorNoticeChanged,
+                                        [&] { told.append(rig.applier->processorNotice()); });
+    const auto label = [&] { return told.isEmpty() ? QStringLiteral("(never told)") : told.last(); };
+    // Reports `state` for the applied video and waits until the label is told something other than `from`.
+    const auto report = [&](const QString& state, const QString& from) {
+        rig.daemonFake->processorDecoding.insert(monitorId, {asset, state});
+        const bool sent = rig.daemonFake->announceProcessorDecodingChanged();
+        return sent && waitUntil([&] { return !told.isEmpty() && told.last() != from; }, kWaitMs);
+    };
+
+    // GOAL: S15.951 -- after ProcessorDecodingChanged with the applied video reported "parts", the label is told the
+    //       approved "parts" sentence; after "all", the approved whole-video sentence.
+    // WHY-THIS-SHAPE: graded on what processorNoticeChanged hands the label, not on the getter: the getter is computed
+    //       fresh on every call, so it is right whether or not the view is ever told. The app is idle, so only the
+    //       signal can make it read GetStatus again.
+    // CONTROL: control_batch.sh 2026-10-24 (T18a), --phase '^processorNotice$', each alone, reverted (bytes restored,
+    //       green again): in app/daemon/apply_controller.cpp, the statusChanged -> processorNoticeChanged connect deleted
+    //       -> "FAIL: S15.951: after "parts" the label is told "(never told)"" while the getter was right; the Share::All
+    //       branch disabled -> "FAIL: S15.951: after "all" the label is told "Parts of this video ...". In
+    //       app/daemon/daemon_client.cpp: "all" mapped to Share::Parts -> the same "all" line; the ProcessorDecodingChanged
+    //       subscription deleted, and separately the onProcessor insert deleted -> the "(never told)" line.
+    //       Re-run 2026-10-24 (T19a) for the new "all" sentence: Share::All branch disabled -> the same "all" line;
+    //       the "all" sentence put back to the old "...can't play this video's format..." text -> "FAIL: S15.951:
+    //       after "all" the label is told "Your graphics card can't play this video's format, ...".
+    const bool partsShown = report(QStringLiteral("parts"), QString());
+    expect(partsShown && label() == parts && rig.applier->processorNotice() == parts,
+           QStringLiteral("S15.951: after \"parts\" the label is told \"%1\"").arg(label()));
+    const bool allShown = report(QStringLiteral("all"), parts);
+    expect(allShown && label() == all && rig.applier->processorNotice() == all,
+           QStringLiteral("S15.951: after \"all\" the label is told \"%1\"").arg(label()));
+
+    // GOAL: S15.951 -- every other state shows nothing: the daemon's checking, none and unknown, and a state this
+    //       build does not know.
+    // WHY-THIS-SHAPE: each state follows "parts", so the wait ends only when the status carrying it has landed and
+    //       changed the label; waiting for an empty label from an empty one would end before the read.
+    // CONTROL: control_batch.sh 2026-10-24 (T18a), --phase '^processorNotice$', reverted: daemon_client.cpp's
+    //       `decoding == u"parts"` made `decoding != u"all"` (app/daemon/daemon_client.cpp) -> "FAIL: S15.951: after
+    //       "checking" the label is told "Parts of this video ..."", and the same for none, unknown and everything_later.
+    for (const QString& state : {QStringLiteral("checking"), QStringLiteral("none"), QStringLiteral("unknown"),
+                                 QStringLiteral("everything_later")}) {
+        const bool back = report(QStringLiteral("parts"), label()) && label() == parts;
+        const bool left = back && report(state, parts);
+        expect(left && label().isEmpty(), QStringLiteral("S15.951: after \"%1\" the label is told \"%2\" (parts shown first %3)")
+                                              .arg(state, label()).arg(back));
+    }
+
+    // GOAL: S15.951 -- the notice is the selected screen's and the open wallpaper's: opening another wallpaper or
+    //       selecting another screen tells the label it is gone, and going back tells it again.
+    // WHY-THIS-SHAPE: the selection signals are emitted on this thread, so each step's emissions are all in `told`
+    //       when select() returns; a step counts only if it told the label something.
+    // CONTROL: control_batch.sh 2026-10-24 (T18a), --phase '^processorNotice$', each alone, reverted, all in
+    //       app/daemon/apply_controller.cpp: the library lambda's `emit processorNoticeChanged();` deleted -> "FAIL:
+    //       S15.951: with river open the label is told "(not told)""; the screen lambda's -> "... with HDMI-A-1 selected
+    //       the label is told "(not told)""; `use->path != assetPath` dropped -> "... with river open the label is told
+    //       "Parts ..."; onProcessor looked up at cbegin() instead of the monitor -> "... with HDMI-A-1 selected the label
+    //       is told "Parts ..."" (green until HDMI-A-1 was given a monitor above).
+    // HDMI-A-1 is given a monitor of its own, so the step to it reaches the per-monitor lookup rather than ending at a
+    // screen the daemon does not know.
+    rig.daemonFake->outputs.insert(QStringLiteral("HDMI-A-1"), monitorId + 1);
+    if (!report(QStringLiteral("parts"), label()) || label() != parts ||
+        !rig.client->status().outputs.contains(QStringLiteral("HDMI-A-1"))) {
+        harnessFailure(std::string(goals) + ": the \"parts\" sentence, with HDMI-A-1 known to the daemon, did not come "
+                                            "back before the selection steps");
+        QObject::disconnect(watch);
+        return;
+    }
+    const auto step = [&](const std::function<void()>& select) {
+        const qsizetype before = told.size();
+        select();
+        return told.size() > before ? label() : QStringLiteral("(not told)");
+    };
+    const QString riverOpen = step([&] { rig.library->select(rig.river); });
+    expect(riverOpen.isEmpty(), QStringLiteral("S15.951: with river open the label is told \"%1\"").arg(riverOpen));
+    const QString oceanAgain = step([&] { rig.library->select(rig.ocean); });
+    expect(oceanAgain == parts, QStringLiteral("S15.951: with ocean open again the label is told \"%1\"").arg(oceanAgain));
+    const QString otherScreen = step([&] { rig.kscreen->select(QStringLiteral("HDMI-A-1")); });
+    expect(otherScreen.isEmpty(), QStringLiteral("S15.951: with HDMI-A-1 selected the label is told \"%1\"").arg(otherScreen));
+    const QString screenAgain = step([&] { rig.kscreen->select(QStringLiteral("DP-1")); });
+    expect(screenAgain == parts, QStringLiteral("S15.951: with DP-1 selected again the label is told \"%1\"").arg(screenAgain));
+    QObject::disconnect(watch);
+}
+
 void refreshReporter() {
     constexpr const char* goals = "S15.912";
     Rig rig;
@@ -2589,6 +2696,7 @@ int main(int argc, char* argv[]) {
     runPhase("soundStatus", soundStatus);
     runPhase("soundSetters", soundSetters);
     runPhase("frameRateNotice", frameRateNotice);
+    runPhase("processorNotice", processorNotice);
     runPhase("refreshReporter", refreshReporter);
     runPhase("frameRateSetters", frameRateSetters);
 

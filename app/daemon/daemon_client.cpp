@@ -144,6 +144,18 @@ std::expected<DaemonStatus, QString> parseDaemonStatus(const QByteArray& json)
             status.occupied.insert(*id);
             if (std::string_view(field) == "wallpapers") {
                 status.wallpapers.insert(*id);
+                const QJsonObject wallpaper = it.value().toObject();
+                const QJsonValue path = wallpaper.value(QStringLiteral("path_literal"));
+                const QString decoding =
+                    wallpaper.value(QStringLiteral("processor_decoding")).toObject().value(QStringLiteral("state")).toString();
+                // Any other state, a later daemon's included, shows nothing.
+                using Share = DaemonStatus::OnProcessor::Share;
+                const std::optional<Share> share = decoding == u"parts" ? std::optional(Share::Parts)
+                                                   : decoding == u"all" ? std::optional(Share::All)
+                                                                        : std::nullopt;
+                if (share && path.isString()) {
+                    status.onProcessor.insert(*id, DaemonStatus::OnProcessor{path.toString(), *share});
+                }
             }
             if (std::string_view(field) == "pause") {
                 const QString mode = it.value().toObject().value(QStringLiteral("mode")).toString();
@@ -247,6 +259,9 @@ DaemonClient::DaemonClient(QDBusConnection bus, QString service, DaemonTimeouts 
     // How a save the daemon did not wait for is heard of: its reply comes before the write.
     m_bus.connect(m_service, QString::fromLatin1(kObjectPath), QString::fromLatin1(kInterface),
                   QStringLiteral("PersistenceChanged"), this, SLOT(refresh()));
+    // How a wallpaper's scan, which ends after its SetWallpaper is answered, is heard of.
+    m_bus.connect(m_service, QString::fromLatin1(kObjectPath), QString::fromLatin1(kInterface),
+                  QStringLiteral("ProcessorDecodingChanged"), this, SLOT(refresh()));
 }
 
 QVariantMap DaemonClient::pauseModes() const

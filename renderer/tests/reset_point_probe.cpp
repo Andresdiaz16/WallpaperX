@@ -5,6 +5,7 @@
 // copies of real packets with their first picture rewritten into the kinds that must not count.
 
 #include "video/reset_point.h"
+#include "video/software_scan.h"
 
 #include "support/check.h"
 #include "support/reset_point_reference.h"
@@ -15,6 +16,7 @@ extern "C" {
 #include <libavutil/mem.h>
 }
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -211,7 +213,7 @@ struct OwnedPacket {
 //       firstSlice and beyond lines); for hvcC -> "hvcC declaring 2-byte lengths: firstSlice() finds ...";
 //       changesExtradata() by size only -> "a same-size NEW_EXTRADATA with one byte changed ..."; by presence
 //       only -> "a byte-identical NEW_EXTRADATA does not change ..."; hevcSubLayers() reading unit[2] & 7 ->
-//       "... reads 3 sub-layers from the SPS (got 6)".
+//       "... reads 3 sub-layers from the SPS (got 6)" (re-run 2026-10-24, G5, on the hevcType() form; restored).
 void runLengthSizeChecks() {
     using wallpaperx::testing::check;
     auto avcC = [](uint8_t lengthByte) {
@@ -271,6 +273,81 @@ void runLengthSizeChecks() {
     check(!wallpaperx::changesExtradata(header(h264, avc2), *idr.packet), "a packet with no NEW_EXTRADATA changes nothing");
 }
 
+// GOAL: S15.952/S15.953 -- scanSoftwareStretches() finds a missing reference exactly where the decoder sends shown
+//       pictures to software: an H.264 frame_num gap (counter_gap.mp4), a cut on a non-IDR I (counter_cut_nonidr.mp4),
+//       an HEVC dropped reference or CRA start (counter_hevc_gap.mp4, counter_cut_cra.mp4); and none for healthy files or for an
+//       H.264 transport stream cut mid-group whose lead-in ends at an IDR and is never shown (counter_cut_start.ts).
+//       A lead-in ending at a non-IDR I with no recovery point (counter_lead_then_i.mp4) may be shown, so it is read
+//       as the decoder sends it, and its missing references are found.
+// WHY-THIS-SHAPE: answers graded on real cut and damaged files, both directions, rather than on the follower's
+//       internals: the property is the scan's agreement with the decoder, which video_pipeline_damaged_device grades
+//       on the same fixtures.
+// CONTROL: control_batch.sh 2026-10-24 (T18b), each alone, reverted, renderer/video/software_scan.cpp: the lead-in
+//       skip off in scanOnce() -> "counter_cut_start.ts: missing reference found, none due"; the H.264 frame_num
+//       rule's `return true` made false -> "counter_gap.mp4: no missing reference found"; the HEVC rule's `return
+//       true` made false -> "counter_hevc_gap.mp4: no missing reference found". control_batch.sh 2026-10-24 (T18d),
+//       restored, renderer/video/reset_point.cpp h264UnitMayShow() not counting an I slice ->
+//       "counter_lead_then_i.mp4: no missing reference found".
+// COVERAGE-ASSERT: each row is graded or accounted for: a missing fixture sets g_notVerified (main() then exits
+//       kNotVerifiedExitCode, a ctest skip, not a pass), and a scan that throws or gives no answer calls fail().
+void runScanChecks() {
+    struct Row {
+        const char* file;
+        bool missingReference;
+    };
+    const Row rows[] = {{"counter_gap.mp4", true},         {"counter_cut_nonidr.mp4", true},
+                        {"counter_hevc_gap.mp4", true},
+                        {"counter_cut_cra.mp4", true},     {"counter_cut_start.ts", false},
+                        {"counter_lead_then_i.mp4", true},
+                        {"counter_opengop.ts", false},     {"counter_two_idr.mp4", false},
+                        {"counter_nonidr_src.mp4", false}, {"counter_opengop_hevc.mp4", false}};
+    for (const Row& row : rows) {
+        const std::string path = asset(row.file);
+        if (!std::filesystem::exists(path)) {
+            std::printf("reset_point_probe: NOT VERIFIED -- %s was not generated, so the scan is not graded on it\n",
+                        row.file);
+            g_notVerified = true;
+            continue;
+        }
+        const std::atomic<bool> stop{false};
+        std::optional<wallpaperx::SoftwareStretches> found;
+        try {
+            found = wallpaperx::scanSoftwareStretches(path, stop);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "FAIL: reset_point_probe: %s: the scan threw %s\n", row.file, e.what());
+            fail("scanSoftwareStretches() reads every fixture through");
+            continue;
+        }
+        if (!found) {
+            std::fprintf(stderr, "FAIL: reset_point_probe: %s: the scan gave no answer without being stopped\n", row.file);
+            fail("scanSoftwareStretches() answers when not stopped");
+            continue;
+        }
+        if (found->missingReference != row.missingReference) {
+            std::fprintf(stderr, "FAIL: reset_point_probe: %s: %s\n", row.file,
+                         row.missingReference ? "no missing reference found" : "missing reference found, none due");
+            fail("the scan finds a missing reference exactly where the decoder makes one up");
+        }
+        if (found->parameterSetsChangeOffReset) {
+            std::fprintf(stderr, "FAIL: reset_point_probe: %s: a parameter-set change off a reset point found\n", row.file);
+            fail("the scan finds no parameter-set change in a file without one");
+        }
+    }
+
+    // GOAL: S15.952 -- a parameter-set change off a reset point sends pictures to software only on a device without
+    //       inline parameters, and is not known without a device.
+    // CONTROL: control_batch.sh 2026-10-24 (T18b), reverted, renderer/video/software_scan.h
+    //       parameterSetsToSoftware(): `return !*inlineParameters` made `return *inlineParameters` -> "FAIL:
+    //       parameterSetsToSoftware() answers software only for a change on a device without inline parameters".
+    wallpaperx::SoftwareStretches change;
+    change.parameterSetsChangeOffReset = true;
+    const wallpaperx::SoftwareStretches none;
+    const bool rule = change.parameterSetsToSoftware(false) == true && change.parameterSetsToSoftware(true) == false &&
+                      !change.parameterSetsToSoftware(std::nullopt).has_value() &&
+                      none.parameterSetsToSoftware(false) == false && none.parameterSetsToSoftware(std::nullopt) == false;
+    if (!rule) fail("parameterSetsToSoftware() answers software only for a change on a device without inline parameters");
+}
+
 }  // namespace
 
 // With no argument, the H.264 and HEVC fixtures, which are always generated; with `av1`, the AV1 one, which
@@ -297,7 +374,8 @@ int main(int argc, char** argv) {
     //       does not reset the decoder"; hevcUnit() also accepting types 16-18 -> "counter_opengop_hevc.ts
     //       packet 45 rewritten as NAL type 16: resetsDecoder() said it resets the decoder"; av1TemporalUnit()
     //       ignoring show_frame -> on reset_point_detector_av1, "counter_av1.mp4 packet 0 rewritten as a hidden
-    //       key frame: resetsDecoder() said it resets the decoder".
+    //       key frame: resetsDecoder() said it resets the decoder". The two hevcUnit() breaks re-run 2026-10-24
+    //       (G5) on its hevc::isIdr() form via control_batch.sh, the same lines; restored.
     // COVERAGE-ASSERT: each fixture must hold reset points and keyframe-flagged packets that are not, and the
     //       HEVC and AV1 rewrites must have run -- red with counter_long.mp4 in counter_opengop.mp4's place
     //       (test-side, by hand, 2026-09-30), "14 reset points, 0 open keyframes, 0 rewrites". Each rewrite
@@ -331,6 +409,7 @@ int main(int argc, char** argv) {
     }
 
     if (!av1Entry) runLengthSizeChecks();
+    if (!av1Entry) runScanChecks();
 
     const int failures = wallpaperx::testing::reportFailures("reset_point_probe");
     if (failures > 0) return 1;

@@ -4,6 +4,7 @@
 
 #include "ffmpeg_file.h"
 #include "frame_converter.h"
+#include "nal_bits.h"
 #include "reset_point.h"
 
 #include "../vulkan/format_features.h"
@@ -266,7 +267,7 @@ bool nonrefLeavesOutReferenced(const CodecHeader& stream, const AVPacket& packet
     if (stream.stream->codec_id != AV_CODEC_ID_HEVC) return false;
     const uint8_t* header = firstSlice(stream, packet);
     if (header == nullptr) return true;
-    const int type = (header[0] >> 1) & 0x3f;
+    const int type = hevcType(header);
     const bool subLayerNonReference = type <= 14 && type % 2 == 0;
     const int temporalId = (header[1] & 7) - 1;
     const uint8_t layers = hevcSubLayers(stream);
@@ -644,17 +645,17 @@ void VideoDecoder::openDecoder(const std::optional<std::vector<uint8_t>>& extrad
     const AVStream& stream = *m_format->streams[m_stream];
     const AVCodecID id = stream.codecpar->codec_id;
 
-    // Software is settled here whenever the device's own report settles it; the stream's
-    // profile and size are the decoder's question, asked in choose().
-    if (m_device.info().videoDecodeOps == 0) {
-        m_path = Path::SoftwareNoDecoder;
-    } else if (m_path == Path::Undecided && (m_device.info().videoDecodeOps & decodeOperation(id)) == 0) {
-        m_path = Path::SoftwareCodec;
+    // The device's own report decides here; the stream's profile and size are the decoder's
+    // question, asked in choose().
+    if (m_path == Path::Undecided) {
+        if (m_device.info().videoDecodeOps == 0) {
+            refuse(Path::SoftwareNoDecoder);
+        } else if ((m_device.info().videoDecodeOps & decodeOperation(id)) == 0 || vulkanDecoder(id) == nullptr) {
+            refuse(Path::SoftwareCodec);
+        }
     }
-    const AVCodec* codec = m_path == Path::Undecided ? vulkanDecoder(id) : nullptr;
-    if (m_path == Path::Undecided && codec == nullptr) m_path = Path::SoftwareCodec;
     const bool hardware = m_path == Path::Undecided;
-    if (!hardware) codec = avcodec_find_decoder(id);
+    const AVCodec* codec = hardware ? vulkanDecoder(id) : avcodec_find_decoder(id);
     if (codec == nullptr) throw WallpaperContentError(describeRejection(kComponent, "no decoder for the video", m_file));
 
     m_codec = avcodec_alloc_context3(codec);
@@ -788,7 +789,7 @@ bool VideoDecoder::raisesShortage(int err) const {
 }
 
 void VideoDecoder::refuseAfterFailure() {
-    m_path = Path::SoftwareRefused;
+    refuse(Path::SoftwareRefused);
     if (m_switched) m_handBack = NextPass{};
 }
 
@@ -1183,6 +1184,28 @@ bool VideoDecoder::beforeLandingKeyframe() const {
            !(extradataPlaced() && resetsDecoder(header(), *m_packet));
 }
 
+// A stream cut inside a group -- a transport stream picked up part way -- starts on pictures that reference ones
+// it lacks. Sent, they make the device a stand-in and go to software, which decodes them on every pass for ffmpeg to
+// output none. Read past instead when the first IDR ends them. When anything else does -- a packet ffmpeg could
+// start its output at, or the end -- every pass sends them all, as before: learnt once, rewinding to packet 1.
+void VideoDecoder::skipUnshownLead() {
+    const uint32_t readSince = m_readSinceReturned;
+    bool skipped = false;
+    while (neverShownBeforeReset(header(), *m_packet)) {
+        skipped = true;
+        av_packet_unref(m_packet);
+        const int err = readVideoPacket();
+        if (err == AVERROR(ENOMEM)) throwOutOfMemory("VideoDecoder");
+        if (err == AVERROR_EOF) break;
+        // Not the lead's end: a failed read says nothing about the file, so nothing is learnt from it.
+        if (err < 0) throwFileFailure("cannot read the wallpaper", err, m_file);
+    }
+    if (!skipped || (m_packet->data != nullptr && resetsDecoder(header(), *m_packet))) return;
+    m_leadMayShow = true;
+    rewind();
+    m_readSinceReturned = readSince;
+}
+
 // Called with each packet decoded. The first after a seek is a keyframe and shows where it landed;
 // any later one can only show that a picture past the resume point was left to decode.
 void VideoDecoder::recordLanding() {
@@ -1250,7 +1273,7 @@ bool VideoDecoder::attachDevice() {
                              " enables VK_KHR_video_queue but has no "
                              "vkGetPhysicalDeviceVideoFormatPropertiesKHR, and no longer answers");
         }
-        m_path = Path::SoftwareRefused;
+        refuse(Path::SoftwareRefused);
         return false;
     }
     m_videoCapabilities = reinterpret_cast<PFN_vkGetPhysicalDeviceVideoCapabilitiesKHR>(
@@ -1261,7 +1284,7 @@ bool VideoDecoder::attachDevice() {
                              " enables VK_KHR_video_queue but has no vkGetPhysicalDeviceVideoCapabilitiesKHR, "
                              "and no longer answers");
         }
-        m_path = Path::SoftwareRefused;
+        refuse(Path::SoftwareRefused);
         return false;
     }
     m_codec->hw_device_ctx = ref.release();
@@ -1283,14 +1306,14 @@ bool VideoDecoder::attachHardwareFrames(AVCodecContext* codec) {
     const int err = avcodec_get_hw_frames_parameters(codec, codec->hw_device_ctx, AV_PIX_FMT_VULKAN, &frames.ref);
     if (err == AVERROR(ENOMEM)) throwOutOfMemory("VideoDecoder");
     if (err == AVERROR(ENOENT) || err == AVERROR(ENOSYS)) {
-        m_path = Path::SoftwareCodec;
+        refuse(Path::SoftwareCodec);
         return false;
     }
     if (err < 0) {
         // ffmpeg folds every capability answer it does not name -- picture layout, codec, Std
         // header version -- into the same code as a failed call; nothing has been asked of the
         // device but questions, so all of it is the device declining.
-        m_path = Path::SoftwareRefused;
+        refuse(Path::SoftwareRefused);
         return false;
     }
 
@@ -1303,7 +1326,7 @@ bool VideoDecoder::attachHardwareFrames(AVCodecContext* codec) {
     // converter that would refuse it as bad content.
     if (profiles == nullptr || profiles->profileCount == 0 || vk->format[0] == VK_FORMAT_UNDEFINED ||
         vk->format[1] != VK_FORMAT_UNDEFINED || !FrameConverter::readsDeviceImage(m_device, context->sw_format, vk->format[0])) {
-        m_path = Path::SoftwareRefused;
+        refuse(Path::SoftwareRefused);
         return false;
     }
 
@@ -1314,7 +1337,7 @@ bool VideoDecoder::attachHardwareFrames(AVCodecContext* codec) {
         (vk->usage & (VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR | VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR)) | renderer;
     const VkFormatFeatureFlags2 features = formatFeatures(m_device.physicalDevice(), vk->format[0], vk->tiling);
     if ((usageFfmpegCreates(0, features) & renderer) != renderer) {
-        m_path = Path::SoftwareRefused;
+        refuse(Path::SoftwareRefused);
         return false;
     }
     const VkImageUsageFlags usage = usageFfmpegCreates(asked, features);
@@ -1330,7 +1353,7 @@ bool VideoDecoder::attachHardwareFrames(AVCodecContext* codec) {
         formats.resize(count);
     }
     if (isVideoRefusal(result)) {
-        m_path = Path::SoftwareRefused;
+        refuse(Path::SoftwareRefused);
         return false;
     }
     if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
@@ -1347,7 +1370,7 @@ bool VideoDecoder::attachHardwareFrames(AVCodecContext* codec) {
                          : match->imageCreateFlags &
                                (VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
     if (flags == 0) {
-        m_path = Path::SoftwareRefused;
+        refuse(Path::SoftwareRefused);
         return false;
     }
     VkExtent2D minCoded{};
@@ -1432,7 +1455,7 @@ AVPixelFormat VideoDecoder::choose(AVCodecContext* codec, const AVPixelFormat* o
         refuseAfterFailure();
     } else {
         // The codec offers no Vulkan output for this stream's pixel format.
-        m_path = Path::SoftwareRefused;
+        refuse(Path::SoftwareRefused);
     }
     // Never software on this context: it was opened for the device -- single-threaded, and for
     // AV1 a decoder with no software output of its own.
@@ -1463,7 +1486,7 @@ int VideoDecoder::allocatePicture(AVCodecContext* codec, AVFrame* frame, int fla
         // which would read as a stand-in.
         if (self->m_pending == Pending::ReopenInSoftware || self->m_parkedFailure) return AVERROR(ENOSYS);
         if (!self->holds(*codec->hw_frames_ctx, frame->width, frame->height)) {
-            self->m_path = Path::SoftwareRefused;
+            self->refuse(Path::SoftwareRefused);
             self->require(Pending::ReopenInSoftware);
             return AVERROR(ENOSYS);
         }
@@ -1703,6 +1726,7 @@ std::variant<std::optional<DecodedFrame>, VideoDecoder::Dropping> VideoDecoder::
         }
         if (err == 0) {
             m_awaitingHardwareSetup = false;
+            settle(Opening::Accepted);
             if (m_frame->format == AV_PIX_FMT_VULKAN) m_path = Path::Hardware;
             const int64_t timestamp = m_frame->best_effort_timestamp;
             if (m_frame->pts == AV_NOPTS_VALUE || m_frame->pts != timestamp) m_packetTimesHold = false;
@@ -1787,6 +1811,10 @@ std::variant<std::optional<DecodedFrame>, VideoDecoder::Dropping> VideoDecoder::
             }
         }
         if (!m_flushed && !m_packetVerdict) {
+            if (m_packetsRead == uint64_t{1} && !m_leadMayShow) {
+                skipUnshownLead();
+                if (m_packet->data == nullptr) continue;
+            }
             // First, so the guards below judge the packet as it will be sent.
             alignCodecExtradata();
             const CodecHeader opened = CodecHeader::of(*m_format->streams[m_stream]->codecpar);

@@ -142,6 +142,13 @@ public:
     // start there. Empty before the first draw and when the decoder could not find it again.
     std::optional<StreamPosition> shownPosition() const { return m_shownPosition; }
 
+    // Whether the picture draw() showed last was decoded in software. Throws std::logic_error before the first.
+    bool shownFromSoftware() const;
+
+    // As VideoDecoder::softwareFromSetup(), as of the picture decoded last. It never turns false again, so
+    // when true every picture shown was decoded in software.
+    bool softwareFromSetup() const { return m_softwareFromSetup; }
+
 private:
     enum class Waiting { ForPicture, Never };
     // No `skip` decodes the whole stream on this thread and leaves a decode thread's level as it is.
@@ -165,6 +172,7 @@ private:
     // The system had no thread to give, so this thread decodes for good.
     bool m_noDecodeThread = false;
     PictureSkip m_deepest;
+    bool m_softwareFromSetup = false;
     // Where every ShowGrid for this file is laid from, read before a decode thread owns the decoder.
     std::chrono::nanoseconds m_origin;
     // Null until the first picture is converted.

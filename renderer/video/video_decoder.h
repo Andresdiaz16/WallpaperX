@@ -229,7 +229,9 @@ public:
         // until the first reset point, as resetsDecoder() defines one, after the packet that needed it,
         // and the device decodes from there. Not once parameter sets beyond the stream's extradata have been
         // sent this pass: a device decoder opened from it would lack them, so software keeps the rest of the
-        // pass. The third stand-in in one pass keeps it in software for good.
+        // pass. The third stand-in in one pass keeps it in software for good. An H.264 stream that starts part way
+        // into a group on pictures ffmpeg would output none of, up to its first IDR, never comes here: from the
+        // stream's first packet those are read past, not decoded, as neverShownBeforeReset() decides.
         SoftwareMissingReference,
     };
 
@@ -347,6 +349,11 @@ public:
     size_t extradataChangesRecorded() const { return m_extradataMap.changes.size(); }
 
     Path path() const { return m_path; }
+
+    // Whether the constructor's codec went to software before the device returned a picture -- the device turned the
+    // stream down or its hardware setup failed -- so no picture of the stream reaches the device and nothing hands it
+    // back. Once true, every picture this decoder returns is decoded in software.
+    bool softwareFromSetup() const { return m_opening == Opening::Refused; }
 
     // How a decoder whose next() runs off the GPU thread asks whether the device still answers,
     // which only the GPU thread can find out: `ask` must put the question to it and return its
@@ -491,6 +498,10 @@ private:
     // Whether the packet just read comes after a seek and before the first keyframe since; it is
     // skipped, never decoded.
     bool beforeLandingKeyframe() const;
+    // With packet 1 held and about to be sent: reads past the packets before the first IDR that ffmpeg outputs no
+    // picture from, as neverShownBeforeReset() decides, leaving that IDR held. Leaves the packet empty when it
+    // has to be read again.
+    void skipUnshownLead();
     void recordLanding();
     // True means decode on the device. False means the path was decided as software, because
     // ffmpeg cannot decode on a device that still answers.
@@ -625,6 +636,20 @@ private:
     std::variant<std::monostate, Seeked, DropThrough, DropThroughPacket, DropCount> m_resume;
     bool m_flushed = false;
     Path m_path = Path::Undecided;
+    // How the stream opened, settled once: Refused when the constructor's codec went to software, for good, before
+    // any picture; Accepted at the first picture, from wherever it came. What decoding meets after that moves
+    // m_path, never this.
+    enum class Opening { Unanswered, Accepted, Refused };
+    Opening m_opening = Opening::Unanswered;
+    void settle(Opening answer) {
+        if (m_opening == Opening::Unanswered) m_opening = answer;
+    }
+    // m_path set to software where nothing hands the constructor's codec's stream back, so before any picture on that
+    // codec the opening is Refused. A caller that will hand it back sets m_path itself.
+    void refuse(Path why) {
+        m_path = why;
+        if (!m_switched) settle(Opening::Refused);
+    }
     // Set when the device accepted the stream and ffmpeg was told to decode on it, cleared when a
     // frame arrives. A format negotiation that comes back without Vulkan while this is set is
     // ffmpeg retreating from a hardware setup that failed after the device's yes.
@@ -713,6 +738,9 @@ private:
     // The constructor's start, while the first next() has yet to make it.
     std::optional<StreamPosition> m_deferredStart;
     const std::atomic<bool>* m_stopStart = nullptr;
+    // The packets before the file's first IDR include one ffmpeg could output a picture from, so every pass sends
+    // them all. Learnt once: the file does not change while this decoder holds it.
+    bool m_leadMayShow = false;
     // Stand-ins met this pass, and the packet sent last, which a stand-in is blamed on.
     uint32_t m_standIns = 0;
     std::optional<PacketMark> m_lastSent;

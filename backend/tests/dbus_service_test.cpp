@@ -688,8 +688,15 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
         // GOAL: S15.685 -- PersistenceChanged is exported, with no arguments: a consumer reads GetStatus again.
         // CONTROL: control_batch.sh 2026-10-17, phase host, `sdbus::registerSignal("PersistenceChanged")` in
         //       DbusService::registerVTable (backend/daemon/dbus_service.cpp) renamed "PersistenceNotice" ->
-        //       "FAIL: io.wallpaperx.Daemon exports exactly the signals this table names". Reverted.
+        //       "FAIL: io.wallpaperx.Daemon exports exactly the signals this table names". Reverted. Re-run
+        //       2026-10-24 (G5) with ProcessorDecodingChanged listed after it: the same line.
         {"signal", "PersistenceChanged", ArgList{}},
+        // GOAL: ProcessorDecodingChanged is exported, with no arguments: a consumer reads GetStatus's
+        //       processor_decoding again.
+        // CONTROL: control_batch.sh 2026-10-24 (T18a), phase host, `sdbus::registerSignal("ProcessorDecodingChanged")`
+        //       in DbusService::registerVTable (backend/daemon/dbus_service.cpp) renamed "ProcessorDecodingNotice" ->
+        //       "FAIL: io.wallpaperx.Daemon exports exactly the signals this table names". Reverted.
+        {"signal", "ProcessorDecodingChanged", ArgList{}},
     };
 
     for (const auto& [element, name, expectedArgs] : expected) {

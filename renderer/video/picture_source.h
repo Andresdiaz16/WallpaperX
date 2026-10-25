@@ -56,6 +56,8 @@ public:
         PictureTiming timing;
         // As VideoDecoder::deepestSkip() when this picture was returned.
         PictureSkip deepest = PictureSkip::Nothing;
+        // As VideoDecoder::softwareFromSetup() when this picture was returned.
+        bool softwareFromSetup = false;
     };
     // The stream is exhausted; when looping, it has shown nothing or has no picture to start again from.
     struct End {};

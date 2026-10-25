@@ -130,9 +130,11 @@ add_library(wallpaperx-daemon-lib STATIC
     daemon/kept_rows.cpp
     daemon/http_server.cpp
     daemon/log_pump.cpp
+    daemon/processor_check.cpp
     daemon/record_file.cpp
     daemon/render_worker.cpp
     daemon/resume_record.cpp
+    daemon/scan_record.cpp
     daemon/wallpaper_manager.cpp
     daemon/wallpaper_properties.cpp
 )
@@ -498,6 +500,18 @@ target_link_libraries(wallpaperx-config-store-test PRIVATE wallpaperx-daemon-lib
 # Each caller's share of the render worker's queue, on the manager's record alone.
 add_executable(wallpaperx-request-share-test tests/request_share_test.cpp)
 target_link_libraries(wallpaperx-request-share-test PRIVATE wallpaperx-daemon-lib)
+
+# The processor-decoding check below the bus: its states, reuse of saved answers, forget() and the
+# scan record. Counts open() of its own scratch copies of the renderer's video fixtures.
+add_executable(wallpaperx-processor-check-test tests/processor_check_test.cpp)
+target_link_libraries(wallpaperx-processor-check-test PRIVATE wallpaperx-daemon-lib)
+# renderer/tests for LoadedRange, which keeps the open() hook out of ThreadSanitizer's own calls.
+target_include_directories(wallpaperx-processor-check-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+target_compile_definitions(wallpaperx-processor-check-test PRIVATE
+    WALLPAPERX_RENDERER_VIDEO_ASSET_DIR="${CMAKE_CURRENT_BINARY_DIR}/renderer/video_assets")
+if(WALLPAPERX_FFMPEG_EXECUTABLE)
+    add_dependencies(wallpaperx-processor-check-test wallpaperx-video-fixtures)
+endif()
 
 # The same trade the http-server test makes above, for the same measured reason. S10.16's
 # allocation half has one lever -- std::thread's constructor allocates before it asks the kernel
@@ -1211,6 +1225,21 @@ target_compile_definitions(wallpaperx-daemon-system-test PRIVATE
     WALLPAPERX_VIDEO_ASSET_DIR="${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}"
     WALLPAPERX_WEDGE_SHIM="$<TARGET_FILE:wallpaperx-test-wedge-shim>")
 add_dependencies(wallpaperx-daemon-system-test wallpaperx-test-wedge-shim)
+# The renderer's damaged and refused fixtures, for the processor-decoding state over the bus.
+target_compile_definitions(wallpaperx-daemon-system-test PRIVATE
+    WALLPAPERX_RENDERER_VIDEO_ASSET_DIR="${CMAKE_CURRENT_BINARY_DIR}/renderer/video_assets")
+# Whether the renderer generates the VP9 fixture (ffmpeg with libvpx-vp9): its row is dropped only when the
+# build left it out, so a fixture missing despite the recipe still reports NOT VERIFIED.
+get_directory_property(_wx_vp9_recipes DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../renderer
+                       DEFINITION WALLPAPERX_VP9_RECIPES)
+if(_wx_vp9_recipes)
+    target_compile_definitions(wallpaperx-daemon-system-test PRIVATE WALLPAPERX_HAVE_VP9_FIXTURE=1)
+else()
+    target_compile_definitions(wallpaperx-daemon-system-test PRIVATE WALLPAPERX_HAVE_VP9_FIXTURE=0)
+endif()
+if(TARGET wallpaperx-video-fixtures)
+    add_dependencies(wallpaperx-daemon-system-test wallpaperx-video-fixtures)
+endif()
 
 # daemon_system_test's frameAllocationFailure phase fails one chosen allocation on the daemon's
 # frame-reply thread (tests/alloc_fail_shim.cpp). Test-only, and inert unless the test names the
@@ -1396,6 +1425,8 @@ set_tests_properties(config_store PROPERTIES LABELS "novulkan"
 # fixed ten-second quiet period, so the entry takes about eleven seconds.
 wallpaperx_add_test(NAME request_share COMMAND $<TARGET_FILE:wallpaperx-request-share-test>)
 set_tests_properties(request_share PROPERTIES LABELS "novulkan")
+wallpaperx_add_test(NAME processor_check COMMAND $<TARGET_FILE:wallpaperx-processor-check-test>)
+set_tests_properties(processor_check PROPERTIES SKIP_RETURN_CODE 77 LABELS "novulkan")
 
 # Outside the guard too: forked children, signals and files, with no bus, port or driver.
 # `novulkan` because the sanitizer block below selects by label and an unlabelled entry is
@@ -1616,8 +1647,9 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
     # The twin reads the cross-process frame the other way: a LINEAR dma_buf, mapped, where
     # the NVIDIA entry above imports its OPAQUE_FD through the plugin's GL importer.
     if(WALLPAPERX_LAVAPIPE_ICD)
+        # Lavapipe decodes no video, so the phase grading the card's decode answers is not run here.
         wallpaperx_add_test(NAME daemon_system_lavapipe
-                 COMMAND ${_wx_asan_preload} $<TARGET_FILE:wallpaperx-daemon-system-test>)
+                 COMMAND ${_wx_asan_preload} $<TARGET_FILE:wallpaperx-daemon-system-test> --no-card-decode)
         set_tests_properties(daemon_system_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
             LABELS "lavapipe"

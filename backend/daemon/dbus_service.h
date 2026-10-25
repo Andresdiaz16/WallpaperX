@@ -39,6 +39,10 @@ public:
     // Applies the saved wallpapers without drawing them. Call once, before the event loop.
     void restoreSaved();
 
+    // WallpaperManager::startRestoredScans() for what restoreSaved() applied. Call once, after
+    // WallpaperManager::recordStartingVideos() and before renderRestored().
+    void startRestoredScans();
+
     // Posts the renders restoreSaved() held back. Call once, after
     // WallpaperManager::recordStartingVideos(): a video that crashes the render thread before the
     // playing record is open names nothing, and the restart loop that record exists to stop goes on.
@@ -54,6 +58,9 @@ private:
 
     // Emits PersistenceChanged. On the config writer's thread; emitting is thread-safe in sdbus-c++.
     void announcePersistenceChanged() noexcept;
+
+    // Emits ProcessorDecodingChanged. On the scan's thread or the render thread.
+    void announceProcessorDecodingChanged() noexcept;
 
     // DBus method handlers. PLAN.md's DBus Interface section is the wire contract.
     //

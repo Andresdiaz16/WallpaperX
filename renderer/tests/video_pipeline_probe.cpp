@@ -124,6 +124,8 @@ int g_receiveExternalRemaining = 0;
 // Pictures the decoder received, by where they live, while a run records them.
 bool g_recordPictures = false;
 int g_devicePictures = 0;
+// Packets with data sent to the decoder's software context while a run records pictures, shown or not.
+std::atomic<int> g_softwarePacketsSent{0};
 int g_hostPictures = 0;
 
 // Everything below is counted, or applies, only during the call that meets the failure.
@@ -161,6 +163,12 @@ bool g_stripTimestamps = false;
 // av_hwframe_ctx_init fails this many more times for Vulkan images: ffmpeg refusing the device's images
 // inside the format callback of the first packet sent, on a device that still answers.
 int g_failFramesInit = 0;
+// Vulkan frames contexts av_hwframe_ctx_init made: the device's yes to a stream's headers.
+int g_vulkanFramesMade = 0;
+// The next vkCreateVideoSessionKHR fails: ffmpeg's own decoder setup failing after the device's yes. Counted when it
+// fires. ffmpeg loads the function through the decoder's vkGetDeviceProcAddr, interposed below.
+bool g_failNextSession = false;
+int g_sessionsFailed = 0;
 // The next device picture the decoder's hardware context allocates asks for a second one first, from
 // inside the decoder's own get_buffer2: the request ffmpeg makes for a stand-in reference. Counted when made.
 bool g_standInAtNextPicture = false;
@@ -2153,7 +2161,26 @@ struct DamagedRun {
     std::vector<bool> startsPass;
     std::string threw;
     bool exhausted = false;  // what was thrown was a ResourceExhausted
+    bool fromSetup = false;  // VideoPipeline::softwareFromSetup() after the last picture: the daemon's "all"
+    int softwarePackets = 0;  // sent to a software decoder over the whole run
 };
+
+// Video packets in the file, and those before the first that resets the decoder by the reference reader
+// (testing::referenceResets, not the production rule under test); -1 for either when unreadable or absent.
+struct FixturePackets {
+    int count = -1;
+    int lead = -1;
+};
+FixturePackets fixturePackets(const std::string& file) {
+    std::string why;
+    const std::optional<GopLayout> layout = readGopLayout(file, why);
+    if (!layout) {
+        std::fprintf(stderr, "  the harness could not read %s: %s\n", file.c_str(), why.c_str());
+        return {};
+    }
+    const std::vector<size_t> resets = layout->resets();
+    return {static_cast<int>(layout->packets.size()), resets.empty() ? -1 : static_cast<int>(resets.front())};
+}
 
 DamagedRun runDamaged(Device& device, const std::string& file, size_t calls) {
     DamagedRun run;
@@ -2163,6 +2190,7 @@ DamagedRun runDamaged(Device& device, const std::string& file, size_t calls) {
     try {
         OffscreenTargetManager targets(device);
         const OffscreenTarget& target = targets.create(1, kTargetWidth, kTargetHeight);
+        g_softwarePacketsSent.store(0);
         g_recordPictures = true;
         VideoPipeline pipeline(device, file, kShaderDir, VideoPipeline::Playback::Loop);
         for (size_t call = 0; call < calls; ++call) {
@@ -2173,12 +2201,14 @@ DamagedRun runDamaged(Device& device, const std::string& file, size_t calls) {
             run.shown.push_back(wallpaperx::testing::counterFromBgra(
                 wallpaperx::testing::reclaimAndReadback(device, targets, target), target.width, target.height));
         }
+        run.fromSetup = pipeline.softwareFromSetup();
     } catch (const wallpaperx::ResourceExhausted& e) {
         run.threw = e.what();
         run.exhausted = true;
     } catch (const std::exception& e) {
         run.threw = e.what();
     }
+    run.softwarePackets = g_softwarePacketsSent.load();
     return run;
 }
 
@@ -2246,6 +2276,7 @@ void runDamagedChecks(Device& device, const std::string& label, bool onDevice, c
                                 {"counter_ps_gap.mp4", 159, -1, 159, true},
                                 {"counter_gap_bf.mp4", 96, 120, -1, true, 94, true},
                                 {"counter_cut_start.ts", 60, 60, -1, true, kNoneShown, true},
+                                {"counter_lead_then_i.mp4", 150, 150, -1, true, kNoneShown, true},
                                 {"counter_hevc_gap.mp4", 99, -1, 95, true, 95, true},
                                 {"counter_cut_nonidr.mp4", 48, 150, -1, true, 48, true},
                                 {"counter_cut_cra.mp4", 48, 180, -1, true, 48, true}};
@@ -2283,7 +2314,8 @@ void runDamagedChecks(Device& device, const std::string& label, bool onDevice, c
         due.insert(due.end(), ids.begin(), ids.end());
         std::string kinds;
         for (const bool d : run.device) kinds += d ? 'D' : 'S';
-        std::printf("%s: %s: %zu shown over two passes; decoders %s\n", label.c_str(), f.file, run.shown.size(), kinds.c_str());
+        std::printf("%s: %s: %zu shown over two passes, %d packet(s) sent to software; decoders %s\n", label.c_str(),
+                    f.file, run.shown.size(), run.softwarePackets, kinds.c_str());
         if (!run.threw.empty() || run.shown != due || run.startsPass.size() != 2 * n || !run.startsPass[n]) {
             size_t first = 0;
             while (first < run.shown.size() && first < due.size() && run.shown[first] == due[first]) ++first;
@@ -2295,7 +2327,78 @@ void runDamagedChecks(Device& device, const std::string& label, bool onDevice, c
             continue;
         }
         ++graded;
+        // GOAL: S15.953 -- a lead-in that ends at a picture FFmpeg may show (counter_lead_then_i.mp4: B and P pictures,
+        //       then the non-IDR I 48 with no recovery-point SEI, the IDR at 150) is read past, rewound and sent as
+        //       before. In software every packet of the file is sent on every pass. False if a pass drops any.
+        // WHY-THIS-SHAPE: FFmpeg shows none of 39-149 here either way (its I-picture guess needs one reference; the
+        //       PPS declares three), so the drawn counters graded above cannot see the rewind; only the packets sent
+        //       can. On the device the rewind is not observable: the first non-IDR picture sent makes a stand-in, and
+        //       reopenInSoftware() rewinds to packet 1 itself. A lower bound: a resent packet only adds.
+        // CONTROL: control_batch.sh 2026-10-24 (T18d), restored, renderer/video/video_decoder.cpp skipUnshownLead()'s
+        //       rewind() deleted -> damaged_host and damaged_host_lavapipe "counter_lead_then_i.mp4: 515 packet(s) sent
+        //       ... at least 520 due"; renderer/video/reset_point.cpp h264UnitMayShow() not counting an I slice ->
+        //       damaged_host "... 300 packet(s) sent ...". Re-run 2026-10-24 (T19a) after the count moved to
+        //       readGopLayout(): the rewind deletion -> damaged_host "515 packet(s) sent ... at least 520 due".
+        if (!onDevice && std::strcmp(f.file, "counter_lead_then_i.mp4") == 0) {
+            const int packets = fixturePackets(asset(f.file)).count;
+            if (packets <= 0) {
+                std::fprintf(stderr, "FAIL: %s: %s: the harness could not count the file's packets\n", label.c_str(), f.file);
+                fail("the harness could not count the file's packets, which is not a verdict on the decoder");
+            } else if (run.softwarePackets < 2 * packets) {
+                std::fprintf(stderr, "FAIL: %s: %s: %d packet(s) sent to software over two passes, at least %d due "
+                             "(%d in the file, each pass)\n", label.c_str(), f.file, run.softwarePackets, 2 * packets, packets);
+                fail("a lead-in FFmpeg may show is read past, rewound and sent on every pass");
+            }
+        }
         if (!onDevice) continue;
+        // GOAL: S15.953 -- an H.264 stream whose lead-in FFmpeg never shows (counter_cut_start.ts: P and B pictures
+        //       up to an IDR) sends none of it to software, on either pass; the shown pictures are graded above.
+        // WHY-THIS-SHAPE: the skipped pictures are never shown, so the drawn counters cannot see them; the packets
+        //       sent to the decoder's software context are counted at avcodec_send_packet instead.
+        // CONTROL: control_batch.sh 2026-10-24 (T18b), reverted, renderer/video/video_decoder.cpp next(): the
+        //       skipUnshownLead() call given `&& false` -> "counter_cut_start.ts: 30 packet(s) sent to software over
+        //       two passes, 0 due"; re-run 2026-10-24 (T19a) with the lead read by readGopLayout(), same line.
+        // COVERAGE-ASSERT: the fixture must still hold packets before its first IDR (the reference reader over the file),
+        //       or there is no lead-in to skip and the 0 says nothing.
+        if (std::strcmp(f.file, "counter_cut_start.ts") == 0) {
+            const int lead = fixturePackets(asset(f.file)).lead;
+            const int due = 0;
+            if (lead <= 0) {
+                std::fprintf(stderr, "FAIL: %s: %s: no reset point found by the harness\n", label.c_str(), f.file);
+                fail("the harness could not count the packets before the first IDR, which is not a verdict on the decoder");
+            } else if (run.softwarePackets != due) {
+                std::fprintf(stderr, "FAIL: %s: %s: %d packet(s) sent to software over two passes, %d due\n",
+                             label.c_str(), f.file, run.softwarePackets, due);
+                fail("a lead-in FFmpeg never shows is sent to no decoder; one it may show is sent as before");
+            }
+        }
+        // GOAL: S15.953 -- a lead-in that ends at a picture FFmpeg may show (counter_lead_then_i.mp4: B and P pictures,
+        //       then the non-IDR I 48 with no recovery-point SEI, the IDR at 150) is not skipped on the device: each
+        //       pass makes a stand-in at its first non-IDR picture and sends the lead-in to software. False if both
+        //       passes skip the lead-in up to the IDR. Whether every pass sends all of it, and the rewind, are graded
+        //       only by the software check above: on the device reopenInSoftware() resends from packet 1 by design.
+        // WHY-THIS-SHAPE: the drawn counters cannot tell (FFmpeg shows none of 39-149 either way); only the packets
+        //       sent can. A lower bound tied to the file's own pre-IDR count, not equality: a later hand-back (graded
+        //       above, all-device) only adds software packets.
+        // CONTROL: control_batch.sh 2026-10-24 (T18d), restored, renderer/video/reset_point.cpp h264UnitMayShow() not
+        //       counting an I slice -> "counter_lead_then_i.mp4: 0 packet(s) of the lead-in sent ... at least 220 due";
+        //       re-run 2026-10-24 (T19a) with the lead read by readGopLayout() (110 before the IDR), same line.
+        //       Deleting skipUnshownLead()'s rewind() stays green here (see the software check above).
+        // COVERAGE-ASSERT: the lead count must be found (> 0); a fixture whose lead ended at the IDR would send 0
+        //       and go red here, not pass.
+        if (std::strcmp(f.file, "counter_lead_then_i.mp4") == 0) {
+            const int lead = fixturePackets(asset(f.file)).lead;
+            if (lead <= 0) {
+                std::fprintf(stderr, "FAIL: %s: %s: no reset point found by the harness\n", label.c_str(), f.file);
+                fail("the harness could not count the packets before the first IDR, which is not a verdict on the decoder");
+            } else if (run.softwarePackets < 2 * lead) {
+                std::fprintf(stderr,
+                             "FAIL: %s: %s: %d packet(s) of the lead-in sent to software over two passes, at least %d due "
+                             "(%d before the IDR, each pass)\n",
+                             label.c_str(), f.file, run.softwarePackets, 2 * lead, lead);
+                fail("a lead-in FFmpeg may show is read past, rewound and sent on every pass");
+            }
+        }
         // Index of picture number `id` in a pass.
         const auto at = [&](int id) {
             return static_cast<size_t>(std::find(ids.begin(), ids.end(), id) - ids.begin());
@@ -2891,6 +2994,109 @@ void runSwitchFailureChecks(Device& device, const std::string& label) {
     }
     runShortageAtDecodeChecks(device, label, file, ids);
     runUnansweredSwitchChecks(device, label, file);
+}
+
+// GOAL: S15.955 -- the opening is reported as refused (softwareFromSetup(), the daemon's "all") exactly when no picture
+//       of the stream reaches the device and nothing hands it back: the card refusing it (10-bit H.264, VP9), the first
+//       decoder's hardware setup failing (av_hwframe_ctx_init, or ffmpeg's own setup after the device's yes), or a
+//       refused second sequence header before the first picture (sps_late.ts). A failure on a switched decoder costs
+//       that pass only and is not reported so. False if any row below reads the other way.
+// WHY-THIS-SHAPE: graded on VideoPipeline::softwareFromSetup(), the value the daemon's report is read from, rather than
+//       over the bus: the setup failures can only be injected from a test binary's own interposers, and the daemon
+//       binary has none. Each injected or "after the yes" row first proves its condition was reached (injection
+//       consumed, a Vulkan frames context made, the first picture where the row needs it), else it fails as the
+//       harness's; without that a row whose failure never fires would pass as "not refused" or as a plain refusal.
+// CONTROL: control_batch.sh 2026-10-24 (T19b), RTX 3080 Ti, each alone, restored, video_pipeline_opening_report, in
+//       renderer/video/video_decoder.cpp: refuseAfterFailure() setting m_path instead of calling refuse() -> "...
+//       av_hwframe_ctx_init failing on the first decoder: reported as no picture reaching the card" and the same for
+//       "ffmpeg's setup failing after the device's yes"; choose() settling Accepted at the device's yes -> the
+//       sps_late.ts row and the "ffmpeg's setup failing" row. In renderer/video/video_decoder.h: refuse() never
+//       settling Refused -> all five rows.
+// COVERAGE-ASSERT: the rows graded are counted against the rows listed.
+void runOpeningReportChecks(Device& device, const std::string& label) {
+    if (device.info().videoDecodeOps == 0) {
+        std::printf("%s: %s decodes no video, so no opening can be refused -- not answerable here\n", label.c_str(),
+                    device.info().gpuName.c_str());
+        g_notVerified = true;
+        return;
+    }
+    if (!haveAsset("h264_10bit.mp4", label) || !haveAsset("sps_late.ts", label) || !haveAsset("h264_crop.mp4", label) ||
+        !haveAsset("counter_ps.h264", label)) {
+        return;
+    }
+    struct Row {
+        const char* name;
+        const char* file;
+        bool framesFail;   // av_hwframe_ctx_init fails in the constructor's decoder
+        bool sessionFail;  // ffmpeg's setup fails after the device's yes, in the constructor's decoder
+        bool yesFirst;     // the device must have accepted the stream's first headers
+    };
+    std::vector<Row> rows = {
+        {"10-bit H.264, refused by the card", "h264_10bit.mp4", false, false, false},
+        {"a refused second sequence header before the first picture", "sps_late.ts", false, false, true},
+        {"av_hwframe_ctx_init failing on the first decoder", "h264_crop.mp4", true, false, false},
+        {"ffmpeg's setup failing after the device's yes, on the first decoder", "h264_crop.mp4", false, true, true},
+    };
+#if WALLPAPERX_HAVE_VP9_FIXTURE
+    if (haveAsset("counter_vp9.webm", label)) rows.push_back({"VP9, refused by the card", "counter_vp9.webm", false, false, false});
+#else
+    std::printf("%s: VP9 not graded: this build's ffmpeg has no libvpx-vp9 encoder, so counter_vp9.webm is not "
+                "generated\n", label.c_str());
+#endif
+    int graded = 0;
+    for (const Row& row : rows) {
+        g_vulkanFramesMade = 0;
+        g_sessionsFailed = 0;
+        g_failNextSession = row.sessionFail;
+        const CountedRun c = runCountingCodecs(device, asset(row.file), 20, VK_SUCCESS, row.framesFail, false, false, 1);
+        g_failNextSession = false;
+        std::printf("%s: %s: frames contexts made %d, sessions failed %d, frames init injected %s; pictures %s; "
+                    "refused opening %s; threw '%s'\n",
+                    label.c_str(), row.name, g_vulkanFramesMade, g_sessionsFailed,
+                    row.framesFail ? (c.injected ? "yes" : "NO") : "-", c.kinds.c_str(), c.run.fromSetup ? "yes" : "no",
+                    c.run.threw.c_str());
+        const bool reached = c.run.threw.empty() && !c.kinds.empty() && c.kinds[0] == 'S' &&
+                             (!row.framesFail || c.injected) && (!row.sessionFail || g_sessionsFailed == 1) &&
+                             (!row.yesFirst || g_vulkanFramesMade >= 1);
+        if (!reached) {
+            std::fprintf(stderr, "FAIL: %s: %s: the case was not set up as it needs (see the counts above)\n",
+                         label.c_str(), row.name);
+            fail("an opening-report case did not reach its condition, which is not a verdict on the decoder");
+            continue;
+        }
+        ++graded;
+        check(c.run.fromSetup, label + ": " + row.name + ": reported as no picture reaching the card (\"all\")");
+    }
+    // COVERAGE-ASSERT: every row above was graded, not skipped as unreached.
+    check(graded == static_cast<int>(rows.size()), label + ": every opening row was graded (" +
+                                                      std::to_string(graded) + " of " + std::to_string(rows.size()) + ")");
+
+    // GOAL: S15.955, the other half -- the switch's fresh device decoder failing its setup after pictures came from
+    //       the device sends that pass to software and is NOT reported as "all".
+    // CONTROL: control_batch.sh 2026-10-24 (T19b), restored: refuse() (renderer/video/video_decoder.h) setting
+    //       m_opening = Refused unconditionally -> "...: a failure on a switched decoder is not reported as "all"".
+    //       Deleting only refuse()'s `!m_switched` stays green: here the first picture has already settled the
+    //       opening, and no fixture switches decoders before the first picture, so that guard alone is ungraded.
+    const std::filesystem::path path =
+        std::filesystem::temp_directory_path() / ("wpx_opening_" + std::to_string(getpid()) + ".flv");
+    struct Remove {
+        std::filesystem::path path;
+        ~Remove() { std::filesystem::remove(path); }
+    } remove{path};
+    const std::string file = wallpaperx::testing::buildLengthChangeFlv(asset("counter_ps.h264"), path, 4, 2);
+    if (file.empty()) {
+        fail("the switch fixture could not be built, which is not a verdict on the decoder");
+        return;
+    }
+    const CountedRun s = runCountingCodecs(device, file, 300, VK_SUCCESS, true);
+    std::printf("%s: switch's images context failing: injected %s; first picture %c; refused opening %s\n",
+                label.c_str(), s.injected ? "yes" : "no", s.kinds.empty() ? '-' : s.kinds[0],
+                s.run.fromSetup ? "yes" : "no");
+    if (!s.injected || s.kinds.empty() || s.kinds[0] != 'D' || s.kinds.find('S') == std::string::npos) {
+        fail("the switch-failure case did not reach a failing switched decoder, which is not a verdict on the decoder");
+        return;
+    }
+    check(!s.run.fromSetup, label + ": a failure on a switched decoder is not reported as \"all\"");
 }
 
 // GOAL: S15.173 -- a position past the end of the file -- the old position of a file since replaced in place
@@ -8455,6 +8661,26 @@ extern "C" void vkGetDeviceQueue(VkDevice device, uint32_t family, uint32_t inde
     real(device, family, index, queue);
 }
 
+namespace {
+PFN_vkCreateVideoSessionKHR g_realCreateSession = nullptr;
+VKAPI_ATTR VkResult VKAPI_CALL failingCreateSession(VkDevice device, const VkVideoSessionCreateInfoKHR* info,
+                                                    const VkAllocationCallbacks* allocator, VkVideoSessionKHR* session) {
+    if (std::exchange(g_failNextSession, false)) {
+        ++g_sessionsFailed;
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    return g_realCreateSession(device, info, allocator, session);
+}
+}  // namespace
+
+extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice device, const char* name) {
+    static const auto real = realSymbol<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");
+    const PFN_vkVoidFunction function = real(device, name);
+    if (function == nullptr || std::strcmp(name, "vkCreateVideoSessionKHR") != 0) return function;
+    g_realCreateSession = reinterpret_cast<PFN_vkCreateVideoSessionKHR>(function);
+    return reinterpret_cast<PFN_vkVoidFunction>(&failingCreateSession);
+}
+
 extern "C" int av_hwframe_ctx_init(AVBufferRef* ref) {
     static const auto real = realSymbol<int (*)(AVBufferRef*)>("av_hwframe_ctx_init");
     auto* frames = reinterpret_cast<AVHWFramesContext*>(ref->data);
@@ -8471,7 +8697,9 @@ extern "C" int av_hwframe_ctx_init(AVBufferRef* ref) {
         g_hookedPools.push_back(HookedPool{frames, frames->free, g_pools.size() - 1, g_poolGeneration});
         frames->free = &onPoolFreed;
     }
-    return real(ref);
+    const int err = real(ref);
+    if (err >= 0 && frames->format == AV_PIX_FMT_VULKAN) ++g_vulkanFramesMade;
+    return err;
 }
 
 extern "C" int avcodec_receive_frame(AVCodecContext* context, AVFrame* frame) {
@@ -8636,6 +8864,10 @@ extern "C" int avcodec_send_packet(AVCodecContext* context, const AVPacket* pack
     if (g_inFailingCall && packet != nullptr && isDecodersContext(context) && context->hw_device_ctx == nullptr &&
         g_refuseFrom > 0 && pass >= g_refuseFrom && pass <= g_refuseThrough) {
         return AVERROR_INVALIDDATA;
+    }
+    if (g_recordPictures && packet != nullptr && packet->data != nullptr && isDecodersContext(context) &&
+        context->hw_device_ctx == nullptr) {
+        g_softwarePacketsSent.fetch_add(1, std::memory_order_relaxed);
     }
     const int err = real(context, packet);
     if (g_logTraffic && packet != nullptr && err != AVERROR(EAGAIN) && isDecodersContext(context)) {
@@ -9102,7 +9334,7 @@ int main(int argc, char** argv) {
         "bounded-decode-device", "bounded-decode-host", "decode-thread-depth", "decode-thread-pending",
         "decode-thread-failure", "decode-thread-catch-up", "decode-thread-hidden", "decode-thread-software",
         "decode-thread-alloc", "decode-thread-left-running", "decode-thread-pools", "decode-thread-resume", "decode-thread-start-read", "device-completed-off-thread",
-        "device-queue-flags", "damaged-device", "damaged-device-no-inline", "damaged-host"};
+        "device-queue-flags", "damaged-device", "damaged-device-no-inline", "damaged-host", "opening-report"};
     if (std::find(modes.begin(), modes.end(), mode) == modes.end()) {
         std::fprintf(stderr, "usage: %s <mode>, one of:", argv[0]);
         for (const std::string& m : modes) std::fprintf(stderr, " %s", m.c_str());
@@ -9139,8 +9371,8 @@ int main(int argc, char** argv) {
                                mode == "resume-drop-count" || mode == "shape-device" || mode == "loop-device" ||
                                mode == "loop-cost-device" || mode == "loop-resume" || mode == "start-at-device" ||
                                mode == "decode-thread-hidden" || mode == "damaged-device" ||
-                               mode == "damaged-device-no-inline";
-    g_hideVideoMaintenance2 = mode == "damaged-device-no-inline";
+                               mode == "damaged-device-no-inline" || mode == "opening-report";
+    g_hideVideoMaintenance2 = mode == "damaged-device-no-inline" || mode == "opening-report";
 
     g_recordQueues = mode == "device-queue-flags";
     if (mode == "decode-thread-left-running") {
@@ -9343,6 +9575,7 @@ int main(int argc, char** argv) {
                              runSwitchFailureChecks(device, label);
                              runRewindResetChecks(device, label);
                          }
+                         if (mode == "opening-report") runOpeningReportChecks(device, label);
                          if (mode == "start-at-device-av1") runAv1StartChecks(device, label);
                          if (mode == "start-at-host-open-gop") {
                              for (const char* file : {"counter_opengop.ts", "counter_opengop_hevc.ts", "counter_opengop.mp4",

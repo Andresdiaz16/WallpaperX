@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
 struct AVCodecParameters;
 struct AVPacket;
@@ -59,5 +60,20 @@ bool changesParameterSets(const CodecHeader& header, const AVPacket& packet);
 // with: changesExtradata(), or an SPS, PPS or VPS unit that is not one of the extradata's byte for byte.
 // A packet whose units cannot all be read gives none: ffmpeg rejects the whole packet.
 bool beyondExtradata(const CodecHeader& header, const AVPacket& packet);
+
+// Hands `unit` each NAL unit, header included, until it returns true: of `packet` laid out as `header` says, or
+// of `header`'s own extradata. False when the extradata's layout cannot be read or a length runs past the
+// bytes. H.264 and HEVC only; false for any other codec.
+using NalUnit = std::function<bool(const uint8_t* unit, size_t size)>;
+bool eachPacketUnit(const CodecHeader& header, const AVPacket& packet, const NalUnit& unit);
+bool eachExtradataUnit(const CodecHeader& header, const NalUnit& unit);
+
+// Whether an H.264 decoder that has met no IDR since it was opened or flushed can be spared `packet` without a
+// picture it outputs changing, provided an IDR follows before any packet this is false for: it holds no IDR, I or
+// SI slice and no recovery point SEI, and gives no parameter set beyond `header`. FFmpeg 9.0.2 outputs a picture
+// only from the first of those on -- an I picture can be its unmarked random access point -- and decodes an IDR
+// from nothing before it. Data partitions, which FFmpeg does not decode, count as slices. False for any other codec
+// and for a packet whose units cannot all be read.
+bool neverShownBeforeReset(const CodecHeader& header, const AVPacket& packet);
 
 }

@@ -1538,8 +1538,9 @@ void runPlayingRecordRules() {
 // WHY-THIS-SHAPE: one planted file, each entry under its own path, so which entries came back names which
 //       guard held. Each bad value is one that a plain get<T>() narrows to something valid (4294967297 and
 //       -4294967295 to monitor 1), so a missing guard shows as an entry kept, not as garbage.
-// CONTROL: per check below, in readNumber / readResumeRecord (backend/daemon/resume_record.cpp), via
-//       control_batch.sh 2026-10-23, each alone, reverted.
+// CONTROL: per check below, in readNumber (backend/daemon/record_file.h, shared with the scan record) or
+//       readResumeRecord (backend/daemon/resume_record.cpp), via control_batch.sh 2026-10-23, each alone,
+//       reverted; the three readNumber breaks re-run 2026-10-24 (G5) in record_file.h, the same lines.
 // COVERAGE-ASSERT: the valid entry must come back with every value, so a reader that drops everything fails.
 void runResumeRecordRanges() {
     constexpr const char* kGoals = "S15.947 (the resume-record reader's ranges)";

@@ -58,6 +58,15 @@ struct DaemonStatus {
     QSet<int> occupied;
     // Ids holding a wallpaper.
     QSet<int> wallpapers;
+    // How much of a video the daemon decodes on the processor, and the file it holds; for the ids whose video it
+    // decodes some of on the processor, by a state this app knows.
+    struct OnProcessor {
+        enum class Share { Parts, All };
+        QString path;
+        Share share = Share::Parts;
+        bool operator==(const OnProcessor&) const = default;
+    };
+    QHash<int, OnProcessor> onProcessor;
     // A monitor's pause mode; nullopt for one a newer daemon wrote that this one does not apply.
     // A monitor with no entry plays.
     QHash<int, std::optional<QString>> pauseModes;
@@ -143,7 +152,7 @@ public:
 
 public slots:
     // Reads GetStatus again; a reply to an earlier read is then discarded. Also run on the daemon's
-    // PersistenceChanged.
+    // PersistenceChanged and ProcessorDecodingChanged.
     void refresh();
 
 public:

@@ -46,6 +46,7 @@ ApplyController::ApplyController(KScreenClient& kscreen, LibraryManager& library
         endLiveUnlessOpen();
         emit blockedReasonChanged();
         emit applyChanged();
+        emit processorNoticeChanged();
     });
     connect(&m_library, &LibraryManager::propertyValuesChanged, this, &ApplyController::sendLive);
     connect(&m_daemon, &DaemonClient::serviceStarted, this, [this] {
@@ -62,8 +63,10 @@ ApplyController::ApplyController(KScreenClient& kscreen, LibraryManager& library
         emit pauseChanged();
         emit screenSoundChanged();
         emit screenFrameRateChanged();
+        emit processorNoticeChanged();
     });
     connect(&m_daemon, &DaemonClient::statusChanged, this, &ApplyController::frameRateNoticeChanged);
+    connect(&m_daemon, &DaemonClient::statusChanged, this, &ApplyController::processorNoticeChanged);
 }
 
 QString ApplyController::applyMessage() const
@@ -226,6 +229,26 @@ QString ApplyController::frameRateNotice() const
     return tr("Your screens refresh at most %1 times a second. Pictures above that can't be shown — they only cost "
               "power and memory — so WallpaperX plays at your screen's rate. You can keep a higher rate anyway.")
         .arg(above->fastest);
+}
+
+QString ApplyController::processorNotice() const
+{
+    const DaemonStatus& status = m_daemon.status();
+    const auto monitorId = status.outputs.constFind(m_kscreen.selectedOutput());
+    const QString assetPath = m_library.selectedWallpaper().assetPath;
+    if (m_daemon.state() != DaemonClient::State::Ready || monitorId == status.outputs.cend() || assetPath.isEmpty()) {
+        return {};
+    }
+    const auto use = status.onProcessor.constFind(*monitorId);
+    if (use == status.onProcessor.cend() || use->path != assetPath) {
+        return {};
+    }
+    if (use->share == DaemonStatus::OnProcessor::Share::All) {
+        return tr("Your graphics card can't decode this video, so WallpaperX will use the processor for all of it, "
+                  "which costs more power.");
+    }
+    return tr("Parts of this video can't be played by your graphics card, so WallpaperX will use the processor for "
+              "them, which costs more power. Re-saving the video with a video editor usually fixes this.");
 }
 
 void ApplyController::changeGlobalSetting(Change& change, ChangeSignal changed, const QVariant& value,

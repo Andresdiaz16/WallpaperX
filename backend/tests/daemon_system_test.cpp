@@ -3080,7 +3080,8 @@ void checkLossDuringFailedStart(const std::string& validationEnv, const std::str
 // CONTROL: in backend/daemon/main.cpp, `service.renderRestored();` moved above
 //       `manager.recordStartingVideos();` -> "FAIL: a death in a restored video's playback names
 //       that video" ("there is no readable playing record") and "FAIL: and the signal it died of".
-//       Observed 2026-09-22 on NVIDIA. Reverted.
+//       Observed 2026-09-22 on NVIDIA. Reverted. Re-run 2026-10-24 (G5) with startRestoredScans() between
+//       them (the break moves renderRestored() above all three): the same two lines; restored.
 // COVERAGE-ASSERT: the daemon must have died of the staged fault, its line present, or NOT VERIFIED.
 void checkTheRestoredVideoIsPostedAfterTheRecordOpens(const std::string& validationEnv, const std::string& clip,
                                                       const Check& check) {
@@ -5649,6 +5650,221 @@ void checkConfigPreservationOwnership(NameWatcher& names, const std::string& val
     awaitNameRelease(names, "the phase after the config-preservation phase");
 }
 
+// GOAL: S15.954 -- a process that loses the name request leaves the running daemon's scan record
+//       (processor-scans.json in the shared state directory) byte for byte as it was.
+// WHY-THIS-SHAPE: the duplicate is given a config with no video, so a startRestoredScans() run before
+//       the claim would delete the record synchronously; a duplicate restoring a video would only
+//       rewrite it once a scan ended, which may be after it has already exited, and grade a race.
+//       The record's bytes are planted by this test after the first daemon is up, since that daemon,
+//       with no video either, removes any record at its own start.
+// CONTROL: control_batch.sh 2026-10-24 (T18c), --phase '^scanRecordOwnership$', reverted:
+//       a `service.startRestoredScans();` call added above `connection->requestName(...)` in
+//       backend/daemon/main.cpp -> "FAIL: S15.954 a daemon that lost the name request leaves the scan
+//       record exactly as it found it". Re-run 2026-10-24 (G5) after startRestoredScans() was rewritten: the
+//       same line; restored.
+void checkScanRecordOwnership(NameWatcher& names, const std::string& validationEnv, const Check& check) {
+    constexpr const char* kGoal = "S15.954 (the scan record is never written before the bus name is held)";
+    ScratchDir home("scanowner");
+    if (!home.ok()) throw ScratchDirectoryLost("a scratch directory could not be created");
+    std::error_code ec;
+    const std::filesystem::path stateHome = home.path() / "state";
+    const std::filesystem::path record = stateHome / "wallpaperx" / "processor-scans.json";
+    std::filesystem::create_directories(home.path() / "first", ec);
+    std::filesystem::create_directories(home.path() / "second", ec);
+    const std::string stateEnv = "XDG_STATE_HOME=" + stateHome.string();
+
+    SpawnedDaemon first({validationEnv, "XDG_CONFIG_HOME=" + (home.path() / "first").string(), stateEnv});
+    if (!names.waitFor(true)) {
+        if (!reportedStartupFault(first, kGoal)) notVerified(kGoal, "the first daemon never acquired the bus name");
+        return;
+    }
+    // The name appears before the claimed block runs, and that block removes a record no video
+    // claims: planting before it ends would grade the first daemon's own removal.
+    if (!first.waitForOutput("serving io.wallpaperx.Daemon", std::chrono::seconds(10))) {
+        notVerified(kGoal, "the first daemon never said it was serving, so its own start may still remove the record");
+        first.shutdown(SIGTERM);
+        awaitNameRelease(names, "the phase after the scan-record ownership phase");
+        return;
+    }
+    const std::string planted = "{\"planted by\":\"daemon_system_test\"}";
+    std::filesystem::create_directories(record.parent_path(), ec);
+    if (!writeTextFile(record, planted) || readTextFile(record) != planted) {
+        notVerified(kGoal, "the scan record this phase guards could not be written");
+    } else {
+        SpawnedDaemon second({validationEnv, "XDG_CONFIG_HOME=" + (home.path() / "second").string(), stateEnv});
+        const int secondExit = second.waitForExit();
+        if (!reportedStartupFault(second, kGoal)) {
+            check(second.exitedNormally() && secondExit != 0,
+                  "the duplicate instance this phase needs did lose the name request");
+            const bool present = std::filesystem::exists(record, ec);
+            const std::string onDisk = present ? readTextFile(record) : std::string();
+            check(onDisk == planted,
+                  "S15.954 a daemon that lost the name request leaves the scan record exactly as it found it");
+            if (onDisk != planted) {
+                std::fprintf(stderr, "  processor-scans.json now %s\n",
+                             present ? ("holds: " + onDisk).c_str() : "is gone");
+            }
+        }
+    }
+    first.shutdown(SIGTERM);
+    awaitNameRelease(names, "the phase after the scan-record ownership phase");
+}
+
+// The processor_decoding state GetStatus reports, once settled, for each fixture.
+struct DecodingRow {
+    const char* file;
+    const char* want;
+};
+
+// GOAL: S15.952 over the bus -- GetStatus reports processor_decoding "all" for a stream the device
+//       refused at setup (10-bit H.264, VP9), "parts" for a file with a missing reference or a cut
+//       start, "none" for a healthy file and for an H.264 TS cut mid-group whose lead-in is never
+//       shown; and ProcessorDecodingChanged fires as those answers arrive.
+// WHY-THIS-SHAPE: the real daemon on the test bus, one monitor per file, read only once every row
+//       has left "checking" -- a state read earlier would grade the scheduler. The wait wakes on the
+//       signal and re-reads every 500 ms as a stated fallback, so a missing signal fails the signal
+//       check below rather than stalling the states. Two senders owe one signal per monitor each: the
+//       first picture and the scan answer (no file is shown twice, so neither is skipped), hence
+//       2 x rows. Counted after a wait of its own: an 'all' or first_picture row settles before its
+//       scan has answered, so the count at settling would grade the scheduler.
+// CONTROL: control_batch.sh 2026-10-24 (T18c), --phase '^processorDecodingOverBus$', each reverted:
+//       VideoDecoder::softwareFromSetup() (renderer/video/video_decoder.h) returning false -> "...'all' for
+//       h264_10bit.mp4" and "...'all' for counter_vp9.webm", both got parts "first_picture" (re-run G5, the
+//       same two). Rewritten for refuse() and re-run 2026-10-24 (G5), renderer/video/video_decoder.cpp:
+//       attachHardwareFrames()'s unnamed-refusal `refuse(Path::SoftwareRefused)` made a bare m_path store ->
+//       the h264_10bit.mp4 line alone; openDecoder()'s `refuse(Path::SoftwareCodec)` likewise -> the
+//       counter_vp9.webm line alone. noteFirstPictureLocked()'s Software mapped to SoftwareThroughout
+//       (backend/daemon/wallpaper_manager.cpp) -> "...'parts' for counter_cut_nonidr.mp4", got all;
+//       processorDecoding()'s missing_reference reason disabled (backend/daemon/processor_check.cpp) ->
+//       "...'parts' for counter_gap.mp4", got none; noteFirstPictureLocked() always false -> "...settles
+//       within 30 s" and the four all/none rows, got checking. control_batch.sh 2026-10-24 (T19a), same
+//       phase, each reverted: the emitSignal in announceProcessorDecodingChanged()
+//       (backend/daemon/dbus_service.cpp) skipped -> "FAIL: S15.952 ProcessorDecodingChanged fires for every
+//       monitor's first picture and every monitor's scan answer", "0 signal(s) in 30 s, at least 12 due";
+//       recordScan()'s `m_processorNotice();` (backend/daemon/wallpaper_manager.cpp) deleted -> the same
+//       line, "6 signal(s) in 30 s, at least 12 due". NOT RED (G5, 2026-10-24):
+//       refuse()'s `!m_switched` dropped (renderer/video/video_decoder.h) -- no fixture here switches codec
+//       before its first picture, so that guard is ungraded here. The counter_vp9.webm half is graded only where the build
+//       generates that fixture (WALLPAPERX_HAVE_VP9_FIXTURE).
+void checkProcessorDecodingOverBus(NameWatcher& names, const std::string& validationEnv, const Check& check) {
+    constexpr const char* kGoal = "S15.952 (GetStatus reports processor_decoding per wallpaper)";
+    std::vector<DecodingRow> rows = {{"h264_10bit.mp4", "all"},       {"counter_gap.mp4", "parts"},
+                                     {"counter_cut_nonidr.mp4", "parts"}, {"counter_cut_start.ts", "none"},
+                                     {"counter_long.mp4", "none"}};
+    // GOAL: a build without the optional VP9 encoder grades every other row and leaves the entry's result
+    //       visible; a VP9 fixture missing although the build generates it is still NOT VERIFIED.
+    // WHY-THIS-SHAPE: keyed on the build's own recipe, not on the file's absence, which would also hide a
+    //       fixture that failed to generate.
+    // CONTROL: by hand, 2026-10-24 (T19a), each restored: WALLPAPERX_HAVE_VP9_FIXTURE forced to 0 in
+    //       backend/CMakeLists.txt -> "VP9 'all' is not graded ...", entry Passed, not Skipped; with it 1,
+    //       counter_vp9.webm moved aside -> "NOT VERIFIED -- ... counter_vp9.webm was not generated", Skipped.
+    if (WALLPAPERX_HAVE_VP9_FIXTURE) {
+        rows.push_back({"counter_vp9.webm", "all"});
+    } else {
+        std::printf("daemon_system_test: VP9 'all' is not graded: this build's ffmpeg has no libvpx-vp9 encoder, so "
+                    "counter_vp9.webm is not generated\n");
+    }
+    const int kRows = static_cast<int>(rows.size());
+    int kHealthy = -1;
+    for (int id = 0; id < kRows; ++id) {
+        if (std::string_view(rows[id].file) == "counter_long.mp4") kHealthy = id;
+    }
+    std::error_code ec;
+    for (const DecodingRow& row : rows) {
+        const std::string path = std::string(WALLPAPERX_RENDERER_VIDEO_ASSET_DIR) + "/" + row.file;
+        if (!std::filesystem::exists(path, ec)) {
+            notVerified(kGoal, "the fixture " + path + " was not generated");
+            return;
+        }
+    }
+
+    SpawnedDaemon daemon({validationEnv});
+    if (!names.waitFor(true)) {
+        if (!reportedStartupFault(daemon, kGoal)) notVerified(kGoal, "the daemon never acquired the bus name");
+        return;
+    }
+    struct Signals {
+        std::mutex mutex;
+        std::condition_variable wake;
+        int count = 0;
+    } signals;
+    {
+        auto proxy =
+            sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
+        proxy->uponSignal("ProcessorDecodingChanged").onInterface(DbusService::kInterface).call([&signals] {
+            {
+                std::lock_guard<std::mutex> lock(signals.mutex);
+                ++signals.count;
+            }
+            signals.wake.notify_all();
+        });
+        bool set = true;
+        for (int id = 0; id < kRows; ++id) {
+            try {
+                setWallpaper(*proxy, "video", std::string(WALLPAPERX_RENDERER_VIDEO_ASSET_DIR) + "/" + rows[id].file, id);
+            } catch (const sdbus::Error& e) {
+                check(false, (std::string("SetWallpaper accepts ") + rows[id].file).c_str());
+                std::fprintf(stderr, "  %s: %s\n", e.getName().c_str(), e.getMessage().c_str());
+                set = false;
+            }
+        }
+        std::vector<std::string> got(kRows);
+        bool settled = false;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (set) {
+            int seen = 0;
+            {
+                std::lock_guard<std::mutex> lock(signals.mutex);
+                seen = signals.count;
+            }
+            const StatusReply status = getStatusOrExplain(*proxy);
+            settled = status.ok();
+            for (int id = 0; id < kRows && status.ok(); ++id) {
+                const nlohmann::json* entry = wallpaperStatus(status, std::to_string(id));
+                const bool has = entry != nullptr && entry->contains("processor_decoding") &&
+                                 (*entry)["processor_decoding"].is_object();
+                got[id] = has ? (*entry)["processor_decoding"].value("state", std::string("(no state)"))
+                              : std::string("(absent)");
+                if (has) {
+                    for (const auto& reason : (*entry)["processor_decoding"].value("reasons", nlohmann::json::array())) {
+                        got[id] += " " + reason.dump();
+                    }
+                }
+                if (got[id] == "checking" || !has) settled = false;
+            }
+            if (settled || std::chrono::steady_clock::now() >= deadline) break;
+            std::unique_lock<std::mutex> lock(signals.mutex);
+            signals.wake.wait_for(lock, std::chrono::milliseconds(500), [&] { return signals.count != seen; });
+        }
+        if (set) {
+            check(settled, "S15.952 every monitor's processor_decoding settles within 30 s");
+            if (settled && got[kHealthy] == "all") {
+                notVerified(kGoal, "this device decodes nothing on the card (a healthy file reports 'all')");
+            } else {
+                for (int id = 0; id < kRows; ++id) {
+                    const std::string state = got[id].substr(0, got[id].find(' '));
+                    const std::string what =
+                        std::string("S15.952 GetStatus reports '") + rows[id].want + "' for " + rows[id].file;
+                    check(state == rows[id].want, what.c_str());
+                    if (state != rows[id].want) std::fprintf(stderr, "  got: %s\n", got[id].c_str());
+                }
+                const int owed = 2 * kRows;
+                int count = 0;
+                {
+                    std::unique_lock<std::mutex> lock(signals.mutex);
+                    signals.wake.wait_for(lock, std::chrono::seconds(30), [&] { return signals.count >= owed; });
+                    count = signals.count;
+                }
+                check(count >= owed, "S15.952 ProcessorDecodingChanged fires for every monitor's first picture and "
+                                     "every monitor's scan answer");
+                if (count < owed) std::fprintf(stderr, "  %d signal(s) in 30 s, at least %d due\n", count, owed);
+            }
+        }
+    }
+    daemon.shutdown(SIGTERM);
+    awaitNameRelease(names, "the phase after the processor-decoding phase");
+}
+
 void checkRepairWrittenAfterPreservation(NameWatcher& names, const std::string& validationEnv, const Check& check) {
     constexpr const char* kGoals = "S8.23 with S10.14 (a start that both copies its config aside and repairs it "
                                    "preserves the bytes it was given, then writes the repair)";
@@ -6616,6 +6832,7 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
 int main(int argc, char** argv) {
     if (argc > 1 && std::string_view(argv[1]) == kReaderMode) return readBlueFrameChild(argc, argv);
     wallpaperx::testing::g_testName = "daemon_system_test";
+    const bool cardDecodes = !(argc > 1 && std::string_view(argv[1]) == "--no-card-decode");
 
     // S14.9, graded in name_watcher.h. First, before the scratch-directory probe and the config
     // witness, so a refused run spawns nothing and touches no file; one guard rather than a check
@@ -7102,6 +7319,17 @@ int main(int argc, char** argv) {
         phase("restoredVideoIsPostedAfterTheRecordOpens", [&] {
             checkTheRestoredVideoIsPostedAfterTheRecordOpens(validationEnv, wedgeClip, check);
         });
+        phase("scanRecordOwnership", [&] { checkScanRecordOwnership(names, validationEnv, check); });
+        // GOAL: S15.952 over the bus is graded on the real-card entry; an entry whose device has no video decode
+        //       (Lavapipe, which CMake runs with --no-card-decode) skips this phase by name and runs every other.
+        // WHY-THIS-SHAPE: there every stream reports 'all', so the phase could only answer NOT VERIFIED, which
+        //       turns the whole entry Skipped and hides every other phase's pass. Not a check of the daemon.
+        if (cardDecodes) {
+            phase("processorDecodingOverBus", [&] { checkProcessorDecodingOverBus(names, validationEnv, check); });
+        } else {
+            std::printf("daemon_system_test: processorDecodingOverBus not run: this entry's device decodes no video "
+                        "(--no-card-decode)\n");
+        }
 
         // Every Frame's UnixFd closes at scope exit, and the daemon is gone, so this
         // process must be back where it started. A descriptor leaked per GetFrame is

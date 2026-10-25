@@ -9,6 +9,7 @@
 #include "log_escape.h"
 #include "renderers/static_renderer.h"
 #include "resume_record.h"
+#include "scan_record.h"
 #include "video/video_pipeline.h"
 #include "vulkan/device.h"
 #include "wallpaper_file.h"
@@ -274,7 +275,10 @@ WallpaperManager::WallpaperManager(Config config)
               work();
           },
           // A parked session's lifetime rests on its sound being there, which only a round reads.
-          [this] { wakeClock(); })) {
+          [this] { wakeClock(); })),
+      m_processorCheck([this](int monitorId, uint64_t wallpaperSeq, ProcessorCheck::Found found) {
+          recordScan(monitorId, wallpaperSeq, std::move(found));
+      }) {
     if (!m_store.enabled()) {
         // Ok, not Fail: this feeds a worst-wins aggregate, so Fail would make every daemon
         // that never opted in report itself broken.
@@ -642,6 +646,7 @@ void WallpaperManager::ensureGpu() {
         m_gpuStatus.name = m_device->info().gpuName;
         m_gpuStatus.descriptorTier = toString(m_device->descriptorTier());
         m_gpuStatus.frameSync = m_device->info().hasExternalSemaphoreFd;
+        m_gpuStatus.videoInlineParameters = m_device->videoInlineParameters();
     }
     recordHealth(&DaemonHealth::gpu, HealthStatus::Ok,
                  m_gpuStatus.name + " (" + m_gpuStatus.descriptorTier + ")");
@@ -1341,8 +1346,14 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
     }
     if (refusal) throw InvalidRequest(describeRejection(kComponent, *refusal, sanitizeForLog(path)));
 
+    uint64_t wallpaperSeq = 0;
+    const bool video = drawableType(type) == Drawable::Clip;
+    const std::optional<FileIdentity> now = video ? fileIdentityOf(path) : std::nullopt;
+    std::optional<FileScan> known;
     {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        // Before the swap below, while every monitor's answer still belongs to the path it names.
+        if (video) known = knownScanLocked(path, now);
 
         // All or nothing, so an error reply means nothing changed: the wallpaper is swapped in to
         // build its save, and swapped back if queueing that throws.
@@ -1373,6 +1384,8 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
         ++state.wallpaperSeq;
         state.lastError.clear();
         state.quarantined = false;
+        wallpaperSeq = state.wallpaperSeq;
+        state.processorUse = ProcessorUse{wallpaperSeq, ProcessorUse::Scanning{known}};
 
         // Cleared before the render, not after a failure. Whatever happens next, the frame
         // this monitor currently holds no longer matches the request just recorded, and
@@ -1393,6 +1406,12 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
 
     // Any request, whatever it names: it is a new statement about this monitor.
     m_playing.clear(monitorId);
+
+    if (video) {
+        checkVideo(monitorId, wallpaperSeq, path, std::move(known));
+    } else {
+        m_processorCheck.forget(monitorId);
+    }
 
     // Outside the lock, and before the render: what the user asked for is worth keeping
     // whether or not it turns out to draw. The no-answer wait, which cannot throw: the change is
@@ -1943,6 +1962,38 @@ void WallpaperManager::applyPersistOutcomeLocked(DaemonHealth& health) const {
                : HealthStatus::Ok,
            keptDetail(base));
 }
+
+void WallpaperManager::startRestoredScans(const std::vector<int>& monitorIds) {
+    std::map<std::string, FileScan> saved;
+    for (SavedScan& scan : readScanRecord(m_config.stateDir)) {
+        saved.insert_or_assign(std::move(scan.path), FileScan{scan.found, scan.file});
+    }
+    struct Video {
+        int monitorId;
+        uint64_t wallpaperSeq;
+        std::string path;
+        std::optional<FileScan> saved;
+    };
+    std::vector<Video> videos;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        for (const int monitorId : monitorIds) {
+            const auto it = m_monitors.find(monitorId);
+            if (it == m_monitors.end()) continue;
+            MonitorState& state = it->second;
+            // Not a video nothing may decode.
+            if (drawableType(state.type) != Drawable::Clip || state.quarantined) continue;
+            const auto entry = saved.find(state.path);
+            Video& video = videos.emplace_back(Video{monitorId, state.wallpaperSeq, state.path,
+                                                     entry != saved.end() ? std::optional(entry->second) : std::nullopt});
+            state.processorUse = ProcessorUse{state.wallpaperSeq, ProcessorUse::Scanning{video.saved}};
+        }
+    }
+    // Otherwise the first scan to end rewrites the record without the entries no video claimed.
+    if (videos.empty()) removeScanRecord(m_config.stateDir);
+    for (Video& video : videos) checkVideo(video.monitorId, video.wallpaperSeq, video.path, std::move(video.saved));
+}
+
 std::vector<int> WallpaperManager::restoreSaved() {
     std::vector<int> monitorIds;
     std::vector<PersistedWallpaper> pending;
@@ -2344,14 +2395,6 @@ std::vector<int> WallpaperManager::restoreSaved() {
     // yet to copy aside. main() writes it once both are settled.
     if (repaired) m_repair = configToWriteLocked();
     return monitorIds;
-}
-
-std::optional<WallpaperManager::FileIdentity> WallpaperManager::fileIdentityOf(const std::string& path) {
-    struct stat st {};
-    if (::stat(path.c_str(), &st) != 0) return std::nullopt;
-    return FileIdentity{static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino),
-                        static_cast<int64_t>(st.st_size),
-                        static_cast<int64_t>(st.st_mtim.tv_sec) * 1'000'000'000 + st.st_mtim.tv_nsec};
 }
 
 void WallpaperManager::blameFirstMember(VideoSession& session) noexcept {
@@ -3181,6 +3224,113 @@ uint64_t WallpaperManager::commitFrameLocked(MonitorState& state, const Offscree
     return state.generation;
 }
 
+bool WallpaperManager::noteFirstPictureLocked(MonitorState& state, const VideoPipeline& pipeline) {
+    using FirstPicture = ProcessorUse::FirstPicture;
+    ProcessorUse& use = state.processorUse;
+    if (use.forSeq != state.wallpaperSeq || use.firstPicture) return false;
+    use.firstPicture = !pipeline.shownFromSoftware()  ? FirstPicture::Device
+                       : pipeline.softwareFromSetup() ? FirstPicture::SoftwareThroughout
+                                                      : FirstPicture::Software;
+    return true;
+}
+
+const FileScan* WallpaperManager::heldScanLocked(const MonitorState& state) {
+    const ProcessorUse& use = state.processorUse;
+    if (drawableType(state.type) != Drawable::Clip || use.forSeq != state.wallpaperSeq) return nullptr;
+    const FileScan* held = std::get_if<FileScan>(&use.scan);
+    if (const auto* scanning = std::get_if<ProcessorUse::Scanning>(&use.scan); scanning && scanning->previous) {
+        held = &*scanning->previous;
+    }
+    return held != nullptr && held->file ? held : nullptr;
+}
+
+std::optional<FileScan> WallpaperManager::knownScanLocked(const std::string& path,
+                                                          const std::optional<FileIdentity>& now) const {
+    for (const auto& [monitorId, state] : m_monitors) {
+        const FileScan* held = heldScanLocked(state);
+        if (held != nullptr && state.path == path && held->foundFor(now)) return *held;
+    }
+    return std::nullopt;
+}
+
+// A request is committed by the time this runs, so nothing here may throw: a scan not started is a scan failed.
+void WallpaperManager::checkVideo(int monitorId, uint64_t wallpaperSeq, const std::string& path,
+                                   std::optional<FileScan> saved) noexcept {
+    try {
+        m_processorCheck.check(monitorId, wallpaperSeq, path, playingBlameLine(monitorId, path), std::move(saved));
+        return;
+    } catch (...) {
+    }
+    try {
+        recordScan(monitorId, wallpaperSeq, std::string("it could not be queued"));
+    } catch (...) {
+    }
+}
+
+void WallpaperManager::recordScan(int monitorId, uint64_t wallpaperSeq, ProcessorCheck::Found found) {
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        const auto it = m_monitors.find(monitorId);
+        if (it == m_monitors.end() || it->second.wallpaperSeq != wallpaperSeq ||
+            it->second.processorUse.forSeq != wallpaperSeq) {
+            return;
+        }
+        ProcessorUse& use = it->second.processorUse;
+        if (const auto* scanned = std::get_if<FileScan>(&found)) {
+            use.scan = *scanned;
+        } else {
+            use.scan = ProcessorUse::ScanFailed{};
+        }
+    }
+    if (const auto* why = std::get_if<std::string>(&found)) {
+        std::fprintf(stderr, "wallpaperx-daemon: monitor %d: could not tell whether the processor decodes parts of "
+                             "its video: %s\n", monitorId, sanitizeForLog(*why, 1024).c_str());
+    }
+    saveScans();
+    m_processorNotice();
+}
+
+void WallpaperManager::saveScans() {
+    if (m_config.stateDir.empty()) return;
+    std::lock_guard<std::mutex> recordLock(m_scanRecordMutex);
+    struct Held {
+        FileScan scan;
+        bool own;  // the scan's answer, not one carried while it runs
+    };
+    std::multimap<std::string, Held> held;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        for (const auto& [monitorId, state] : m_monitors) {
+            if (const FileScan* scan = heldScanLocked(state)) {
+                held.emplace(state.path, Held{*scan, std::holds_alternative<FileScan>(state.processorUse.scan)});
+            }
+        }
+    }
+    // Asked outside m_stateMutex, and only of a path held more than once.
+    std::vector<SavedScan> scans;
+    for (auto first = held.begin(); first != held.end();) {
+        const auto [begin, end] = held.equal_range(first->first);
+        const std::optional<FileIdentity> now =
+            std::next(begin) != end ? fileIdentityOf(begin->first) : std::nullopt;
+        // One found for the bytes the path names now, else a scan's own over one carried.
+        const auto rank = [&now](const Held& h) { return (h.scan.foundFor(now) ? 2 : 0) + (h.own ? 1 : 0); };
+        auto kept = begin;
+        for (auto it = std::next(begin); it != end; ++it) {
+            if (rank(it->second) > rank(kept->second)) kept = it;
+        }
+        scans.push_back(SavedScan{kept->first, *kept->second.scan.file, kept->second.scan.found});
+        first = end;
+    }
+    if (scans.empty()) {
+        removeScanRecord(m_config.stateDir);
+        return;
+    }
+    if (const std::string why = writeScanRecord(m_config.stateDir, scans); !why.empty()) {
+        std::fprintf(stderr, "wallpaperx-daemon: the processor check's answers were not saved: %s\n",
+                     sanitizeForLog(why, 1024).c_str());
+    }
+}
+
 bool WallpaperManager::relaidOnlySince(const MonitorState& state, uint64_t seq) {
     return state.relaid.to == state.requestSeq && state.relaid.from <= seq && seq < state.requestSeq;
 }
@@ -3707,6 +3857,7 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(uint64_t sessio
         playedClean.reserve(screens.size());
         bool anyTarget = false;
         bool drew = false;
+        bool firstPicture = false;
         for (const Screen& screen : screens) {
             if (!screen.playing) continue;
             // Keeps its picture through those it does not draw: the loop above kept every picture some
@@ -3737,6 +3888,7 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(uint64_t sessio
             const Placement drawnWith = placement(it->second.properties);
             session.pipeline->draw(*m_targets, *target, drawnWith);
             const uint64_t generation = commitFrameLocked(it->second, *target, drawnWith);
+            firstPicture = noteFirstPictureLocked(it->second, *session.pipeline) || firstPicture;
             if (delivered) {
                 m_health.gpu = std::move(*delivered);
                 delivered.reset();
@@ -3753,6 +3905,7 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(uint64_t sessio
             drew = true;
         }
         drawing.reset();
+        if (firstPicture) m_processorNotice();
         // No screen had a free image: the picture waits one interval. `now`, not nothing, when every
         // screen stopped playing meanwhile: a session that stops here has nothing else scheduled to
         // start its idle countdown.
@@ -4137,6 +4290,7 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
     if (failure) tearDownFailed();
 
     bool committed = false;
+    bool firstPicture = false;
     uint64_t generation = 0;
     {
         // Held across the submit deliberately: the submit is what makes this image the
@@ -4200,6 +4354,7 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
         } else if (!keepsFrame) {
             committed = true;
             generation = commitFrameLocked(it->second, *target, drawnWith);
+            if (*kind == Drawable::Clip) firstPicture = noteFirstPictureLocked(it->second, *clip->pipeline);
             // A render asked for and delivered is the GPU working, so it clears a failure an
             // earlier one recorded, with the detail ensureGpu() records. Here and not in the
             // commit helper: a video's pictures commit many times a second, unasked, which would
@@ -4214,6 +4369,7 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
     if (failure) tearDownFailed();
     still.reset();
     applying.reset();
+    if (firstPicture) m_processorNotice();
 
     if (failure) {
         // Outside the state lock: destroying a target waits for device idle, which has
@@ -4482,6 +4638,11 @@ WallpaperManager::Snapshot WallpaperManager::snapshot() const {
         }
         entry.targetSize = targetSizeLocked(monitorId);
         entry.targetSizeReported = reportedSizeLocked(monitorId).has_value();
+        if (drawableType(state.type) == Drawable::Clip && state.processorUse.forSeq == state.wallpaperSeq) {
+            entry.processorDecoding = processorDecoding(
+                state.processorUse,
+                m_gpuStatus.initialized ? std::optional(m_gpuStatus.videoInlineParameters) : std::nullopt);
+        }
         out.monitors.emplace(monitorId, std::move(entry));
     }
     out.outputs = m_outputs;

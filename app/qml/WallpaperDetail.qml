@@ -367,6 +367,13 @@ Item {
                         ? root.applier.blockedReason
                         : root.applier.applyMessage
                 }
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    textFormat: Text.PlainText
+                    visible: text !== ""
+                    text: root.applier.processorNotice
+                }
             }
         }
     }

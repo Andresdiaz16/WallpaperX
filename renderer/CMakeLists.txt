@@ -94,6 +94,7 @@ add_library(wallpaperx-renderer STATIC
     video/ffmpeg_file.cpp
     video/video_decoder.cpp
     video/reset_point.cpp
+    video/software_scan.cpp
     video/frame_converter.cpp
     video/picture_source.cpp
     video/decode_ahead.cpp
@@ -679,8 +680,11 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
     list(APPEND WALLPAPERX_VIDEO_ASSETS ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_hevc_src.mp4)
     # Derived by stream copy: output|input options|input|output options. A cut start drops the first 45
     # packets, so the stream begins inside a group; -copyinkf keeps the non-key packets that lead it.
+    # counter_lead_then_i.mp4 starts on P and B pictures (packets 0-39 dropped) that end at the non-IDR I 48, with
+    # every SEI removed, so no recovery point marks it: a lead-in ffmpeg may show, through to the IDR at 150.
     foreach(DERIVED
             "counter_cut_start.ts||counter_cut_src.ts|-copyinkf -bsf:v noise=drop=not(trunc(n/45)) -f mpegts"
+            "counter_lead_then_i.mp4||counter_nonidr_src.mp4|-bsf:v noise=drop=not(trunc(n/40)),filter_units=remove_types=6"
             "counter_hevc_gap.mp4||counter_hevc_src.mp4|-bsf:v noise=drop=not(n-97)"
             "counter_cut_nonidr.mp4|-ss 1.6|counter_nonidr_src.mp4|"
             "counter_cra_a_cut.mp4|-ss 1.6|counter_cra_a.mp4|")
@@ -713,6 +717,26 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         VERBATIM
     )
     list(APPEND WALLPAPERX_VIDEO_ASSETS ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_cut_cra.mp4)
+    # A refused second sequence header before the first picture: two 8-bit High pictures the decoder holds back
+    # for reordering, then 10-bit High 10, as two transport streams joined end to end.
+    add_custom_command(
+        OUTPUT ${WALLPAPERX_VIDEO_ASSET_DIR}/sps_late_a.ts
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error -f lavfi -i testsrc2=size=320x240:rate=30 -frames:v 2
+                -c:v libx264 -pix_fmt yuv420p -profile:v high -bf 2 -f mpegts ${WALLPAPERX_VIDEO_ASSET_DIR}/sps_late_a.ts
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error -f lavfi -i testsrc2=size=320x240:rate=30:duration=2
+                -c:v libx264 -pix_fmt yuv420p10le -profile:v high10 -output_ts_offset 0.2 -f mpegts
+                ${WALLPAPERX_VIDEO_ASSET_DIR}/sps_late_b.ts
+        COMMENT "Generating video fixture parts sps_late_a.ts, sps_late_b.ts"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT ${WALLPAPERX_VIDEO_ASSET_DIR}/sps_late.ts
+        COMMAND ${CMAKE_COMMAND} -E cat ${WALLPAPERX_VIDEO_ASSET_DIR}/sps_late_a.ts ${WALLPAPERX_VIDEO_ASSET_DIR}/sps_late_b.ts
+                > ${WALLPAPERX_VIDEO_ASSET_DIR}/sps_late.ts
+        DEPENDS ${WALLPAPERX_VIDEO_ASSET_DIR}/sps_late_a.ts
+        COMMENT "Generating video fixture sps_late.ts"
+    )
+    list(APPEND WALLPAPERX_VIDEO_ASSETS ${WALLPAPERX_VIDEO_ASSET_DIR}/sps_late.ts)
     add_custom_target(wallpaperx-video-fixtures DEPENDS ${WALLPAPERX_VIDEO_ASSETS})
 else()
     message(STATUS "  ffmpeg CLI: not found -- video decoder fixtures are not generated and "
@@ -786,7 +810,8 @@ target_link_libraries(wallpaperx-video-pipeline-probe PRIVATE wallpaperx-rendere
 set_target_properties(wallpaperx-video-pipeline-probe PROPERTIES ENABLE_EXPORTS ON)
 target_compile_definitions(wallpaperx-video-pipeline-probe PRIVATE
     WALLPAPERX_VIDEO_ASSET_DIR="${WALLPAPERX_VIDEO_ASSET_DIR}"
-    WALLPAPERX_SHADER_DIR="${SHADER_OUTPUT_DIR}")
+    WALLPAPERX_SHADER_DIR="${SHADER_OUTPUT_DIR}"
+    WALLPAPERX_HAVE_VP9_FIXTURE=$<IF:$<BOOL:${WALLPAPERX_VP9_RECIPES}>,1,0>)
 add_dependencies(wallpaperx-video-pipeline-probe wallpaperx-shaders)
 if(WALLPAPERX_FFMPEG_EXECUTABLE)
     add_dependencies(wallpaperx-video-pipeline-probe wallpaperx-video-fixtures)
@@ -989,7 +1014,7 @@ set(WALLPAPERX_PIPELINE_MODES sequence-device sequence-host resume-timestamps re
     start-at-device-budget start-at-device-av1 bounded-decode-device bounded-decode-host
     decode-thread-depth decode-thread-pending decode-thread-failure decode-thread-catch-up decode-thread-hidden
     decode-thread-software decode-thread-alloc decode-thread-left-running decode-thread-pools decode-thread-resume
-    decode-thread-start-read device-completed-off-thread device-queue-flags damaged-device damaged-device-no-inline damaged-host)
+    decode-thread-start-read device-completed-off-thread device-queue-flags damaged-device damaged-device-no-inline damaged-host opening-report)
 foreach(MODE ${WALLPAPERX_PIPELINE_MODES})
     string(REPLACE "-" "_" MODE_NAME "${MODE}")
     wallpaperx_add_test(NAME video_pipeline_${MODE_NAME} COMMAND wallpaperx-video-pipeline-probe ${MODE})

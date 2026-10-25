@@ -72,6 +72,9 @@ class ApplyController : public QObject {
     // While frameRateAboveScreens and keeping a higher rate is off, why those screens play at their
     // refresh rate; else empty.
     Q_PROPERTY(QString frameRateNotice READ frameRateNotice NOTIFY frameRateNoticeChanged)
+    // While the selected screen shows the wallpaper open in the library and the daemon decodes parts or all of it on
+    // the processor, a sentence saying so; else empty.
+    Q_PROPERTY(QString processorNotice READ processorNotice NOTIFY processorNoticeChanged)
 
 public:
     // Idle: nothing asked yet. Working: a request is running; another is not accepted. Done and
@@ -107,6 +110,7 @@ public:
     QVariant pendingKeepHigher() const { return pendingOf(m_keepHigher); }
     bool frameRateAboveScreens() const { return screensAboveRefresh().has_value(); }
     QString frameRateNotice() const;
+    QString processorNotice() const;
 
     // Does nothing while blockedReason() is not empty or an Apply is running.
     Q_INVOKABLE void apply();
@@ -139,6 +143,7 @@ signals:
     void screenFrameRateChanged();
     void keepHigherChanged();
     void frameRateNoticeChanged();
+    void processorNoticeChanged();
 
 private:
     // A setting change, one at a time per setting: how the last one went, the connector it was for

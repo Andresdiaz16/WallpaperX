@@ -110,6 +110,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -135,6 +136,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -230,27 +232,41 @@ public:
     }
 
     // True when this open was recorded. Cheap when unarmed: one relaxed load, which is what every
-    // open on every thread of this process pays.
-    bool opened(int fd, const char* path) {
+    // open on every thread of this process pays. `byScan` sets the processor-decoding scan's opens
+    // apart (see t_scanThread): it reads each file once beside the decoder, and none of the counts
+    // or the live set here is about it.
+    bool opened(int fd, const char* path, bool byScan) {
         if (!m_armed.load(std::memory_order_relaxed) || path == nullptr || fd < 0) return false;
         std::lock_guard<std::mutex> lock(m_mutex);
         const auto watched = m_watched.find(path);
         if (watched == m_watched.end()) return false;
+        if (byScan) {
+            m_scanLive[fd] = *watched;
+            ++m_scanOpens;
+            return true;
+        }
         m_live[fd] = *watched;
         ++m_opens[*watched];
         return true;
     }
 
-    // The path `fd` was opened on, or empty for a descriptor this ledger never saw.
+    // The path `fd` was opened on, or empty for a descriptor this ledger never saw or the scan opened.
     std::string closing(int fd) {
         if (!m_armed.load(std::memory_order_relaxed) || fd < 0) return {};
         std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_scanLive.erase(fd) != 0) return {};
         const auto it = m_live.find(fd);
         if (it == m_live.end()) return {};
         std::string path = it->second;
         m_live.erase(it);
         ++m_closes[path];
         return path;
+    }
+
+    // Opens of a watched file by the scan's thread since this process started; never reset.
+    int scanOpens() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_scanOpens;
     }
 
     void resetCounts() {
@@ -288,6 +304,8 @@ private:
     mutable std::mutex m_mutex;
     std::set<std::string> m_watched;
     std::map<int, std::string> m_live;
+    std::map<int, std::string> m_scanLive;
+    int m_scanOpens = 0;
     std::map<std::string, int> m_opens;
     std::map<std::string, int> m_closes;
 };
@@ -735,6 +753,66 @@ static bool calledFromSanitizer(const void* returnAddress) { return g_sanitizerR
 static constexpr bool calledFromSanitizer(const void*) { return false; }
 #endif
 
+// The processor-decoding scan's thread (backend/daemon/processor_check.cpp's lowerPriority()) is the one
+// thread that sets itself to nice 19, before it opens anything. Marked from that call, the scan's
+// read of each file is kept out of the ledger's counts and the close gate, and staged open failures
+// are left for the decoder they are aimed at.
+thread_local bool t_scanThread = false;
+
+extern "C" int setpriority(__priority_which_t which, id_t who, int prio) noexcept {
+    using Fn = int (*)(__priority_which_t, id_t, int);
+    static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "setpriority"));
+    if (which == PRIO_PROCESS && prio == 19 && (who == 0 || who == static_cast<id_t>(::gettid()))) t_scanThread = true;
+    return real == nullptr ? -1 : real(which, who, prio);
+}
+
+// Holds the scan thread inside its open() of one armed path until released, so a phase can queue
+// work behind a scan that provably has not finished. Bounded: an unreleased hold gives up after
+// 20 s and says so through expired().
+class ScanOpenGate {
+public:
+    void arm(const std::string& path) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_path = path;
+        m_held = m_released = m_expired = false;
+        m_armed.store(true, std::memory_order_release);
+    }
+    bool waitHeld(std::chrono::milliseconds within) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_wake.wait_for(lock, within, [this] { return m_held; });
+    }
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_released = true;
+            m_armed.store(false, std::memory_order_release);
+        }
+        m_wake.notify_all();
+    }
+    bool expired() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_expired;
+    }
+    void pass(const char* path) {
+        if (!m_armed.load(std::memory_order_acquire) || path == nullptr) return;
+        std::unique_lock<std::mutex> lock(m_mutex);
+        if (m_released || m_path != path) return;
+        m_held = true;
+        m_wake.notify_all();
+        if (!m_wake.wait_for(lock, std::chrono::seconds(20), [this] { return m_released; })) m_expired = true;
+    }
+
+private:
+    std::atomic<bool> m_armed{false};
+    mutable std::mutex m_mutex;
+    std::condition_variable m_wake;
+    std::string m_path;
+    bool m_held = false;
+    bool m_released = false;
+    bool m_expired = false;
+};
+ScanOpenGate g_scanOpenGate;
+
 // The daemon opens a wallpaper file itself, through openWallpaperFile(), and closes that
 // descriptor as the last step of a session's teardown. These two hooks are where the ledger and
 // the close gate see it.
@@ -755,7 +833,7 @@ extern "C" int open(const char* path, int flags, ...) {
         va_end(args);
     }
     if (calledFromSanitizer(__builtin_return_address(0))) return real(path, flags, mode);
-    if (const int error = g_openFailure.failureFor(path); error != 0) {
+    if (const int error = t_scanThread ? 0 : g_openFailure.failureFor(path); error != 0) {
         errno = error;
         return -1;
     }
@@ -768,8 +846,9 @@ extern "C" int open(const char* path, int flags, ...) {
         }
         if (!table.empty()) return real(table.c_str(), flags, mode);
     }
+    if (t_scanThread) g_scanOpenGate.pass(path);
     const int fd = real(path, flags, mode);
-    if (fd >= 0 && g_files.opened(fd, path)) t_lastWallpaperOpened = path;
+    if (fd >= 0 && g_files.opened(fd, path, t_scanThread)) t_lastWallpaperOpened = path;
     return fd;
 }
 
@@ -1958,6 +2037,14 @@ void runSessionChecks(const WallpaperManager::Config& config, const std::vector<
     }
     // What gives every "opens nothing" below its meaning: the same hooks, on the same thread, see
     // this pass open and decode.
+    // GOAL: the counts here are the decoder's alone: the processor-decoding scan's own read of each file
+    //       (t_scanThread) is neither counted as a session's open nor taken for a resident session.
+    // WHY-THIS-SHAPE: told apart by the thread, not by waiting for the scan: it runs at idle priority on its
+    //       own schedule, so a wait would be a bound on the scheduler, and a scan that never opened would pass.
+    // CONTROL: control_batch.sh 2026-10-24 (T18a), --phase '^session$', reverted: lowerPriority()'s setpriority
+    //       deleted (backend/daemon/processor_check.cpp) -> this line red, "committed, 2 open(s), 1 close(s), 3
+    //       packet(s)", and the ninth-video lines. Test-side, by hand, restored: every watched open filed as the
+    //       scan's -> this line and eight more red, "0 open(s)".
     reportUnless(first.opens == 1 && first.decodes > 0,
                  "a monitor's first video pass opens its file and decodes a picture (the counters work)",
                  describe(first));
@@ -8330,6 +8417,10 @@ constexpr int kBlameChildSetupFailed = 4;
                 manager.setOutputVisible("DP-BLAME", false);
                 // Two: the request's own open is a shortage it accepts, the render's is the one
                 // that frees a session to try again.
+                // GOAL: both staged shortages land on the request's and the render's opens, never on the scan's.
+                // CONTROL: test-side, by hand, 2026-10-24 (T18a), restored: the open hook's `t_scanThread ? 0 :`
+                //       removed -> the scan logs "SoftwareScan: the daemon has run out of file descriptors" and
+                //       the phase reports "NOT VERIFIED -- S13.190 ... the 'evict' child never reached ...".
                 g_openFailure.arm(extra, EMFILE, 2);
                 manager.requestWallpaper("video", extra, extraMonitor);
                 worker.post(extraMonitor);
@@ -12157,6 +12248,291 @@ void runPauseRejoinChecks(const WallpaperManager::Config& base) {
     }
 }
 
+// Counts onProcessorDecodingChanged() calls, so a wait for a scan's answer wakes on the notice.
+class ScanNotices {
+public:
+    void attach(WallpaperManager& manager) {
+        manager.onProcessorDecodingChanged([this] {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                ++m_count;
+            }
+            m_wake.notify_all();
+        });
+    }
+    // Returns once monitorId reports "parts". The notice is the wake-up; the 200 ms re-read is a stated
+    // fallback so a missing notice cannot stall this.
+    // WHY-THIS-SHAPE: no deadline of its own. The scan runs at nice 19 in the idle I/O class, so any fixed
+    //       bound grades host load; an answer that never comes hangs the phase into its ctest TIMEOUT, which
+    //       is red, and the line printed every 10 s names what it was waiting for.
+    // CONTROL: test-side, by hand, 2026-10-24 (T19a), restored: the first wait aimed at monitor 99, which has
+    //       no wallpaper, run under `ctest --timeout 45` -> "processorScan: still waiting for monitor 99 to report
+    //       parts (a first scan) after 10 s" (and 20, 30, 40 s), then "***Timeout", Failed.
+    void waitParts(const WallpaperManager& manager, int monitorId, const char* what) {
+        const auto start = std::chrono::steady_clock::now();
+        auto nextNote = start + std::chrono::seconds(10);
+        for (;;) {
+            uint64_t seen = 0;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                seen = m_count;
+            }
+            const std::optional<wallpaperx::MonitorStatus> status = monitorStatus(manager, monitorId);
+            if (status && status->processorDecoding &&
+                status->processorDecoding->state == wallpaperx::ProcessorDecoding::Parts) {
+                return;
+            }
+            if (const auto now = std::chrono::steady_clock::now(); now >= nextNote) {
+                std::fprintf(stderr, "processorScan: still waiting for monitor %d to report parts (%s) after %lld s\n",
+                             monitorId, what,
+                             static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(now - start).count()));
+                nextNote = now + std::chrono::seconds(10);
+            }
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_wake.wait_for(lock, std::chrono::milliseconds(200), [&] { return m_count != seen; });
+        }
+    }
+
+private:
+    std::mutex m_mutex;
+    std::condition_variable m_wake;
+    uint64_t m_count = 0;
+};
+
+// S15.954 in the manager: a scan answer is reused, not read again, on a re-apply, for another screen and after a
+// restart, and a non-video wallpaper withdraws the screen's queued scan. Every file is a copy of counter_gap.mp4,
+// whose scan answer alone ("missing reference") makes the screen report "parts", so no render is needed.
+void runProcessorScanChecks(const WallpaperManager::Config& base, const std::string& still) {
+    const char* kGoals = "S15.954 (scan answers are reused for an unchanged file without reading it)";
+    const std::string gapFixture =
+        (std::filesystem::path(WALLPAPERX_COUNTER_VIDEO).parent_path() / "counter_gap.mp4").string();
+    std::error_code ec;
+    if (!std::filesystem::exists(gapFixture, ec)) {
+        notVerified(kGoals, "the fixture " + gapFixture + " was not generated");
+        return;
+    }
+    const wallpaperx::testing::ScratchDir scratch("processorscan");
+    if (!scratch.ok()) {
+        notVerified(kGoals, "no scratch directory could be created for the state and config");
+        return;
+    }
+    const auto copyOf = [&](const char* name) {
+        const std::string path = (scratch.path() / name).string();
+        std::filesystem::copy_file(gapFixture, path, std::filesystem::copy_options::overwrite_existing);
+        g_files.watch(path);
+        return path;
+    };
+    const std::string shown = copyOf("scan_shown.mp4");
+    WallpaperManager::Config config = base;
+    config.stateDir = scratch.path() / "state";
+    config.configFile = scratch.path() / "config.json";
+    std::filesystem::create_directories(config.stateDir, ec);
+    constexpr int kScreen = 0, kOther = 1, kHeld = 2, kQueued = 3, kSentinel = 4;
+    const auto parts = [](ScanNotices& notices, const WallpaperManager& manager, int id, const char* what) {
+        notices.waitParts(manager, id, what);
+    };
+
+    {
+        ScanNotices notices;
+        WallpaperManager first(config);
+        notices.attach(first);
+        const int before = g_files.scanOpens();
+        first.requestWallpaper("video", shown, kScreen);
+        parts(notices, first, kScreen, "a first scan");
+        // COVERAGE-ASSERT: the scan's opens are counted, so every "0 reads" below can fail. Test-side control, by hand,
+        //       2026-10-24 (T18c), restored: FileLedger::opened()'s `++m_scanOpens` removed -> this NOT VERIFIED,
+        //       "0 scan open(s)", ctest Skipped.
+        if (g_files.scanOpens() - before != 1) {
+            notVerified(kGoals, "a first scan was not seen reading its file (" +
+                                    std::to_string(g_files.scanOpens() - before) + " scan open(s)); the reads below "
+                                    "cannot be counted");
+            return;
+        }
+    }
+
+    {
+        ScanNotices notices;
+        WallpaperManager second(config);
+        notices.attach(second);
+        const int before = g_files.scanOpens();
+        // GOAL: S15.954 -- after a restart the answer comes from the saved record: the unchanged file is not read.
+        // WHY-THIS-SHAPE: a fresh manager, so no in-memory answer or per-path cache can stand in for the record;
+        //       counted after the screen reports "parts", which only the finished scan job sets.
+        // CONTROL: control_batch.sh 2026-10-24 (T18c), --phase '^processorScan$', reverted: startRestoredScans()
+        //       (backend/daemon/wallpaper_manager.cpp) handing every video std::nullopt instead of its record entry
+        //       -> "FAIL: S15.954 after a restart the scan answer comes from the saved record, not a read".
+        //       heldScanLocked() never returning an answer (nothing is saved) -> the same line, and the two below.
+        //       Both re-run 2026-10-24 (G5) after startRestoredScans() and heldScanLocked() changed: the same lines.
+        const std::vector<int> restored = second.restoreSaved();
+        second.startRestoredScans(restored);
+        parts(notices, second, kScreen, "a restored screen");
+        const int reads = g_files.scanOpens() - before;
+        reportUnless(reads == 0, "S15.954 after a restart the scan answer comes from the saved record, not a read",
+                     std::to_string(reads) + " read(s)");
+
+
+        // GOAL: S15.954 -- re-applying the same unchanged video reuses its answer (knownScanLocked) instead of
+        //       reading the file again.
+        // WHY-THIS-SHAPE: right after a restore, whose answer came from the record and so is not in the scan
+        //       thread's per-path cache of files it read: only the request's own reuse can save the read here.
+        // CONTROL: control_batch.sh 2026-10-24 (T18c), --phase '^processorScan$', reverted: knownScanLocked()
+        //       (backend/daemon/wallpaper_manager.cpp) never returning an answer -> "FAIL: S15.954 re-applying the
+        //       same unchanged video reuses its scan answer, no read", and the other-screen line below. Re-run
+        //       2026-10-24 (G5) on knownScanLocked(path, now): the same two lines.
+        const int beforeReapply = g_files.scanOpens();
+        second.requestWallpaper("video", shown, kScreen);
+        parts(notices, second, kScreen, "a re-applied screen");
+        const int reapplyReads = g_files.scanOpens() - beforeReapply;
+        reportUnless(reapplyReads == 0, "S15.954 re-applying the same unchanged video reuses its scan answer, no read",
+                     std::to_string(reapplyReads) + " read(s)");
+
+    }
+
+    {
+        ScanNotices notices;
+        WallpaperManager third(config);
+        notices.attach(third);
+        const std::vector<int> restored = third.restoreSaved();
+        third.startRestoredScans(restored);
+        parts(notices, third, kScreen, "a restored screen, third start");
+        // GOAL: S15.954 -- another screen given the same unchanged file reuses the answer a screen holds
+        //       (heldScanLocked through knownScanLocked) instead of reading it.
+        // WHY-THIS-SHAPE: again right after a restore, for the cache reason above.
+        // CONTROL: control_batch.sh 2026-10-24 (T18c), --phase '^processorScan$', reverted: knownScanLocked()'s
+        //       `state.path == path` (backend/daemon/wallpaper_manager.cpp) made `!=` -> "FAIL: S15.954 another screen
+        //       on the same unchanged file reuses the answer, no read" (and the re-apply line above). Re-run
+        //       2026-10-24 (G5) on the foundFor(now) form: the same two lines.
+        const int before = g_files.scanOpens();
+        third.requestWallpaper("video", shown, kOther);
+        parts(notices, third, kOther, "a second screen");
+        const int reads = g_files.scanOpens() - before;
+        reportUnless(reads == 0, "S15.954 another screen on the same unchanged file reuses the answer, no read",
+                     std::to_string(reads) + " read(s)");
+
+
+        // GOAL: S15.954 -- a non-video wallpaper given to a screen withdraws its scan: a queued scan of its old
+        //       video never reads the file.
+        // WHY-THIS-SHAPE: the scan thread is held inside its open() of another file (g_scanOpenGate), so the
+        //       withdrawn scan is provably still queued when the still is applied; a sentinel scan queued after
+        //       it is the barrier, since the one scan thread works its queue in order.
+        // CONTROL: control_batch.sh 2026-10-24 (T18c), --phase '^processorScan$', reverted: requestWallpaper()'s
+        //       `m_processorCheck.forget(monitorId);` (backend/daemon/wallpaper_manager.cpp) deleted -> "FAIL:
+        //       S15.954 a non-video wallpaper withdraws the screen's queued scan: it never reads". Re-run
+        //       2026-10-24 (G5) after requestWallpaper() changed: the same line.
+        const std::string held = copyOf("scan_held.mp4");
+        const std::string queued = copyOf("scan_queued.mp4");
+        const std::string sentinel = copyOf("scan_sentinel.mp4");
+        const int beforeCancel = g_files.scanOpens();
+        g_scanOpenGate.arm(held);
+        third.requestWallpaper("video", held, kHeld);
+        if (!g_scanOpenGate.waitHeld(std::chrono::seconds(10))) {
+            g_scanOpenGate.release();
+            notVerified("S15.954 (a non-video wallpaper withdraws the screen's scan)",
+                        "the scan thread never reached its open of the held file");
+            return;
+        }
+        third.requestWallpaper("video", queued, kQueued);
+        third.requestWallpaper("static", still, kQueued);
+        third.requestWallpaper("video", sentinel, kSentinel);
+        g_scanOpenGate.release();
+        if (g_scanOpenGate.expired()) {
+            notVerified("S15.954 (a non-video wallpaper withdraws the screen's scan)", "the held open timed out");
+            return;
+        }
+        parts(notices, third, kSentinel, "the sentinel scan");
+        const int cancelReads = g_files.scanOpens() - beforeCancel;
+        reportUnless(cancelReads == 2, "S15.954 a non-video wallpaper withdraws the screen's queued scan: it never reads",
+                     std::to_string(cancelReads) + " read(s), 2 due (the held and the sentinel file)");
+
+    }
+}
+
+// S15.956: two screens on one file whose bytes were replaced. Every file is a copy of counter_gap.mp4, so a scan answer
+// alone makes a screen report "parts", and the replacement has a new identity (a new inode) with the same content.
+void runSharedScanChecks(const WallpaperManager::Config& base) {
+    const char* kGoal = "S15.956 (the scan answer for the file as it is now wins)";
+    const std::string gapFixture =
+        (std::filesystem::path(WALLPAPERX_COUNTER_VIDEO).parent_path() / "counter_gap.mp4").string();
+    std::error_code ec;
+    if (!std::filesystem::exists(gapFixture, ec)) {
+        notVerified(kGoal, "the fixture " + gapFixture + " was not generated");
+        return;
+    }
+    const wallpaperx::testing::ScratchDir scratch("sharedscan");
+    if (!scratch.ok()) {
+        notVerified(kGoal, "no scratch directory could be created for the state and config");
+        return;
+    }
+    const std::string path = (scratch.path() / "shared.mp4").string();
+    std::filesystem::copy_file(gapFixture, path, ec);
+    g_files.watch(path);
+    WallpaperManager::Config config = base;
+    config.stateDir = scratch.path() / "state";
+    config.configFile = scratch.path() / "config.json";
+    std::filesystem::create_directories(config.stateDir, ec);
+    // The stale answer sits on the lower id, which every per-path walk visits first.
+    constexpr int kStale = 0, kFresh = 1;
+
+    {
+        ScanNotices notices;
+        WallpaperManager first(config);
+        notices.attach(first);
+        first.requestWallpaper("video", path, kStale);
+        notices.waitParts(first, kStale, "the first screen's scan");
+        first.requestWallpaper("video", path, kFresh);
+        notices.waitParts(first, kFresh, "the second screen");
+
+        const std::string next = path + ".next";
+        std::filesystem::copy_file(gapFixture, next, ec);
+        std::filesystem::rename(next, path, ec);
+        struct stat after {};
+        if (ec || ::stat(path.c_str(), &after) != 0) {
+            notVerified(kGoal, "the shared file could not be replaced");
+            return;
+        }
+
+        // GOAL: S15.956 -- a screen re-applied to the replaced file is answered by reading it, never by the stale
+        //       answer the other screen holds. False if that answer is handed out and used.
+        // WHY-THIS-SHAPE: counted reads, not the status while the scan runs: GetStatus never shows an answer carried
+        //       into a scan, so a status check here cannot fail. Two guards keep the stale answer out --
+        //       knownScanLocked()'s identity filter and the scan's own identity check of what it is handed -- and a
+        //       read is what both missing would remove.
+        // CONTROL: control_batch.sh 2026-10-24 (T19b), --phase '^processorScanShared$', restored:
+        //       knownScanLocked()'s foundFor(now) made `true` (backend/daemon/wallpaper_manager.cpp) together with
+        //       ProcessorCheck::run()'s `before == job.saved->file` made `true` (backend/daemon/processor_check.cpp)
+        //       -> "FAIL: S15.956 a screen re-applied to a replaced file is answered by reading it". Either alone
+        //       stays green: the other guard still forces the read.
+        const int before = g_files.scanOpens();
+        first.requestWallpaper("video", path, kFresh);
+        notices.waitParts(first, kFresh, "the re-applied screen");
+        const int reads = g_files.scanOpens() - before;
+        std::printf("processorScanShared: the re-applied screen's answer took %d read(s) of the replaced file\n", reads);
+        reportUnless(reads == 1, "S15.956 a screen re-applied to a replaced file is answered by reading it, not by the "
+                                 "stale answer another screen holds",
+                     std::to_string(reads) + " read(s), 1 due");
+        if (reads != 1) return;
+    }
+
+    // GOAL: S15.956 -- the saved record keeps the answer for the file as it is now: a restart answers both screens
+    //       from it without reading the file.
+    // WHY-THIS-SHAPE: graded by a restart's reads rather than by parsing processor-scans.json: a stale entry fails the
+    //       scan's identity check and costs exactly the read counted here, and the record's layout stays its own.
+    // CONTROL: control_batch.sh 2026-10-24 (T19b), --phase '^processorScanShared$', restored: saveScans()'s rank
+    //       without its foundFor(now) term (backend/daemon/wallpaper_manager.cpp) -> "FAIL: S15.956 the saved scan
+    //       answer is the one for the file as it is now: a restart reads nothing".
+    ScanNotices notices;
+    WallpaperManager second(config);
+    notices.attach(second);
+    const int before = g_files.scanOpens();
+    second.startRestoredScans(second.restoreSaved());
+    notices.waitParts(second, kStale, "a restored screen");
+    notices.waitParts(second, kFresh, "the other restored screen");
+    const int reads = g_files.scanOpens() - before;
+    std::printf("processorScanShared: the restart read the file %d time(s)\n", reads);
+    reportUnless(reads == 0, "S15.956 the saved scan answer is the one for the file as it is now: a restart reads nothing",
+                 std::to_string(reads) + " read(s)");
+}
+
 // S15.820-S15.824: screens showing one file at one speed share one decoder. Every pass and clock round
 // runs on this thread with no worker, so the file ledger counts only what this function drove.
 void runDecodeOnceChecks(const WallpaperManager::Config& base, const std::string& clip, const std::string& onePicture) {
@@ -12192,6 +12568,10 @@ void runDecodeOnceChecks(const WallpaperManager::Config& base, const std::string
         notVerified(kGoals, "the first video render on this host produced no frame");
         return;
     }
+    // GOAL: as in the session phase -- the scan's read of each file is not counted as a decoder's open.
+    // CONTROL: control_batch.sh 2026-10-24 (T18a), --phase '^decodeOnce$', reverted: lowerPriority()'s setpriority
+    //       deleted (backend/daemon/processor_check.cpp) -> this line red, "committed, 2 open(s), 1 close(s), 3
+    //       packet(s)". Test-side, by hand, restored: every watched open filed as the scan's -> this line, "0 open(s)".
     reportUnless(first.opens == 1 && first.decodes > 0,
                  "a first screen on a file opens it and decodes a picture (the counters work)", describe(first));
 
@@ -13096,6 +13476,8 @@ int main(int argc, char** argv) {
         phase("dueSlowdown", [&] { onSlowFile("S15.120", runDueSlowdownChecks); });
         phase("playbackBlame", [&] { runPlaybackBlameChecks(config, clips, still, onePicture); });
         phase("decodeOnce", [&] { runDecodeOnceChecks(config, clip, onePicture); });
+        phase("processorScan", [&] { runProcessorScanChecks(config, still); });
+        phase("processorScanShared", [&] { runSharedScanChecks(config); });
         phase("sharedRelease", [&] { runSharedReleaseChecks(config, clip); });
         phase("sharedEviction", [&] { runSharedEvictionChecks(config, clips); });
         phase("pauseRejoin", [&] { runPauseRejoinChecks(config); });

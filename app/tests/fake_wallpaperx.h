@@ -33,6 +33,7 @@
 #include <QJsonObject>
 #include <QList>
 #include <QMap>
+#include <QPair>
 #include <QSet>
 #include <QString>
 #include <QStringList>
@@ -196,10 +197,17 @@ public:
     QJsonValue keepHigherFrameRate = false;
     QMap<int, QJsonValue> screenFrameRate;
     QMap<QString, double> refreshRates;
+    // Monitor id -> the file GetStatus names for its video, and the processor_decoding state it reports for it
+    // ("parts" with a reason, any other state with none).
+    QMap<int, QPair<QString, QString>> processorDecoding;
 
     // The daemon's PersistenceChanged, from the connection owning the stand-in's name.
     bool announcePersistenceChanged() {
         return m_bus.send(QDBusMessage::createSignal(m_path, QStringLiteral("io.wallpaperx.Daemon"), QStringLiteral("PersistenceChanged")));
+    }
+    bool announceProcessorDecodingChanged() {
+        return m_bus.send(
+            QDBusMessage::createSignal(m_path, QStringLiteral("io.wallpaperx.Daemon"), QStringLiteral("ProcessorDecodingChanged")));
     }
 
     QString status() const {
@@ -210,7 +218,16 @@ public:
             names.insert(it.key(), it.value());
         }
         for (const int id : wallpapers) {
-            shown.insert(QString::number(id), QJsonObject{{QStringLiteral("type"), QStringLiteral("video")}});
+            QJsonObject wallpaper{{QStringLiteral("type"), QStringLiteral("video")}};
+            if (processorDecoding.contains(id)) {
+                const auto& [path, state] = processorDecoding.value(id);
+                const QJsonArray reasons =
+                    state == u"parts" ? QJsonArray{QStringLiteral("missing_reference")} : QJsonArray{};
+                wallpaper.insert(QStringLiteral("path_literal"), path);
+                wallpaper.insert(QStringLiteral("processor_decoding"),
+                                 QJsonObject{{QStringLiteral("state"), state}, {QStringLiteral("reasons"), reasons}});
+            }
+            shown.insert(QString::number(id), wallpaper);
         }
         for (auto it = pause.cbegin(); it != pause.cend(); ++it) {
             modes.insert(QString::number(it.key()), QJsonObject{{QStringLiteral("mode"), it.value()}, {QStringLiteral("paused"), false}});

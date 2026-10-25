@@ -10,6 +10,7 @@
 #include "kept_rows.h"
 #include "log_escape.h"
 #include "pause_mode.h"
+#include "processor_check.h"
 #include "screen_focus.h"
 #include "sound_setting.h"
 // kTargetDepth and the two numbers behind it: separate because the KDE plugin sizes its import
@@ -175,6 +176,9 @@ struct MonitorStatus {
     // answer to "why has this wallpaper stopped moving".
     bool screenVisible = true;
     bool watched = false;
+
+    // For a video: whether parts of it are decoded by the processor on this machine.
+    std::optional<ProcessorDecodingStatus> processorDecoding;
 };
 
 // A monitor's pause setting and what it comes to now. Apart from MonitorStatus because a screen can
@@ -226,6 +230,9 @@ struct GpuStatus {
     // array either because this daemon cannot produce one or because it chose not to, and the two
     // call for different reports to the user.
     bool frameSync = false;
+
+    // Device::videoInlineParameters(): whether a parameter-set change off a reset point stays on the device.
+    bool videoInlineParameters = false;
 };
 
 // Pending is a real answer: nothing has been tried yet. Since restoreSaved() renders at
@@ -735,6 +742,12 @@ public:
     // Call once. Writes nothing: a repair it computed is held for writeRepairedConfig().
     std::vector<int> restoreSaved();
 
+    // Starts the processor check of each video among `monitorIds`, which restoreSaved() returned, handing it the
+    // answer the scan record holds for its path. Call once, after recordStartingVideos() and before their renders
+    // are posted: a scan rewrites the scan record and names its video in the playing record, both the running
+    // daemon's. Throws std::bad_alloc.
+    void startRestoredScans(const std::vector<int>& monitorIds);
+
     // Moves an unreadable config aside, or copies one whose rows this run rejected or is about
     // to rewrite, and records the outcome in the persistence health. Separate from the
     // constructor because it writes, and a duplicate instance must not touch the running
@@ -777,6 +790,10 @@ public:
     // health snapshot() reports can change without any call; empty stops it. See
     // ConfigWriter::onWritten for the lock rule.
     void onConfigWritten(std::function<void()> written) { m_writer.onWritten(std::move(written)); }
+
+    // Called on the scan's thread, or on the render thread with m_gpuMutex held, whenever a video wallpaper's
+    // processor_decoding may have changed; never with m_stateMutex held. Empty stops it: see ChangeNotice.
+    void onProcessorDecodingChanged(std::function<void()> changed) { m_processorNotice.set(std::move(changed)); }
 
     // Renders the monitor's current request, on the render worker's thread and never the DBus
     // one. rendered=true only when the frame is still the one that was asked for: a request
@@ -1035,13 +1052,7 @@ private:
     // What a path named when a session opened it, so a screen asking for the same path later joins
     // that session only while the path still names those bytes: a file rewritten in place must not
     // be shown from a decoder opened on what it held before.
-    struct FileIdentity {
-        uint64_t device = 0;
-        uint64_t inode = 0;
-        int64_t size = 0;
-        int64_t modifiedNs = 0;
-        bool operator==(const FileIdentity&) const = default;
-    };
+    using FileIdentity = wallpaperx::FileIdentity;
 
     struct MonitorState {
         std::string type;
@@ -1213,6 +1224,9 @@ private:
             bool cleared = false;
         };
         CleanPlay cleanPlay;
+
+        // What decides the video's processor_decoding. Set afresh for every video wallpaper given.
+        ProcessorUse processorUse;
     };
 
     // Creates the Device and target manager on first use, so a machine with no working Vulkan
@@ -1350,9 +1364,6 @@ private:
         VideoSession* session = nullptr;
     };
     VideoSessionRef videoSessionOfLocked(int monitorId);
-
-    // What `path` names now; nothing when it cannot be asked.
-    static std::optional<FileIdentity> fileIdentityOf(const std::string& path);
 
     // Points the session's blame at its first member, the screen a death while the clock works on it
     // is counted against. Costs a compare when it already does; a rebuild that fails is tried again
@@ -2014,6 +2025,31 @@ private:
     GpuStatus m_gpuStatus;
     DaemonHealth m_health;
     bool m_configServerAttached = false;
+
+    // onProcessorDecodingChanged()'s callback.
+    ChangeNotice m_processorNotice;
+
+    // Starts `path`'s scan for the wallpaper `wallpaperSeq` names on `monitorId`; a scan that cannot be started
+    // is recorded as failed. Never under m_stateMutex, which recordScan() takes.
+    void checkVideo(int monitorId, uint64_t wallpaperSeq, const std::string& path,
+                    std::optional<FileScan> saved = std::nullopt) noexcept;
+    void recordScan(int monitorId, uint64_t wallpaperSeq, ProcessorCheck::Found found);
+    // Rewrites the scan record from the answers the monitors' videos hold now, so it keeps none for a wallpaper
+    // since replaced. Takes m_scanRecordMutex, then m_stateMutex. Throws std::bad_alloc.
+    void saveScans();
+    // Records how the first picture drawn for this monitor's wallpaper was decoded; true when this was it.
+    // Caller holds m_stateMutex and m_gpuMutex, under which `pipeline` drew it.
+    static bool noteFirstPictureLocked(MonitorState& state, const VideoPipeline& pipeline);
+    // The answer `state`'s video holds for its path, its scan's or the one carried while that runs, with the bytes
+    // it was found for; null when none. Caller holds m_stateMutex.
+    static const FileScan* heldScanLocked(const MonitorState& state);
+    // Any monitor's for `path` that was found for the bytes it names `now`. Caller holds m_stateMutex.
+    std::optional<FileScan> knownScanLocked(const std::string& path, const std::optional<FileIdentity>& now) const;
+
+    // Orders saveScans()' writes, so the last to land holds the newest answers.
+    std::mutex m_scanRecordMutex;
+    // Last, so it is destroyed first: its thread reports into the state above.
+    ProcessorCheck m_processorCheck;
 };
 
 }

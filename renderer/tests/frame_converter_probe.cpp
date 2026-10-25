@@ -1735,7 +1735,8 @@ void runNoYcbcrChecks(Device& device, const std::string& label) {
     //       exists. Frame counts are compared so a stream that stops early cannot pass as playing.
     // CONTROL: renderer/video/video_decoder.cpp openDecoder() choosing SoftwareRefused whenever the
     //       feature is absent -- the removed check, restored: "10 frames on SoftwareRefused; with it:
-    //       10 frames on Hardware" for both streams. Reverted. Harness: feature not hidden -> "was not
+    //       10 frames on Hardware" for both streams. Reverted. Re-run 2026-10-24 (G5) via control_batch.sh,
+    //       as a `refuse(Path::SoftwareRefused)` first in openDecoder()'s undecided branch: the same. Harness: feature not hidden -> "was not
     //       hidden, so a device without it was never built".
     for (const char* name : {"conv_709_tv.mp4", "conv_hevc10.mp4"}) {
         if (!haveAsset(name, label)) continue;
