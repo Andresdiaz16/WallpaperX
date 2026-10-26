@@ -185,15 +185,6 @@ qsizetype inFlight(const KScreenClient& c) {
     return c.findChildren<QDBusPendingCallWatcher*>().size();
 }
 
-QString stateName(State s) {
-    switch (s) {
-    case State::Loading: return QStringLiteral("Loading");
-    case State::Ready: return QStringLiteral("Ready");
-    case State::Unavailable: return QStringLiteral("Unavailable");
-    }
-    return QStringLiteral("?");
-}
-
 bool keepsStopping(const KScreenClient& c) {
     return c.state() == State::Unavailable && c.unavailableReason().contains(QLatin1String("keeps stopping"));
 }
@@ -215,8 +206,8 @@ struct Phase {
 
     Phase(const char* suffix, int stayUpMs)
         : name(QLatin1String(kPrefix) + QLatin1String(suffix))
-        , client(std::make_unique<KScreenClient>(QDBusConnection::sessionBus(), name,
-                                                 KScreenTimeouts{.backendMs = kWaitMs, .callMs = 3000, .launcherStayUpMs = stayUpMs})) {
+        , client(std::make_unique<KScreenClient>(dbusSource(name,
+                                                 KScreenTimeouts{.backendMs = kWaitMs, .callMs = 3000, .launcherStayUpMs = stayUpMs}))) {
         QObject::connect(client.get(), &KScreenClient::stateChanged, [this] {
             snaps.append({g_clock.elapsed(), client->state(), client->monitors().size(), client->selectedOutput(), client->unavailableReason()});
         });
@@ -275,9 +266,9 @@ void coldStart() {
     // WHY-THIS-SHAPE: the arrival signal precedes the requestBackend reply on the client's
     //       connection, so once the answer is handled and nothing is in flight, a second read the
     //       arrival caused would already be counted.
-    // CONTROL: app/kde/kscreen_client.cpp, onLauncherOwnerChanged's new-owner `&& m_state ==
-    //       State::Unavailable` removed -> red, "1 start(s), 2 requestBackend, 1 getConfig"; re-run
-    //       via control_batch.sh 2026-10-05; restored, green.
+    // CONTROL: app/kde/kscreen_client.cpp, the `returned` handler's `if (m_state ==
+    //       State::Unavailable)` made `if (true)` -> red, "1 start(s), 2 requestBackend, 1 getConfig";
+    //       re-run via control_batch.sh 2026-10-26; restored, green.
     Phase p("ColdStart", 60000);
     p.client->refresh();
     if (p.readyWith(1, QStringLiteral("S15.30"))) {
@@ -295,12 +286,12 @@ void crashingLauncher() {
     // WHY-THIS-SHAPE: starts are the stand-in's own log, not calls, so a restart loop is counted
     //       as processes. Each count is taken after a hold of several stay-up periods with the
     //       event loop running, so a late extra start is inside the count.
-    // CONTROL: app/kde/kscreen_client.cpp, onLauncherOwnerChanged, each re-run via control_batch.sh
-    //       2026-10-05: `m_launcherRetrySpent = m_launcherRetrySpent ||
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, onLauncherOwnerChanged, each re-run via
+    //       control_batch.sh 2026-10-26: `m_launcherRetrySpent = m_launcherRetrySpent ||
     //       newOwner.isEmpty();` deleted -> red, "never settled on "keeps stopping""; the loss
     //       branch never retrying (`if (m_launcherRetrySpent && newOwner.isEmpty())` made
-    //       `if (true)`) -> red, "1 start(s)"; refresh() clearing `m_launcherRetrySpent`, with the
-    //       loss branch setting it after its own refresh() so only other callers clear it -> red,
+    //       `if (true)`) -> red, "1 start(s)"; read() clearing `m_launcherRetrySpent`, with the
+    //       loss branch setting it after its own read() so only other callers clear it -> red,
     //       "Try again started it 2 more time(s)"; restored, green.
     constexpr int stayUpMs = 300;
     Phase p("Crashy", stayUpMs);
@@ -333,11 +324,12 @@ void launcherExitsOnce() {
     // WHY-THIS-SHAPE: DP-3 is chosen with two screens selectable, so only the remembered choice
     //       can put it back. The Loading step is read from the snapshots taken at each
     //       stateChanged, since polling cannot see a step that lasts milliseconds.
-    // CONTROL: app/kde/kscreen_client.cpp, monitors() returning `m_answer` whatever the state -> red,
-    //       "the client went Loading/2/"DP-3" -> Ready/2/"DP-3""; settled()'s reconciling
+    // CONTROL: app/kde/kscreen_client.h, monitors() returning `m_answer` whatever the state -> red,
+    //       "the client went Loading/2/"DP-3" -> Ready/2/"DP-3""; app/kde/kscreen_client.cpp,
+    //       settled()'s reconciling
     //       `if (m_state == State::Ready)` made `m_state != State::Unavailable`, so a Loading step
     //       reconciles the choice -> red, "expected Ready with DP-3 selected again", selected "".
-    //       Both re-run via control_batch.sh 2026-10-05; restored, green.
+    //       Both re-run via control_batch.sh 2026-10-26; restored, green.
     Phase p("ExitOnce", 60000);
     p.client->refresh();
     if (!p.readyWith(1, QStringLiteral("S15.27 exits once")) || !p.client->select(QStringLiteral("DP-3"))) {
@@ -373,10 +365,10 @@ void launcherExitsAfterEveryAnswer() {
     // WHY-THIS-SHAPE: the second loss must land inside the period, so the verdict is taken only
     //       when the client's reaction came less than 9/10 of a period after it went Loading for
     //       the retry (the period cannot have started earlier); otherwise not verified.
-    // CONTROL: app/kde/kscreen_client.cpp, settled()'s `m_launcherStayUp.start();` made
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, requestConfig's `m_launcherStayUp.start();` made
     //       `m_launcherRetrySpent = false;`, so any Ready answer re-arms the retry -> red,
-    //       "expected 2 starts and "keeps stopping"" with 3 starts; re-run via control_batch.sh
-    //       2026-10-05; restored, green.
+    //       "expected 2 starts and "keeps stopping" ... state Ready ... 3 start(s)"; re-run via
+    //       control_batch.sh 2026-10-26; restored, green.
     constexpr int stayUpMs = 600;
     Phase p("ExitEvery", stayUpMs);
     p.client->refresh();
@@ -421,9 +413,10 @@ void launcherStaysUpBetweenStops() {
     // WHY-THIS-SHAPE: each stop is sent after an event-loop pass made 1.4 periods after the Ready
     //       answer was seen; the period's timer started before that answer and Qt lets a coarse
     //       timer run at most 5% late, so that pass has dispatched it however late this thread ran.
-    // CONTROL: app/kde/kscreen_client.cpp, settled()'s `m_launcherStayUp.start();` deleted, so the
-    //       retry is never re-armed -> red, "stop 2 ... did not end Ready", Unavailable "keeps
-    //       stopping" with 2 starts; re-run via control_batch.sh 2026-10-05; restored, green.
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, requestConfig's `m_launcherStayUp.start();` deleted,
+    //       so the retry is never re-armed -> red, "stop 2 ... did not end Ready ...; state Unavailable,
+    //       reason "... keeps stopping." ...; 2 start(s)"; re-run via control_batch.sh 2026-10-26;
+    //       restored, green.
     constexpr int stayUpMs = 400;
     Phase p("StaysUp", stayUpMs);
     p.client->refresh();
@@ -458,9 +451,9 @@ void laterReadyKeepsThePeriod() {
     // WHY-THIS-SHAPE: "Try again" at 0.9 of the period, the loss at 1.4: the verdict is taken
     //       only when the client reacted before 0.9 of a period had run from the "Try again", so a
     //       period restarted by that answer cannot have ended; otherwise not verified.
-    // CONTROL: app/kde/kscreen_client.cpp, settled()'s `&& !m_launcherStayUp.isActive()` removed,
-    //       so every Ready answer restarts the period -> red, "a loss 1.4 periods after the first
-    //       Ready was not retried"; re-run via control_batch.sh 2026-10-05; restored, green.
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, requestConfig's `&& !m_launcherStayUp.isActive()`
+    //       removed, so every Ready answer restarts the period -> red, "a loss 1.4 periods after the
+    //       first Ready was not retried"; re-run via control_batch.sh 2026-10-26; restored, green.
     constexpr int stayUpMs = 1000;
     Phase p("LaterReady", stayUpMs);
     p.client->refresh();
@@ -504,10 +497,10 @@ void destroyedDuringThePeriod() {
     // WHY-THIS-SHAPE: this binary is built with AddressSanitizer, so a callback that outlives the
     //       client and writes to it aborts the run with a report instead of passing silently; the
     //       event loop runs for three periods after the destruction.
-    // CONTROL: app/kde/kscreen_client.cpp, settled()'s `m_launcherStayUp.start();` made
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, requestConfig's `m_launcherStayUp.start();` made
     //       `QTimer::singleShot(m_timeouts.launcherStayUpMs, [this] { m_launcherRetrySpent = false; });`
     //       (no context object) -> red, AddressSanitizer "heap-use-after-free"; re-run via
-    //       control_batch.sh 2026-10-05; restored, green.
+    //       control_batch.sh 2026-10-26; restored, green.
     constexpr int stayUpMs = 300;
     Phase p("Destroyed", stayUpMs);
     p.client->refresh();
@@ -535,6 +528,13 @@ int main(int argc, char* argv[]) {
     }
     QCoreApplication app(argc, argv);
     const QStringList names = QStringLiteral(WALLPAPERX_STANDIN_NAMES).split(u';', Qt::SkipEmptyParts);
+    for (const QString& name : names) {
+        if (!name.startsWith(QLatin1String(kPrefix))) {
+            wallpaperx::testing::harnessFailure("the build allows " + name.toStdString() + " to be started, which is not a test name");
+            static_cast<void>(wallpaperx::testing::reportHarnessFaults("in this test's build, not in the app"));
+            return 1;
+        }
+    }
     if (const auto refused = refuseUnlessPrivateBus(names)) {
         return *refused;
     }

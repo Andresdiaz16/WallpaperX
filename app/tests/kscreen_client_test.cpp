@@ -39,15 +39,6 @@ void expect(bool cond, const QString& msg) {
     check(cond, msg.toStdString().c_str());
 }
 
-QString stateName(State s) {
-    switch (s) {
-    case State::Loading: return QStringLiteral("Loading");
-    case State::Ready: return QStringLiteral("Ready");
-    case State::Unavailable: return QStringLiteral("Unavailable");
-    }
-    return QStringLiteral("?");
-}
-
 QString names(const QList<Monitor>& monitors) {
     QStringList out;
     for (const Monitor& m : monitors) {
@@ -86,7 +77,7 @@ struct Rig {
             notVerified(goals, std::string(phase) + ": the fake KScreen could not stand up: " + fault.toStdString());
             return std::nullopt;
         }
-        rig.client = std::make_unique<KScreenClient>(QDBusConnection::sessionBus(), rig.fake->service(), timeouts);
+        rig.client = std::make_unique<KScreenClient>(dbusSource(rig.fake->service(), timeouts));
         rig.releaseWithinMs = std::min(timeouts.backendMs, timeouts.callMs) * 3 / 5;
         return rig;
     }
@@ -211,15 +202,15 @@ void wireRoundTrip() {
     }
 
     // GOAL: S15.14 -- the answer came from the fake: one getConfig from the client's connection.
-    // CONTROL: app/kde/kscreen_client.cpp, requestConfig called twice per refresh -> red, "the fake
-    //       saw 2 getConfig call(s)"; restored, green.
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, requestConfig called twice per read -> red, "the fake
+    //       saw 2 getConfig call(s)"; restored, green (re-run via control_batch.sh 2026-10-26).
     expect(rig->fake->configCalls == 1, QStringLiteral("S15.14: the fake saw %1 getConfig call(s), expected 1").arg(rig->fake->configCalls));
     rig->expectOnlyClientCalled("S15.14");
 
     // GOAL: S15.7 -- the backend is requested with an empty name and empty arguments, which lets
     //       KScreen's launcher pick by its own platform; a file name ("KSC_KWayland") makes it
     //       answer false.
-    // CONTROL: app/kde/kscreen_client.cpp, requestBackend's name set to "KSC_KWayland" -> red,
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, requestBackend's name set to "KSC_KWayland" -> red,
     //       "requestBackend was asked for (KSC_KWayland, ...)"; restored, green.
     const QVariantList args = rig->fake->backendArguments.value(0);
     expect(args.size() == 2 && args[0].toString().isEmpty() && args[0].metaType().id() == QMetaType::QString,
@@ -245,8 +236,8 @@ void unavailableStates() {
     // GOAL: S15.7 -- a service that is not on the bus reads Unavailable, saying KScreen is not running.
     // WHY-THIS-SHAPE: a name nobody owns on a bus that can activate nothing; the bus is asked, so
     //       the premise is proven rather than assumed.
-    // CONTROL: app/kde/kscreen_client.cpp, describe()'s `if (isUnreachable(error))` made `if (false)`
-    //       (control_batch, 2026-10-04) -> red, "S15.7 absent: the reason should say "is not running";
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, describe()'s `if (isUnreachable(error))` made `if (false)`
+    //       (control_batch, 2026-10-26) -> red, "S15.7 absent: the reason should say "is not running";
     //       ... reason "KScreen refused the request: The name ... was not provided by any .service files"".
     {
         const QString nobody = QStringLiteral("io.wallpaperx.test.NobodyHome");
@@ -254,7 +245,7 @@ void unavailableStates() {
             notVerified("S15.7 (absent service)", "the name meant to be absent is owned");
         } else {
             Rig rig;
-            rig.client = std::make_unique<KScreenClient>(QDBusConnection::sessionBus(), nobody);
+            rig.client = std::make_unique<KScreenClient>(dbusSource(nobody));
             if (rig.refreshAndSettle("S15.7 absent")) {
                 expectUnavailable(rig, "S15.7 absent", QStringLiteral("is not running"));
             }
@@ -265,7 +256,7 @@ void unavailableStates() {
     //       client does not go on to read a configuration.
     // WHY-THIS-SHAPE: the fake still serves a valid configuration, so a client that ignored the
     //       false would reach Ready here rather than fail somewhere else.
-    // CONTROL: app/kde/kscreen_client.cpp, `|| !args.front().toBool()` removed -> red, Ready with
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, `|| !args.front().toBool()` removed -> red, Ready with
     //       DP-3 and DP-4; restored, green.
     if (auto rig = Rig::make("backendfalse", "S15.7 (backend refused)")) {
         rig->fake->backendAnswer = false;
@@ -278,7 +269,7 @@ void unavailableStates() {
     }
 
     // GOAL: S15.7 -- a getConfig error reads Unavailable with KScreen's own message.
-    // CONTROL: app/kde/kscreen_client.cpp, requestConfig's ErrorMessage branch removed -> red, the
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, requestConfig's ErrorMessage branch removed -> red, the
     //       reason became "KScreen answered with something other than a configuration."; restored.
     if (auto rig = Rig::make("configerror", "S15.7 (getConfig error)")) {
         rig->fake->configMode = FakeKScreen::Mode::Error;
@@ -308,8 +299,8 @@ void unavailableStates() {
 
     // GOAL: S15.262 -- KScreen's own message in a refusal is cut at 300 characters with "…", so a
     //       long one cannot fill the window.
-    // CONTROL: app/kde/kscreen_client.cpp, describe()'s `clamped(error.message())` made
-    //       `error.message()` (control_batch, 2026-10-04) -> red, "S15.262: a 400-character refusal
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, describe()'s `clamped(error.message())` made
+    //       `error.message()` (control_batch, 2026-10-26) -> red, "S15.262: a 400-character refusal
     //       reads as 429 characters".
     if (auto rig = Rig::make("longerror", "S15.262 (KScreen)")) {
         rig->fake->configMode = FakeKScreen::Mode::Error;
@@ -327,9 +318,10 @@ void unavailableStates() {
     //       (static_assert), so reaching the bound is itself the failure and the check waits
     //       milliseconds; the fake proves it held the call, so the client's silence is not
     //       mistaken for a client that never asked.
-    // CONTROL: app/kde/kscreen_client.cpp, requestConfig's asyncCall given `m_timeouts.backendMs`
-    //       -> red, "the refresh was not answered within 2000 ms (Loading, 1 call(s) in flight...)";
-    //       given a literal 60000 (the injected value ignored) -> the same red; restored, green.
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, requestConfig's asyncCall given `m_timeouts.backendMs`
+    //       -> red, "the refresh was not answered within 2000 ms (Loading, 1 call(s) in flight...)"
+    //       (re-run via control_batch.sh 2026-10-26); given a literal 60000 (the injected value
+    //       ignored) -> the same red (re-run via control_batch.sh 2026-10-26); restored, green.
     static constexpr KScreenTimeouts hang{.backendMs = 5000, .callMs = 200};
     static constexpr int hangWaitMs = hang.backendMs * 2 / 5;
     static_assert(hang.callMs < hangWaitMs && hangWaitMs < hang.backendMs);
@@ -345,7 +337,7 @@ void unavailableStates() {
 
     // GOAL: S15.7 -- a malformed reply reads Unavailable with the parser's sentence, and a reply
     //       that is not a map at all is refused by the client.
-    // CONTROL: app/kde/kscreen_client.cpp, a refused parse settled as Ready with no monitors -> red,
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, a refused parse answered as no monitors -> red,
     //       "S15.7 malformed: expected Unavailable; state Ready"; the not-a-map branch removed -> red, the reason became
     //       "KScreen's reply has no list of outputs."; restored, green.
     if (auto rig = Rig::make("malformed", "S15.7 (malformed reply)")) {
@@ -596,8 +588,9 @@ void separateTimeouts() {
     //       outlived the call bound, and released inside 3/5 of the backend bound (static_assert
     //       keeps the two apart). The timing is confirmed before the state is graded: a harness
     //       that ran late would otherwise blame the client's correct backend timeout on it.
-    // CONTROL: app/kde/kscreen_client.cpp, refresh()'s asyncCall given `m_timeouts.callMs` ->
-    //       red, "gave up on requestBackend at the call timeout, after 1xx ms"; restored, green.
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, read()'s requestBackend asyncCall given
+    //       `m_timeouts.callMs` -> red, "gave up on requestBackend at the call timeout, after 1xx ms";
+    //       restored, green.
     static constexpr KScreenTimeouts slow{.backendMs = 3000, .callMs = 150};
     static constexpr int slowHoldMs = slow.callMs * 4;
     static constexpr int slowReleaseMs = slow.backendMs * 3 / 5;
@@ -632,8 +625,8 @@ void separateTimeouts() {
     // WHY-THIS-SHAPE: the wait is bounded between the short injected backend timeout and the long
     //       call timeout (static_assert): only a client that times requestBackend by the backend
     //       bound gets there.
-    // CONTROL: app/kde/kscreen_client.cpp, refresh()'s asyncCall given `m_timeouts.callMs` -> red,
-    //       "not answered within 3000 ms"; restored, green.
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, read()'s requestBackend asyncCall given
+    //       `m_timeouts.callMs` -> red, "not answered within 3000 ms"; restored, green.
     static constexpr KScreenTimeouts backendHang{.backendMs = 200, .callMs = 5000};
     static constexpr int backendHangWaitMs = backendHang.callMs * 3 / 5;
     static_assert(backendHang.backendMs < backendHangWaitMs && backendHangWaitMs < backendHang.callMs);
@@ -725,7 +718,7 @@ void staleRepliesDropped() {
     // WHY-THIS-SHAPE: both getConfig calls are held by the fake, so the order the replies arrive
     //       in is the test's choice and not the scheduler's; the "no call in flight" barrier is
     //       what proves the late reply was handled before the check reads the list.
-    // CONTROL: app/kde/kscreen_client.cpp, `if (!isCurrent(generation)) return;` removed from
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, `if (!isCurrent(generation)) return;` removed from
     //       requestConfig's reply handler -> red, monitors became [DP-3, DP-4]; restored, green.
     if (auto rig = Rig::make("staleconfig", "S15.9 (stale getConfig)")) {
         rig->fake->configMode = FakeKScreen::Mode::Hold;
@@ -756,8 +749,8 @@ void staleRepliesDropped() {
 
     // GOAL: S15.9 -- a requestBackend refusal belonging to an older refresh does not turn a
     //       client that the newer refresh made Ready into Unavailable.
-    // CONTROL: app/kde/kscreen_client.cpp, `if (!isCurrent(generation)) return;` removed from
-    //       refresh()'s reply handler -> red, Unavailable "could not load a display backend";
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, `if (!isCurrent(generation)) return;` removed from
+    //       read()'s requestBackend reply handler -> red, Unavailable "could not load a display backend";
     //       restored, green.
     if (auto rig = Rig::make("stalebackend", "S15.9 (stale requestBackend)")) {
         rig->fake->backendMode = FakeKScreen::Mode::Hold;
@@ -799,9 +792,9 @@ void configChangedReReads() {
     // WHY-THIS-SHAPE: the fake holds the re-read, so "stays Ready" is observed while the new
     //       answer provably has not arrived, not after it may already have; and only inside the
     //       call timeout, since past it the client's correct timeout would read as this failure.
-    // CONTROL: app/kde/kscreen_client.cpp, onBackendConfigChanged's body emptied -> red,
-    //       "configChanged led to no re-read"; refresh() made to settle Loading unconditionally
-    //       -> red, "Loading during the re-read"; restored, green.
+    // CONTROL: app/kde/kscreen_dbus_source.h, onBackendConfigChanged's body emptied -> red,
+    //       "configChanged led to no re-read"; app/kde/kscreen_client.cpp, refresh() made to settle
+    //       Loading unconditionally -> red, "Loading during the re-read"; restored, green.
     rig->fake->configMode = FakeKScreen::Mode::Hold;
     rig->sinceHeld.start();
     rig->fake->emitConfigChanged();
@@ -829,8 +822,8 @@ void edidNames() {
     //       at that position in the list.
     // WHY-THIS-SHAPE: the reply lists DP-3 (id 2) first, so id and list position disagree for
     //       both screens; in KScreen's own order they coincide and a positional mix-up is invisible.
-    // CONTROL: app/kde/kscreen_client.cpp, the reply written to the monitor whose kscreenId is its
-    //       list position + 1 -> red, DP-3 named "M27Q P"; restored, green.
+    // CONTROL: app/kde/kscreen_client.cpp, rename() writing the name to the monitor whose list
+    //       position + 1 is the kscreenId -> red, "expected DP-3/M27Q and DP-4/M27Q P"; restored, green (re-run via control_batch.sh 2026-10-26).
     if (auto rig = Rig::make("edid", "S15.11")) {
         rig->fake->config = withOutputs(g_fixture, reversed(g_fixture.value(QStringLiteral("outputs")).toList()));
         rig->fake->edids = {{1, edidNamed("M27Q P")}, {2, edidNamed("M27Q")}};
@@ -845,9 +838,8 @@ void edidNames() {
 
     // GOAL: S15.11 -- when the selected screen's name arrives, selectedMonitor carries it and
     //       selectionChanged says so.
-    // CONTROL: app/kde/kscreen_client.cpp, the getEdid handler's `if (it->outputName ==
-    //       selectedOutput()) { emit selectionChanged(); }` removed -> red, "0 selectionChanged";
-    //       restored, green.
+    // CONTROL: app/kde/kscreen_client.cpp, rename()'s `if (it->outputName == selectedOutput())
+    //       { emit selectionChanged(); }` removed -> red, "0 selectionChanged"; restored, green (re-run via control_batch.sh 2026-10-26).
     if (auto rig = Rig::make("edidselected", "S15.11 (selected name)")) {
         Emissions e;
         count(*rig->client, e);
@@ -878,8 +870,8 @@ void edidNames() {
     //       read's answer.
     // WHY-THIS-SHAPE: all four getEdid calls are held and released newest first, which is the
     //       order a slow first answer produces; the barrier proves the old ones were handled.
-    // CONTROL: app/kde/kscreen_client.cpp, `!isCurrent(generation) ||` removed from the getEdid
-    //       handler -> red, names became OLD-1/OLD-2; restored, green.
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, `!isCurrent(generation) ||` removed from the getEdid
+    //       handler -> red, names became OLD-1/OLD-2; restored, green (re-run via control_batch.sh 2026-10-26).
     if (auto rig = Rig::make("edidstale", "S15.11 (stale name)")) {
         rig->fake->config = g_fixture;
         rig->fake->edidMode = FakeKScreen::Mode::Hold;
@@ -912,8 +904,8 @@ void edidNames() {
 
     // GOAL: S15.11 -- a getEdid that fails costs only the friendly name: the client stays Ready
     //       with every screen, named by connector.
-    // CONTROL: app/kde/kscreen_client.cpp, a getEdid error reply settled as Unavailable -> red;
-    //       restored, green.
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, a getEdid error reply emitted as unavailable -> red,
+    //       "a failed getEdid should leave Ready"; restored, green (re-run via control_batch.sh 2026-10-26).
     if (auto rig = Rig::make("ediderror", "S15.11 (failed getEdid)")) {
         rig->fake->config = g_fixture;
         rig->fake->edidMode = FakeKScreen::Mode::Error;
@@ -991,7 +983,7 @@ void edidNamesCarried() {
     //       previous answer, not re-read.
     // CONTROL: app/kde/kscreen_client.cpp, settleReady()'s `keepKnownNames(answer, m_answer);`
     //       deleted -> red, "[DP-4/DP-4, DP-3/DP-3]" with 1 monitorsChanged; re-run via
-    //       control_batch.sh 2026-10-05; restored, green.
+    //       control_batch.sh 2026-10-26; restored, green.
     if (!read(real, "S15.18 unchanged")) {
         return;
     }
@@ -1001,13 +993,16 @@ void edidNamesCarried() {
                .arg(e.monitors)
                .arg(e.selection));
 
-    // GOAL: S15.18 -- a getEdid answer is authoritative: an EDID with no name turns a carried name
-    //       back into the connector name, while a getEdid that fails keeps the name shown.
+    // GOAL: S15.18, S15.965 -- a getEdid answer is authoritative: an EDID with no name (named() with
+    //       an empty name) turns a carried name back into the connector name, while a getEdid that
+    //       fails keeps the name shown.
     // WHY-THIS-SHAPE: both arrive on the same re-read, one per screen, and each screen had a
     //       carried name, so each branch decides its own screen's name.
-    // CONTROL: app/kde/kscreen_client.cpp, the getEdid handler returning on an empty name -> red,
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, the getEdid handler returning on an empty name -> red,
     //       "DP-3 should be named DP-3"; the handler taking an error reply as an EDID (the
-    //       ErrorMessage test removed) -> red, "DP-4 should keep M27Q P"; restored, green.
+    //       ErrorMessage test removed) -> red, "DP-4 should keep M27Q P"; app/kde/kscreen_client.cpp,
+    //       rename()'s connector-name fallback dropped (`shown = modelName`) -> red, "DP-3 should be
+    //       named DP-3"; each re-run via control_batch.sh 2026-10-26, restored, green.
     QByteArray nameless = edidNamed("X");
     nameless[54 + 18 + 3] = '\x10'; // a dummy descriptor: a valid EDID with no name in it
     if (answer({{2, nameless}, {1, std::nullopt}}, "S15.18 nameless and failed")) {
@@ -1059,7 +1054,7 @@ void edidNamesCarried() {
     // GOAL: S15.18 -- a reply that describes no panel (neither sizeMM nor modes) carries no name,
     //       since nothing shows the panel is the same one.
     // CONTROL: app/kde/kscreen_client.cpp, keepKnownNames without `!monitor.panel.isEmpty() &&`
-    //       -> red, "[DP-4/M27Q P, DP-3/M27Q]"; restored, green.
+    //       -> red, "with no panel described ... got [DP-4/M27Q P, DP-3/M27Q]"; restored, green (re-run via control_batch.sh 2026-10-26).
     const QVariantMap bare = configOf({screen(QStringLiteral("DP-4"), 1, 1440), screen(QStringLiteral("DP-3"), 2, 0)});
     if (read(bare, "S15.18 no panel") && answer(realNames, "S15.18 no panel") &&
         names(c.monitors()) == QStringLiteral("[DP-4/M27Q P, DP-3/M27Q]") && read(bare, "S15.18 no panel again")) {
@@ -1093,12 +1088,13 @@ void launcherRestart() {
     // WHY-THIS-SHAPE: the fake is destroyed, which releases the name and sends nothing else; the
     //       bus can start nothing, so the one retry must fail. The Loading step lasts
     //       milliseconds, so it is seen by snapshotting at each stateChanged, not by polling.
-    // CONTROL: app/kde/kscreen_client.cpp, the `connect(launcher, ...serviceOwnerChanged...)`
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, the `connect(launcher, ...serviceOwnerChanged...)`
     //       deleted -> red, "the launcher left the bus and the client stayed state Ready";
-    //       monitors() returning `m_answer` whatever the state (a non-Ready client cannot otherwise
-    //       be made to show a list) -> red, "went Loading with 2 monitor(s)"; the loss branch never
-    //       retrying (`if (m_launcherRetrySpent && newOwner.isEmpty())` made `if (true)`) -> red, "the
-    //       reason should say "is not running"". All re-run via control_batch.sh 2026-10-05; restored.
+    //       app/kde/kscreen_client.h, monitors() returning `m_answer` whatever the state (a non-Ready
+    //       client cannot otherwise be made to show a list) -> red, "went Loading with 2 monitor(s)";
+    //       app/kde/kscreen_dbus_source.cpp, the loss branch never retrying (`if (m_launcherRetrySpent
+    //       && newOwner.isEmpty())` made `if (true)`) -> red, "the reason should say "is not running"".
+    //       All re-run via control_batch.sh 2026-10-26; restored.
     struct Seen {
         State state;
         qsizetype monitors;
@@ -1126,10 +1122,10 @@ void launcherRestart() {
     // WHY-THIS-SHAPE: the new fake lists a third screen, so its list is told apart from the old
     //       one; two selectable screens rule out auto-select putting DP-3 back. Counted after the
     //       quiesce barrier, so a second read would already be in the counts.
-    // CONTROL: app/kde/kscreen_client.cpp, the watcher's `WatchForOwnerChange` made
-    //       `WatchForUnregistration` -> red, "the new launcher was never read"; the new-owner
-    //       branch's `refresh();` doubled -> red, "(2 requestBackend, 1 getConfig) DP-3 should be
-    //       selected again"; restored, green.
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, the watcher's `WatchForOwnerChange` made
+    //       `WatchForUnregistration` -> red, "the new launcher was never read";
+    //       app/kde/kscreen_client.cpp, the `returned` handler's `refresh();` doubled -> red,
+    //       "DP-3 should be selected again"; restored, green (both re-run 2026-10-26).
     auto second = std::make_unique<FakeKScreen>(service);
     second->config = configOf({dp3, dp4, screen(QStringLiteral("HDMI-A-2"), 3, 3840)});
     if (const QString fault = second->start(); !fault.isEmpty()) {
@@ -1214,9 +1210,10 @@ void launcherReplaced() {
     //       atomically; a watcher of the test's own proves that premise. Each new fake lists one
     //       more screen, so its answer is told apart; counts are read after the quiesce barrier.
     //       The retry is spent by a real loss between the two hand-overs, inside the 60 s stay-up.
-    // CONTROL: app/kde/kscreen_client.cpp via control_batch.sh, 2026-10-05, each reverted:
-    //       onLauncherOwnerChanged's new-owner `&& m_state == State::Unavailable` removed -> "FAIL:
-    //       S15.28 retry unspent: the new owner saw 2 requestBackend"; `if (m_launcherRetrySpent &&
+    // CONTROL: via control_batch.sh, 2026-10-26, each reverted: app/kde/kscreen_client.cpp, the
+    //       `returned` handler's `if (m_state == State::Unavailable)` made `if (true)` -> "FAIL:
+    //       S15.28 retry unspent: the new owner saw 2 requestBackend";
+    //       app/kde/kscreen_dbus_source.cpp, onLauncherOwnerChanged's `if (m_launcherRetrySpent &&
     //       newOwner.isEmpty())` made `if (m_launcherRetrySpent)` -> "FAIL: S15.28 retry spent: the
     //       hand-over passed through [... Unavailable ... keeps stopping ...]";
     //       `m_launcherRetrySpent = m_launcherRetrySpent || newOwner.isEmpty();` made `= true;` ->
@@ -1291,7 +1288,7 @@ void namesSurviveLauncherLoss() {
     //       carried across the non-Ready states; the non-Ready states are snapshotted as emitted.
     //       The fixture's panels carry sizeMM and modes, which carrying a name requires.
     // CONTROL: app/kde/kscreen_client.cpp, settleReady() carrying names only when
-    //       `before.state == State::Ready`, via control_batch.sh, 2026-10-05 -> "FAIL: S15.334: after the
+    //       `before.state == State::Ready`, via control_batch.sh, 2026-10-26 -> "FAIL: S15.334: after the
     //       launcher came back the names read [DP-4/DP-4, DP-3/DP-3]". Reverted.
     QStringList notReady;
     QObject::connect(&c, &KScreenClient::stateChanged, [&] {
@@ -1325,8 +1322,8 @@ void idsAndEmptyConnectors() {
     //       panel to name, while a connected but disabled monitor still has one.
     // WHY-THIS-SHAPE: the empty connector has an id, so the id test alone would ask for it; the
     //       disabled monitor sits beside it, so "connected" and "selectable" are told apart.
-    // CONTROL: app/kde/kscreen_client.cpp, requestMonitorNames' `|| !monitor.connected` removed
-    //       -> red, "getEdid was asked for ids [1, 3, 4]"; restored, green.
+    // CONTROL: app/kde/kscreen_dbus_source.cpp, requestMonitorNames' `|| !monitor.connected` removed
+    //       -> red, "getEdid was asked for ids [1, 3, 4]"; restored, green (re-run via control_batch.sh 2026-10-26).
     if (auto rig = Rig::make("emptyconnector", "S15.26 (no getEdid for an empty connector)")) {
         rig->fake->config = configOf({screen(QStringLiteral("DP-1"), 1, 0),
                                       output({.name = QStringLiteral("HDMI-A-1"), .id = 3, .enabled = false, .connected = false,
@@ -1374,13 +1371,13 @@ void readyToUnavailable() {
     //       the three already reads the new state, list and selection.
     // WHY-THIS-SHAPE: the handlers snapshot all three fields at emission time; checking the
     //       fields after the wait instead passes whatever order the signals fire in.
-    // CONTROL: app/kde/kscreen_client.cpp, monitors() returning `m_answer` whatever the state -> red,
+    // CONTROL: app/kde/kscreen_client.h, monitors() returning `m_answer` whatever the state -> red,
     //       "stateChanged saw state Unavailable, 1 monitor(s)" on both paths, via control_batch.sh
-    //       2026-10-05; restored, green. A non-Ready client's list is derived from its state in
+    //       2026-10-26; restored, green. A non-Ready client's list is derived from its state in
     //       monitors(), and every signal is emitted from settled() after the fields are written, so
     //       monitors() is the place left where an ordering break can be written.
-    // COVERAGE-ASSERT: settled()'s `emit monitorsChanged()` removed -> red, "expected all three
-    //       signals, saw stateChanged,selectionChanged" (re-run via control_batch.sh 2026-10-05).
+    // COVERAGE-ASSERT: app/kde/kscreen_client.cpp, settled()'s `emit monitorsChanged()` removed -> red, "expected all three
+    //       signals, saw stateChanged,selectionChanged" on both paths (re-run via control_batch.sh 2026-10-26).
     for (const bool viaBackend : {false, true}) {
         const char* phase = viaBackend ? "S15.12 (backend refused)" : "S15.12 (getConfig error)";
         auto rig = Rig::make(viaBackend ? "unavailable2" : "unavailable1", phase);

@@ -795,7 +795,7 @@ int main(int argc, char* argv[]) {
     }
     // Every getEdid is held, so each screen keeps its connector name as its display name.
     fake->edidMode = FakeKScreen::Mode::Hold;
-    auto client = std::make_unique<KScreenClient>(QDBusConnection::sessionBus(), fake->service());
+    auto client = std::make_unique<KScreenClient>(dbusSource(fake->service()));
     const QString libraryDirectory = scratch.path() + QStringLiteral("/wallpaperx");
     auto library = std::make_unique<LibraryManager>(wallpapersDirectory(libraryDirectory), 30);
     auto importer = std::make_unique<Importer>(libraryDirectory, wallpapersDirectory(libraryDirectory), 30);

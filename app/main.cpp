@@ -4,6 +4,7 @@
 #include "daemon/daemon_client.h"
 #include "daemon/refresh_rate_reporter.h"
 #include "kde/kscreen_client.h"
+#include "kde/kscreen_source.h"
 #include "kde/plasma_controller.h"
 #include "library/importer.h"
 #include "library/library_manager.h"
@@ -133,7 +134,7 @@ int main(int argc, char* argv[])
     }
 
     // Declared before the engine so they outlive every binding that reads them.
-    wallpaperx::KScreenClient kscreen(QDBusConnection::sessionBus());
+    wallpaperx::KScreenClient kscreen(wallpaperx::systemKScreenSource(QDBusConnection::sessionBus()));
     const QString libraryDirectory = wallpaperx::defaultLibraryDirectory();
     wallpaperx::LibraryManager library(wallpaperx::wallpapersDirectory(libraryDirectory));
     wallpaperx::Importer importer(libraryDirectory, wallpaperx::wallpapersDirectory(libraryDirectory));

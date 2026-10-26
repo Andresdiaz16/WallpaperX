@@ -515,7 +515,7 @@ int main(int argc, char* argv[]) {
     }
     // Every getEdid is held, so each screen keeps its connector name as its display name.
     fake->edidMode = FakeKScreen::Mode::Hold;
-    auto client = std::make_unique<KScreenClient>(QDBusConnection::sessionBus(), fake->service());
+    auto client = std::make_unique<KScreenClient>(dbusSource(fake->service()));
 
     QQuickWindow window;
     window.resize(1000, 700);

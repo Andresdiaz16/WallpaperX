@@ -3,46 +3,24 @@
 #pragma once
 
 #include "kscreen_config.h"
+#include "kscreen_source.h"
 
-#include <QDBusConnection>
 #include <QList>
 #include <QObject>
 #include <QString>
-#include <QTimer>
 #include <QtQml/qqmlregistration.h>
 
+#include <memory>
 #include <optional>
-
-class QDBusMessage;
 
 namespace wallpaperx {
 
-// How long each call may take before KScreen counts as not answering, and how long a launcher
-// must stay up after answering before its loss is retried again.
-struct KScreenTimeouts {
-    // requestBackend may have to start the launcher (systemd allows it 5 s to take its name) and
-    // then load a plugin that talks to the compositor, so it gets D-Bus's own default.
-    int backendMs = 25000;
-    // getConfig and getEdid run once the backend is loaded and answer from its state.
-    int callMs = 5000;
-    // The launcher stops on its own after idling for minutes; one that leaves sooner than this
-    // after a Ready answer counts as failing, not idling.
-    int launcherStayUpMs = 60000;
-};
-
-// The monitors KDE's display configuration service reports, and which one the user picked.
-//
-// KScreen's launcher serves /backend only after a client has asked it to load a backend, so a
-// query is two calls: requestBackend on "/", then getConfig on "/backend". An empty backend name
-// lets the launcher pick by its own platform; a name must be the plugin's suffix ("KWayland"),
-// not its file name, or the launcher answers false.
-//
-// The bus, service name and timeouts are injected so a test can stand up its own service on a
-// private bus and wait milliseconds; the application passes the session bus and the defaults.
+// The monitors KDE's display configuration reports, and which one the user picked. Where the list
+// comes from is the source's business (kscreen_source.h); everything here is the same for each.
 class KScreenClient : public QObject {
     Q_OBJECT
     QML_ELEMENT
-    QML_UNCREATABLE("Created by the application with the bus it should use.")
+    QML_UNCREATABLE("Created by the application with the source it should read.")
     Q_PROPERTY(State state READ state NOTIFY stateChanged)
     Q_PROPERTY(QString unavailableReason READ unavailableReason NOTIFY stateChanged)
     Q_PROPERTY(QList<wallpaperx::Monitor> monitors READ monitors NOTIFY monitorsChanged)
@@ -50,17 +28,15 @@ class KScreenClient : public QObject {
     Q_PROPERTY(wallpaperx::Monitor selectedMonitor READ selectedMonitor NOTIFY selectionChanged)
 
 public:
-    // Loading: no answer yet, or re-reading after the launcher left the bus. Ready: `monitors` is
-    // KScreen's latest answer. Unavailable: the last attempt failed or the launcher left again
-    // before staying up launcherStayUpMs after an answer, `monitors` is empty, `unavailableReason` says why, and
-    // nothing is read until refresh() or a new launcher takes the name.
+    // Loading: no answer yet, or re-reading after what was shown stopped describing anything.
+    // Ready: `monitors` is the source's latest answer. Unavailable: the last read failed, `monitors`
+    // is empty, `unavailableReason` says why, and nothing is read until refresh() or the source
+    // reports its service back; a read that ran past its limit may still answer.
     enum class State { Loading, Ready, Unavailable };
     Q_ENUM(State)
 
-    static constexpr const char* kDefaultService = "org.kde.KScreen";
-
-    explicit KScreenClient(QDBusConnection bus, QString service = QString::fromLatin1(kDefaultService),
-                           KScreenTimeouts timeouts = {}, QObject* parent = nullptr);
+    // Reads `source`, which becomes this client's child.
+    explicit KScreenClient(std::unique_ptr<KScreenSource> source, QObject* parent = nullptr);
 
     State state() const { return m_state; }
     QString unavailableReason() const { return m_unavailableReason; }
@@ -70,8 +46,8 @@ public:
     QString selectedOutput() const { return selectedMonitor().outputName; }
     Monitor selectedMonitor() const;
 
-    // Asks KScreen again. A client already Ready stays Ready, showing the previous answer, until
-    // the new one arrives; any reply to an earlier refresh is then discarded.
+    // Reads again. A client already Ready stays Ready, showing the previous answer, until the new
+    // one arrives; any answer to an earlier refresh is then discarded.
     Q_INVOKABLE void refresh();
     // False, changing nothing, unless `outputName` is a selectable monitor.
     Q_INVOKABLE bool select(const QString& outputName);
@@ -81,17 +57,12 @@ signals:
     void monitorsChanged();
     void selectionChanged();
 
-private slots:
-    void onBackendConfigChanged();
-
 private:
-    void onLauncherOwnerChanged(const QString& service, const QString& oldOwner, const QString& newOwner);
-    QDBusMessage call(const QString& path, const QString& interface, const QString& method) const;
-    void requestConfig(quint64 generation);
     // The writers of state and reason, settle() for Loading or Unavailable and settleReady() with
     // an answer, so a selection never outlives its monitor in a Ready answer.
     void settle(State state, QString reason);
     void settleReady(QList<Monitor> answer);
+    void rename(int kscreenId, const QString& modelName);
     struct Shown {
         State state;
         QString reason;
@@ -101,15 +72,12 @@ private:
     Shown shown() const { return {m_state, m_unavailableReason, monitors(), selectedMonitor()}; }
     // After a write: applies the selection rules, and announces what differs from `before`.
     void settled(const Shown& before);
-    void requestMonitorNames(quint64 generation);
-    bool isCurrent(quint64 generation) const { return generation == m_generation; }
 
-    QDBusConnection m_bus;
-    QString m_service;
-    KScreenTimeouts m_timeouts;
+    // A child, so it and its pending reads go with this client.
+    KScreenSource* m_source;
     State m_state = State::Loading;
     QString m_unavailableReason;
-    // KScreen's latest Ready answer with the model names learned since. Kept, hidden by monitors(),
+    // The latest Ready answer with the model names learned since. Kept, hidden by monitors(),
     // while not Ready, so the next answer can carry those names instead of showing connector names.
     QList<Monitor> m_answer;
     // The user's choice; read it only through selectedMonitor(), which hides it while `monitors`
@@ -118,15 +86,6 @@ private:
     // that until the user picks again, since Apply acts on whatever this names. A failed or
     // pending read is not an answer and keeps it.
     std::optional<QString> m_selection;
-    quint64 m_generation = 0;
-    // Spends the one re-read a launcher loss gets; a name handed straight to a new owner is no
-    // loss, as nothing need be started. Cleared only when m_launcherStayUp fires, not
-    // by a Ready answer or refresh(), so a launcher that exits after every answer, or each
-    // "Try again" on one that crashes, gets one start per loss rather than a loop.
-    bool m_launcherRetrySpent = false;
-    // Runs only while the retry is spent: from the first Ready answer after that until the
-    // launcher has stayed up launcherStayUpMs. Any loss stops it.
-    QTimer m_launcherStayUp;
 };
 
 } // namespace wallpaperx

@@ -156,7 +156,7 @@ struct Rig {
                 return why;
             }
         }
-        kscreen = std::make_unique<KScreenClient>(QDBusConnection::sessionBus(), kscreenFake->service());
+        kscreen = std::make_unique<KScreenClient>(dbusSource(kscreenFake->service()));
         library = std::make_unique<LibraryManager>(lib, 30);
         client = std::make_unique<DaemonClient>(QDBusConnection::sessionBus(), daemonFake->service(), timeouts);
         plasma = std::make_unique<PlasmaController>(QDBusConnection::sessionBus(), shellFake->service(), plasmaTimeoutMs);

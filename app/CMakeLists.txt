@@ -21,6 +21,21 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBZIP REQUIRED IMPORTED_TARGET libzip)
 # Only to tell whether a video has sound, with the FFmpeg the daemon plays it with.
 pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET libavformat>=61 libavcodec>=61 libavutil>=59)
+# Plasma 6.8 and later list monitors only through libkscreen in-process; without it the app reads
+# KScreen's D-Bus service, which those releases no longer ship.
+find_package(KF6Screen CONFIG QUIET)
+if(KF6Screen_FOUND)
+    # The library source asks the compositor for its globals itself; libKF6Screen needs it anyway.
+    # Not searched in CMAKE_PREFIX_PATH: a copy found there puts that prefix on the run path, where
+    # it can shadow the libKF6Screen found above.
+    pkg_check_modules(WAYLAND_CLIENT QUIET IMPORTED_TARGET NO_CMAKE_PATH NO_CMAKE_ENVIRONMENT_PATH wayland-client)
+endif()
+# Whether the in-process library source is built, here and in the tests.
+if(KF6Screen_FOUND AND WAYLAND_CLIENT_FOUND)
+    set(WALLPAPERX_KSCREEN_LIBRARY ON)
+else()
+    set(WALLPAPERX_KSCREEN_LIBRARY OFF)
+endif()
 
 # --------------------------------------------------------------------------- #
 # wallpaperx GUI
@@ -35,6 +50,10 @@ qt_add_executable(wallpaperx
     kde/kscreen_config.h
     kde/kscreen_client.cpp
     kde/kscreen_client.h
+    kde/kscreen_source.cpp
+    kde/kscreen_source.h
+    kde/kscreen_dbus_source.cpp
+    kde/kscreen_dbus_source.h
     kde/plasma_controller.cpp
     kde/plasma_controller.h
     daemon/daemon_client.cpp
@@ -58,6 +77,12 @@ qt_add_executable(wallpaperx
     library/preview_image_provider.cpp
     library/preview_image_provider.h
 )
+
+if(WALLPAPERX_KSCREEN_LIBRARY)
+    target_sources(wallpaperx PRIVATE kde/kscreen_library_source.cpp kde/kscreen_library_source.h)
+    target_link_libraries(wallpaperx PRIVATE KF6::Screen PkgConfig::WAYLAND_CLIENT ${CMAKE_DL_LIBS})
+    target_compile_definitions(wallpaperx PRIVATE WALLPAPERX_HAVE_KSCREEN_LIBRARY=1)
+endif()
 
 # The generated QML type registration includes these headers by bare name.
 target_include_directories(wallpaperx PRIVATE kde library daemon)
@@ -105,3 +130,10 @@ add_subdirectory(tests)
 
 message(STATUS "wallpaperx configured")
 message(STATUS "  Qt6: ${Qt6_VERSION}")
+if(WALLPAPERX_KSCREEN_LIBRARY)
+    message(STATUS "  KF6Screen: ${KF6Screen_VERSION} -- monitors listed through it when its backend runs in-process (Plasma 6.8+), else through KScreen's D-Bus service")
+elseif(KF6Screen_FOUND)
+    message(STATUS "  KF6Screen: ${KF6Screen_VERSION} found, but wayland-client not in the system's pkg-config path -- monitors listed only through KScreen's D-Bus service, which Plasma 6.8 and later do not have")
+else()
+    message(STATUS "  KF6Screen: not found -- monitors listed only through KScreen's D-Bus service, which Plasma 6.8 and later do not have")
+endif()

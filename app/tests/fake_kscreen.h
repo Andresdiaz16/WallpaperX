@@ -5,6 +5,8 @@
 // A stand-in for KScreen's launcher on a private bus, and the guard that keeps the tests using it
 // off the desktop's own session bus.
 
+#include "kscreen_client.h"
+#include "kscreen_dbus_source.h"
 #include "tests/test_report.h"
 
 #include <QCoreApplication>
@@ -21,6 +23,7 @@
 #include <QVariant>
 
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -28,6 +31,16 @@
 #include <unistd.h>
 
 namespace wallpaperx::apptest {
+
+// No default case, so -Wswitch flags a State added later.
+inline QString stateName(KScreenClient::State s) {
+    switch (s) {
+    case KScreenClient::State::Loading: return QStringLiteral("Loading");
+    case KScreenClient::State::Ready: return QStringLiteral("Ready");
+    case KScreenClient::State::Unavailable: return QStringLiteral("Unavailable");
+    }
+    return QStringLiteral("?");
+}
 
 // Runs the event loop until `pred` holds. False at the deadline: every caller treats that as the
 // check failing or the phase being abandoned, never as a result.
@@ -43,6 +56,11 @@ bool waitFor(Pred pred, int timeoutMs) {
         QCoreApplication::processEvents(QEventLoop::WaitForMoreEvents);
     }
     return true;
+}
+
+// A KScreenClient's source for KScreen's service `service` on the session bus.
+inline std::unique_ptr<KScreenSource> dbusSource(const QString& service, KScreenTimeouts timeouts = {}) {
+    return std::make_unique<KScreenDBusSource>(QDBusConnection::sessionBus(), service, timeouts);
 }
 
 inline pid_t parentOf(pid_t pid) {
@@ -93,8 +111,9 @@ inline std::optional<int> refuseUnlessUnderDbusRunSession() {
 // 77 when the bus is, or may be, the user's own: the binary was started outside ctest. 1 when the
 // bus is private but could let something other than the fake answer: a bus with service
 // directories can auto-start the real KScreen launcher, which reads the live compositor.
-// `activatable` is the exact set of names the bus may start, each under io.wallpaperx.test.; empty
-// for every test but the one that needs activation.
+// `activatable` is the exact set of names the bus may start; empty for every test without
+// activation. This checks names only, never what the bus would run for them: a caller allowing a
+// name a real service also uses (org.kde.KScreen) must prove the service file's Exec itself.
 //
 // GOAL: S15.14 -- a test that stands up a fake KScreen never does so on a bus it did not get from
 //       dbus-run-session, nor on one that can start anything but the test's own stand-ins.
@@ -104,8 +123,8 @@ inline std::optional<int> refuseUnlessUnderDbusRunSession() {
 //       dbus-run-session fails (it lists org.kde.KScreen among its activatable names).
 // CONTROL: by hand, each observed: under plain `dbus-run-session --`, with no configuration of
 //       the test's -> exit 1, "can start services on demand" listing
-//       org.kde.KScreen; the activation test with an extra org.kde.KScreen.service (Exec=/bin/false)
-//       dropped into its service directory -> exit 1, naming it; under ctest -> passes this guard.
+//       org.kde.KScreen; kscreen_launcher_test with an extra org.kde.KScreen.service dropped into
+//       its service directory -> exit 1, naming it; under ctest -> passes this guard.
 inline std::optional<int> refuseUnlessPrivateBus(const QStringList& activatable = {}) {
     using namespace wallpaperx::testing;
     const auto broken = [](const std::string& fault) {
@@ -135,11 +154,6 @@ inline std::optional<int> refuseUnlessPrivateBus(const QStringList& activatable 
     const QDBusReply<QStringList> listed = bus.interface()->activatableServiceNames();
     if (!listed.isValid()) {
         return broken("the private bus would not list its activatable names");
-    }
-    for (const QString& allowed : activatable) {
-        if (!allowed.startsWith(QLatin1String("io.wallpaperx.test."))) {
-            return broken("the test allows " + allowed.toStdString() + " to be started, which is not a test name");
-        }
     }
     QStringList others = listed.value();
     others.removeAll(QStringLiteral("org.freedesktop.DBus"));

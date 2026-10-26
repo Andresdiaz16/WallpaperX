@@ -722,7 +722,7 @@ void positionControls(QQmlEngine& engine, QQuickWindow& window, const QString& s
         return;
     }
     LibraryManager library(dir, 30);
-    KScreenClient kscreen(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.KScreen.unowned"));
+    KScreenClient kscreen(dbusSource(QStringLiteral("io.wallpaperx.test.KScreen.unowned")));
     DaemonClient daemon(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.Daemon.unowned"));
     PlasmaController plasma(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.PlasmaShell.unowned"));
     ApplyController applier(kscreen, library, daemon, plasma);
@@ -924,7 +924,7 @@ int main(int argc, char* argv[]) {
     auto importer = std::make_unique<Importer>(scratch.path() + QStringLiteral("/drop"), dir, 30);
     // WallpaperDetail requires an ApplyController. Its clients name services nobody owns on this
     // bus and are never asked, so no monitor is selected and Apply stays blocked.
-    KScreenClient kscreen(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.KScreen.unowned"));
+    KScreenClient kscreen(dbusSource(QStringLiteral("io.wallpaperx.test.KScreen.unowned")));
     DaemonClient daemon(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.Daemon.unowned"));
     PlasmaController plasma(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.PlasmaShell.unowned"));
     auto applier = std::make_unique<ApplyController>(kscreen, *library, daemon, plasma);

@@ -15,6 +15,9 @@ set(WALLPAPERX_APP_KDE_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../kde/kscreen_config.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../kde/kscreen_client.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../kde/kscreen_client.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../kde/kscreen_source.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../kde/kscreen_dbus_source.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../kde/kscreen_dbus_source.h
 )
 
 # Applying: the daemon and Plasma clients, and what drives them from the picker and the library.
@@ -70,6 +73,23 @@ function(wallpaperx_app_test_target target)
         WALLPAPERX_APP_TEST_DATA="${WALLPAPERX_APP_TESTS_DIR}/data")
     target_link_libraries(${target} PRIVATE Qt6::Core Qt6::DBus Qt6::Qml)
 endfunction()
+
+# S15.970: kscreen_client.h declares no D-Bus constructor and does not pull in the D-Bus source.
+# Compiled by its test entry, not by the build, so a header that breaks it fails one entry; and by
+# the compiler directly, syntax only, from a response file, so the entry never builds -- and so never
+# regenerates -- the tree other entries are running from.
+set(header_check_includes ${WALLPAPERX_APP_TESTS_DIR}/../kde)
+set(header_check_defines)
+foreach(qt Qt6::Core Qt6::DBus Qt6::Qml)
+    list(APPEND header_check_includes "$<TARGET_PROPERTY:${qt},INTERFACE_INCLUDE_DIRECTORIES>")
+    list(APPEND header_check_defines "$<TARGET_PROPERTY:${qt},INTERFACE_COMPILE_DEFINITIONS>")
+endforeach()
+file(GENERATE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/kscreen_client_header_check.rsp
+     CONTENT "-std=c++${CMAKE_CXX_STANDARD}\n-fsyntax-only\n-fPIC\n-I$<JOIN:$<REMOVE_DUPLICATES:${header_check_includes}>,\n-I>\n-D$<JOIN:$<REMOVE_DUPLICATES:${header_check_defines}>,\n-D>\n")
+wallpaperx_add_test(NAME app_kscreen_client_header
+                    COMMAND ${CMAKE_CXX_COMPILER} @${CMAKE_CURRENT_BINARY_DIR}/kscreen_client_header_check.rsp
+                            ${CMAKE_CURRENT_SOURCE_DIR}/kscreen_client_header_check.cpp)
+set_tests_properties(app_kscreen_client_header PROPERTIES LABELS "novulkan" TIMEOUT 120)
 
 # S15.1-S15.5, S15.21, S15.22, S15.25: the reply parser and the EDID reader. Uses no bus.
 qt_add_executable(wallpaperx-kscreen-config-test kscreen_config_test.cpp ${WALLPAPERX_APP_KDE_SOURCES})
@@ -251,6 +271,69 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
     set_tests_properties(app_apply PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77 TIMEOUT 120
                          ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
 
+    # S15.959-S15.964, S15.967: the monitor list read through libKF6Screen in this process, and the
+    # run-time choice of source. Only where the app builds that source; AddressSanitizer for S15.964.
+    if(WALLPAPERX_KSCREEN_LIBRARY)
+        qt_add_executable(wallpaperx-kscreen-library-test kscreen_library_test.cpp ${WALLPAPERX_APP_KDE_SOURCES}
+                          ${CMAKE_CURRENT_SOURCE_DIR}/../kde/kscreen_source.cpp
+                          ${CMAKE_CURRENT_SOURCE_DIR}/../kde/kscreen_library_source.cpp
+                          ${CMAKE_CURRENT_SOURCE_DIR}/../kde/kscreen_library_source.h)
+        wallpaperx_app_test_target(wallpaperx-kscreen-library-test)
+        target_compile_definitions(wallpaperx-kscreen-library-test PRIVATE WALLPAPERX_HAVE_KSCREEN_LIBRARY=1)
+        target_link_libraries(wallpaperx-kscreen-library-test PRIVATE Qt6::Gui KF6::Screen PkgConfig::WAYLAND_CLIENT ${CMAKE_DL_LIBS})
+        target_compile_options(wallpaperx-kscreen-library-test PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+        target_link_options(wallpaperx-kscreen-library-test PRIVATE -fsanitize=address)
+        # Two virtual outputs, changed by kscreen-doctor inside the entry's own nested KWin.
+        wallpaperx_add_display_test(NAME app_kscreen_library COMMAND wallpaperx-kscreen-library-test display)
+        set_tests_properties(app_kscreen_library PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77 TIMEOUT 120
+                             ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0;WALLPAPERX_TEST_KWIN_OUTPUTS=2")
+        wallpaperx_add_test(NAME app_kscreen_library_offscreen COMMAND wallpaperx-kscreen-library-test offscreen)
+        set_tests_properties(app_kscreen_library_offscreen PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77 TIMEOUT 60
+                             ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+        # S15.959's older half: libKF6Screen 6.7.5, unpacked from a package, loaded in place of the
+        # installed one, on a bus whose only startable service is a recording org.kde.KScreen stand-in.
+        set(WALLPAPERX_OLD_KSCREEN_PACKAGE /var/cache/pacman/pkg/libkscreen-6.7.5-1-x86_64.pkg.tar.zst CACHE FILEPATH
+            "A libkscreen 6.7.x package archive holding usr/lib/libKF6Screen.so.6.7.5, for app_kscreen_library_old")
+        set(old_package ${WALLPAPERX_OLD_KSCREEN_PACKAGE})
+        set(old_root ${CMAKE_CURRENT_BINARY_DIR}/libkscreen-6.7.5)
+        set(old_library ${old_root}/usr/lib/libKF6Screen.so.6.7.5)
+        if(EXISTS ${old_package} AND (NOT EXISTS ${old_library} OR ${old_package} IS_NEWER_THAN ${old_library}))
+            # Unpacked beside the tree and renamed into place, so a configure that stops part-way
+            # never leaves a half-written tree for the loader to fall back from.
+            file(REMOVE_RECURSE ${old_root}.tmp)
+            # TOUCH: without it the files keep the archive's own, older times, and the test above
+            # would unpack again on every configure.
+            file(ARCHIVE_EXTRACT INPUT ${old_package} DESTINATION ${old_root}.tmp PATTERNS "usr/lib/libKF6Screen.so*" TOUCH)
+            if(EXISTS ${old_root}.tmp/usr/lib/libKF6Screen.so.6.7.5)
+                file(REMOVE_RECURSE ${old_root})
+                file(RENAME ${old_root}.tmp ${old_root})
+            else()
+                file(REMOVE_RECURSE ${old_root}.tmp)
+            endif()
+        endif()
+        if(EXISTS ${old_package} AND EXISTS ${old_library})
+            set(old_services ${CMAKE_CURRENT_BINARY_DIR}/kscreen_old_services)
+            file(REMOVE_RECURSE ${old_services})
+            file(GENERATE OUTPUT ${old_services}/org.kde.KScreen.service
+                 CONTENT "[D-BUS Service]\nName=org.kde.KScreen\nExec='$<TARGET_FILE:wallpaperx-kscreen-library-test>' --stand-in\n")
+            wallpaperx_xml_text(WALLPAPERX_APP_TEST_SERVICE_DIR_XML "${old_services}")
+            wallpaperx_xml_text(WALLPAPERX_ISOLATED_SESSION_CONF_XML "${WALLPAPERX_ISOLATED_SESSION_CONF}")
+            configure_file(activating_session.conf.in ${CMAKE_CURRENT_BINARY_DIR}/kscreen_old_session.conf @ONLY)
+            wallpaperx_add_test(NAME app_kscreen_library_old
+                                COMMAND /bin/sh ${WALLPAPERX_ISOLATION_SUPPORT_DIR}/private_bus.sh ${WALLPAPERX_DBUS_RUN_SESSION}
+                                        ${CMAKE_CURRENT_BINARY_DIR}/kscreen_old_session.conf
+                                        -- $<TARGET_FILE:wallpaperx-kscreen-library-test> oldlib)
+            set_tests_properties(app_kscreen_library_old PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77 TIMEOUT 60
+                                 ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0;LD_LIBRARY_PATH=${old_root}/usr/lib;WALLPAPERX_KSCREEN_OLD_SERVICES=${old_services}")
+        else()
+            wallpaperx_tests_not_registered("${old_package} not found, or holds no usr/lib/libKF6Screen.so.6.7.5 -- "
+                                            "app_kscreen_library_old (S15.959, older library) is not registered; point "
+                                            "WALLPAPERX_OLD_KSCREEN_PACKAGE at a libkscreen 6.7.x package to restore it")
+        endif()
+    else()
+        wallpaperx_tests_not_registered("KF6Screen or wayland-client not found -- app_kscreen_library (S15.959-S15.964, S15.967) is not registered")
+    endif()
+
     if(Qt6Test_FOUND AND Qt6Quick_FOUND)
         # S15.13, S15.17, S15.24, S15.26, S15.55: the picker's tiles, offscreen. Its own QML module under the app's URI, built from
         # the app's own MonitorPicker.qml and C++ types, because the app's module lives inside the
@@ -304,6 +387,25 @@ add_dependencies(wallpaperx-desktop-integration-test wallpaperx)
 wallpaperx_add_test(NAME app_desktop_integration COMMAND wallpaperx-desktop-integration-test ${CMAKE_COMMAND} ${PROJECT_BINARY_DIR})
 set_tests_properties(app_desktop_integration PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77 TIMEOUT 90
                      RESOURCE_LOCK wallpaperx_app_install_manifest)
+
+# S15.966: the app configured without KF6Screen builds and holds only the D-Bus path. Opt-in, since it
+# configures and builds a second copy of the app.
+option(WALLPAPERX_TEST_NO_KSCREEN_BUILD "Register app_no_kscreen_library_build (builds the app again without KF6Screen)" OFF)
+if(WALLPAPERX_TEST_NO_KSCREEN_BUILD)
+    # The outer tree's choices go through an initial-cache script, so a list-valued prefix path
+    # survives the trip into the test's command line.
+    file(CONFIGURE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/no_kscreen_build_cache.cmake
+         CONTENT "set(CMAKE_PREFIX_PATH [==[${CMAKE_PREFIX_PATH}]==] CACHE STRING \"\")
+set(CMAKE_CXX_COMPILER [==[${CMAKE_CXX_COMPILER}]==] CACHE FILEPATH \"\")
+set(CMAKE_BUILD_TYPE [==[${CMAKE_BUILD_TYPE}]==] CACHE STRING \"\")
+set(KF6Screen_DIR [==[${KF6Screen_DIR}]==] CACHE PATH \"\")
+")
+    wallpaperx_add_test(NAME app_no_kscreen_library_build
+                        COMMAND /bin/sh ${CMAKE_CURRENT_SOURCE_DIR}/no_kscreen_library_build.sh ${CMAKE_COMMAND}
+                                ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_BINARY_DIR}/no_kscreen_build
+                                -G ${CMAKE_GENERATOR} -C ${CMAKE_CURRENT_BINARY_DIR}/no_kscreen_build_cache.cmake)
+    set_tests_properties(app_no_kscreen_library_build PROPERTIES LABELS "novulkan" TIMEOUT 900)
+endif()
 
 # That every entry in this tree runs through isolated_run.sh, read from ctest's own listing, so an
 # entry registered with a bare add_test() -- here or in a subdirectory -- is caught. The floor is
