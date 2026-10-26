@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <vector>
 #include <memory>
 #include <stdexcept>
@@ -17,6 +18,8 @@
 #include <atomic>
 #include <optional>
 #include <thread>
+#include <type_traits>
+#include <utility>
 
 namespace wallpaperx {
 
@@ -191,10 +194,56 @@ public:
             uint64_t value;
         };
 
-        std::vector<Wait> wait;
-        std::vector<VkSemaphore> signal;
-        std::vector<TimelineWait> timelineWait;
-        std::vector<TimelineSignal> timelineSignal;
+        // Room for more of each kind than any caller adds (a draw of a decoded picture adds one
+        // timeline wait and one signal). Fixed, so a scope built on every draw allocates nothing;
+        // adding past it throws std::length_error before anything is submitted.
+        static constexpr size_t kCapacity = 4;
+
+        template <class T>
+        class List {
+            static_assert(std::is_trivially_copyable_v<T> && std::is_trivially_destructible_v<T>);
+
+        public:
+            List() {}
+            List(std::initializer_list<T> items) {
+                for (const T& item : items) push_back(item);
+            }
+            List(const List& other) : m_size(other.m_size) {
+                std::uninitialized_copy(other.begin(), other.end(), m_items);
+            }
+            List& operator=(const List& other) {
+                if (this == &other) return *this;
+                m_size = other.m_size;
+                std::uninitialized_copy(other.begin(), other.end(), m_items);
+                return *this;
+            }
+
+            template <class... Args>
+            T& emplace_back(Args&&... args) {
+                if (m_size == kCapacity) throw std::length_error("Device::SubmitScope: more entries than it holds");
+                T* item = std::construct_at(m_items + m_size, std::forward<Args>(args)...);
+                ++m_size;
+                return *item;
+            }
+            void push_back(const T& item) { emplace_back(item); }
+
+            const T* begin() const { return m_items; }
+            const T* end() const { return m_items + m_size; }
+            size_t size() const { return m_size; }
+            bool empty() const { return m_size == 0; }
+
+        private:
+            // A union, so the entries need no default constructor: they deliberately have none.
+            union {
+                T m_items[kCapacity];
+            };
+            size_t m_size = 0;
+        };
+
+        List<Wait> wait;
+        List<VkSemaphore> signal;
+        List<TimelineWait> timelineWait;
+        List<TimelineSignal> timelineSignal;
     };
 
     // Names one submitted batch, for a caller that has to know when it finished.

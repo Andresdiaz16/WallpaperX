@@ -2,8 +2,9 @@
 //
 // The still-image renderer: that it draws
 // "scaled and cropped" -- uniformly scaled to cover the monitor, centred, overflow cropped -- on
-// every descriptor tier, showing the same region the video renderer shows; and that every position
-// mode lays the picture where its rule says, identically in both renderers.
+// every descriptor tier, showing the same region the production video draw (YcbcrRenderer) shows of
+// the same picture; and that every position mode lays the picture where its rule says, identically
+// in both renderers. Each PNG fixture has a lossless video twin (renderer/CMakeLists.txt, still_*).
 //
 // HOW THE GEOMETRY IS READ BACK. The fixtures are ramps: red rises with x, green with y. A monitor
 // pixel's red and green name the image position it was sampled from, so the region shown is
@@ -11,7 +12,8 @@
 // (support/cover_expectation.h) -- never against placedRegion(), which is what is under test.
 
 #include "renderers/static_renderer.h"
-#include "renderers/video_renderer.h"
+#include "video/video_decoder.h"
+#include "video/ycbcr_renderer.h"
 #include "vulkan/device.h"
 #include "vulkan/offscreen.h"
 
@@ -19,7 +21,6 @@
 #include "support/cover_expectation.h"
 #include "support/descriptor_probe_support.h"
 #include "support/gpu_readback.h"
-#include "support/lent_frame.h"
 #include "support/test_image.h"
 #include "support/validation_grade.h"
 
@@ -27,8 +28,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -40,7 +43,9 @@ using wallpaperx::Device;
 using wallpaperx::OffscreenTarget;
 using wallpaperx::OffscreenTargetManager;
 using wallpaperx::StaticRenderer;
-using wallpaperx::VideoRenderer;
+using wallpaperx::DecodedFrame;
+using wallpaperx::VideoDecoder;
+using wallpaperx::YcbcrRenderer;
 using wallpaperx::testing::check;
 using wallpaperx::testing::CropRect;
 using wallpaperx::testing::expectedCover;
@@ -90,10 +95,34 @@ Fixture rampFixture(uint32_t width, uint32_t height) {
     return makeFixture(width, height, 0, width, 0, height, kConstantBlue, kConstantBlue);
 }
 
-std::vector<unsigned char> toBgra(const std::vector<unsigned char>& rgba) {
-    std::vector<unsigned char> bgra = rgba;
-    for (size_t i = 0; i + 3 < bgra.size(); i += 4) std::swap(bgra[i], bgra[i + 2]);
-    return bgra;
+// A fixture's video twin decoded to its first picture and shown by YcbcrRenderer. The decoder is
+// declared first so the renderer, which may hold one of its images, is destroyed before it.
+struct VideoTwin {
+    std::unique_ptr<VideoDecoder> decoder;
+    std::optional<YcbcrRenderer> renderer;
+};
+
+const char* const kVideoTwins[] = {"still_ramp_64x32.mp4",   "still_ramp_50x30.mp4",       "still_ramp_16x8.mp4",
+                                   "still_ramp_1000x2.mp4",  "still_ramp_2x1000.mp4",      "still_agree_wide_24x12.mp4",
+                                   "still_agree_tall_12x24.mp4"};
+
+std::string videoAsset(const char* name) {
+    return (std::filesystem::path(WALLPAPERX_VIDEO_ASSET_DIR) / name).string();
+}
+
+// Throws on a twin that does not decode to the fixture's size: the tier's catch reports it by name.
+std::unique_ptr<VideoTwin> openTwin(Device& device, const Fixture& fixture, const char* file) {
+    auto twin = std::make_unique<VideoTwin>();
+    twin->decoder = std::make_unique<VideoDecoder>(device, videoAsset(file));
+    std::optional<DecodedFrame> frame = twin->decoder->next();
+    if (!frame) throw std::runtime_error(std::string(file) + " decoded to no frames");
+    const VkExtent2D size = frame->visible().extent;
+    if (size.width != fixture.width || size.height != fixture.height) {
+        throw std::runtime_error(std::string(file) + " decoded to " + std::to_string(size.width) + "x" +
+                                 std::to_string(size.height) + ", not its still's size");
+    }
+    twin->renderer.emplace(device, std::move(*frame), WALLPAPERX_SHADER_DIR);
+    return twin;
 }
 
 std::string writeFixture(const Fixture& fixture, const std::string& name) {
@@ -311,16 +340,6 @@ constexpr int kMarkerVisible = 32;
 // one code of output rounding.
 constexpr double kFilterCodes = 255.0 / 32 + 1;
 
-// How far the video's whole-texel crop may sit from the exact one on an axis: the larger distance
-// from a cut edge to its nearest whole texel. The still samples the exact edges and the video the
-// rounded ones, and both map linearly between them, so no sample on the axis moves further.
-double cutEdgeDrift(double exact0, double exact1) {
-    return std::max(std::abs(exact0 - std::round(exact0)), std::abs(exact1 - std::round(exact1)));
-}
-
-// Codes a ramp of `extent` texels changes over `texels`.
-double rampCodes(double texels, uint32_t extent) { return texels * 255.0 / (extent - 1); }
-
 // The weight a linear filter at texel coordinate `u` gives texels inside [in0, in1), clamped to edge.
 double weightInside(double u, int in0, int in1, uint32_t extent) {
     const double t = u - 0.5;
@@ -361,12 +380,11 @@ EdgeMarker gradeMarker(const std::vector<unsigned char>& pixels, const Fixture& 
 }
 
 void gradeAgreement(Device& device, OffscreenTargetManager& targets, int monitorId, const Fixture& fixture,
-                    const std::string& path, int mx0, int mx1, int my0, int my1, uint32_t targetWidth,
-                    uint32_t targetHeight, const std::string& what) {
+                    const std::string& path, const char* videoFile, int mx0, int mx1, int my0, int my1,
+                    uint32_t targetWidth, uint32_t targetHeight, const std::string& what) {
     StaticRenderer still(device, targets.renderPass(), path, WALLPAPERX_SHADER_DIR);
-    wallpaperx::testing::LentFrame frame(device, fixture.width, fixture.height, VK_IMAGE_LAYOUT_GENERAL,
-                                         toBgra(fixture.rgba), "cover-agreement-frame");
-    VideoRenderer video(device, frame.frame());
+    const std::unique_ptr<VideoTwin> twin = openTwin(device, fixture, videoFile);
+    YcbcrRenderer& video = *twin->renderer;
 
     const std::vector<unsigned char> stillPixels =
         wallpaperx::testing::renderReference(device, targets, still, monitorId, targetWidth, targetHeight);
@@ -377,9 +395,6 @@ void gradeAgreement(Device& device, OffscreenTargetManager& targets, int monitor
     const CropRect crop = expectedCover(fixture.width, fixture.height, targetWidth, targetHeight);
     const double cx1 = crop.x0 + crop.width, cy1 = crop.y0 + crop.height;
     // Red (byte 2) follows x and green (byte 1) y; blue carries the marker and is graded per renderer.
-    const double allowance[4] = {0, kAgreementCodes + rampCodes(cutEdgeDrift(crop.y0, cy1), fixture.height),
-                                 kAgreementCodes + rampCodes(cutEdgeDrift(crop.x0, cx1), fixture.width),
-                                 kAgreementCodes};
     size_t compared = 0;
     double worst = 0;
     uint32_t worstX = 0, worstY = 0;
@@ -392,32 +407,31 @@ void gradeAgreement(Device& device, OffscreenTargetManager& targets, int monitor
                 for (int channel = 1; channel < 4; ++channel) {
                     const double over = std::abs(static_cast<int>(stillPixels[offset + channel]) -
                                                  static_cast<int>(videoPixels[offset + channel])) -
-                                        allowance[channel];
+                                        kAgreementCodes;
                     if (over > worst) worst = over, worstX = x, worstY = y;
                 }
             }
         }
         stillMarker = gradeMarker(stillPixels, fixture, crop.x0, crop.y0, cx1, cy1, mx0, mx1, my0, my1, targetWidth,
                                   targetHeight);
-        videoMarker = gradeMarker(videoPixels, fixture, std::round(crop.x0), std::round(crop.y0), std::round(cx1),
-                                  std::round(cy1), mx0, mx1, my0, my1, targetWidth, targetHeight);
+        videoMarker = gradeMarker(videoPixels, fixture, crop.x0, crop.y0, cx1, cy1, mx0, mx1, my0, my1, targetWidth,
+                                  targetHeight);
     }
 
     check(compared == static_cast<size_t>(targetWidth) * targetHeight,
           "every monitor pixel was compared, for: " + what);
 
-    // GOAL: S13.111 -- the still-image and video renderers keep the same region of the same image on the same
-    //       monitor, apart from the video's rounding of a cut edge to a whole texel.
-    // WHY-THIS-SHAPE: compared pixel for pixel against the video renderer, not against the cover
-    //       rule, because the video probe's own geometry check samples 25 points at a 4-pixel
-    //       tolerance, which a one-texel drift passes. The allowance per channel is the codes its
-    //       ramp moves over the derived cut-edge drift (cutEdgeDrift), so the whole-texel cases keep
-    //       4 codes and a one-texel shift, 11 codes on the 24-texel ramp, stays red everywhere.
-    // CONTROL: via control_batch, every tier, both ICDs, reverted: (a) the blit's `srcOffsets[0]`
-    //       x in renderer/renderers/video_renderer.cpp given `region->source.x0 + 1` -> both wide
-    //       cases red (7.0 and 7.6 codes over the allowance); (b)
-    //       renderer/renderers/static_renderer.cpp pushing `shown.x0 + 1` as the origin -> the
-    //       same (8.0 and 7.6). Changing placedRegion's scale leaves this green: both renderers move.
+    // GOAL: S13.111 -- the still-image renderer and the video draw keep the same region of the same image
+    //       on the same monitor, cut edges included: both sample the exact crop.
+    // WHY-THIS-SHAPE: compared pixel for pixel against the video draw, not against the cover rule,
+    //       because video_draw_probe's geometry check samples 25 points at a 1.5-pixel tolerance,
+    //       which a crop rounded to whole texels passes. No allowance for rounding a cut edge: 4
+    //       codes covers each side's rounding, the Y'CbCr round trip and filter precision, and the
+    //       70x50 case's cut edges are 0.4 texel (4.4 codes) from whole texels.
+    // CONTROL: via control_batch, both ICDs, reverted. renderer/video/ycbcr_renderer.cpp record()
+    //       sampling region->source (the whole-texel crop) in place of region->exact -> "FAIL: the
+    //       still image and the video show the same region, for: heap: a wide image, crop not whole
+    //       texels" on every tier, 1.0 code over; the whole-texel case stays green, as it must.
     check(worst <= 0, "the still image and the video show the same region, for: " + what);
     if (worst > 0) {
         std::fprintf(stderr, "  the renderers differ by %.1f codes more than allowed, first at (%u,%u)\n", worst,
@@ -425,17 +439,16 @@ void gradeAgreement(Device& device, OffscreenTargetManager& targets, int monitor
     }
 
     // GOAL: S15.761 -- under magnification each renderer blends in the texel beyond a cropped edge by
-    //       exactly its own crop's share: the still by the exact cover crop, the video by that crop
-    //       rounded to whole texels. That blending is accepted behaviour (S13.113), so this grades
-    //       its amount and never its absence.
+    //       exactly the exact cover crop's share, the still and the video alike. That blending is
+    //       accepted behaviour (S13.113), so this grades its amount and never its absence.
     // WHY-THIS-SHAPE: blue is 255 on the marked texels and 0 elsewhere, so a pixel's blue is the
-    //       weight its filter gave the marked texels, worked out here for each crop. Agreement
-    //       between the two cannot be graded any more: at a cut edge not on a whole texel the still
-    //       reads a part of the marker texel that the video's rounded crop leaves out.
+    //       weight its filter gave the marked texels, worked out here from the crop. Graded per
+    //       renderer, so a failure names which one left the exact crop.
     // CONTROL: via control_batch, every tier, both ICDs, reverted. renderer/renderers/static_renderer.cpp
     //       sampling region->source -> the still's check red on "crop not whole texels" (99.9
-    //       codes off), the video's green; renderer/renderers/cover_crop.h placeSpan rounding
-    //       source0 with std::floor -> the video's red (228 codes off), the still's green.
+    //       codes off), the video's green; renderer/video/ycbcr_renderer.cpp record() sampling
+    //       region->source -> "FAIL: at the cropped edge the video blends in the marker by the exact
+    //       crop's share" on "crop not whole texels" (99.9 codes off at (69,0)), the still's green.
     // COVERAGE-ASSERT: both expectations must reach the marker somewhere, so a fixture or target that
     //       stops the filter reaching past the crop fails instead of comparing unmarked edges.
     check(stillMarker.mostExpected >= kMarkerVisible && videoMarker.mostExpected >= kMarkerVisible,
@@ -443,7 +456,7 @@ void gradeAgreement(Device& device, OffscreenTargetManager& targets, int monitor
     check(stillMarker.worstMiss <= kFilterCodes,
           "at the cropped edge the still image blends in the marker by the exact crop's share, for: " + what);
     check(videoMarker.worstMiss <= kFilterCodes,
-          "at the cropped edge the video blends in the marker by the whole-texel crop's share, for: " + what);
+          "at the cropped edge the video blends in the marker by the exact crop's share, for: " + what);
     if (stillMarker.worstMiss > kFilterCodes || videoMarker.worstMiss > kFilterCodes) {
         std::fprintf(stderr, "  marker blue off by up to %.1f codes on the still at (%u,%u), %.1f on the video at (%u,%u)\n",
                      stillMarker.worstMiss, stillMarker.x, stillMarker.y, videoMarker.worstMiss, videoMarker.x,
@@ -459,10 +472,13 @@ void runAgreementCases(Device& device, const std::string& tier) {
     const Fixture tall = makeFixture(12, 24, 0, 12, 4, 20, 0, 255);
     const std::string widePath = writeFixture(wide, "agree_wide");
     const std::string tallPath = writeFixture(tall, "agree_tall");
-    gradeAgreement(device, targets, 1, wide, widePath, 4, 20, 0, 12, 64, 48, tier + ": a wide image, whole-texel crop");
-    gradeAgreement(device, targets, 3, wide, widePath, 4, 20, 0, 12, 70, 50,
+    const char* const wideVideo = "still_agree_wide_24x12.mp4";
+    gradeAgreement(device, targets, 1, wide, widePath, wideVideo, 4, 20, 0, 12, 64, 48,
+                   tier + ": a wide image, whole-texel crop");
+    gradeAgreement(device, targets, 3, wide, widePath, wideVideo, 4, 20, 0, 12, 70, 50,
                    tier + ": a wide image, crop not whole texels");
-    gradeAgreement(device, targets, 5, tall, tallPath, 0, 12, 4, 20, 48, 64, tier + ": a tall image");
+    gradeAgreement(device, targets, 5, tall, tallPath, "still_agree_tall_12x24.mp4", 0, 12, 4, 20, 48, 64,
+                   tier + ": a tall image");
 }
 
 // ------------------------------------------------------------------------- //
@@ -531,13 +547,11 @@ double expectedTexel(double centre, const AxisRule& a, bool tile, uint32_t sourc
     return std::clamp((centre - a.start) / a.scale - 0.5, 0.0, double(source - 1));
 }
 
-// The video's blit rounds every edge: a cut edge to the nearest whole texel, an uncut one to the
-// nearest pixel. A still samples its cut edges exactly, so it is owed only the uncut edges' half
-// pixel, 0.5/scale texels, and only where such an edge is not on a whole pixel.
-double texelTolerance(const AxisRule& a, uint32_t source, uint32_t target, bool still) {
+// Both renderers sample their cut edges exactly, so each is owed only the uncut edges' rounding to
+// whole pixels, 0.5/scale texels, and only where such an edge is not on a whole pixel.
+double texelTolerance(const AxisRule& a, uint32_t source, uint32_t target) {
     const double base = (source - 1) / 255.0 + 0.25;
     if (a.exact) return base;
-    if (!still) return base + 0.5 * std::max(1.0, 1.0 / a.scale);
     const bool offPixel = (a.start >= 0 && !whole(a.start)) || (a.end <= target && !whole(a.end));
     return base + (offPixel ? 0.5 / a.scale : 0.0);
 }
@@ -550,13 +564,13 @@ struct PlacedReport {
 };
 
 PlacedReport measurePlaced(const std::vector<unsigned char>& pixels, const Placement& placement, const Fixture& f,
-                           uint32_t tw, uint32_t th, bool still) {
+                           uint32_t tw, uint32_t th) {
     PlacedReport r;
     if (pixels.size() < static_cast<size_t>(tw) * th * 4) return r;
     const Placed e = expectedPlacement(placement, f.width, f.height, tw, th);
     const bool tile = placement.mode == PositionMode::Tile;
     const AxisRule ax = axisRule(e.left, e.scaleX, f.width, tw), ay = axisRule(e.top, e.scaleY, f.height, th);
-    const double tolX = texelTolerance(ax, f.width, tw, still), tolY = texelTolerance(ay, f.height, th, still);
+    const double tolX = texelTolerance(ax, f.width, tw), tolY = texelTolerance(ay, f.height, th);
     auto note = [&](size_t& counter, uint32_t x, uint32_t y) {
         if (r.notBlack + r.notPicture + r.wrongTexel == 0) r.firstX = x, r.firstY = y;
         ++counter;
@@ -592,8 +606,8 @@ int g_placedAgreements = 0;
 
 // Grades one read-back; true when the picture landed at all, for the caller's coverage count.
 bool gradePlaced(const std::vector<unsigned char>& pixels, const Placement& placement, const Fixture& f, uint32_t tw,
-                 uint32_t th, const std::string& what, bool fullyOff, bool still) {
-    const PlacedReport r = measurePlaced(pixels, placement, f, tw, th, still);
+                 uint32_t th, const std::string& what, bool fullyOff) {
+    const PlacedReport r = measurePlaced(pixels, placement, f, tw, th);
     ++g_placedCases;
     const size_t total = static_cast<size_t>(tw) * th;
     // COVERAGE-ASSERT: every pixel is classified, and a placement that shows the picture must
@@ -607,19 +621,20 @@ bool gradePlaced(const std::vector<unsigned char>& pixels, const Placement& plac
     //       mode's scale and offset put there (uniform scale on both axes except in stretch).
     // WHY-THIS-SHAPE: graded against geometry derived here from the stated rules, not against
     //       placedRegion(): calling it would grade the function against itself. Tolerance is zero
-    //       rounding where every visible edge falls on whole pixels and texels; otherwise the video
-    //       is owed half a texel for its blit and a still only half a pixel at an uncut edge
-    //       (texelTolerance), so a still cropped to whole texels like the video fails.
+    //       rounding where every visible edge falls on whole pixels and texels; otherwise either
+    //       renderer is owed only half a pixel at an uncut edge (texelTolerance), so one cropped to
+    //       whole texels fails.
     // CONTROL: each via control_batch, red on all tiers and both ICDs, reverted. In
     //       renderer/renderers/cover_crop.h: Fit's min -> max, "not black ... fit"; Fit's y axis
     //       scaled to the screen's height, the portrait squash, the same; centredStart + 1, "the
     //       picture wherever it is placed ... center"; Free's `0.5 + x` -> `0.5 - x`, free cases
-    //       red; placeSpan's source0 + 1 at a cut start edge, "reads the expected source texel ...
-    //       free 2,-0.25,0.25 (video)" (a still samples the exact edge, so only the video moves);
-    //       Stretch falling into Cover's case, stretch red; a fully-off placement drawn as cover,
-    //       "not black ... free 1,5,0"; static_renderer.cpp sampling region->source, "reads the
-    //       expected source texel ... cover (default) (still)" and free stills. Grey clears in
-    //       static_renderer.cpp and video_renderer.cpp, "not black" for that renderer; the tile
+    //       red; Stretch falling into Cover's case, stretch red; a fully-off placement drawn as
+    //       cover, "not black ... free 1,5,0"; static_renderer.cpp sampling region->source, "reads
+    //       the expected source texel ... cover (default) (still)" and free stills; a grey clear in
+    //       static_renderer.cpp, "not black" for the still. renderer/video/ycbcr_renderer.cpp
+    //       record() sampling region->source -> "each placed pixel reads the expected source texel
+    //       ... cover (default) (video)" (worst 0.58-0.65 texel); its clear made grey -> "black
+    //       wherever the picture does not reach ... fit (video)". Both ICDs. The tile
     //       push flag forced 0, fullscreen_set.frag without fract() (buffer and classic only) and
     //       fullscreen_heap.frag without it (heap only), "reads the expected source texel ... tile".
     check(r.notBlack == 0, "black wherever the picture does not reach, for: " + what);
@@ -663,13 +678,6 @@ const Screen kScreens[] = {{36, 64}, {128, 128}, {96, 54}, {40, 20}};
 constexpr int kScreenCount = static_cast<int>(std::size(kScreens));
 constexpr int kPositionFixtures = 2;
 
-// The cut-edge drift (cutEdgeDrift) of one axis of a placement: zero where neither edge is cut.
-double placedDrift(double start, double scale, uint32_t source, uint32_t target) {
-    const double exact0 = start < 0 ? -start / scale : 0.0;
-    const double exact1 = start + source * scale > target ? (target - start) / scale : source;
-    return cutEdgeDrift(exact0, exact1);
-}
-
 int g_coverFreeComparisons = 0;
 
 void runPositionCases(Device& device, const std::string& tier) {
@@ -677,13 +685,13 @@ void runPositionCases(Device& device, const std::string& tier) {
     const Fixture fixtures[kPositionFixtures] = {rampFixture(64, 32), rampFixture(50, 30)};
     const std::string paths[kPositionFixtures] = {writeFixture(fixtures[0], "pos_wide"),
                                                   writeFixture(fixtures[1], "pos_odd")};
+    const char* const kPositionVideos[kPositionFixtures] = {"still_ramp_64x32.mp4", "still_ramp_50x30.mp4"};
     int monitorId = 100;
     for (int which = 0; which < kPositionFixtures; ++which) {
         const Fixture& f = fixtures[which];
         StaticRenderer still(device, targets.renderPass(), paths[which], WALLPAPERX_SHADER_DIR);
-        wallpaperx::testing::LentFrame frame(device, f.width, f.height, VK_IMAGE_LAYOUT_GENERAL, toBgra(f.rgba),
-                                             "position-frame");
-        VideoRenderer video(device, frame.frame());
+        const std::unique_ptr<VideoTwin> twin = openTwin(device, f, kPositionVideos[which]);
+        YcbcrRenderer& video = *twin->renderer;
         std::vector<unsigned char> coverStill[kScreenCount], coverVideo[kScreenCount];
         for (const ModeCase& c : kModeCases) {
             for (int screen = 0; screen < kScreenCount; ++screen) {
@@ -694,13 +702,13 @@ void runPositionCases(Device& device, const std::string& tier) {
                 still.place(c.placement);
                 const auto stillPixels =
                     wallpaperx::testing::renderReference(device, targets, still, monitorId++, s.width, s.height);
-                gradePlaced(stillPixels, c.placement, f, s.width, s.height, what + " (still)", c.fullyOff, true);
-                if (c.placement.mode == PositionMode::Tile) continue;  // refused by video: video_renderer_probe
+                gradePlaced(stillPixels, c.placement, f, s.width, s.height, what + " (still)", c.fullyOff);
+                if (c.placement.mode == PositionMode::Tile) continue;  // refused by video: video_draw_probe placement
 
                 video.place(c.placement);
                 const auto videoPixels =
                     wallpaperx::testing::renderReference(device, targets, video, monitorId++, s.width, s.height);
-                gradePlaced(videoPixels, c.placement, f, s.width, s.height, what + " (video)", c.fullyOff, false);
+                gradePlaced(videoPixels, c.placement, f, s.width, s.height, what + " (video)", c.fullyOff);
 
                 // GOAL: S15.762 -- free mode at zoom 1, offset 0,0 draws exactly what cover draws, for
                 //       a still and for a video, on every screen.
@@ -709,7 +717,7 @@ void runPositionCases(Device& device, const std::string& tier) {
                 //       the placement grading above would pass within its rounding allowance.
                 // CONTROL: renderer/renderers/cover_crop.h placedRegion adding 0.3 pixel to `left`
                 //       in Free only -> both checks red for every screen and fixture, every tier,
-                //       both ICDs, via control_batch. Reverted.
+                //       both ICDs, via control_batch. Reverted; re-run with YcbcrRenderer as the video.
                 if (c.placement.mode == PositionMode::Cover) {
                     coverStill[screen] = stillPixels;
                     coverVideo[screen] = videoPixels;
@@ -723,30 +731,21 @@ void runPositionCases(Device& device, const std::string& tier) {
                 }
 
                 // GOAL: S15.702 -- the still and video renderers draw the same frame in every mode but
-                //       tile, edges and bars included, apart from the video's rounding of a cut edge to
-                //       a whole texel.
+                //       tile, edges, bars and cut edges included.
                 // WHY-THIS-SHAPE: every byte of the frame, not the interior only: an edge that
-                //       differs is a real divergence (a draw and a blit placed on different pixels),
-                //       which an interior-only compare would pass. Red and green are allowed the
-                //       codes their ramp moves over the axis's cut-edge drift (placedDrift), worked
-                //       out from the mode's rule here, so an axis with no cut edge stays at 4 codes.
-                // CONTROL: via control_batch, every tier, both ICDs, reverted:
-                //       renderer/renderers/video_renderer.cpp's blit dstOffsets[0].x + 1 -> red
-                //       across modes (up to 251 codes over); renderer/renderers/cover_crop.h placeSpan
-                //       rounding source0 down, a video crop half a texel further than rounding
-                //       allows -> red on cut cases of the 50x30 fixture (0.8 and 3.5 codes over).
-                const Placed e = expectedPlacement(c.placement, f.width, f.height, s.width, s.height);
-                const double allowance[4] = {
-                    kAgreementCodes,
-                    kAgreementCodes + rampCodes(placedDrift(e.top, e.scaleY, f.height, s.height), f.height),
-                    kAgreementCodes + rampCodes(placedDrift(e.left, e.scaleX, f.width, s.width), f.width),
-                    kAgreementCodes};
+                //       differs is a real divergence (two draws placed on different pixels), which an
+                //       interior-only compare would pass. One allowance, 4 codes, for every channel:
+                //       both sample the exact crop, so none is owed for rounding a cut edge.
+                // CONTROL: via control_batch, both ICDs, reverted. renderer/video/ycbcr_renderer.cpp
+                //       record() sampling region->source -> "FAIL: the still and the video draw the
+                //       same frame, for: heap: 50x30 on 40x20, cover (default)" and free cases, 1.0
+                //       code over; its clear made grey -> the same line for every fit case.
                 size_t compared = 0;
                 double worst = 0;
                 if (stillPixels.size() == videoPixels.size() &&
                     stillPixels.size() >= static_cast<size_t>(s.width) * s.height * 4) {
                     for (size_t i = 0; i < static_cast<size_t>(s.width) * s.height * 4; ++i, ++compared) {
-                        worst = std::max(worst, std::abs(int(stillPixels[i]) - int(videoPixels[i])) - allowance[i % 4]);
+                        worst = std::max(worst, std::abs(int(stillPixels[i]) - int(videoPixels[i])) - double(kAgreementCodes));
                     }
                 }
                 ++g_placedAgreements;
@@ -771,16 +770,19 @@ struct ThinCase {
     const char* name;
     // The one column or row the picture must land on; -1 where that axis is covered whole.
     int column, row;
+    const char* video;
 };
 
 // On 96x54. Fit of 1000x2 is 0.192 pixels tall; the Free cases leave 0.3 pixel of a 64x32 image
 // on the screen's left or right edge (cover scale 1.6875, so x = -+1.059375).
 constexpr uint32_t kThinWidth = 96, kThinHeight = 54;
 const ThinCase kThinCases[] = {
-    {1000, 2, {PositionMode::Fit}, "fit 1000x2 (0.192 pixel tall)", -1, 27},
-    {2, 1000, {PositionMode::Fit}, "fit 2x1000 (0.108 pixel wide)", 48, -1},
-    {64, 32, {PositionMode::Free, 1.0, -1.059375, 0.0}, "free, 0.3 pixel left on the left edge", 0, -1},
-    {64, 32, {PositionMode::Free, 1.0, 1.059375, 0.0}, "free, 0.3 pixel left on the right edge", 95, -1},
+    {1000, 2, {PositionMode::Fit}, "fit 1000x2 (0.192 pixel tall)", -1, 27, "still_ramp_1000x2.mp4"},
+    {2, 1000, {PositionMode::Fit}, "fit 2x1000 (0.108 pixel wide)", 48, -1, "still_ramp_2x1000.mp4"},
+    {64, 32, {PositionMode::Free, 1.0, -1.059375, 0.0}, "free, 0.3 pixel left on the left edge", 0, -1,
+     "still_ramp_64x32.mp4"},
+    {64, 32, {PositionMode::Free, 1.0, 1.059375, 0.0}, "free, 0.3 pixel left on the right edge", 95, -1,
+     "still_ramp_64x32.mp4"},
 };
 constexpr int kThinCaseCount = static_cast<int>(std::size(kThinCases));
 
@@ -794,7 +796,8 @@ constexpr int kThinCaseCount = static_cast<int>(std::size(kThinCases));
 //       every tier, NVIDIA and Lavapipe; its far-edge `target0 -= 1` made `target0 -= 0` (NVIDIA) or
 //       `target1 += 1` (Lavapipe; on NVIDIA that draw loses the device first) -> the right-edge case alone;
 //       the `!(end > 0 && start < limit)` guard deleted -> gradePlaced's "black wherever ... free 1,5,0
-//       (fully off screen)", both ICDs.
+//       (fully off screen)", both ICDs. With YcbcrRenderer as the video, the widening deleted again
+//       -> the same line red for "(video)" as for "(still)", both ICDs.
 void runThinCases(Device& device, const std::string& tier) {
     OffscreenTargetManager targets(device);
     int monitorId = 400;
@@ -802,9 +805,8 @@ void runThinCases(Device& device, const std::string& tier) {
         const Fixture f = rampFixture(c.sourceWidth, c.sourceHeight);
         const std::string path = writeFixture(f, "thin_" + std::to_string(c.sourceWidth) + "x" + std::to_string(c.sourceHeight));
         StaticRenderer still(device, targets.renderPass(), path, WALLPAPERX_SHADER_DIR);
-        wallpaperx::testing::LentFrame frame(device, f.width, f.height, VK_IMAGE_LAYOUT_GENERAL, toBgra(f.rgba),
-                                             "thin-frame");
-        VideoRenderer video(device, frame.frame());
+        const std::unique_ptr<VideoTwin> twin = openTwin(device, f, c.video);
+        YcbcrRenderer& video = *twin->renderer;
         still.place(c.placement);
         video.place(c.placement);
         const std::pair<const char*, std::vector<unsigned char>> drawn[] = {
@@ -862,20 +864,19 @@ void runPanCases(Device& device, const std::string& tier) {
     constexpr double kZoom = 4.0;
     const double scale = kZoom * std::max(double(kSize) / f.width, double(kSize) / f.height);
     StaticRenderer still(device, targets.renderPass(), path, WALLPAPERX_SHADER_DIR);
-    wallpaperx::testing::LentFrame frame(device, f.width, f.height, VK_IMAGE_LAYOUT_GENERAL, toBgra(f.rgba), "pan-frame");
-    VideoRenderer video(device, frame.frame());
+    const std::unique_ptr<VideoTwin> twin = openTwin(device, f, "still_ramp_16x8.mp4");
+    YcbcrRenderer& video = *twin->renderer;
 
-    // GOAL: S15.763 -- at high zoom a small change of position.x moves a still by the matching
-    //       fraction of a texel, and a video by whole texels, the nearest whole number to it.
+    // GOAL: S15.763 -- at high zoom a small change of position.x moves a still and a video alike by
+    //       the matching fraction of a texel.
     // WHY-THIS-SHAPE: the mean column over the whole frame, against the move worked out from Free's
-    //       rule (a pixel of x offset is 1/scale texels), in quarter-texel steps: a still stepping
-    //       in whole texels misses a quarter-texel step by 0.25, four times the 0.06 allowed. The
-    //       video's step must be within half a texel of the exact move (a blit only takes whole
-    //       texels, so that is its own bound, not graded).
+    //       rule (a pixel of x offset is 1/scale texels), in quarter-texel steps: a renderer stepping
+    //       in whole texels misses a quarter-texel step by 0.25, four times the 0.06 allowed.
     // CONTROL: via control_batch, every tier, both ICDs, reverted. renderer/renderers/static_renderer.cpp
     //       sampling region->source -> the still's check red on steps 1-3 ("expected a move of
-    //       -0.25 texels: the still moved 0.000"); renderer/renderers/cover_crop.h placeSpan
-    //       rounding source0 with std::floor -> the video's red on steps 1 and 2.
+    //       -0.25 texels: the still moved 0.000"); renderer/video/ycbcr_renderer.cpp record()
+    //       sampling region->source -> "FAIL: a video pans by the fraction of a texel the offset
+    //       asks" on steps 1-3 ("the video 0.000" for a -0.25 move).
     // COVERAGE-ASSERT: all five steps rendered for both renderers, and the exact moves span a full
     //       texel, so the steps cannot all fall on whole texels.
     std::vector<unsigned char> firstStill, firstVideo;
@@ -895,9 +896,8 @@ void runPanCases(Device& device, const std::string& tier) {
         const double videoMove = meanColumn(videoPixels, f.width) - meanColumn(firstVideo, f.width);
         const std::string what = tier + ": a quarter-texel pan step " + std::to_string(step) + " at zoom 4";
         check(std::abs(stillMove - exact) <= 0.06, "a still pans by the fraction of a texel the offset asks, for: " + what);
-        check(std::abs(videoMove - exact) <= 0.5 + 0.06,
-              "a video pans by the whole texel nearest the offset's move, for: " + what);
-        if (std::abs(stillMove - exact) > 0.06 || std::abs(videoMove - exact) > 0.56) {
+        check(std::abs(videoMove - exact) <= 0.06, "a video pans by the fraction of a texel the offset asks, for: " + what);
+        if (std::abs(stillMove - exact) > 0.06 || std::abs(videoMove - exact) > 0.06) {
             std::fprintf(stderr, "  expected a move of %.2f texels: the still moved %.3f, the video %.3f\n", exact,
                          stillMove, videoMove);
         }
@@ -940,8 +940,8 @@ void runSharedStillCases(Device& device, const std::string& tier) {
         centre.place({PositionMode::Centre});
         centrePixels = wallpaperx::testing::renderReference(device, targets, centre, 201, 128, 128);
     }
-    gradePlaced(fitPixels, {PositionMode::Fit}, first, 128, 128, tier + ": a shared still drawn fit", false, true);
-    gradePlaced(centrePixels, {PositionMode::Centre}, first, 128, 128, tier + ": the same still drawn centred", false, true);
+    gradePlaced(fitPixels, {PositionMode::Fit}, first, 128, 128, tier + ": a shared still drawn fit", false);
+    gradePlaced(centrePixels, {PositionMode::Centre}, first, 128, 128, tier + ": the same still drawn centred", false);
     check(StillImage::load(device, path, image) == image,
           tier + ": loading an unchanged still again with it kept decodes nothing");
 
@@ -1086,6 +1086,14 @@ bool runCoverOnEveryTier() {
 }  // namespace
 
 int main() {
+    for (const char* twin : kVideoTwins) {
+        if (!std::filesystem::exists(videoAsset(twin))) {
+            std::printf("static_renderer_probe: NOT VERIFIED -- video fixture %s was not generated (no ffmpeg at "
+                        "configure time?), so the stills have nothing to be compared with; reported as a skip\n",
+                        twin);
+            return kNotVerifiedExitCode;
+        }
+    }
     bool ok = true;
     ok &= runCoverOnEveryTier();
     const int failures = wallpaperx::testing::reportFailures("static_renderer_probe");

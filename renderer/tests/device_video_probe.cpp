@@ -14,7 +14,7 @@
 // HOW. The executable's definition of a Vulkan entry point preempts libvulkan's for every call
 // site linked into it, including those inside wallpaperx-renderer.a; the real entry point is
 // reached through RTLD_NEXT. That is the same technique ownership_transfer_probe and
-// video_renderer_probe use, and it is required here because X.6 forbids a test-only seam in a
+// video_draw_probe use, and it is required here because X.6 forbids a test-only seam in a
 // production header -- there is no other way to see the argument a call was made with.
 //
 // FOUR ENTRIES, ONE BINARY. `enabled` and `waits` answer on any driver. `decode` answers

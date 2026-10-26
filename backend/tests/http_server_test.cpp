@@ -50,6 +50,7 @@
 #include "tests/client/scratch_dir.h"
 #include "tests/manager_output.h"
 #include "tests/self_exec.h"
+#include "tests/test_phase.h"
 #include "tests/test_report.h"
 
 #include <httplib.h>
@@ -3048,16 +3049,11 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& shader
                     "to compare against");
     }
 
-    // ------------------------------------------------------------------ //
-    // (g) a GPU that breaks after it has already worked, and the recovery from it.
-    // ------------------------------------------------------------------ //
-    runGpuFailureChecks(bluePath, base, check);
-
     // WHAT REMAINS UNCOVERED OF S7.10e, stated rather than left to be inferred from an
     // absence. The goal itself records the limit: GpuFailure is thrown from
     // Device::immediateSubmit and nowhere else, so a device-level fault in
     // OffscreenTargetManager's image or render-pass creation, or in pipeline creation,
-    // still leaves /health blaming `wallpapers`. Scenario (g) below fails a submit, which
+    // still leaves /health blaming `wallpapers`. Scenario (g), runGpuFailureChecks(), fails a submit, which
     // reaches every GpuFailure site there is; it cannot reach the ones that do not exist.
     //
     // Also uncovered: the other two throw sites inside immediateSubmit --
@@ -3193,13 +3189,17 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
     //       and the equality adds only "no further submit followed". What the split cannot
     //       measure is the *order* of the three stages; renderPending fixes that by
     //       construction, since it cannot render before the renderer it renders with exists.
-    // CONTROL: two edits to offscreen.cpp made the upload the last submit -- a dummy
-    //       immediateSubmit added to OffscreenTargetManager's constructor, and the one in
-    //       its render() skipped. Without this guard that world passed entirely green, the
+    // CONTROL: two edits to renderer/vulkan/offscreen.cpp made the upload the last submit -- a
+    //       dummy immediateSubmit added to OffscreenTargetManager's constructor, and render()'s
+    //       submit (today `renderer.submit(m_device, std::ref(recordBatch))`) skipped. Without
+    //       this guard that world passed entirely green, the
     //       four checks below reading exactly as on a healthy run while the render's catch
     //       was never entered. With it: exit 77, "OffscreenTargetManager::render made 0
     //       vkQueueSubmit call(s), the texture upload 1 and device/target setup 1, which is
-    //       2 against the 2 a whole manager render costs". Both edits reverted.
+    //       2 against the 2 a whole manager render costs". Both edits reverted. Re-run 2026-10-26
+    //       (T20k) through control_batch.sh with --phase '^gpuFailure$': the same line, entry
+    //       Skipped; restored, "all checks passed", Passed. The tool grades this "NOT RED", because
+    //       the guard's designed answer is a skip, so read its red.log rather than its verdict.
     // COVERAGE-ASSERT: `split.render >= 1` is deliberately not folded into the sum. Under
     //       that control the sum balanced (1 + 1 + 0 == 2) and only the render stage's own
     //       count fell short. The sum has its own control -- the upload stage's measurement
@@ -5930,42 +5930,61 @@ int main(int argc, char** argv) {
 
             httplib::Client cli = makeClient(server->port());
 
-            runBindChecks(*proxy, manager, *server, check);
+            using wallpaperx::testing::phaseSelected;
+            if (phaseSelected("bind")) runBindChecks(*proxy, manager, *server, check);
 
             // Before anything renders: the whole point of the S7.10b pre-device check is
             // that nothing has been tried yet on this manager, so `pending` is the true
             // answer for all three checks.
-            runHealthBeforeDeviceChecks(cli, check);
+            if (phaseSelected("healthBeforeDevice")) runHealthBeforeDeviceChecks(cli, check);
 
             // Before any device exists, on a daemon of its own: the fewer threads are
             // allocating in this process, the more exactly the one-shot below lands.
-            runHandlerExceptionChecks(check);
+            if (phaseSelected("handlerException")) runHandlerExceptionChecks(check);
 
             // Runs on managers of its own, so it neither needs nor disturbs the state
             // above -- and so it can be reached on a host with no Vulkan at all, where the
             // main render below never happens.
-            runHealthStateChecks(bluePath, shaderPath, junkPath, check);
+            if (phaseSelected("healthState")) runHealthStateChecks(bluePath, shaderPath, junkPath, check);
+
+            // (g): a GPU that breaks after it has already worked, and the recovery from it. Its own
+            // daemons, on the same configuration as the phase above.
+            if (phaseSelected("gpuFailure")) {
+                WallpaperManager::Config base;
+                base.width = kTargetWidth;
+                base.height = kTargetHeight;
+                base.enableValidation = false;
+                runGpuFailureChecks(bluePath, base, check);
+            }
 
             // Its own daemon, like the phase above, and placed beside it because it is the same
             // question asked of a type this build draws.
-            runVideoHealthChecks(check);
-            runExportAllocationSweep(check);
+            if (phaseSelected("videoHealth")) runVideoHealthChecks(check);
+            if (phaseSelected("exportAllocationSweep")) runExportAllocationSweep(check);
 
             // Recorded through the manager rather than through SetWallpaper, so no render
             // is queued and the "before any device" state above survives into this phase.
-            manager.requestWallpaper("static", bluePath, kMonitorParam);
-            runMonitorParamChecks(cli, bluePath, check);
+            if (phaseSelected("monitorParam")) {
+                manager.requestWallpaper("static", bluePath, kMonitorParam);
+                runMonitorParamChecks(cli, bluePath, check);
+            }
 
             // Same reasoning as the line above: recorded through the manager, so the phase
             // adds monitors and connector names without queueing a render.
-            runOutputParamChecks(manager, cli, bluePath, namedPath, namedOtherPath, check);
+            if (phaseSelected("outputParam")) {
+                runOutputParamChecks(manager, cli, bluePath, namedPath, namedOtherPath, check);
+            }
 
-            runTornReadChecks(manager, cli, bluePath, shaderPath, check);
+            if (phaseSelected("tornRead")) runTornReadChecks(manager, cli, bluePath, shaderPath, check);
 
             // First render of the run. Everything after it needs a Device to exist.
-            setWallpaper(*proxy, "static", hostilePath, kMonitorAgree);
-            const bool rendered = signals.wait(kMonitorAgree, 1);
-            if (!rendered) {
+            const bool afterRender = phaseSelected("afterRender");
+            bool rendered = false;
+            if (afterRender) {
+                setWallpaper(*proxy, "static", hostilePath, kMonitorAgree);
+                rendered = signals.wait(kMonitorAgree, 1);
+            }
+            if (afterRender && !rendered) {
                 // X.3 again: on a host with no working Vulkan this is not a fault of the
                 // HTTP server, and grading the four phases below would produce a page of
                 // FAIL lines pointing at the wrong component.
@@ -5978,7 +5997,7 @@ int main(int argc, char** argv) {
                                 (entry != nullptr && entry->contains("last_error")
                                      ? " -- last_error: " + entry->value("last_error", std::string())
                                      : std::string()));
-            } else {
+            } else if (afterRender) {
                 runAgreementChecks(cli, *proxy, manager, signals, hostilePath, check);
                 runHealthAfterDeviceChecks(cli, *proxy, manager, check);
                 runReadOnlyChecks(cli, *proxy, check);
@@ -5990,9 +6009,10 @@ int main(int argc, char** argv) {
             server.reset();
         }
 
-        runShutdownChecks(manager, check);
-        runKeepAliveShutdownChecks(manager, check);
-        runSilentClientShutdownChecks(manager, check);
+        using wallpaperx::testing::phaseSelected;
+        if (phaseSelected("shutdown")) runShutdownChecks(manager, check);
+        if (phaseSelected("keepAliveShutdown")) runKeepAliveShutdownChecks(manager, check);
+        if (phaseSelected("silentClientShutdown")) runSilentClientShutdownChecks(manager, check);
 
         // GOAL: S7.20's release half again, from the direction the phases feel it -- the
         //       registration guard may turn away no HttpServer built anywhere in this run.

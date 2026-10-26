@@ -3,9 +3,9 @@
 #include "video_decoder.h"
 
 #include "ffmpeg_file.h"
-#include "frame_converter.h"
 #include "nal_bits.h"
 #include "reset_point.h"
+#include "ycbcr_renderer.h"
 
 #include "../vulkan/format_features.h"
 #include "../vulkan/gpu_fault.h"
@@ -449,6 +449,16 @@ DecodedFrame::DeviceImage DecodedFrame::deviceImage() const {
     if (storage() != Storage::DeviceImage) throw std::logic_error("DecodedFrame: a host frame has no device image");
     const FrameLock lock(framesContext(frame()), vkFrame(frame()));
     return deviceImageLocked();
+}
+
+VkExtent2D DecodedFrame::imageExtent() const {
+    if (storage() != Storage::DeviceImage) throw std::logic_error("DecodedFrame: a host frame has no device image");
+    const AVHWFramesContext* pool = framesContext(frame());
+    return {static_cast<uint32_t>(pool->width), static_cast<uint32_t>(pool->height)};
+}
+
+const void* DecodedFrame::imagePool() const {
+    return storage() == Storage::DeviceImage ? static_cast<const void*>(framesContext(frame())) : nullptr;
 }
 
 DecodedFrame::DeviceImage DecodedFrame::deviceImageLocked() const {
@@ -1321,18 +1331,20 @@ bool VideoDecoder::attachHardwareFrames(AVCodecContext* codec) {
     auto* vk = static_cast<AVVulkanFramesContext*>(context->hwctx);
     const auto* profiles = static_cast<const VkVideoProfileListInfoKHR*>(
         findInChain(vk->create_pnext, VK_STRUCTURE_TYPE_VIDEO_PROFILE_LIST_INFO_KHR));
-    // One multi-planar image per picture, of a layout and format the converter reads, is what
-    // submit() and the conversion after it handle. Anything else goes to software, never to a
-    // converter that would refuse it as bad content.
+    // One multi-planar image per picture, of a layout and format the renderer reads, is what
+    // submit() and the draws after it handle. Anything else goes to software, never to a
+    // renderer that would refuse it as bad content. Optimal tiling is what readsDeviceImage()
+    // asks about the plane formats, and what ffmpeg keeps at init on a device it did not create.
     if (profiles == nullptr || profiles->profileCount == 0 || vk->format[0] == VK_FORMAT_UNDEFINED ||
-        vk->format[1] != VK_FORMAT_UNDEFINED || !FrameConverter::readsDeviceImage(m_device, context->sw_format, vk->format[0])) {
+        vk->format[1] != VK_FORMAT_UNDEFINED || vk->tiling != VK_IMAGE_TILING_OPTIMAL ||
+        !YcbcrRenderer::readsDeviceImage(m_device, context->sw_format, vk->format[0])) {
         refuse(Path::SoftwareRefused);
         return false;
     }
 
-    // The decoder's own usage plus a copy source for the conversion that follows, which copies
-    // the planes out rather than sampling them; the query is made with what ffmpeg will add.
-    const VkImageUsageFlags renderer = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    // The decoder's own usage plus sampling for the draws that read each plane where it is; the
+    // query is made with what ffmpeg will add.
+    const VkImageUsageFlags renderer = VK_IMAGE_USAGE_SAMPLED_BIT;
     const VkImageUsageFlags asked =
         (vk->usage & (VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR | VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR)) | renderer;
     const VkFormatFeatureFlags2 features = formatFeatures(m_device.physicalDevice(), vk->format[0], vk->tiling);
@@ -1363,13 +1375,14 @@ bool VideoDecoder::attachHardwareFrames(AVCodecContext* codec) {
     for (const VkVideoFormatPropertiesKHR& candidate : formats) {
         if (candidate.format == vk->format[0] && candidate.imageTiling == vk->tiling) match = &candidate;
     }
-    // ffmpeg reads zero flags as unset and fills in its own, ALIAS among them, so a profile that
-    // allows neither of the two it would otherwise get cannot be given a valid image.
+    // A plane is viewed in its own format, which needs MUTABLE_FORMAT (VUID-VkImageViewCreateInfo-image-12397);
+    // EXTENDED_USAGE alone allows no such view. ffmpeg reads zero flags as unset and fills in its own,
+    // ALIAS among them, which this never leaves it.
     const VkImageCreateFlags flags =
         match == nullptr ? 0
                          : match->imageCreateFlags &
                                (VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
-    if (flags == 0) {
+    if ((flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) == 0) {
         refuse(Path::SoftwareRefused);
         return false;
     }

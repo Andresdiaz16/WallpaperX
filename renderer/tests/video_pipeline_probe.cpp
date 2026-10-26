@@ -22,6 +22,7 @@
 
 #include "video/video_decoder.h"
 #include "video/video_pipeline.h"
+#include "video/ycbcr_renderer.h"
 #include "vulkan/device.h"
 #include "vulkan/owned_device.h"
 #include "vulkan/gpu_fault.h"
@@ -267,6 +268,9 @@ constexpr int kFirstWait = k_vkWaitForFences;
 // inside the call.
 thread_local bool g_countVulkan = false;
 std::array<int, kVulkanCallCount> g_vulkanCalls{};
+// The images that plane views (a view of one plane of a multi-planar image) were made of while g_countVulkan
+// was set: what the renderer makes the first time it shows a decoded pool image.
+thread_local std::vector<VkImage> g_planeViewImages;
 
 struct VulkanTally {
     std::array<int, kVulkanCallCount> calls{};
@@ -728,10 +732,11 @@ void runSequenceChecks(Device& device, const std::string& label, bool onDevice) 
     //       (black on the first), which only a per-call identity sees; a frame count cannot. Reading
     //       back adds a wait after the call, never inside it, so the order graded is the pipeline's.
     // CONTROL: each reverted. The convert now lives in renderer/video/video_pipeline.cpp decodeNext() and
-    //       the blit in draw(), so "rendering before converting" is renderNext() calling draw() first.
+    //       the draw in draw(), so "rendering before converting" is renderNext() calling draw() first.
     //       Re-run there 2026-09-15: all four fixtures red on the host path, "the pipeline threw after 0
     //       pictures: VideoPipeline::draw: no picture has been decoded" -- the split turned what used to
     //       show a stale picture into a throw, which is why this text no longer says "call 1 showed -1".
+    //       Re-run 2026-10-26 (G6), control_batch.sh, sequence-host on the RTX: the same line, all fixtures.
     //       renderer/video/video_decoder.cpp admit()
     //       dropping, outside a resume, a picture whose timestamp is not above the last returned:
     //       counter_jump.ts "60 pictures shown against 120", counter_repeat.mkv "30 pictures shown
@@ -3953,10 +3958,10 @@ void runShapeChecks(Device& device, const std::string& label) {
     // WHY-THIS-SHAPE: a counter drawn at both sizes and read back after every call. Black reads as
     //       unreadable, so "never black" needs no separate check. This entry is the software path; the
     //       hardware path is the shape-device entry's, S13.80 onwards.
-    // CONTROL: renderer/video/video_pipeline.cpp, each reverted. The stage built only for the first picture
-    //       in convert() (`if (!m_stage)`), re-observed on the Lavapipe entry via control_batch.sh
-    //       2026-10-12: "the pipeline threw after 30 pictures: FrameConverter: the frame's picture differs
-    //       from the one this converter was built for". The rendering-before-converting mutation is now
+    // CONTROL: renderer/video/video_pipeline.cpp, each reverted. convert() building a renderer only for the
+    //       first picture (`if (!m_renderer)`), via control_batch.sh 2026-10-26 (G6) on the Lavapipe entry:
+    //       "counter_resize.h264: the pipeline threw after 30 pictures: YcbcrRenderer: the frame's shape
+    //       differs from the one this renderer was built for". The rendering-before-converting mutation is now
     //       renderNext() drawing before it decodes, which throws on the FIRST call rather than showing black; that was
     //       re-observed on the sequence entry, not re-run here.
     // COVERAGE-ASSERT: the independent decode shows two picture widths -- red with a single-size stream
@@ -4185,7 +4190,7 @@ std::optional<VkExtent2D> firstDeclined(const SizeChangeFixture& fixture, const 
 // The largest amount a coded extent exceeds its visible picture by: one macroblock or coding block.
 constexpr uint32_t kCodingBlock = 16;
 
-// Every picture of `file` decoded directly and shown through a converter of the probe's own, so each
+// Every picture of `file` decoded directly and drawn by a YcbcrRenderer of the probe's own, so each
 // extent() and visible() read is paired with the counter drawn in that same picture.
 bool gradeReportedSizes(Device& device, const std::string& label, const std::string& what,
                         const SizeChangeFixture& fixture, bool shrinksOnDevice, const CounterReference& reference) {
@@ -4195,30 +4200,26 @@ bool gradeReportedSizes(Device& device, const std::string& label, const std::str
         VkRect2D visible;
         bool onDevice;
     };
-    struct Stage {
-        Stage(Device& d, const DecodedFrame& first)
-            : converter(d, first, kShaderDir), renderer(d, converter.frame()) {}
-        wallpaperx::FrameConverter converter;
-        wallpaperx::VideoRenderer renderer;
-    };
     std::vector<Shown> shown;
     std::string threw;
     try {
         OffscreenTargetManager targets(device);
         const OffscreenTarget& target = targets.create(1, kTargetWidth, kTargetHeight);
         VideoDecoder decoder(device, asset(fixture.file));
-        std::unique_ptr<Stage> stage;
+        std::unique_ptr<wallpaperx::YcbcrRenderer> stage;
         while (std::optional<DecodedFrame> frame = decoder.next()) {
             if (shown.size() > reference.ids.size() + 8) {
                 threw = "the stream did not end";
                 break;
             }
             Shown entry{-1, frame->extent(), frame->visible(), frame->storage() == DecodedFrame::Storage::DeviceImage};
-            if (!stage || wallpaperx::FrameConverter::pictureOf(*frame) != stage->converter.picture()) {
-                stage = std::make_unique<Stage>(device, *frame);
+            if (!stage || !(wallpaperx::YcbcrRenderer::shapeOf(*frame) == stage->shape())) {
+                stage.reset();
+                stage = std::make_unique<wallpaperx::YcbcrRenderer>(device, std::move(*frame), kShaderDir);
+            } else {
+                stage->show(std::move(*frame));
             }
-            static_cast<void>(stage->converter.convert(*frame));
-            targets.render(stage->renderer, target);
+            targets.render(*stage, target);
             entry.id = wallpaperx::testing::counterFromBgra(
                 wallpaperx::testing::reclaimAndReadback(device, targets, target), target.width, target.height);
             shown.push_back(entry);
@@ -4237,10 +4238,9 @@ bool gradeReportedSizes(Device& device, const std::string& label, const std::str
     //       fills its pool.
     // CONTROL: renderer/video/video_decoder.cpp, each reverted. extent() returning the image pool's size on
     //       the device path: counter_big.obu alone, "picture 30 is 320x240, reported visible 320x240 at (0,0)
-    //       with a coded extent of 640x480". visible() from the pool's size: counter_big.obu, "the direct
-    //       decode threw after 30 pictures: FrameConverter: the stream's visible rectangle lies outside its
-    //       coded picture". visible() two pixels narrower on device frames: all eleven, "picture 0 is
-    //       320x240, reported visible 318x240".
+    //       with a coded extent of 640x480" (re-run 2026-10-26, G6, through YcbcrRenderer: "... on the device"). visible() two pixels
+    //       narrower on device frames, drawn through YcbcrRenderer: "picture 0 is 320x240, reported visible
+    //       318x240", restored green.
     // COVERAGE-ASSERT: every picture compared, in the reference's order; and, where the device takes a
     //       smaller size into images kept from the first, at least one device picture is smaller than them.
     std::string fault;
@@ -5498,11 +5498,26 @@ void runSteadyChecks(Device& device, const std::string& label, bool onDevice) {
     const char* const file = "counter_long.mp4";
     if (!haveAsset(file, label)) return;
 
-    // GOAL: S13.67 -- once its stage exists, a call creates no Vulkan object and waits on nothing.
-    // WHY-THIS-SHAPE: counted at this executable's Vulkan symbols during renderNext() alone -- which since
+    // GOAL: S13.67 -- once its stage exists, a call creates no Vulkan object and waits on nothing, except that the
+    //       first showing of each decoded pool image may make that image's plane views, descriptor pool and set;
+    //       once every pool image has been shown once, nothing is created. False for a renderer that remakes a
+    //       source for an image it has shown before, or that meets an unbounded stream of new images.
+    // WHY-THIS-SHAPE: a first showing is recognised by the plane views the call made (g_planeViewImages): all of one
+    //       image never viewed before. Excusing "the first N calls" instead would grade the scheduler -- when ffmpeg
+    //       first hands out each pool image depends on decode-ahead timing -- and excusing any call that made plane
+    //       views would let a renderer that remakes them for an image already shown pass. Only that showing's own
+    //       footprint (the views, one pool, one set) is excused; anything else it made still counts.
+    // CONTROL: control_batch.sh 2026-10-25 (T20a), RTX 3080 Ti, device path, each reverted: YcbcrRenderer::sourceFor()
+    //       (renderer/video/ycbcr_renderer.cpp) never finding its cached source -> "318 steady calls made vkCreateImageView
+    //       x939, vkCreateDescriptorPool x313, vkAllocateDescriptorSets x313"; every hardware frame kept alive by
+    //       VideoDecoder (renderer/video/video_decoder.cpp), so the pool makes an image per picture -> "321 distinct
+    //       decoded images were shown for the first time"; Device::waitForSubmissions() after the render in
+    //       VideoPipeline::draw() (renderer/video/video_pipeline.cpp) -> "318 steady calls made vkWaitForFences x318".
+    //       Green: 7 pool images shown for the first time, 318 steady calls made none.
+    // The rest of the shape: counted at this executable's Vulkan symbols during renderNext() alone -- which since
     //       the split is decodeNext() and draw() together, so both halves are inside the count. The
     //       queue is drained before each counted call, so a wait inside it is the pipeline's and not
-    //       one a slow GPU forced: FrameConverter's host path waits when two uploads are still in
+    //       one a slow GPU forced: YcbcrRenderer's host path waits when two uploads are still in
     //       flight, and counting across an undrained queue would grade the scheduler. The first calls
     //       are left out because the Device's fence and command buffer pool grows to its most batches.
     //       Counted on the calling thread only (g_countVulkan is thread_local): the decode thread's calls are
@@ -5517,7 +5532,10 @@ void runSteadyChecks(Device& device, const std::string& label, bool onDevice) {
     //       control_batch.sh, restored: waitForSubmissions() after the render in draw() -> "318 steady calls made
     //       vkWaitForFences x249"; a fence created and destroyed in draw() -> "vkCreateFence x318". Test-side, the
     //       flag made process-wide again: 5 of 6 runs "318 steady calls made vkAllocateMemory x1"; per thread, 8 of 8 green.
-    // COVERAGE-ASSERT: the first call, which builds the stage, must be seen creating -- red with
+    //       Re-run 2026-10-26 (G6), steady-device, control_batch.sh, restored: convert() building a new YcbcrRenderer
+    //       for every picture -> "318 steady calls made vkCreateImageView x939, vkCreateSampler x318, ..."; the
+    //       waitForSubmissions() in draw() -> "318 steady calls made vkWaitForFences x317".
+    // COVERAGE-ASSERT: the first call, which builds the renderer, must be seen creating -- red with
     //       counting never switched on, "the first call was seen making none" -- and the wait counter
     //       proven wired by waitCounterIsWired(); and 300 calls counted, red on the 20-picture fixture,
     //       "only 17 calls counted". The first call is NOT required to wait: it waits only if the GPU
@@ -5525,8 +5543,13 @@ void runSteadyChecks(Device& device, const std::string& label, bool onDevice) {
     //       under a parallel ctest run.
     constexpr int kUncountedCalls = 3;
     constexpr int kMinCountedCalls = 300;
+    // ffmpeg's decode pool holds the decoder's reference pictures and a few in flight; H.264 and HEVC allow at most
+    // 16 references, so more distinct images than this is images made per picture, not a pool.
+    constexpr size_t kMaxPoolImages = 32;
     VulkanTally first;
     VulkanTally steady;
+    std::vector<VkImage> shownImages;
+    int firstShowings = 0;
     int calls = 0;
     int counted = 0;
     int devicePictures = 0;
@@ -5541,6 +5564,7 @@ void runSteadyChecks(Device& device, const std::string& label, bool onDevice) {
         for (;;) {
             device.waitForSubmissions();
             g_vulkanCalls.fill(0);
+            g_planeViewImages.clear();
             g_countVulkan = true;
             bool more = false;
             try {
@@ -5552,6 +5576,17 @@ void runSteadyChecks(Device& device, const std::string& label, bool onDevice) {
             g_countVulkan = false;
             if (!more) break;
             if (calls == 0) first.calls = g_vulkanCalls;
+            const std::vector<VkImage>& viewed = g_planeViewImages;
+            const bool oneImage = !viewed.empty() && std::all_of(viewed.begin(), viewed.end(),
+                                                                 [&](VkImage i) { return i == viewed.front(); });
+            if (oneImage && std::find(shownImages.begin(), shownImages.end(), viewed.front()) == shownImages.end()) {
+                shownImages.push_back(viewed.front());
+                ++firstShowings;
+                const auto excuse = [&](VulkanCall call, int n) { g_vulkanCalls[call] -= std::min(g_vulkanCalls[call], n); };
+                excuse(k_vkCreateImageView, static_cast<int>(viewed.size()));
+                excuse(k_vkCreateDescriptorPool, 1);
+                excuse(k_vkAllocateDescriptorSets, 1);
+            }
             if (calls >= kUncountedCalls) {
                 for (int i = 0; i < kVulkanCallCount; ++i) steady.calls[i] += g_vulkanCalls[i];
                 ++counted;
@@ -5589,12 +5624,24 @@ void runSteadyChecks(Device& device, const std::string& label, bool onDevice) {
         fail("too few steady calls were counted to grade");
         return;
     }
+    // COVERAGE-ASSERT: on the device path the plane views must have been recognised, or the allowance above was
+    //       never exercised and a count of zero would not show that the shown images were the pool's.
+    if (onDevice && shownImages.empty()) {
+        std::fprintf(stderr, "FAIL: %s: no plane view of a decoded image was seen\n", label.c_str());
+        fail("the first showing of a pool image was never recognised");
+        return;
+    }
+    if (shownImages.size() > kMaxPoolImages) {
+        std::fprintf(stderr, "FAIL: %s: %zu distinct decoded images were shown for the first time\n", label.c_str(),
+                     shownImages.size());
+        fail("the renderer met more decoded images than a pool holds");
+    }
     if (steady.creations() != 0 || steady.waits() != 0) {
         std::fprintf(stderr, "FAIL: %s: %d steady calls made %s\n", label.c_str(), counted, steady.describe().c_str());
         fail("a steady picture created a Vulkan object or waited");
     }
-    std::printf("%s: first call made %s; %d steady calls made %s\n", label.c_str(), first.describe().c_str(), counted,
-                steady.describe().c_str());
+    std::printf("%s: first call made %s; %d steady calls made %s; %d pool images shown for the first time\n",
+                label.c_str(), first.describe().c_str(), counted, steady.describe().c_str(), firstShowings);
 }
 
 // ------------------------------------------------------------------------- //
@@ -6642,8 +6689,8 @@ void runHalvesChecks(Device& device, const std::string& label, bool onDevice) {
     //       so a second read with no draw between throws rather than answering. Publication is the
     //       property anyway -- only render() publishes, so a decodeNext() that drew anywhere would leave
     //       the target published, and one that did not cannot.
-    // CONTROL: control_batch.sh 2026-10-15, reverted, halves-host on Lavapipe, renderer/video/video_pipeline.cpp: draw()'s
-    //       no-stage guard returning instead of throwing -> "FAIL: draw() before any picture has been decoded
+    // CONTROL: control_batch.sh 2026-10-15, re-run 2026-10-26 (G6, all three held), reverted, halves-host on Lavapipe,
+    //       renderer/video/video_pipeline.cpp: draw()'s no-renderer guard returning instead of throwing -> "FAIL: draw() before any picture has been decoded
     //       throws std::logic_error"; draw() rendering only while nothing has been shown -> "FAIL: and the draw
     //       that follows it does publish one"; convert() converting only the first picture -> "FAIL: and the
     //       draw that follows shows the picture that decode had decoded". The untouched-target check has no
@@ -8509,9 +8556,19 @@ extern "C" VkResult vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physic
     }
 WALLPAPERX_COUNTED(vkCreateImage, (VkDevice d, const VkImageCreateInfo* i, const VkAllocationCallbacks* a, VkImage* o),
                    (d, i, a, o))
-WALLPAPERX_COUNTED(vkCreateImageView,
-                   (VkDevice d, const VkImageViewCreateInfo* i, const VkAllocationCallbacks* a, VkImageView* o),
-                   (d, i, a, o))
+extern "C" VkResult vkCreateImageView(VkDevice d, const VkImageViewCreateInfo* i, const VkAllocationCallbacks* a,
+                                      VkImageView* o) {
+    static const auto real =
+        realSymbol<VkResult (*)(VkDevice, const VkImageViewCreateInfo*, const VkAllocationCallbacks*, VkImageView*)>(
+            "vkCreateImageView");
+    if (g_countVulkan) {
+        ++g_vulkanCalls[k_vkCreateImageView];
+        constexpr VkImageAspectFlags kPlanes =
+            VK_IMAGE_ASPECT_PLANE_0_BIT | VK_IMAGE_ASPECT_PLANE_1_BIT | VK_IMAGE_ASPECT_PLANE_2_BIT;
+        if (i != nullptr && (i->subresourceRange.aspectMask & kPlanes) != 0) g_planeViewImages.push_back(i->image);
+    }
+    return real(d, i, a, o);
+}
 WALLPAPERX_COUNTED(vkCreateBuffer, (VkDevice d, const VkBufferCreateInfo* i, const VkAllocationCallbacks* a, VkBuffer* o),
                    (d, i, a, o))
 WALLPAPERX_COUNTED(vkCreateFence, (VkDevice d, const VkFenceCreateInfo* i, const VkAllocationCallbacks* a, VkFence* o),

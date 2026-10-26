@@ -88,18 +88,21 @@ public:
     // second copy of the mask in another file silently stops matching the first the
     // moment a renderer needs a new bit.
     //
-    // TRANSFER_SRC so the rendered frame can be copied out (readback for tests, and the
-    // natural expectation for a frame we intend to export/hand off). TRANSFER_DST because
-    // VideoRenderer blits into a target rather than drawing.
+    // Drawn only through the render pass; nothing copies or blits into a target. SAMPLED
+    // because the pass leaves the image in kRenderedLayout, which Vulkan allows only on a
+    // sampled (or input-attachment) image -- and the consumer samples it. TRANSFER_SRC for
+    // the pixel tests' read-back. TRANSFER_DST because the plugin imports an exported
+    // optimal-tiled image through OpenGL, which cannot be told the usage and assumes one:
+    // the mask must not shrink below what that import was checked against.
     static constexpr VkImageUsageFlags kUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
-    // What a target's tiling must support beyond what kUsage already implies. A usage bit is
-    // checked by image creation against the format features it maps to, and BLIT_DST maps
-    // from no usage bit at all -- so a modifier that can be transferred into but not blitted
-    // into passes every creation-time check and fails at the blit. Held to by the modifier
-    // filter for dma_buf targets and by VideoRenderer for optimal-tiled ones.
-    static constexpr VkFormatFeatureFlags kFormatFeatures = VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    // What a target's tiling must support beyond what kUsage already implies, which today is
+    // nothing. A usage bit is checked by image creation against the format features it maps
+    // to, but BLIT_DST maps from no usage bit at all: a renderer that blits into a target has
+    // to ask for it here, or a modifier it cannot blit into passes every creation-time check.
+    // Held to by the modifier filter for dma_buf targets only.
+    static constexpr VkFormatFeatureFlags kFormatFeatures = 0;
 
     explicit OffscreenTargetManager(Device& device);
     ~OffscreenTargetManager();
@@ -167,10 +170,10 @@ public:
     // submitted after it on this queue sees the acquire, since a barrier's first scope covers
     // everything submitted earlier. A caller that reads the image on the HOST must wait.
     //
-    // Anything on this device that touches the image outside render() -- a readback copy --
-    // must call this first and then transition from GENERAL. Reading an image the graphics
-    // queue does not own is undefined however the barrier names its layouts, and no
-    // validation layer says so: ownership transfers are not tracked.
+    // Anything on this device that touches the image outside render() must call this first
+    // and then transition from GENERAL. Reading an image the graphics queue does not own is
+    // undefined however the barrier names its layouts, and no validation layer says so:
+    // ownership transfers are not tracked.
     //
     // The target stops being published, so nothing may export it until the next render.
     // Throws if it was not published, which is a caller bug -- only a successful render
@@ -207,5 +210,11 @@ private:
     VkRenderPass m_renderPass = VK_NULL_HANDLE;
     std::unordered_map<int, Ring> m_targets;
 };
+
+// The pass every target's framebuffer is made with, differing only in its load op: the manager's
+// clears, and a renderer that writes every pixel itself may discard instead. Its dependencies are
+// what render()'s barriers rely on, so this is their one definition. The caller owns the pass. A
+// failure throws as throwVkFailure() does, naming `who`.
+VkRenderPass createOffscreenRenderPass(VkDevice device, VkAttachmentLoadOp load, const char* who);
 
 }

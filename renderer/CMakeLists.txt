@@ -90,12 +90,12 @@ add_library(wallpaperx-renderer STATIC
     vulkan/shader_module.cpp
     vulkan/format_features.cpp
     renderers/static_renderer.cpp
-    renderers/video_renderer.cpp
     video/ffmpeg_file.cpp
     video/video_decoder.cpp
     video/reset_point.cpp
     video/software_scan.cpp
-    video/frame_converter.cpp
+    video/ycbcr_planes.cpp
+    video/ycbcr_renderer.cpp
     video/picture_source.cpp
     video/decode_ahead.cpp
     video/video_pipeline.cpp
@@ -161,7 +161,7 @@ set(WALLPAPERX_SHADER_OUTPUT_DIR ${SHADER_OUTPUT_DIR} CACHE INTERNAL
     "Directory holding the renderer's compiled SPIR-V")
 
 set(SHADER_SPV_FILES "")
-foreach(SHADER_SRC fullscreen.vert fullscreen_set.frag fullscreen_heap.frag ycbcr_convert.vert ycbcr_convert.frag)
+foreach(SHADER_SRC fullscreen.vert fullscreen_set.frag fullscreen_heap.frag ycbcr_convert.vert ycbcr_convert.frag ycbcr_draw.frag)
     set(SHADER_SPV ${SHADER_OUTPUT_DIR}/${SHADER_SRC}.spv)
     add_custom_command(
         OUTPUT ${SHADER_SPV}
@@ -288,13 +288,9 @@ wallpaperx_add_shader_probe(wallpaperx-target-ring-probe tests/target_ring_probe
 add_executable(wallpaperx-descriptor-inflight-probe tests/descriptor_inflight_probe.cpp)
 target_link_libraries(wallpaperx-descriptor-inflight-probe PRIVATE wallpaperx-renderer)
 
-# The video renderer's only caller anywhere: nothing decodes yet, so without this probe its
-# 343 lines are never executed. Interposes vkCmdPipelineBarrier to read the layout transitions
-# it submitted -- like ownership_transfer_probe that replaces a Vulkan entry point and not the
-# allocator, so it needs no WALLPAPERX_SANITIZE opt-out. No shaders and no PNG fixture (it
-# builds its source frame in memory), hence no RESOURCE_LOCK.
-add_executable(wallpaperx-video-renderer-probe tests/video_renderer_probe.cpp)
-target_link_libraries(wallpaperx-video-renderer-probe PRIVATE wallpaperx-renderer)
+# usableDrmModifiers()'s tiling-feature filter and its reach into Memory::createExportableImage.
+add_executable(wallpaperx-modifier-filter-probe tests/modifier_filter_probe.cpp)
+target_link_libraries(wallpaperx-modifier-filter-probe PRIVATE wallpaperx-renderer)
 
 # Which queue and fence results latch Device::lost(). Interposes vkQueueSubmit,
 # vkWaitForFences and vkGetFenceStatus to hand the Device a scripted result, since no driver
@@ -357,6 +353,15 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
     # and the 4:4:4 _hw pair is lossless H.265, which a hardware decoder takes at any crop offset.
     set(BT709 "colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv")
     set(BARS "-f lavfi -i smptehdbars=size=320x240:rate=10:duration=1")
+    # Ramps for the placement entry: red rises with x and green with y, so a drawn pixel names the
+    # position it was sampled from. Lossless 10-bit 4:4:4 keeps the round trip through Y'CbCr well
+    # inside a code; H.265 cannot code 512x2, so that one is H.264.
+    set(RAMP "-vf format=gbrp16le,geq=r=65535*X/(W-1):g=65535*Y/(H-1):b=32896,scale=out_color_matrix=bt709:out_range=tv,format=yuv444p10le,setparams=${BT709}")
+    # static_renderer_probe's video twins of its PNG fixtures: lossless H.264, which codes the 2-texel
+    # sides H.265 cannot. The agree_ pair's blue marks the texels outside [4, 20) of the long axis;
+    # floor(abs(...)/8) is the comma-free form of that test, as separate_arguments eats escapes.
+    set(RAMP_TAIL "scale=out_color_matrix=bt709:out_range=tv,format=yuv444p10le,setparams=${BT709}")
+    set(STILL_TWIN "-c:v libx264 -qp 0 -g 5")
     set(WALLPAPERX_CONVERTER_RECIPES
         "conv_709_tv.mp4|${BARS}|-vf format=yuv420p,setparams=${BT709} -c:v libx264 -threads 1 -g 5"
         "conv_709_as_601.mp4|${BARS}|-vf format=yuv420p,setparams=colorspace=smpte170m:color_primaries=bt709:color_trc=bt709:range=tv -c:v libx264 -threads 1 -g 5"
@@ -389,6 +394,18 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         "tag_bt2020_10_transfer.mp4|-f lavfi -i testsrc2=size=64x48:rate=10:duration=0.3|-vf format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt2020-10:range=tv -c:v libx264"
         "shape_part_large.h264|-f lavfi -i smptehdbars=size=320x240:rate=10:duration=0.5|-vf format=yuv420p,setparams=${BT709} -c:v libx264 -g 5 -bsf:v h264_mp4toannexb -f h264"
         "shape_part_small.h264|-f lavfi -i smptehdbars=size=160x120:rate=10:duration=0.5|-vf format=yuv420p,setparams=${BT709} -c:v libx264 -g 5 -bsf:v h264_mp4toannexb -f h264"
+        "ramp_512x256.mp4|-f lavfi -i color=c=black:size=512x256:rate=10:duration=0.3|${RAMP} -c:v libx265 -x265-params log-level=error:lossless=1 -g 5"
+        "ramp_256x512.mp4|-f lavfi -i color=c=black:size=256x512:rate=10:duration=0.3|${RAMP} -c:v libx265 -x265-params log-level=error:lossless=1 -g 5"
+        "ramp_256x256.mp4|-f lavfi -i color=c=black:size=256x256:rate=10:duration=0.3|${RAMP} -c:v libx265 -x265-params log-level=error:lossless=1 -g 5"
+        "ramp_512x2.mp4|-f lavfi -i color=c=black:size=512x2:rate=10:duration=0.3|${RAMP} -c:v libx264 -qp 0 -g 5"
+        "ramp_mirror_pq_512x256.mp4|-f lavfi -i color=c=black:size=512x256:rate=10:duration=0.3|-vf format=gbrp16le,geq=r=65535*(W-1-X)/(W-1):g=65535*Y/(H-1):b=32896,scale=out_color_matrix=bt709:out_range=tv,format=yuv444p10le,setparams=colorspace=bt709:color_primaries=bt709:color_trc=smpte2084:range=tv -c:v libx265 -x265-params log-level=error:lossless=1 -g 5"
+        "still_ramp_64x32.mp4|-f lavfi -i color=c=black:size=64x32:rate=10:duration=0.3|${RAMP} ${STILL_TWIN}"
+        "still_ramp_50x30.mp4|-f lavfi -i color=c=black:size=50x30:rate=10:duration=0.3|${RAMP} ${STILL_TWIN}"
+        "still_ramp_16x8.mp4|-f lavfi -i color=c=black:size=16x8:rate=10:duration=0.3|${RAMP} ${STILL_TWIN}"
+        "still_ramp_1000x2.mp4|-f lavfi -i color=c=black:size=1000x2:rate=10:duration=0.3|${RAMP} ${STILL_TWIN}"
+        "still_ramp_2x1000.mp4|-f lavfi -i color=c=black:size=2x1000:rate=10:duration=0.3|${RAMP} ${STILL_TWIN}"
+        "still_agree_wide_24x12.mp4|-f lavfi -i color=c=black:size=24x12:rate=10:duration=0.3|-vf format=gbrp16le,geq=r=65535*X/(W-1):g=65535*Y/(H-1):b=65535*floor(abs(X-11.5)/8),${RAMP_TAIL} ${STILL_TWIN}"
+        "still_agree_tall_12x24.mp4|-f lavfi -i color=c=black:size=12x24:rate=10:duration=0.3|-vf format=gbrp16le,geq=r=65535*X/(W-1):g=65535*Y/(H-1):b=65535*floor(abs(Y-11.5)/8),${RAMP_TAIL} ${STILL_TWIN}"
         "shape_part_pq.h264|-f lavfi -i smptehdbars=size=320x240:rate=10:duration=0.5|-vf format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=smpte2084:range=tv -c:v libx264 -g 5 -bsf:v h264_mp4toannexb -f h264"
     )
     foreach(RECIPE ${WALLPAPERX_CONVERTER_RECIPES})
@@ -765,28 +782,34 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
     add_dependencies(wallpaperx-video-decoder-probe wallpaperx-video-fixtures)
 endif()
 
-# The colour conversion pass, graded against libswscale told the matrix and range explicitly.
+# Drawing decoded video, graded against libswscale told the matrix and range explicitly.
 # libswscale is a test-only dependency and optional: without it the entries that need a reference
 # exit 77 with the reason. Replaces operator new to count allocations, which a sanitizer's
 # allocator cannot coexist with, so the counter compiles out there and its entry skips.
 pkg_check_modules(SWSCALE IMPORTED_TARGET libswscale)
-add_executable(wallpaperx-frame-converter-probe tests/frame_converter_probe.cpp)
-target_link_libraries(wallpaperx-frame-converter-probe PRIVATE wallpaperx-renderer)
-target_compile_definitions(wallpaperx-frame-converter-probe PRIVATE
+add_executable(wallpaperx-video-draw-probe tests/video_draw_probe.cpp)
+target_link_libraries(wallpaperx-video-draw-probe PRIVATE wallpaperx-renderer)
+target_compile_definitions(wallpaperx-video-draw-probe PRIVATE
     WALLPAPERX_VIDEO_ASSET_DIR="${WALLPAPERX_VIDEO_ASSET_DIR}"
     WALLPAPERX_SHADER_DIR="${SHADER_OUTPUT_DIR}")
-add_dependencies(wallpaperx-frame-converter-probe wallpaperx-shaders)
+add_dependencies(wallpaperx-video-draw-probe wallpaperx-shaders)
 if(SWSCALE_FOUND)
-    target_link_libraries(wallpaperx-frame-converter-probe PRIVATE PkgConfig::SWSCALE)
-    target_compile_definitions(wallpaperx-frame-converter-probe PRIVATE WALLPAPERX_HAVE_SWSCALE)
+    target_link_libraries(wallpaperx-video-draw-probe PRIVATE PkgConfig::SWSCALE)
+    target_compile_definitions(wallpaperx-video-draw-probe PRIVATE WALLPAPERX_HAVE_SWSCALE)
 else()
-    message(STATUS "  libswscale: not found -- frame_converter colour entries will report a skip")
+    message(STATUS "  libswscale: not found -- video_draw colour entries will report a skip")
 endif()
 if(WALLPAPERX_SANITIZE)
-    target_compile_definitions(wallpaperx-frame-converter-probe PRIVATE WALLPAPERX_ALLOCATION_INSTRUMENT=0)
+    target_compile_definitions(wallpaperx-video-draw-probe PRIVATE WALLPAPERX_ALLOCATION_INSTRUMENT=0)
 endif()
 if(WALLPAPERX_FFMPEG_EXECUTABLE)
-    add_dependencies(wallpaperx-frame-converter-probe wallpaperx-video-fixtures)
+    add_dependencies(wallpaperx-video-draw-probe wallpaperx-video-fixtures)
+endif()
+# static_renderer_probe draws each still's video twin through the production video draw.
+target_compile_definitions(wallpaperx-static-renderer-probe PRIVATE
+    WALLPAPERX_VIDEO_ASSET_DIR="${WALLPAPERX_VIDEO_ASSET_DIR}")
+if(WALLPAPERX_FFMPEG_EXECUTABLE)
+    add_dependencies(wallpaperx-static-renderer-probe wallpaperx-video-fixtures)
 endif()
 
 # VideoPipeline, and VideoDecoder's resume after a mid-stream hardware failure, graded by the frame
@@ -915,14 +938,7 @@ wallpaperx_add_test(NAME ownership_transfer_probe COMMAND wallpaperx-ownership-t
 wallpaperx_add_test(NAME consumer_modifier_probe COMMAND wallpaperx-consumer-modifier-probe)
 wallpaperx_add_test(NAME frame_acquire_probe COMMAND wallpaperx-frame-acquire-probe)
 wallpaperx_add_test(NAME target_ring_probe COMMAND wallpaperx-target-ring-probe)
-# Two entries, one binary, and they answer on different hardware. `render` needs nothing but a
-# Device, so it is answerable everywhere. `modifiers` grades that a DRM format modifier whose
-# tiling features lack a required one is dropped, and telling that apart from a filter that
-# drops everything needs a driver offering two modifiers that differ in some feature -- which
-# Lavapipe, with its single LINEAR modifier, cannot. One verdict for both would either claim
-# that measurement was made where it was not, or mark a working renderer unverified.
-wallpaperx_add_test(NAME video_renderer_probe COMMAND wallpaperx-video-renderer-probe render)
-wallpaperx_add_test(NAME video_modifier_filter_probe COMMAND wallpaperx-video-renderer-probe modifiers)
+wallpaperx_add_test(NAME modifier_filter_probe COMMAND wallpaperx-modifier-filter-probe)
 # 77 when the host has no Vulkan device at all.
 wallpaperx_add_test(NAME device_lost_probe COMMAND wallpaperx-device-lost-probe)
 set_tests_properties(device_lost_probe PROPERTIES SKIP_RETURN_CODE 77)
@@ -974,32 +990,32 @@ set_tests_properties(video_decoder_hardware video_decoder_refused video_decoder_
 # unreached states as verified. The device-path, gate, no-ycbcr and shape-fallback entries need a
 # hardware decoder and skip without one. shader_read opens no driver. SKIP_RETURN_CODE throughout:
 # a missing ffmpeg command line, libswscale or decoder must not read as a pass.
-wallpaperx_add_test(NAME frame_converter_colour_host COMMAND wallpaperx-frame-converter-probe colour-host)
-wallpaperx_add_test(NAME frame_converter_colour_device COMMAND wallpaperx-frame-converter-probe colour-device)
-wallpaperx_add_test(NAME frame_converter_edges_host COMMAND wallpaperx-frame-converter-probe edges-host)
-wallpaperx_add_test(NAME frame_converter_edges_device COMMAND wallpaperx-frame-converter-probe edges-device)
-wallpaperx_add_test(NAME frame_converter_siting COMMAND wallpaperx-frame-converter-probe siting)
-wallpaperx_add_test(NAME frame_converter_refusal COMMAND wallpaperx-frame-converter-probe refusal)
-wallpaperx_add_test(NAME frame_converter_output COMMAND wallpaperx-frame-converter-probe output)
-wallpaperx_add_test(NAME frame_converter_allocation COMMAND wallpaperx-frame-converter-probe allocation)
-wallpaperx_add_test(NAME frame_converter_gate COMMAND wallpaperx-frame-converter-probe gate)
-wallpaperx_add_test(NAME frame_converter_no_ycbcr COMMAND wallpaperx-frame-converter-probe no-ycbcr)
-wallpaperx_add_test(NAME frame_converter_shape_resize COMMAND wallpaperx-frame-converter-probe shape-resize)
-wallpaperx_add_test(NAME frame_converter_shape_tags COMMAND wallpaperx-frame-converter-probe shape-tags)
-wallpaperx_add_test(NAME frame_converter_shape_fallback COMMAND wallpaperx-frame-converter-probe shape-fallback)
-wallpaperx_add_test(NAME frame_converter_shader_read COMMAND wallpaperx-frame-converter-probe shader-read)
-wallpaperx_add_test(NAME frame_converter_pipeline_colour_host COMMAND wallpaperx-frame-converter-probe pipeline-colour-host)
-wallpaperx_add_test(NAME frame_converter_pipeline_colour_device COMMAND wallpaperx-frame-converter-probe pipeline-colour-device)
-set_tests_properties(frame_converter_pipeline_colour_host frame_converter_pipeline_colour_device
+wallpaperx_add_test(NAME video_draw_colour_host COMMAND wallpaperx-video-draw-probe colour-host)
+wallpaperx_add_test(NAME video_draw_colour_device COMMAND wallpaperx-video-draw-probe colour-device)
+wallpaperx_add_test(NAME video_draw_edges_host COMMAND wallpaperx-video-draw-probe edges-host)
+wallpaperx_add_test(NAME video_draw_edges_device COMMAND wallpaperx-video-draw-probe edges-device)
+wallpaperx_add_test(NAME video_draw_siting COMMAND wallpaperx-video-draw-probe siting)
+wallpaperx_add_test(NAME video_draw_refusal COMMAND wallpaperx-video-draw-probe refusal)
+wallpaperx_add_test(NAME video_draw_allocation COMMAND wallpaperx-video-draw-probe allocation)
+wallpaperx_add_test(NAME video_draw_gate COMMAND wallpaperx-video-draw-probe gate)
+wallpaperx_add_test(NAME video_draw_no_ycbcr COMMAND wallpaperx-video-draw-probe no-ycbcr)
+wallpaperx_add_test(NAME video_draw_shape_resize COMMAND wallpaperx-video-draw-probe shape-resize)
+wallpaperx_add_test(NAME video_draw_shape_tags COMMAND wallpaperx-video-draw-probe shape-tags)
+wallpaperx_add_test(NAME video_draw_shape_fallback COMMAND wallpaperx-video-draw-probe shape-fallback)
+wallpaperx_add_test(NAME video_draw_shader_read COMMAND wallpaperx-video-draw-probe shader-read)
+wallpaperx_add_test(NAME video_draw_pipeline_colour_host COMMAND wallpaperx-video-draw-probe pipeline-colour-host)
+wallpaperx_add_test(NAME video_draw_pipeline_colour_device COMMAND wallpaperx-video-draw-probe pipeline-colour-device)
+wallpaperx_add_test(NAME video_draw_placement COMMAND wallpaperx-video-draw-probe placement)
+set_tests_properties(video_draw_pipeline_colour_host video_draw_pipeline_colour_device
                      PROPERTIES SKIP_RETURN_CODE 77)
-set_tests_properties(frame_converter_colour_host frame_converter_colour_device frame_converter_edges_host
-                     frame_converter_edges_device frame_converter_siting frame_converter_refusal
-                     frame_converter_output frame_converter_allocation frame_converter_gate
-                     frame_converter_no_ycbcr frame_converter_shape_resize frame_converter_shape_tags
-                     frame_converter_shape_fallback
-                     frame_converter_shader_read
+set_tests_properties(video_draw_colour_host video_draw_colour_device video_draw_edges_host
+                     video_draw_edges_device video_draw_siting video_draw_refusal
+                     video_draw_allocation video_draw_gate
+                     video_draw_no_ycbcr video_draw_shape_resize video_draw_shape_tags
+                     video_draw_shape_fallback
+                     video_draw_shader_read video_draw_placement
                      PROPERTIES SKIP_RETURN_CODE 77)
-set_tests_properties(frame_converter_shader_read PROPERTIES LABELS "novulkan")
+set_tests_properties(video_draw_shader_read PROPERTIES LABELS "novulkan")
 
 # One entry per mode. The resume entries and the _device entries need a hardware decoder and skip
 # without one; the _host entries and shape build a device with the video extensions stripped.
@@ -1050,9 +1066,8 @@ set_tests_properties(descriptor_inflight_heap descriptor_inflight_buffer descrip
 # modifiers at all, none usable for a target-shaped image, or -- the Lavapipe case -- only one,
 # so no feature splits the set and a filter that keeps the advertisers cannot be told from one
 # that drops everything. Without SKIP_RETURN_CODE that run exits 0 and reads as a verified
-# filter. The render entry has no such code: everything it grades is available wherever a
-# Device comes up.
-set_tests_properties(video_modifier_filter_probe PROPERTIES SKIP_RETURN_CODE 77)
+# filter.
+set_tests_properties(modifier_filter_probe PROPERTIES SKIP_RETURN_CODE 77)
 
 # Two entries, one binary, and they cannot share a process. The probe asks the loader
 # whether the validation layer exists at all, that answer is cached for the life of the
@@ -1145,8 +1160,7 @@ if(WALLPAPERX_LAVAPIPE_ICD)
     wallpaperx_add_test(NAME consumer_modifier_probe_lavapipe COMMAND wallpaperx-consumer-modifier-probe)
     wallpaperx_add_test(NAME frame_acquire_probe_lavapipe COMMAND wallpaperx-frame-acquire-probe)
     wallpaperx_add_test(NAME target_ring_probe_lavapipe COMMAND wallpaperx-target-ring-probe)
-    wallpaperx_add_test(NAME video_renderer_probe_lavapipe COMMAND wallpaperx-video-renderer-probe render)
-    wallpaperx_add_test(NAME video_modifier_filter_probe_lavapipe COMMAND wallpaperx-video-renderer-probe modifiers)
+    wallpaperx_add_test(NAME modifier_filter_probe_lavapipe COMMAND wallpaperx-modifier-filter-probe)
     wallpaperx_add_test(NAME device_lost_probe_lavapipe COMMAND wallpaperx-device-lost-probe)
     # The software driver is where "a device with no hardware decoder reports none and still
     # builds, submits and tears down" is actually answered -- the real GPU cannot show it. The
@@ -1182,8 +1196,7 @@ if(WALLPAPERX_LAVAPIPE_ICD)
         consumer_modifier_probe_lavapipe
         frame_acquire_probe_lavapipe
         target_ring_probe_lavapipe
-        video_renderer_probe_lavapipe
-        video_modifier_filter_probe_lavapipe
+        modifier_filter_probe_lavapipe
         device_lost_probe_lavapipe
         device_video_enabled_lavapipe
         device_video_decode_lavapipe
@@ -1223,29 +1236,29 @@ if(WALLPAPERX_LAVAPIPE_ICD)
                          PROPERTIES SKIP_RETURN_CODE 77)
     # Lavapipe offers one modifier, so this entry is expected to report the split half as
     # unverified and exit 77 there -- see the comment on the non-lavapipe entry.
-    set_tests_properties(video_modifier_filter_probe_lavapipe PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(modifier_filter_probe_lavapipe PROPERTIES SKIP_RETURN_CODE 77)
     # Expected to skip here: no video extension means no decode family to manufacture one onto.
     set_tests_properties(device_video_shared_queue_lavapipe PROPERTIES SKIP_RETURN_CODE 77)
     # 77 here means the ffmpeg command line was missing at configure time and no fixture exists.
     set_tests_properties(video_decoder_no_decoder_lavapipe video_decoder_content_lavapipe
                          PROPERTIES SKIP_RETURN_CODE 77)
-    # The converter's entries that need no hardware decoder. On this driver every stream is decoded
+    # The video draw entries that need no hardware decoder. On this driver every stream is decoded
     # in software, so these are its host path; the device path is graded on the real GPU only.
-    wallpaperx_add_test(NAME frame_converter_colour_host_lavapipe COMMAND wallpaperx-frame-converter-probe colour-host)
-    wallpaperx_add_test(NAME frame_converter_edges_host_lavapipe COMMAND wallpaperx-frame-converter-probe edges-host)
-    wallpaperx_add_test(NAME frame_converter_siting_lavapipe COMMAND wallpaperx-frame-converter-probe siting)
-    wallpaperx_add_test(NAME frame_converter_refusal_lavapipe COMMAND wallpaperx-frame-converter-probe refusal)
-    wallpaperx_add_test(NAME frame_converter_output_lavapipe COMMAND wallpaperx-frame-converter-probe output)
-    wallpaperx_add_test(NAME frame_converter_allocation_lavapipe COMMAND wallpaperx-frame-converter-probe allocation)
-    wallpaperx_add_test(NAME frame_converter_shape_resize_lavapipe COMMAND wallpaperx-frame-converter-probe shape-resize)
-    wallpaperx_add_test(NAME frame_converter_shape_tags_lavapipe COMMAND wallpaperx-frame-converter-probe shape-tags)
-    wallpaperx_add_test(NAME frame_converter_pipeline_colour_host_lavapipe
-             COMMAND wallpaperx-frame-converter-probe pipeline-colour-host)
-    set_tests_properties(frame_converter_colour_host_lavapipe frame_converter_edges_host_lavapipe
-                         frame_converter_siting_lavapipe frame_converter_refusal_lavapipe
-                         frame_converter_output_lavapipe frame_converter_allocation_lavapipe
-                         frame_converter_shape_resize_lavapipe frame_converter_shape_tags_lavapipe
-                         frame_converter_pipeline_colour_host_lavapipe
+    wallpaperx_add_test(NAME video_draw_colour_host_lavapipe COMMAND wallpaperx-video-draw-probe colour-host)
+    wallpaperx_add_test(NAME video_draw_edges_host_lavapipe COMMAND wallpaperx-video-draw-probe edges-host)
+    wallpaperx_add_test(NAME video_draw_siting_lavapipe COMMAND wallpaperx-video-draw-probe siting)
+    wallpaperx_add_test(NAME video_draw_refusal_lavapipe COMMAND wallpaperx-video-draw-probe refusal)
+    wallpaperx_add_test(NAME video_draw_allocation_lavapipe COMMAND wallpaperx-video-draw-probe allocation)
+    wallpaperx_add_test(NAME video_draw_shape_resize_lavapipe COMMAND wallpaperx-video-draw-probe shape-resize)
+    wallpaperx_add_test(NAME video_draw_shape_tags_lavapipe COMMAND wallpaperx-video-draw-probe shape-tags)
+    wallpaperx_add_test(NAME video_draw_pipeline_colour_host_lavapipe
+             COMMAND wallpaperx-video-draw-probe pipeline-colour-host)
+    wallpaperx_add_test(NAME video_draw_placement_lavapipe COMMAND wallpaperx-video-draw-probe placement)
+    set_tests_properties(video_draw_colour_host_lavapipe video_draw_edges_host_lavapipe
+                         video_draw_siting_lavapipe video_draw_refusal_lavapipe
+                         video_draw_allocation_lavapipe
+                         video_draw_shape_resize_lavapipe video_draw_shape_tags_lavapipe
+                         video_draw_pipeline_colour_host_lavapipe video_draw_placement_lavapipe
                          PROPERTIES ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
                                     LABELS "lavapipe" SKIP_RETURN_CODE 77)
     # The pipeline's entries that need no hardware decoder.

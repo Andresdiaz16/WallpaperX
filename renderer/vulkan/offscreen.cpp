@@ -11,7 +11,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <functional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace wallpaperx {
@@ -39,11 +41,10 @@ VkImageMemoryBarrier transferOf(VkImage image, VkImageLayout oldLayout, VkImageL
 // named, in the same direction. A transfer performs its transition once, on whichever side
 // the driver picks, so halves that disagree leave the conversion undone.
 //
-// The destination scope covers everything on purpose. IRenderer::record may write the image
-// as a colour attachment, a compute store or a blit, and this is recorded before record()
-// runs -- nothing here can know which. A scope too narrow for what follows makes neither the
-// acquire nor the transition visible to it, and no validation layer says so: an ownership
-// transfer's scopes are not checked. One barrier per frame, so the width costs nothing.
+// The destination scope covers everything on purpose. This is recorded before
+// IRenderer::record runs, and nothing here can know how that will write the image. A scope
+// too narrow for what follows makes neither the acquire nor the transition visible to it, and
+// no validation layer says so: an ownership transfer's scopes are not checked. One barrier per frame, so the width costs nothing.
 void recordAcquire(VkCommandBuffer cmd, const OffscreenTarget& target, uint32_t graphicsFamily) {
     VkImageMemoryBarrier acquire = transferOf(target.image.image, target.releasedFromLayout,
                                               VK_IMAGE_LAYOUT_GENERAL, target.externalOwner, graphicsFamily);
@@ -54,6 +55,10 @@ void recordAcquire(VkCommandBuffer cmd, const OffscreenTarget& target, uint32_t 
 }
 
 }  // namespace
+
+void IRenderer::submit(Device& device, const std::function<void(VkCommandBuffer)>& recordBatch) {
+    static_cast<void>(device.submit(recordBatch));
+}
 
 OffscreenTargetManager::OffscreenTargetManager(Device& device) : m_device(device) {
     createRenderPass();
@@ -76,11 +81,11 @@ OffscreenTargetManager::~OffscreenTargetManager() {
     vkDestroyRenderPass(m_device.device(), m_renderPass, nullptr);
 }
 
-void OffscreenTargetManager::createRenderPass() {
+VkRenderPass createOffscreenRenderPass(VkDevice device, VkAttachmentLoadOp load, const char* who) {
     VkAttachmentDescription colorAttachment{};
-    colorAttachment.format = kFormat;
+    colorAttachment.format = OffscreenTargetManager::kFormat;
     colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
-    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.loadOp = load;
     colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -122,10 +127,15 @@ void OffscreenTargetManager::createRenderPass() {
     renderPassInfo.dependencyCount = static_cast<uint32_t>(dependencies.size());
     renderPassInfo.pDependencies = dependencies.data();
 
-    if (const VkResult r = vkCreateRenderPass(m_device.device(), &renderPassInfo, nullptr, &m_renderPass);
-        r != VK_SUCCESS) {
-        throwVkFailure("OffscreenTargetManager: vkCreateRenderPass", r);
+    VkRenderPass pass = VK_NULL_HANDLE;
+    if (const VkResult r = vkCreateRenderPass(device, &renderPassInfo, nullptr, &pass); r != VK_SUCCESS) {
+        throwVkFailure(std::string(who) + ": vkCreateRenderPass", r);
     }
+    return pass;
+}
+
+void OffscreenTargetManager::createRenderPass() {
+    m_renderPass = createOffscreenRenderPass(m_device.device(), VK_ATTACHMENT_LOAD_OP_CLEAR, "OffscreenTargetManager");
 }
 
 void OffscreenTargetManager::render(IRenderer& renderer, const OffscreenTarget& target) {
@@ -145,7 +155,7 @@ void OffscreenTargetManager::render(IRenderer& renderer, const OffscreenTarget& 
     // external dependency both name everything submitted earlier on this queue -- and a
     // consumer is ordered by the semaphore exportFrameAcquireFd signals, which is the only
     // ordering a host wait here never provided.
-    m_device.submit([&](VkCommandBuffer cmd) {
+    const auto recordBatch = [&](VkCommandBuffer cmd) {
         // Take ownership back before writing. The previous render released it to an
         // external consumer, and a release with no matching acquire is where a driver's
         // compressed-modifier metadata resolve is undefined.
@@ -177,7 +187,10 @@ void OffscreenTargetManager::render(IRenderer& renderer, const OffscreenTarget& 
         release.dstAccessMask = 0;  // ownership release: the acquire side does the rest
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
                              nullptr, 0, nullptr, 1, &release);
-    });
+    };
+    // By reference: std::function holds a reference_wrapper inline, where these captures would
+    // cost a heap allocation per draw.
+    renderer.submit(m_device, std::ref(recordBatch));
     target.notifyPublished(consumer, renderedLayout);
     makeCurrent(target);
 }

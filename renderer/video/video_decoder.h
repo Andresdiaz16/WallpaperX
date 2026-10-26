@@ -104,7 +104,7 @@ public:
 
     struct DeviceImage {
         VkImage image = VK_NULL_HANDLE;
-        // A multi-planar format; the converter copies its planes out through plane aspects.
+        // A multi-planar format; its planes are read through plane aspects.
         VkFormat format = VK_FORMAT_UNDEFINED;
         VkImageTiling tiling = VK_IMAGE_TILING_OPTIMAL;
         VkImageUsageFlags usage = 0;
@@ -115,6 +115,17 @@ public:
     // Read under ffmpeg's lock on the frame, which must not be held by the caller: it is a plain
     // mutex. Throws std::logic_error on a host frame.
     DeviceImage deviceImage() const;
+
+    // A device frame's image's own extent, the same for every image of its pool, which can exceed
+    // the picture's: AV1 keeps its images across a change to a smaller size. Needs no lock. Throws
+    // std::logic_error on a host frame.
+    VkExtent2D imageExtent() const;
+
+    // Names the image pool a device frame's image belongs to; null for a host frame. Two frames
+    // alive at once name the same pool exactly when their images come from it, and a pool's
+    // images outlive every frame of it -- so an image handle seen in frames of one pool names one
+    // image throughout. A name may be reused once no frame of its pool is left.
+    const void* imagePool() const;
 
     // Submits a batch that reads the device image, ordered after the decoder's write of it and
     // before the decoder's next write into it. The frame's timeline semaphore is the only
@@ -209,8 +220,8 @@ public:
         SoftwareNoDecoder,  // the device has no video decode queue at all (Lavapipe)
         SoftwareCodec,      // the device, or ffmpeg, decodes but not this codec
         // The device decodes this codec but not this stream -- profile, depth, size -- or not
-        // into one multi-planar image FrameConverter::readsDeviceImage() accepts and can copy
-        // from under this profile; or ffmpeg's hardware path failed on a device that still answers; or an
+        // into one multi-planar image YcbcrRenderer::readsDeviceImage() accepts and can view
+        // plane by plane and sample under this profile; or ffmpeg's hardware path failed on a device that still answers; or an
         // H.264 or HEVC packet that is not a reset point carries AV_PKT_DATA_NEW_EXTRADATA with parameter sets
         // unlike the device codec's, which ffmpeg's hardware path does not follow unless
         // Device::videoInlineParameters(). At a reset point the device codec is emptied, freed and opened

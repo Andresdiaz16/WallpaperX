@@ -1069,7 +1069,8 @@ void runHardwareChecks(Device& device) {
     //       semaphore, the stored value left -> "FAIL: the frame's batch waits on one semaphore and signals
     //       another". The value lines index only when the batch carried values, so (3) reports, not overreads.
     //       Re-run 2026-10-19 (T7), video_decoder_hardware (RTX), submit() now reading the image under the frame's
-    //       lock: (1) and (2) held, the same lines.
+    //       lock: (1) and (2) held, the same lines. Re-run 2026-10-26 (G6), Device::submit building its
+    //       arrays from SubmitScope's fixed lists: (1) and (3) held, the same lines.
     // COVERAGE-ASSERT: each bracket asserts that exactly one submit was recorded inside it, so a
     //       future change that routes the frame's work somewhere else -- or lets ffmpeg's own
     //       submissions fall into the window -- fails here rather than grading the wrong batch.

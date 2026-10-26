@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// The colour conversion pass, and what it forced on the decoder: S13.44-S13.55.
+// Drawing decoded video, and what it forced on the decoder: S13.44-S13.55 and S13.68, graded
+// through YcbcrRenderer and VideoPipeline, the code production draws video with.
 //
-// WHY THIS FILE EXISTS. FrameConverter's colour had only ever been compared against libswscale in
-// scratch programs its authors did not keep. The reference here is libswscale told the matrix and
+// WHY THIS FILE EXISTS. The colour of a drawn picture had only ever been compared against
+// libswscale in scratch programs nobody kept. The reference here is libswscale told the matrix and
 // range explicitly, with accurate rounding and no dither -- never the ffmpeg command line's default
 // reading, which applied BT.601 to a BT.709 file.
 //
@@ -18,10 +19,9 @@
 // MANY ENTRIES, ONE BINARY: each mode needs its own device -- video extensions stripped or not, a
 // feature or a format feature hidden -- and one verdict would report unreached states as verified.
 
-#include "renderers/video_renderer.h"
-#include "video/frame_converter.h"
 #include "video/video_decoder.h"
 #include "video/video_pipeline.h"
+#include "video/ycbcr_renderer.h"
 #include "vulkan/device.h"
 #include "vulkan/gpu_fault.h"
 #include "vulkan/offscreen.h"
@@ -66,6 +66,7 @@ extern "C" {
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <optional>
 #include <stdexcept>
@@ -77,14 +78,12 @@ namespace {
 using wallpaperx::DecodedFrame;
 using wallpaperx::Device;
 using wallpaperx::FrameColour;
-using wallpaperx::FrameConverter;
 using wallpaperx::OffscreenTarget;
 using wallpaperx::OffscreenTargetManager;
 using wallpaperx::VideoDecoder;
-using wallpaperx::VideoFrame;
 using wallpaperx::VideoPipeline;
-using wallpaperx::VideoRenderer;
 using wallpaperx::WallpaperContentError;
+using wallpaperx::YcbcrRenderer;
 using wallpaperx::testing::check;
 using wallpaperx::testing::fail;
 using wallpaperx::testing::ScratchDir;
@@ -123,6 +122,36 @@ struct HwFramesProposal {
     bool profileList = false;
 };
 HwFramesProposal g_hwFrames;
+
+// S15.957's injections, each read by the interposers below. The window opens when a Vulkan frames
+// proposal returns from avcodec_get_hw_frames_parameters and closes at the next Vulkan
+// av_hwframe_ctx_init or when the test closes it: what is asked inside it is the decoder's own
+// decision about that proposal, not ffmpeg's setup query.
+std::atomic<bool> g_proposeLinearTiling{false};
+std::atomic<bool> g_hideMutableFormat{false};
+std::atomic<bool> g_proposalWindow{false};
+std::atomic<int> g_linearProposals{0};
+std::atomic<int> g_mutableStripped{0};
+std::atomic<int> g_queriesInWindow{0};
+
+// What the decoder handed av_hwframe_ctx_init for its decode pool: the first Vulkan init in a window.
+struct DecodePoolInit {
+    int calls = 0;
+    VkImageUsageFlags usage = 0;
+    VkImageCreateFlags flags = 0;
+};
+std::mutex g_poolInitMutex;
+DecodePoolInit g_poolInit;
+
+// Each Vulkan picture avcodec_receive_frame handed back, by image: lets a test edit what
+// DecodedFrame::deviceImage() reads -- the frame's tiling, its pool's format and usage.
+struct ReceivedVkFrame {
+    VkImage image = VK_NULL_HANDLE;
+    AVVkFrame* frame = nullptr;
+    AVHWFramesContext* pool = nullptr;
+};
+std::mutex g_receivedMutex;
+std::vector<ReceivedVkFrame> g_receivedVkFrames;
 
 // Every vkQueueSubmit this executable's code makes; ffmpeg's own go through dispatch pointers.
 std::atomic<int> g_queueSubmits{0};
@@ -440,19 +469,35 @@ Agreement agreement(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b
     return result;
 }
 
-void waitReporting(Device& device, Device::SubmitTicket ticket, const char* what) {
-    try {
-        device.wait(ticket);
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "FAIL: waiting for %s did not complete: %s\n", what, e.what());
-        fail("a batch this probe submitted never finished");
-    }
+// `frame` drawn one to one by YcbcrRenderer, production's video draw, onto a target the visible
+// picture's size, read back as tightly-packed BGRA. A device frame is moved into the renderer.
+std::vector<uint8_t> drawAndRead(Device& device, DecodedFrame&& frame) {
+    const VkExtent2D size = frame.visible().extent;
+    OffscreenTargetManager targets(device);
+    const OffscreenTarget& target = targets.create(1, size.width, size.height);
+    YcbcrRenderer renderer(device, std::move(frame), kShaderDir);
+    targets.render(renderer, target);
+    return wallpaperx::testing::reclaimAndReadback(device, targets, target);
 }
 
-std::vector<uint8_t> convertAndRead(Device& device, FrameConverter& converter, DecodedFrame& frame) {
-    waitReporting(device, converter.convert(frame), "a conversion");
-    const VideoFrame& out = converter.frame();
-    return wallpaperx::testing::readbackImage(device, out.image, out.source.width, out.source.height);
+// Draws every picture `decoder` has left through one renderer onto a small target, rebuilding
+// nothing: a picture of another shape throws, as it would in production. Returns how many.
+int drawRest(Device& device, VideoDecoder& decoder) {
+    OffscreenTargetManager targets(device);
+    const OffscreenTarget& target = targets.create(1, 64, 64);
+    std::optional<YcbcrRenderer> renderer;
+    int drawn = 0;
+    while (std::optional<DecodedFrame> frame = decoder.next()) {
+        if (!renderer) {
+            renderer.emplace(device, std::move(*frame), kShaderDir);
+        } else {
+            renderer->show(std::move(*frame));
+        }
+        targets.render(*renderer, target);
+        ++drawn;
+    }
+    device.waitForSubmissions();
+    return drawn;
 }
 
 // ------------------------------------------------------------------------- //
@@ -658,15 +703,12 @@ void runColourHostChecks(Device& device, const std::string& label) {
                 fail("a host frame could not be copied out for the reference");
                 continue;
             }
-            FrameConverter converter(device, *opened.frame, kShaderDir);
-            std::vector<uint8_t> converted = convertAndRead(device, converter, *opened.frame);
+            std::vector<uint8_t> converted = drawAndRead(device, std::move(*opened.frame));
             // GOAL: S13.44 -- every flat pixel within one code of libswscale, for each matrix, range,
             //       depth and subsampling in the table. Shape and guards: gradeColour, file header.
-            // CONTROL: renderer/video/frame_converter.cpp, each reverted. BT.709 coefficients set
-            //       to BT.601's: the four BT.709-tagged fixtures 32-33 codes off, BT.601 ones green.
-            //       Limited-range luma scaled over 255: every limited fixture 36 codes off. The R16
-            //       host sample scale 65535 -> 1023: the 10-bit fixture alone, 255 codes off.
-            //       renderer/shaders/ycbcr_convert.frag alpha 0.5: "not opaque everywhere", all six.
+            // CONTROL: renderer/video/ycbcr_planes.cpp BT.709 coefficients set to BT.601's, through
+            //       control_run.sh: "conv_709_tv.mp4 differs from libswscale by 32 codes at (147,0)", restored green.
+            //       renderer/shaders/ycbcr_draw.frag alpha 0.5: "the converted picture is not opaque everywhere".
             std::optional<std::vector<uint8_t>> mask = gradeColour(
                 label, fixture.file, *picture, converted, fixture.swsMatrix, fixture.fullRange, fixture.swsOtherMatrix);
             if (!mask) continue;
@@ -688,9 +730,8 @@ void runColourHostChecks(Device& device, const std::string& label) {
     //       each other. The per-fixture grade already fixes each against its own reference; this
     //       states the goal directly, and asserts the samples really are identical first -- two
     //       encodes that differ would make any difference in output meaningless.
-    // CONTROL: renderer/video/frame_converter.cpp, BT.709's coefficients set to BT.601's: "convert
-    //       to pixels at most 0 codes apart". Reverted. The identical-samples guard went red when
-    //       conv_709_tv.mp4 was swapped for flat grey.
+    // CONTROL: renderer/video/ycbcr_planes.cpp BT.709 coefficients set to BT.601's: "convert to pixels at
+    //       most" red, restored green. The identical-samples guard is harness-side and path-independent.
     if (tagged709 && tagged601) {
         const bool samePlanes = tagged709->picture.planes == tagged601->picture.planes &&
                                 tagged709->picture.stride == tagged601->picture.stride;
@@ -766,8 +807,9 @@ void runColourDeviceChecks(Device& device, const std::string& label) {
             }
             // COVERAGE-ASSERT: a fixture that does not reach the device path makes the entry a skip,
             //       so a layout the decoder stops sending to the device cannot leave it green with
-            //       the others graded. Observed with renderer/video/frame_converter.cpp's 8-bit
-            //       4:4:4 format refused: "conv_hevc444.mp4 took the SoftwareRefused path", exit 77.
+            //       the others graded. Observed by hand with renderer/video/ycbcr_planes.cpp
+            //       deviceFormatFor's 8-bit 4:4:4 case returning UNDEFINED: "conv_hevc444.mp4 took the
+            //       SoftwareRefused path", exit 77; restored, passed.
             if (opened.frame->storage() != DecodedFrame::Storage::DeviceImage) {
                 std::printf("%s: %s took the %s path on %s, so the device path is not answerable for it\n",
                             label.c_str(), fixture.file, pathName(opened.decoder->path()),
@@ -782,16 +824,10 @@ void runColourDeviceChecks(Device& device, const std::string& label) {
                 fail("the software reference decode does not describe the picture the hardware decoded");
                 continue;
             }
-            FrameConverter converter(device, *opened.frame, kShaderDir);
-            std::vector<uint8_t> converted = convertAndRead(device, converter, *opened.frame);
+            std::vector<uint8_t> converted = drawAndRead(device, std::move(*opened.frame));
             const std::string name = std::string(fixture.file) + " on the device";
-            // CONTROL: renderer/video/frame_converter.cpp, each reverted. BT.709 coefficients set
-            //       to BT.601's: every BT.709 fixture 32-33 codes off, the BT.601 one green. R10X6
-            //       luma sample scale 1023 -> 65535: P010 and 10-bit 4:4:4 alone, 255 codes off. The
-            //       device 4:4:4 chroma region computed as if subsampled: both 4:4:4 fixtures alone,
-            //       234 and 255 codes off. The shape guard above: renderer/video/video_decoder.cpp
-            //       visible() two pixels narrower on device frames, "does not describe the picture
-            //       the hardware decoded" for all five.
+            // CONTROL: renderer/video/ycbcr_planes.cpp BT.709 coefficients set to BT.601's: "conv_709_tv.mp4 on
+            //       the device differs from libswscale by 32 codes", restored green.
             if (gradeColour(label, name.c_str(), *reference, converted, fixture.swsMatrix, fixture.fullRange,
                             fixture.swsOtherMatrix)) {
                 ++graded;
@@ -839,14 +875,13 @@ constexpr int kMinPaddingContrast = 30;
 //       past the rectangle moves an edge pixel by tens of codes. A plain cropped stream is no test:
 //       padding that repeats the edge changes nothing when read. So the padding's difference from
 //       the edge is asserted per side first, as is the count of sides that have any.
-// CONTROL: renderer/video/frame_converter.cpp, the constructor's chroma plane region, each reverted.
-//       One texel wider and taller: every edge fixture red on all four edges, host and device. One
-//       texel earlier on a padded side: the offset fixtures red, the corner ones green, both paths.
-//       The device 4:4:4 region computed as if subsampled, or one texel into the padding: both
-//       4:4:4 device fixtures red on every edge, host memory green.
-//       Harness: padding smeared from the edge -> "differs by at most 0 luma and 0 Cr codes"; the
-//       corner fixture swapped for a four-side crop -> "4 sides ... not 2"; a 4:4:4 recipe that
-//       padded before converting misplaced its border -> "0 flat pixels, too few to grade".
+// CONTROL: renderer/shaders/ycbcr_draw.frag chroma clamp widened by one texel each way: edges-device
+//       "edge_offset_420_hw.mp4 on the device: the first visible row differs from libswscale by 126
+//       codes", restored green. That break leaves edges-host green: host planes are uploaded cropped
+//       to the visible region, so no padding is there to read. The upload region is the host path's
+//       guard: renderer/video/ycbcr_renderer.cpp upload() copying each plane from column 0 instead of
+//       the region's left edge, through control_batch.sh: "edge_offset_420.mp4 from host memory: the
+//       first visible row differs from libswscale by 153 codes", restored green.
 // COVERAGE-ASSERT: each edge compares at least kMinEdgePixels flat pixels, and the number of padded
 //       sides found must be the fixture's literal.
 void gradeEdges(const std::string& label, const std::string& name, const HostPicture& picture,
@@ -999,8 +1034,9 @@ void runEdgeChecks(Device& device, const std::string& label, bool onDevice) {
             }
             const bool deviceFrame = opened.frame->storage() == DecodedFrame::Storage::DeviceImage;
             // COVERAGE-ASSERT: a device fixture that falls back to software makes the entry a skip,
-            //       not a pass on the others. Observed with renderer/video/frame_converter.cpp's 8-bit
-            //       4:4:4 format refused: "edge_offset_444_hw.mp4 took the SoftwareRefused path", exit 77.
+            //       not a pass on the others. Observed by hand with renderer/video/ycbcr_planes.cpp
+            //       deviceFormatFor's 8-bit 4:4:4 case returning UNDEFINED: "edge_offset_444_hw.mp4
+            //       took the SoftwareRefused path", exit 77; restored, passed.
             if (onDevice && !deviceFrame) {
                 std::printf("%s: %s took the %s path, so the device path is not answerable for it\n", label.c_str(),
                             fixture.file, pathName(opened.decoder->path()));
@@ -1023,8 +1059,7 @@ void runEdgeChecks(Device& device, const std::string& label, bool onDevice) {
                 fail("the reference decode and the graded decode disagree on the visible rectangle");
                 return;
             }
-            FrameConverter converter(device, *opened.frame, kShaderDir);
-            std::vector<uint8_t> converted = convertAndRead(device, converter, *opened.frame);
+            std::vector<uint8_t> converted = drawAndRead(device, std::move(*opened.frame));
             gradeEdges(label, std::string(fixture.file) + (deviceFrame ? " on the device" : " from host memory"),
                        *picture, converted, fixture.paddedSides);
             ++graded;
@@ -1080,12 +1115,10 @@ constexpr int kSitingCaseCount = 5;
 //       the defect this goal exists for. Written as YUV4MPEG2 at runtime: the container carries the
 //       siting tag and the samples verbatim, where any lossy codec would soften the edge being
 //       measured. The tag reaching the frame is asserted before anything is measured.
-// CONTROL: renderer/video/frame_converter.cpp chromaShift(), each reverted. x hard-coded to half a
-//       pixel: 4:1:1 alone red, its ramp one pixel late. CENTER given the left shift: the centre
-//       case red. TOPLEFT's y negated: the top-left case red. Harness: the centre case written as
-//       420paldv -> "does not carry the siting"; Cr 120/136 -> "too faint to locate".
+// CONTROL: renderer/video/ycbcr_planes.cpp chromaSiting()'s default (left) case returning no shift:
+//       "4:2:0 sited left, across columns: blend weight measured/expected" red, restored green.
 void runSitingChecks(Device& device, const std::string& label) {
-    ScratchDir scratch("wallpaperx-converter");
+    ScratchDir scratch("wallpaperx-video-draw");
     if (!scratch.ok()) {
         fail("could not make a scratch directory, so chroma siting was not exercised");
         return;
@@ -1123,8 +1156,7 @@ void runSitingChecks(Device& device, const std::string& label) {
                 fail("a siting fixture does not carry the siting its container tags");
                 continue;
             }
-            FrameConverter converter(device, *opened.frame, kShaderDir);
-            const std::vector<uint8_t> converted = convertAndRead(device, converter, *opened.frame);
+            const std::vector<uint8_t> converted = drawAndRead(device, std::move(*opened.frame));
             const auto red = [&](uint32_t p) {
                 const uint32_t x = c.acrossRows ? width / 2 : p;
                 const uint32_t y = c.acrossRows ? p : height / 2;
@@ -1194,17 +1226,17 @@ constexpr int kRefusedTagCases = 7;
 constexpr int kAcceptedTagCases = 4;
 
 // GOAL: S13.48 -- primaries and transfer are allowlists: each refused tag raises
-//       WallpaperContentError from the constructor, each accepted one converts.
+//       WallpaperContentError from YcbcrRenderer's constructor, each accepted one is drawn.
 // WHY-THIS-SHAPE: each refused case changes one tag against an otherwise accepted stream, so a
 //       refusal cannot be earned by a different tag. The tags reaching FrameColour are asserted
 //       first: libx264 given -color_primaries drops it silently, and a refusal check on an untagged
 //       stream would be grading nothing -- which is exactly what the first recipes produced.
-// CONTROL: renderer/video/frame_converter.cpp, reverted. P3 and bt470m allowed, LINEAR allowed,
-//       SMPTE170M primaries and the sRGB and bt2020-10 transfers removed: six named reds. PQ, HLG,
-//       BT.2020 primaries and a BT.2020 matrix allowed: four more. The primaries refusal thrown as
-//       std::runtime_error: "raised something other than WallpaperContentError". Harness: tag_p3.mp4
-//       encoded with -color_primaries -> "decoded with ... primaries unknown". Deleting the explicit
-//       HDR or BT.2020-matrix refusal alone stays green: the allowlists refuse the same streams.
+// CONTROL: renderer/video/ycbcr_planes.cpp primariesWithoutConversion() also accepting SMPTE432,
+//       through control_batch.sh: "a stream tagged with P3 (smpte432) primaries was accepted", restored
+//       green. Its refuse() throwing std::runtime_error: "raised something other than
+//       WallpaperContentError", restored green. Harness, earlier: tag_p3.mp4 encoded with
+//       -color_primaries -> "decoded with ... primaries unknown". Deleting the explicit HDR or
+//       BT.2020-matrix refusal alone stays green: the allowlists refuse the same streams.
 // COVERAGE-ASSERT: literal counts of cases reached, refused and accepted.
 void runRefusalChecks(Device& device, const std::string& label) {
     int reached = 0;
@@ -1229,13 +1261,16 @@ void runRefusalChecks(Device& device, const std::string& label) {
             }
             ++reached;
             try {
-                FrameConverter converter(device, *opened.frame, kShaderDir);
+                OffscreenTargetManager targets(device);
+                const OffscreenTarget& target = targets.create(1, 64, 64);
+                YcbcrRenderer renderer(device, std::move(*opened.frame), kShaderDir);
                 if (c.refused) {
                     std::fprintf(stderr, "FAIL: %s: a stream tagged with %s was accepted\n", label.c_str(), c.what);
                     fail("colour this pass cannot render was accepted");
                     continue;
                 }
-                waitReporting(device, converter.convert(*opened.frame), c.what);
+                targets.render(renderer, target);
+                device.waitForSubmissions();
                 ++accepted;
             } catch (const WallpaperContentError& e) {
                 if (c.refused) {
@@ -1254,17 +1289,16 @@ void runRefusalChecks(Device& device, const std::string& label) {
         }
     }
     if (present == static_cast<int>(std::size(kTagCases))) {
-        check(reached == kRefusedTagCases + kAcceptedTagCases, "not every tag case reached the converter");
+        check(reached == kRefusedTagCases + kAcceptedTagCases, "not every tag case reached the renderer");
         check(refused == kRefusedTagCases, "not every unsupported tag was refused as content");
-        check(accepted == kAcceptedTagCases, "not every supported tag converted");
+        check(accepted == kAcceptedTagCases, "not every supported tag was drawn");
     }
-    std::printf("%s: %d tag cases reached the converter: %d refused as content, %d converted\n", label.c_str(),
+    std::printf("%s: %d tag cases reached the renderer: %d refused as content, %d drawn\n", label.c_str(),
                 reached, refused, accepted);
 }
 
 // ------------------------------------------------------------------------- //
-// S13.49 -- the output is what VideoRenderer takes, from construction
-// S13.51 -- the shader loader refuses a short read (the module half)
+// S13.51 -- the shader loader refuses a short read
 // ------------------------------------------------------------------------- //
 
 // A file that reports more bytes than a read returns, which is what a shader file truncated between
@@ -1295,134 +1329,6 @@ bool shortReadAvailable(const std::string& label) {
     return false;
 }
 
-void runOutputChecks(Device& device, const std::string& label) {
-    ScratchDir scratch("wallpaperx-converter");
-    if (!scratch.ok()) {
-        fail("could not make a scratch directory, so the output was not exercised");
-        return;
-    }
-    constexpr uint32_t kWidth = 64;
-    constexpr uint32_t kHeight = 32;
-    const std::string file = scratch.file("output.y4m");
-    if (!writeY4m(file, "420mpeg2", kWidth, kHeight, kWidth / 2, kHeight / 2, 1,
-                  [](int plane, int, uint32_t x, uint32_t y) {
-                      if (plane == 0) return static_cast<uint8_t>(40 + 2 * x + y);
-                      if (plane == 1) return static_cast<uint8_t>(90 + 3 * y);
-                      return static_cast<uint8_t>(80 + 4 * x);
-                  })) {
-        fail("could not write the output fixture");
-        return;
-    }
-
-    Opened opened = openFirst(device, file);
-    if (!opened.frame) {
-        fail("the output fixture decoded to no frames");
-        return;
-    }
-    FrameConverter converter(device, *opened.frame, kShaderDir);
-    const VideoFrame& out = converter.frame();
-    const uint32_t w = out.source.width;
-    const uint32_t h = out.source.height;
-
-    // GOAL: S13.49 -- before any convert(), the image already is what frame() declares: that
-    //       declaration, in TRANSFER_SRC_OPTIMAL, and cleared to opaque black.
-    // WHY-THIS-SHAPE: read back before the first conversion, because every later state is written
-    //       by the pass and would hide a constructor that never cleared or transitioned. The copy
-    //       out names TRANSFER_SRC_OPTIMAL, so an image left in another layout is reported by the
-    //       validation layer rather than by the pixels, which a zero-filled allocation can fake.
-    // CONTROL: renderer/video/frame_converter.cpp, each reverted. Clear colour 0.2 red: "2048 pixels
-    //       ... not opaque black". clearOutput() not called: the same, plus VUID-vkCmdDraw-None-09600.
-    //       Output layout SHADER_READ_ONLY, format R8G8B8A8, TRANSFER_SRC dropped, width and height
-    //       swapped: each reddens its own named check. The layout also draws validation errors; the
-    //       other three break the render or the readback after it.
-    check(out.layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, "the converter's frame is not declared TRANSFER_SRC");
-    check(out.source.format == VK_FORMAT_B8G8R8A8_UNORM && out.source.tiling == VK_IMAGE_TILING_OPTIMAL,
-          "the converter's frame is not B8G8R8A8_UNORM optimal");
-    check(w == kWidth && h == kHeight, "the converter's frame is not the visible rectangle's size");
-    check((out.source.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0, "the converter's frame cannot be blitted from");
-    const std::vector<uint8_t> initial = wallpaperx::testing::readbackImage(device, out.image, w, h);
-    int notBlack = 0;
-    for (size_t i = 0; i < initial.size(); i += 4) {
-        notBlack += (initial[i] | initial[i + 1] | initial[i + 2]) != 0 || initial[i + 3] != 255 ? 1 : 0;
-    }
-    if (notBlack != 0) {
-        std::fprintf(stderr, "FAIL: %s: %d pixels of the unconverted output are not opaque black\n", label.c_str(),
-                     notBlack);
-        fail("the converter's image is not cleared before its first conversion");
-    }
-
-    // GOAL: S13.49 -- VideoRenderer accepts that frame as it stands, before and after a conversion,
-    //       and a render shows exactly what the conversion wrote.
-    // WHY-THIS-SHAPE: the target is the frame's own size, so the blit is one to one and the shown
-    //       picture can be compared with the converted one directly. The converted readback is
-    //       asserted to hold something other than black first, so "shows black before" is not
-    //       satisfied by an output nothing ever writes.
-    // CONTROL: renderer/renderers/video_renderer.cpp blit destination flipped vertically: "differs
-    //       from the converted frame by 127 codes". renderer/video/frame_converter.cpp recordHost()
-    //       without its pass: "the conversion left the output mostly black". Both reverted.
-    OffscreenTargetManager targets(device);
-    const OffscreenTarget& target = targets.create(/*monitorId=*/1, w, h);
-    std::optional<VideoRenderer> renderer;
-    try {
-        renderer.emplace(device, out);
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "FAIL: %s: VideoRenderer refused the unconverted frame: %s\n", label.c_str(), e.what());
-        fail("VideoRenderer does not accept what the converter hands out before its first conversion");
-        return;
-    }
-    targets.render(*renderer, target);
-    const std::vector<uint8_t> shownBefore = wallpaperx::testing::reclaimAndReadback(device, targets, target);
-    int shownNotBlack = 0;
-    for (size_t i = 0; i < shownBefore.size(); i += 4) {
-        shownNotBlack += (shownBefore[i] | shownBefore[i + 1] | shownBefore[i + 2]) != 0 ? 1 : 0;
-    }
-    check(shownNotBlack == 0, "a render of the unconverted frame did not show black");
-
-    waitReporting(device, converter.convert(*opened.frame), "the output fixture's conversion");
-    const std::vector<uint8_t> converted = wallpaperx::testing::readbackImage(device, out.image, w, h);
-    int convertedNotBlack = 0;
-    for (size_t i = 0; i < converted.size(); i += 4) {
-        convertedNotBlack += (converted[i] | converted[i + 1] | converted[i + 2]) != 0 ? 1 : 0;
-    }
-    check(convertedNotBlack > static_cast<int>(w * h / 2), "the conversion left the output mostly black");
-    try {
-        renderer->show(converter.frame());
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "FAIL: %s: VideoRenderer refused the converted frame: %s\n", label.c_str(), e.what());
-        fail("VideoRenderer does not accept what the converter hands out after a conversion");
-        return;
-    }
-    targets.render(*renderer, target);
-    const std::vector<uint8_t> shownAfter = wallpaperx::testing::reclaimAndReadback(device, targets, target);
-    const Agreement shown = agreement(shownAfter, converted, w, h, [](uint32_t, uint32_t) { return true; });
-    if (shown.worst > kToleranceCodes) {
-        std::fprintf(stderr, "FAIL: %s: the rendered target differs from the converted frame by %d codes at (%d,%d)\n",
-                     label.c_str(), shown.worst, shown.worstX, shown.worstY);
-        fail("a render does not show the converted picture");
-    }
-    device.waitForSubmissions();
-
-    // GOAL: S13.51 -- a ShaderModule built from a file that reads short throws before the driver
-    //       is handed anything.
-    // CONTROL: renderer/vulkan/shader_module.cpp, readSpirv's short-read test replaced by `false`:
-    //       both lines red, and VUID-VkShaderModuleCreateInfo-pCode-08738 from the layer. Reverted.
-    if (shortReadAvailable(label)) {
-        const int before = g_shaderModulesCreated.load();
-        bool refused = false;
-        try {
-            wallpaperx::ShaderModule module(device.device(), kShortReadFile, "frame_converter_probe");
-        } catch (const std::runtime_error&) {
-            refused = true;
-        }
-        check(refused, "a shader module was built from a file that read short");
-        check(g_shaderModulesCreated.load() == before, "a file that read short was handed to vkCreateShaderModule");
-    } else {
-        g_notVerified = true;
-    }
-    std::printf("%s: %ux%u output declared and cleared before conversion; rendered within %d code(s) after\n",
-                label.c_str(), w, h, shown.worst);
-}
-
 // ------------------------------------------------------------------------- //
 // S13.50 -- a host frame costs no allocation
 // ------------------------------------------------------------------------- //
@@ -1434,41 +1340,51 @@ constexpr int kAllocationWarmUp = 2;
 struct AllocationRun {
     bool ran = false;
     long constructor = 0;
-    long converting = 0;
+    long showing = 0;
+    long drawing = 0;
     int measured = 0;
 };
 
-// Builds a converter for the file's first frame and converts every frame, counting operator new on
-// this thread across the constructor and across each convert() after the warm-up -- never across
-// the decode, the wait or the readback, about which the header promises nothing.
-AllocationRun measureConversions(Device& device, const std::string& file) {
+// Builds a renderer for the file's first picture, then shows and draws every picture, counting
+// operator new on this thread across the constructor, and across each show() and each render()
+// after the warm-up -- never across the decode, the wait or the readback.
+AllocationRun measureShows(Device& device, const std::string& file) {
     AllocationRun run;
     VideoDecoder decoder(device, file);
     std::vector<DecodedFrame> frames;
     while (std::optional<DecodedFrame> frame = decoder.next()) frames.push_back(std::move(*frame));
     if (frames.size() != kAllocationFrames || frames[0].storage() != DecodedFrame::Storage::HostPlanes) return run;
-    std::optional<FrameConverter> converter;
+    OffscreenTargetManager targets(device);
+    const OffscreenTarget& target = targets.create(1, 64, 32);
+    std::optional<YcbcrRenderer> renderer;
     {
         g_allocations = 0;
         CountAllocations counting;
-        converter.emplace(device, frames[0], kShaderDir);
+        renderer.emplace(device, std::move(frames[0]), kShaderDir);
         run.constructor = g_allocations.load();
     }
-    for (int i = 0; i < kAllocationWarmUp; ++i) {
-        waitReporting(device, converter->convert(frames[i]), "a warm-up conversion");
+    targets.render(*renderer, target);
+    // Picture 0 went through the constructor's show(); this brings both upload buffers into use.
+    for (int i = 1; i < kAllocationWarmUp; ++i) {
+        renderer->show(std::move(frames[i]));
+        targets.render(*renderer, target);
     }
-    g_allocations = 0;
     for (int i = kAllocationWarmUp; i < kAllocationFrames; ++i) {
-        Device::SubmitTicket ticket;
+        g_allocations = 0;
         {
             CountAllocations counting;
-            ticket = converter->convert(frames[i]);
+            renderer->show(std::move(frames[i]));
         }
+        run.showing += g_allocations.load();
+        g_allocations = 0;
+        {
+            CountAllocations counting;
+            targets.render(*renderer, target);
+        }
+        run.drawing += g_allocations.load();
         ++run.measured;
-        waitReporting(device, ticket, "a measured conversion");
+        device.waitForSubmissions();
     }
-    run.converting = g_allocations.load();
-    device.waitForSubmissions();
     run.ran = true;
     return run;
 }
@@ -1476,7 +1392,7 @@ AllocationRun measureConversions(Device& device, const std::string& file) {
 
 void runAllocationChecks(Device& device, const std::string& label) {
 #if WALLPAPERX_ALLOCATION_INSTRUMENT
-    ScratchDir scratch("wallpaperx-converter");
+    ScratchDir scratch("wallpaperx-video-draw");
     if (!scratch.ok()) {
         fail("could not make a scratch directory, so allocation was not measured");
         return;
@@ -1492,22 +1408,26 @@ void runAllocationChecks(Device& device, const std::string& label) {
         return;
     }
 
-    // The same conversions under the validation layer, so the layer grades them; not counted.
-    if (!measureConversions(device, file).ran) {
+    // The same pictures under the validation layer, so the layer grades them; not counted.
+    if (!measureShows(device, file).ran) {
         fail("the allocation fixture did not decode to its twelve host frames");
         return;
     }
 
-    // GOAL: S13.50 -- convert() on a host frame makes no operator new call, once the converter has
-    //       been through both of its upload buffers.
+    // GOAL: S13.50 -- YcbcrRenderer::show() on a host picture makes no operator new call once both
+    //       upload buffers have been used: uploading a software-decoded picture costs no allocation.
     // WHY-THIS-SHAPE: counted through a replaced global operator new, on a second Device built
     //       without the validation layer. The layer is C++ and its own bookkeeping reaches the
-    //       replaced operator new from inside vkQueueSubmit: measured at 147 calls per conversion
-    //       with the layer loaded and 0 without, on both drivers. Counting only callers inside this
-    //       executable would miss allocations libstdc++ makes out of line on the converter's behalf.
-    // CONTROL: renderer/video/frame_converter.cpp convert() building a 40-character std::string on
-    //       the host path: "10 host-frame conversions made 10 operator new calls". Reverted. Harness:
-    //       CountAllocations never switching counting on -> "saw nothing while the converter was built".
+    //       replaced operator new from inside vkQueueSubmit (147 calls per picture, measured, with it
+    //       loaded; 0 without). Counting only callers inside this executable would miss allocations
+    //       libstdc++ makes out of line on the renderer's behalf. render() is counted apart and
+    //       printed, not asserted: it is the draw every renderer shares, outside this goal, and today
+    //       makes one allocation per draw (OffscreenTargetManager::render's lambda outgrows
+    //       std::function's inline storage).
+    // CONTROL: renderer/video/ycbcr_renderer.cpp upload()'s barrier array made a std::vector, through
+    //       control_batch.sh: "10 host pictures shown made 10 operator new calls in show()", restored
+    //       green; re-run 2026-10-26 (G6) after Device::submit stopped allocating, the same line. Harness:
+    //       CountAllocations never switching counting on -> "saw nothing while the renderer was built".
     // COVERAGE-ASSERT: the constructor, measured the same way, must count allocations -- otherwise
     //       a counter that sees nothing on this thread would report zero here as well.
     AllocationRun counted;
@@ -1515,25 +1435,25 @@ void runAllocationChecks(Device& device, const std::string& label) {
         Device unlayered(/*enableValidation=*/false);
         if (unlayered.validationLayerActive()) {
             std::printf("%s: a validation layer is loaded into a device built without one (VK_INSTANCE_LAYERS?), "
-                        "and its allocations cannot be told from the converter's -- not answerable\n",
+                        "and its allocations cannot be told from the renderer's -- not answerable\n",
                         label.c_str());
             g_notVerified = true;
             return;
         }
-        counted = measureConversions(unlayered, file);
+        counted = measureShows(unlayered, file);
     }
     if (!counted.ran) {
         fail("the allocation fixture did not decode to its twelve host frames on the unlayered device");
         return;
     }
-    check(counted.constructor > 0, "the allocation counter saw nothing while the converter was built");
-    if (counted.converting != 0) {
-        std::fprintf(stderr, "FAIL: %s: %d host-frame conversions made %ld operator new calls\n", label.c_str(),
-                     counted.measured, counted.converting);
-        fail("converting a host frame allocates host memory");
+    check(counted.constructor > 0, "the allocation counter saw nothing while the renderer was built");
+    if (counted.showing != 0) {
+        std::fprintf(stderr, "FAIL: %s: %d host pictures shown made %ld operator new calls in show()\n", label.c_str(),
+                     counted.measured, counted.showing);
+        fail("showing a host picture allocates host memory");
     }
-    std::printf("%s: %d host-frame conversions, %ld allocations (the constructor made %ld)\n", label.c_str(),
-                counted.measured, counted.converting, counted.constructor);
+    std::printf("%s: %d host pictures, %ld allocations showing and %ld drawing (the constructor made %ld)\n",
+                label.c_str(), counted.measured, counted.showing, counted.drawing, counted.constructor);
 #else
     (void)device;
     std::printf("%s: built with a sanitizer, whose allocator the counter cannot replace -- not answerable\n",
@@ -1559,15 +1479,16 @@ void runGateChecks(Device& device, const std::string& label) {
     //       yuv444p is three-plane, which no decoder produces and the rule refused both before and
     //       after 4:4:4 was admitted, so asking about it grades nothing. nv42 is asked about the
     //       VkFormat nv24 is accepted in, so only the plane order differs.
-    // CONTROL: renderer/video/frame_converter.cpp deviceFormatFor(), each reverted. The 8-bit 4:4:4
-    //       case returning UNDEFINED: "refuses an 8-bit 4:4:4 decoder image (nv24)". The 10-bit case
-    //       the same: "(p410le)". The Cb-before-Cr test removed: "accepts ... Cr before Cb (nv42)".
-    check(FrameConverter::readsDeviceImage(device, AV_PIX_FMT_NV24, VK_FORMAT_G8_B8R8_2PLANE_444_UNORM),
+    //       Asked of YcbcrRenderer::readsDeviceImage, the function video_decoder.cpp calls.
+    // CONTROL: renderer/video/ycbcr_planes.cpp deviceFormatFor(), each through control_batch.sh and
+    //       restored green. The 8-bit 4:4:4 case returning UNDEFINED: "refuses an 8-bit 4:4:4 decoder
+    //       image (nv24)". The Cb-before-Cr test made true: "accepts a 4:4:4 image with Cr before Cb".
+    check(YcbcrRenderer::readsDeviceImage(device, AV_PIX_FMT_NV24, VK_FORMAT_G8_B8R8_2PLANE_444_UNORM),
           "readsDeviceImage refuses an 8-bit 4:4:4 decoder image (nv24)");
-    check(FrameConverter::readsDeviceImage(device, AV_PIX_FMT_P410LE,
+    check(YcbcrRenderer::readsDeviceImage(device, AV_PIX_FMT_P410LE,
                                            VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16),
           "readsDeviceImage refuses a 10-bit 4:4:4 decoder image (p410le)");
-    check(!FrameConverter::readsDeviceImage(device, AV_PIX_FMT_NV42, VK_FORMAT_G8_B8R8_2PLANE_444_UNORM),
+    check(!YcbcrRenderer::readsDeviceImage(device, AV_PIX_FMT_NV42, VK_FORMAT_G8_B8R8_2PLANE_444_UNORM),
           "readsDeviceImage accepts a 4:4:4 image with Cr before Cb (nv42) in a format that holds Cb first");
 
     // GOAL: S13.52 -- the decoder asks the rule before decoding on the device: an H.265 4:4:4
@@ -1578,10 +1499,10 @@ void runGateChecks(Device& device, const std::string& label) {
     //       are turned away inside avcodec_get_hw_frames_parameters, which also ends in
     //       SoftwareRefused and would pass with the decoder never asking. So the interposed setup is
     //       asserted to have proposed one image with a video profile first; otherwise not answerable.
-    // CONTROL: renderer/video/video_decoder.cpp without its readsDeviceImage() call: "did not take the
-    //       software path" and "was decoded into a device image", so this GPU decodes the stream and
-    //       the fallback is the rule's doing. Reverted. Harness: the interposer recording a failed
-    //       setup -> "never asked the rule -- not answerable", exit 77.
+    // CONTROL: renderer/video/video_decoder.cpp without its YcbcrRenderer::readsDeviceImage() call,
+    //       through control_batch.sh: "the rule refuses did not take the software path", so this GPU
+    //       decodes the stream and the fallback is the rule's doing; restored green. Harness, earlier:
+    //       the interposer recording a failed setup -> "never asked the rule -- not answerable", exit 77.
     if (haveAsset("conv_hevc444_12.mp4", label)) {
         try {
             g_hwFrames = HwFramesProposal{};
@@ -1597,7 +1518,7 @@ void runGateChecks(Device& device, const std::string& label) {
                             label.c_str(), device.info().gpuName.c_str(), proposal.calls, proposal.result);
                 g_notVerified = true;
             } else {
-                check(!FrameConverter::readsDeviceImage(device, proposal.swFormat, proposal.imageFormat),
+                check(!YcbcrRenderer::readsDeviceImage(device, proposal.swFormat, proposal.imageFormat),
                       "readsDeviceImage accepts the 12-bit 4:4:4 image ffmpeg proposed, so this stream no longer "
                       "shows the decoder obeying a refusal");
                 check(decoder.path() == VideoDecoder::Path::SoftwareRefused,
@@ -1617,8 +1538,7 @@ void runGateChecks(Device& device, const std::string& label) {
                     }
                 }
                 if (picture) {
-                    FrameConverter converter(device, *frame, kShaderDir);
-                    const std::vector<uint8_t> converted = convertAndRead(device, converter, *frame);
+                    const std::vector<uint8_t> converted = drawAndRead(device, std::move(*frame));
                     if (kHaveReference) {
                         (void)gradeColour(label, fixture.file, *picture, converted, fixture.swsMatrix,
                                           fixture.fullRange, fixture.swsOtherMatrix);
@@ -1628,13 +1548,9 @@ void runGateChecks(Device& device, const std::string& label) {
                                     label.c_str());
                         g_notVerified = true;
                     }
-                    int more = 0;
-                    while (std::optional<DecodedFrame> next = decoder.next()) {
-                        waitReporting(device, converter.convert(*next), "a later H.265 4:4:4 12-bit frame");
-                        ++more;
-                    }
+                    const int more = drawRest(device, decoder);
                     std::printf("%s: H.265 4:4:4 12-bit -> ffmpeg proposed %s, the rule refused it, %s, %d frames "
-                                "converted\n",
+                                "drawn\n",
                                 label.c_str(), orUnknown(av_get_pix_fmt_name(proposal.swFormat)),
                                 pathName(decoder.path()), more + 1);
                 }
@@ -1653,11 +1569,13 @@ void runGateChecks(Device& device, const std::string& label) {
     //       the two outcomes in one run. A decoder that asked a different rule, or a constructor
     //       that did, leaves one of the three answers unchanged. Stripping a 10-bit plane format
     //       leaves the host path's R16 formats alone, so the software fallback still converts.
-    // CONTROL: renderer/video/frame_converter.cpp, each reverted. readsDeviceImage answering from the
-    //       layout without asking the device: "still accepts P010", "did not take software", "decoded
-    //       on the device". The constructor's device refusal thrown as WallpaperContentError: "refused
-    //       the device frame as content". The rule negated with the decoder not asking it: "refuses a
-    //       device frame the decoder chose".
+    //       The constructor is given a second picture of the stream: the first is moved into the
+    //       renderer that accepts it.
+    // CONTROL: renderer/video/ycbcr_renderer.cpp, each through control_batch.sh and restored green.
+    //       readsDeviceImage answering from the layout without asking the device: "still accepts P010
+    //       on a device that cannot filter" and "the decoder did not take software", the decoder
+    //       asking the same function. The constructor's device refusal thrown as
+    //       WallpaperContentError: "refused the device frame as content".
     try {
         VideoDecoder decoder(device, asset("conv_hevc10.mp4"));
         std::optional<DecodedFrame> frame = decoder.next();
@@ -1668,21 +1586,23 @@ void runGateChecks(Device& device, const std::string& label) {
             g_notVerified = true;
             return;
         }
-        const DecodedFrame::DeviceImage image = frame->deviceImage();
-        check(FrameConverter::readsDeviceImage(device, frame->pixelFormat(), image.format),
-              "readsDeviceImage refuses a device frame the decoder chose to decode on the device");
-        {
-            FrameConverter accepted(device, *frame, kShaderDir);
-            waitReporting(device, accepted.convert(*frame), "the accepted 10-bit device frame");
+        std::optional<DecodedFrame> second = decoder.next();
+        if (!second || second->storage() != DecodedFrame::Storage::DeviceImage) {
+            fail("the 10-bit fixture did not decode a second picture on the device");
+            return;
         }
+        const DecodedFrame::DeviceImage image = frame->deviceImage();
+        check(YcbcrRenderer::readsDeviceImage(device, frame->pixelFormat(), image.format),
+              "readsDeviceImage refuses a device frame the decoder chose to decode on the device");
+        (void)drawAndRead(device, std::move(*second));
         device.waitForSubmissions();
 
         StrippedX6LinearFilter stripped;
-        check(!FrameConverter::readsDeviceImage(device, frame->pixelFormat(), image.format),
+        check(!YcbcrRenderer::readsDeviceImage(device, frame->pixelFormat(), image.format),
               "readsDeviceImage still accepts P010 on a device that cannot filter its plane format");
         bool constructorRefused = false;
         try {
-            FrameConverter refused(device, *frame, kShaderDir);
+            YcbcrRenderer refused(device, std::move(*frame), kShaderDir);
         } catch (const WallpaperContentError& e) {
             std::fprintf(stderr, "FAIL: %s: the constructor refused the device frame as content: %s\n", label.c_str(),
                          e.what());
@@ -1701,15 +1621,409 @@ void runGateChecks(Device& device, const std::string& label) {
               "the decoder did not take software for a stream the rule refuses");
         check(host->storage() == DecodedFrame::Storage::HostPlanes,
               "the decoder decoded on the device a stream the rule refuses");
-        if (host->storage() == DecodedFrame::Storage::HostPlanes) {
-            FrameConverter converter(device, *host, kShaderDir);
-            waitReporting(device, converter.convert(*host), "the software-decoded 10-bit frame");
-        }
+        if (host->storage() == DecodedFrame::Storage::HostPlanes) (void)drawAndRead(device, std::move(*host));
         std::printf("%s: H.265 Main10 -> Hardware; with its plane format unfilterable -> %s\n", label.c_str(),
                     pathName(fallback.path()));
     } catch (const std::exception& e) {
         reportThrow(label, "the H.265 Main10 fixture", e);
     }
+}
+
+// ------------------------------------------------------------------------- //
+// S15.957 -- what the decoder asks of its decode pool, and what the renderer refuses
+// ------------------------------------------------------------------------- //
+
+std::optional<ReceivedVkFrame> receivedFor(VkImage image) {
+    std::lock_guard lock(g_receivedMutex);
+    for (const ReceivedVkFrame& received : g_receivedVkFrames) {
+        if (received.image == image) return received;
+    }
+    return std::nullopt;
+}
+
+void openProposalWindow() {
+    {
+        std::lock_guard lock(g_poolInitMutex);
+        g_poolInit = DecodePoolInit{};
+    }
+    g_linearProposals = 0;
+    g_mutableStripped = 0;
+    g_queriesInWindow = 0;
+    g_proposalWindow = false;
+}
+
+DecodePoolInit poolInit() {
+    std::lock_guard lock(g_poolInitMutex);
+    return g_poolInit;
+}
+
+// The constructor given `frame`, one field of whose image description the caller has made false.
+// Graded on checkDecoderImage's own message, so a refusal from anywhere else does not count.
+void gradeContractRefusal(Device& device, DecodedFrame&& frame, const std::string& label, const char* what,
+                          const char* message) {
+    bool refused = false;
+    try {
+        YcbcrRenderer accepted(device, std::move(frame), kShaderDir);
+        std::fprintf(stderr, "FAIL: %s: the constructor accepted a decoder image %s\n", label.c_str(), what);
+    } catch (const std::logic_error& e) {
+        refused = std::strstr(e.what(), message) != nullptr;
+        if (!refused) std::fprintf(stderr, "FAIL: %s: an image %s was refused as: %s\n", label.c_str(), what, e.what());
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "FAIL: %s: an image %s raised: %s\n", label.c_str(), what, e.what());
+    }
+    check(refused, std::string("YcbcrRenderer refuses a decoder image ") + what);
+}
+
+void runDecodePoolChecks(Device& device, const std::string& label) {
+    if (device.info().videoDecodeOps == 0 || !haveAsset("conv_hevc10.mp4", label)) return;  // said by the gate
+    const std::string file = asset("conv_hevc10.mp4");
+
+    // GOAL: S15.957 -- the decode pool the decoder hands ffmpeg asks for SAMPLED usage, which the
+    //       renderer's plane views read, and for MUTABLE_FORMAT, which a plane view in its own format
+    //       needs. False if either is missing from what av_hwframe_ctx_init is given.
+    // WHY-THIS-SHAPE: read at av_hwframe_ctx_init's entry, not from the finished pool: ffmpeg adds
+    //       SAMPLED itself wherever the format can be sampled, so the finished pool carries it whether
+    //       or not the decoder asked. ffmpeg's own DPB pool is also built with this call; only the
+    //       first Vulkan init after the stream's proposal is the decoder's.
+    // CONTROL: renderer/video/video_decoder.cpp attachHardwareFrames(), each through control_batch.sh.
+    //       `| renderer` dropped from `asked` -> "FAIL: the decoder's decode pool asks for SAMPLED usage".
+    //       img_flags given only EXTENDED_USAGE -> "FAIL: the decoder's decode pool asks for MUTABLE_FORMAT".
+    //       Both held (red, then green restored).
+    std::optional<VideoDecoder> decoder;
+    std::optional<DecodedFrame> frames[4];
+    try {
+        openProposalWindow();
+        decoder.emplace(device, file);
+        for (std::optional<DecodedFrame>& frame : frames) frame = decoder->next();
+        g_proposalWindow = false;
+    } catch (const std::exception& e) {
+        g_proposalWindow = false;
+        reportThrow(label, "the decode-pool fixture", e);
+        return;
+    }
+    for (const std::optional<DecodedFrame>& frame : frames) {
+        if (!frame || frame->storage() != DecodedFrame::Storage::DeviceImage) {
+            std::printf("%s: H.265 Main10 did not decode four pictures on the device here, so the decode pool "
+                        "cannot be read -- not answerable\n",
+                        label.c_str());
+            g_notVerified = true;
+            return;
+        }
+    }
+    const DecodePoolInit init = poolInit();
+    if (init.calls == 0) {
+        fail("the stream decoded on the device, yet no av_hwframe_ctx_init followed its proposal");
+    } else {
+        check((init.usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0, "the decoder's decode pool asks for SAMPLED usage");
+        check((init.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) != 0,
+              "the decoder's decode pool asks for MUTABLE_FORMAT");
+        std::printf("%s: decode pool asked usage 0x%x, flags 0x%x\n", label.c_str(), init.usage, init.flags);
+    }
+
+    // GOAL: S15.957 -- YcbcrRenderer refuses a decoder image of the wrong format, one without SAMPLED
+    //       usage, and one not optimally tiled, each with checkDecoderImage's std::logic_error.
+    // WHY-THIS-SHAPE: a real decoded picture whose description is edited where deviceImage() reads it
+    //       -- the pool's format and usage, the frame's tiling -- and restored at once. The image
+    //       itself stays valid, so a renderer that skips the check builds views on it and is seen
+    //       accepting it, rather than crashing. A hand-made DecodedFrame cannot exist.
+    // CONTROL: renderer/video/ycbcr_renderer.cpp checkDecoderImage(), each `if` made `if (false)`,
+    //       through control_batch.sh, each held: "FAIL: YcbcrRenderer refuses a decoder image of
+    //       another format", "... without SAMPLED usage", "... not optimally tiled".
+    struct Lie {
+        const char* what;
+        const char* message;
+    };
+    const Lie lies[3] = {{"of another format", "format does not match"},
+                         {"without SAMPLED usage", "cannot be sampled"},
+                         {"not optimally tiled", "not optimally tiled"}};
+    for (int i = 0; i < 3; ++i) {
+        DecodedFrame& frame = *frames[i + 1];
+        const std::optional<ReceivedVkFrame> received = receivedFor(frame.deviceImage().image);
+        if (!received) {
+            fail("a device picture was handed back without avcodec_receive_frame seeing it");
+            continue;
+        }
+        auto* pool = static_cast<AVVulkanFramesContext*>(received->pool->hwctx);
+        const VkFormat format = pool->format[0];
+        const VkImageUsageFlagBits usage = pool->usage;
+        const VkImageTiling tiling = received->frame->tiling;
+        if (i == 0) {
+            pool->format[0] = format == VK_FORMAT_G8_B8R8_2PLANE_444_UNORM ? VK_FORMAT_G8_B8R8_2PLANE_420_UNORM
+                                                                          : VK_FORMAT_G8_B8R8_2PLANE_444_UNORM;
+        }
+        if (i == 1) pool->usage = static_cast<VkImageUsageFlagBits>(usage & ~VK_IMAGE_USAGE_SAMPLED_BIT);
+        if (i == 2) received->frame->tiling = VK_IMAGE_TILING_LINEAR;
+        gradeContractRefusal(device, std::move(frame), label, lies[i].what, lies[i].message);
+        device.waitForSubmissions();
+        pool->format[0] = format;
+        pool->usage = usage;
+        received->frame->tiling = tiling;
+    }
+    for (std::optional<DecodedFrame>& frame : frames) frame.reset();
+    decoder.reset();
+
+    // GOAL: S15.957 -- a proposal for a decode pool that is not optimally tiled is sent to software
+    //       at once: the decoder asks the device nothing about it, creates no pool, and decodes on the
+    //       processor. False if a linear pool goes on to be asked about or built.
+    // WHY-THIS-SHAPE: the proposal is made linear as it leaves avcodec_get_hw_frames_parameters, and
+    //       the device queries after it are counted. Grading the path alone cannot fail: on this card
+    //       a linear decode pool is refused further on anyway, so a decoder without the tiling test
+    //       still ends on SoftwareRefused, having asked the device about the linear pool first.
+    // CONTROL: renderer/video/video_decoder.cpp attachHardwareFrames(), `vk->tiling !=
+    //       VK_IMAGE_TILING_OPTIMAL ||` deleted from the refusal, through control_batch.sh: "FAIL: a linear
+    //       decode-pool proposal is refused before the device is asked about it". Held.
+    // COVERAGE-ASSERT: the injection is asserted to have made a proposal linear.
+    try {
+        openProposalWindow();
+        g_proposeLinearTiling = true;
+        VideoDecoder linear(device, file);
+        std::optional<DecodedFrame> frame = linear.next();
+        g_proposeLinearTiling = false;
+        g_proposalWindow = false;
+        const int queries = g_queriesInWindow.load();
+        check(g_linearProposals.load() > 0, "the linear-tiling injection reached a decode-pool proposal");
+        if (queries != 0) {
+            std::fprintf(stderr, "FAIL: %s: %d device queries followed a linear decode-pool proposal\n",
+                         label.c_str(), queries);
+        }
+        check(queries == 0, "a linear decode-pool proposal is refused before the device is asked about it");
+        check(poolInit().calls == 0, "a linear decode-pool proposal created no decode pool");
+        check(linear.path() == VideoDecoder::Path::SoftwareRefused,
+              "a linear decode-pool proposal sends the stream to software");
+        check(frame && frame->storage() == DecodedFrame::Storage::HostPlanes,
+              "a stream whose decode pool would be linear decodes into host memory");
+        std::printf("%s: linear proposal -> %s, %d queries after it\n", label.c_str(), pathName(linear.path()),
+                    queries);
+    } catch (const std::exception& e) {
+        g_proposeLinearTiling = false;
+        g_proposalWindow = false;
+        reportThrow(label, "the linear-tiling proposal", e);
+    }
+
+    // GOAL: S15.957 -- a device whose video-format answer for the stream offers no MUTABLE_FORMAT sends
+    //       the stream to software, creating no decode pool. False if the decoder decodes on the device
+    //       into images its plane views cannot be made on.
+    // WHY-THIS-SHAPE: the flag is stripped only from the decoder's own query -- the one inside the
+    //       window after ffmpeg's proposal -- so ffmpeg's setup query still succeeds and the stream
+    //       reaches the requirement rather than being turned away before it.
+    // CONTROL: renderer/video/video_decoder.cpp attachHardwareFrames(), the MUTABLE_FORMAT refusal made
+    //       `if (false)`, through control_batch.sh: "FAIL: a device offering no MUTABLE_FORMAT for the
+    //       stream sends it to software". Held.
+    // COVERAGE-ASSERT: the injection is asserted to have stripped the flag from an answer.
+    try {
+        openProposalWindow();
+        g_hideMutableFormat = true;
+        VideoDecoder immutable(device, file);
+        std::optional<DecodedFrame> frame = immutable.next();
+        g_hideMutableFormat = false;
+        g_proposalWindow = false;
+        check(g_mutableStripped.load() > 0, "the injection stripped MUTABLE_FORMAT from the decoder's format query");
+        check(immutable.path() == VideoDecoder::Path::SoftwareRefused,
+              "a device offering no MUTABLE_FORMAT for the stream sends it to software");
+        check(poolInit().calls == 0, "a device offering no MUTABLE_FORMAT gets no decode pool built");
+        check(frame && frame->storage() == DecodedFrame::Storage::HostPlanes,
+              "a stream refused for MUTABLE_FORMAT decodes into host memory");
+        std::printf("%s: no MUTABLE_FORMAT offered -> %s\n", label.c_str(), pathName(immutable.path()));
+    } catch (const std::exception& e) {
+        g_hideMutableFormat = false;
+        g_proposalWindow = false;
+        reportThrow(label, "the MUTABLE_FORMAT refusal", e);
+    }
+}
+
+// ------------------------------------------------------------------------- //
+// S15.958 -- a submission's scope holds four of each kind without allocating
+// ------------------------------------------------------------------------- //
+
+VkSemaphore fakeSemaphore(uintptr_t n) { return reinterpret_cast<VkSemaphore>(0x1000 + n * 16); }
+
+bool holdsFour(const Device::SubmitScope& scope) {
+    if (scope.wait.size() != 4 || scope.signal.size() != 4 || scope.timelineWait.size() != 4 ||
+        scope.timelineSignal.size() != 4) {
+        return false;
+    }
+    for (uintptr_t i = 0; i < 4; ++i) {
+        const auto& wait = scope.wait.begin()[i];
+        const auto& timelineWait = scope.timelineWait.begin()[i];
+        const auto& timelineSignal = scope.timelineSignal.begin()[i];
+        if (wait.semaphore != fakeSemaphore(i) || wait.stage != VK_PIPELINE_STAGE_ALL_COMMANDS_BIT ||
+            scope.signal.begin()[i] != fakeSemaphore(10 + i) || timelineWait.semaphore != fakeSemaphore(20 + i) ||
+            timelineWait.value != 100 + i || timelineSignal.semaphore != fakeSemaphore(30 + i) ||
+            timelineSignal.value != 200 + i) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void runSubmitScopeChecks(Device& device, const std::string& label) {
+    using Scope = Device::SubmitScope;
+    constexpr VkPipelineStageFlags kStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+
+    // GOAL: S15.958 -- a SubmitScope holds four entries of each kind, built by emplace_back, push_back
+    //       and an initializer list, kept intact through a copy and an assignment, with no operator new.
+    // WHY-THIS-SHAPE: the entries are compared by value after the copy and the assignment, since a
+    //       copy is how DecodedFrame::submit takes its scope; a size check alone would pass a copy that
+    //       lost its contents. Fake handles: nothing here reaches Vulkan.
+    // CONTROL: renderer/vulkan/device.h, each through control_batch.sh, each held. kCapacity 4 -> 3:
+    //       "FAIL: Device::SubmitScope holds four entries of each kind, intact through a copy". The
+    //       copy constructor staging through a std::vector: "FAIL: building, copying and assigning a
+    //       full SubmitScope allocates nothing".
+    // COVERAGE-ASSERT: one deliberate allocation inside the counted region must be counted.
+#if WALLPAPERX_ALLOCATION_INSTRUMENT
+    long allocations = -1;
+    long probe = 0;
+    bool held = false;
+    std::string threw;
+    {
+        const CountAllocations counting;
+        const long before = g_allocations.load();
+        try {
+            Scope scope;
+            for (uintptr_t i = 0; i < 4; ++i) {
+                scope.wait.emplace_back(fakeSemaphore(i), kStage);
+                scope.signal.push_back(fakeSemaphore(10 + i));
+                scope.timelineWait.emplace_back(fakeSemaphore(20 + i), 100 + i, kStage);
+            }
+            scope.timelineSignal = {Scope::TimelineSignal(fakeSemaphore(30), 200), Scope::TimelineSignal(fakeSemaphore(31), 201),
+                                    Scope::TimelineSignal(fakeSemaphore(32), 202), Scope::TimelineSignal(fakeSemaphore(33), 203)};
+            const Scope copied(scope);
+            Scope assigned;
+            assigned = copied;
+            allocations = g_allocations.load() - before;
+            held = holdsFour(scope) && holdsFour(copied) && holdsFour(assigned);
+        } catch (const std::exception& e) {
+            threw = e.what();
+        }
+        const long beforeProbe = g_allocations.load();
+        int* volatile deliberate = new int(1);  // volatile: a plain new/delete pair may be elided
+        delete deliberate;
+        probe = g_allocations.load() - beforeProbe;
+    }
+    if (!threw.empty()) std::fprintf(stderr, "FAIL: %s: a full SubmitScope threw: %s\n", label.c_str(), threw.c_str());
+    check(held, "Device::SubmitScope holds four entries of each kind, intact through a copy");
+    check(probe == 1, "the allocation counter saw the deliberate allocation in the SubmitScope check");
+    // A scope that threw before the count was taken has no count; the check above already failed.
+    if (threw.empty()) {
+        if (allocations != 0) {
+            std::fprintf(stderr, "FAIL: %s: a full SubmitScope made %ld operator new calls\n", label.c_str(),
+                         allocations);
+        }
+        check(allocations == 0, "building, copying and assigning a full SubmitScope allocates nothing");
+    }
+#else
+    std::printf("%s: built with a sanitizer, whose allocator the counter cannot replace -- SubmitScope's "
+                "allocations not answerable\n",
+                label.c_str());
+    g_notVerified = true;
+#endif
+
+    // GOAL: S15.958 -- a fifth entry of any kind throws std::length_error and leaves the four in place,
+    //       and a scope over-filled while it is built for Device::submit submits nothing.
+    // WHY-THIS-SHAPE: the over-filled scope is built in the argument to a real submit, with real
+    //       semaphores, so a list that dropped the fifth quietly would be seen submitting. The other
+    //       three kinds are only filled, with fake handles that must never reach a submit.
+    // CONTROL: renderer/vulkan/device.h emplace_back, the full case returning the last entry instead of
+    //       throwing, through control_batch.sh: "FAIL: a fifth timeline signal in a scope built for
+    //       Device::submit throws std::length_error and submits nothing". Held.
+    auto fifth = [&](auto& list, auto entry, const char* kind) {
+        bool lengthError = false;
+        try {
+            list.push_back(entry);
+        } catch (const std::length_error&) {
+            lengthError = true;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "FAIL: %s: a fifth %s raised: %s\n", label.c_str(), kind, e.what());
+        }
+        check(lengthError && list.size() == 4,
+              std::string("a fifth ") + kind + " throws std::length_error and leaves four entries");
+    };
+    {
+        Scope scope;
+        for (uintptr_t i = 0; i < 4; ++i) {
+            scope.wait.emplace_back(fakeSemaphore(i), kStage);
+            scope.signal.push_back(fakeSemaphore(10 + i));
+            scope.timelineWait.emplace_back(fakeSemaphore(20 + i), 100 + i, kStage);
+        }
+        fifth(scope.wait, Scope::Wait(fakeSemaphore(4), kStage), "wait");
+        fifth(scope.signal, fakeSemaphore(14), "signal");
+        fifth(scope.timelineWait, Scope::TimelineWait(fakeSemaphore(24), 104, kStage), "timeline wait");
+    }
+
+    // GOAL: S15.958 -- Device::submit carries all four entries of each kind to the queue: every one of
+    //       four timeline signals is reached, after waits on four binary semaphores and four timelines.
+    // WHY-THIS-SHAPE: the counters are read after the batch completed, so a dropped signal reads as a
+    //       value short, not as a hang. Timeline waits are on value 0, which never blocks: a dropped
+    //       signal must not wedge the queue the rest of the probe runs on.
+    // CONTROL: renderer/vulkan/device.cpp submit(), the flattening of timeline signals skipping the
+    //       last entry, through control_batch.sh: "FAIL: a submission with four timeline signals
+    //       signals all four". Held.
+    VkDevice vk = device.device();
+    std::array<VkSemaphore, 4> binary{};
+    std::array<VkSemaphore, 4> timeline{};
+    auto destroy = [&] {
+        try {
+            device.waitForSubmissions();
+        } catch (const std::exception& e) {
+            reportThrow(label, "waiting before the SubmitScope semaphores are destroyed", e);
+        }
+        for (VkSemaphore s : binary) if (s) vkDestroySemaphore(vk, s, nullptr);
+        for (VkSemaphore s : timeline) if (s) vkDestroySemaphore(vk, s, nullptr);
+    };
+    try {
+        VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+        type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        VkSemaphoreCreateInfo timelineInfo{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+        const VkSemaphoreCreateInfo binaryInfo{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        for (size_t i = 0; i < 4; ++i) {
+            if (vkCreateSemaphore(vk, &binaryInfo, nullptr, &binary[i]) != VK_SUCCESS ||
+                vkCreateSemaphore(vk, &timelineInfo, nullptr, &timeline[i]) != VK_SUCCESS) {
+                throw std::runtime_error("vkCreateSemaphore failed");
+            }
+        }
+        const auto nothing = [](VkCommandBuffer) {};
+
+        Scope full;
+        for (uintptr_t i = 0; i < 4; ++i) full.timelineSignal.emplace_back(timeline[i], 1 + i);
+        const int before = g_queueSubmits.load();
+        bool lengthError = false;
+        try {
+            device.submit(nothing, [&] {
+                Scope over = full;
+                over.timelineSignal.emplace_back(timeline[0], 9);
+                return over;
+            }());
+        } catch (const std::length_error&) {
+            lengthError = true;
+        }
+        check(lengthError && g_queueSubmits.load() == before,
+              "a fifth timeline signal in a scope built for Device::submit throws std::length_error and submits "
+              "nothing");
+
+        Scope signalling;
+        for (VkSemaphore s : binary) signalling.signal.push_back(s);
+        device.submit(nothing, signalling);
+        Scope waiting = full;
+        for (size_t i = 0; i < 4; ++i) {
+            waiting.wait.emplace_back(binary[i], kStage);
+            waiting.timelineWait.emplace_back(timeline[i], 0, kStage);
+        }
+        device.wait(device.submit(nothing, waiting));
+        bool all = true;
+        for (size_t i = 0; i < 4; ++i) {
+            uint64_t value = 0;
+            if (vkGetSemaphoreCounterValue(vk, timeline[i], &value) != VK_SUCCESS) throw std::runtime_error("counter");
+            if (value != 1 + i) {
+                std::fprintf(stderr, "FAIL: %s: timeline signal %zu reads %llu, expected %zu\n", label.c_str(), i,
+                             static_cast<unsigned long long>(value), 1 + i);
+                all = false;
+            }
+        }
+        check(all, "a submission with four timeline signals signals all four");
+    } catch (const std::exception& e) {
+        reportThrow(label, "the SubmitScope submissions", e);
+    }
+    destroy();
 }
 
 // ------------------------------------------------------------------------- //
@@ -1728,16 +2042,17 @@ void runNoYcbcrChecks(Device& device, const std::string& label) {
         return;
     }
     // GOAL: S13.53 -- on a device that lacks samplerYcbcrConversion, a stream plays exactly as it
-    //       does on the same GPU with the feature: every frame decodes and converts, on the same path.
+    //       does on the same GPU with the feature: every frame decodes and is drawn by YcbcrRenderer,
+    //       on the same path.
     // WHY-THIS-SHAPE: compared with the same GPU built with the feature, in this run, rather than
     //       asserting Hardware: whether ffmpeg needs the feature is the open question, and the
     //       property worth holding is that its absence changes nothing -- not that a fallback
     //       exists. Frame counts are compared so a stream that stops early cannot pass as playing.
-    // CONTROL: renderer/video/video_decoder.cpp openDecoder() choosing SoftwareRefused whenever the
-    //       feature is absent -- the removed check, restored: "10 frames on SoftwareRefused; with it:
-    //       10 frames on Hardware" for both streams. Reverted. Re-run 2026-10-24 (G5) via control_batch.sh,
-    //       as a `refuse(Path::SoftwareRefused)` first in openDecoder()'s undecided branch: the same. Harness: feature not hidden -> "was not
-    //       hidden, so a device without it was never built".
+    // CONTROL: through control_batch.sh, each restored green. renderer/video/video_decoder.cpp
+    //       openDecoder() refusing to SoftwareRefused whenever the feature is absent: "10 frames on
+    //       SoftwareRefused; with it: 10 frames on Hardware". renderer/video/ycbcr_renderer.cpp's
+    //       constructor throwing WallpaperContentError without the feature: "conv_709_tv.mp4 threw".
+    //       Harness, earlier: feature not hidden -> "was not hidden, so a device without it was never built".
     for (const char* name : {"conv_709_tv.mp4", "conv_hevc10.mp4"}) {
         if (!haveAsset(name, label)) continue;
         try {
@@ -1756,13 +2071,7 @@ void runNoYcbcrChecks(Device& device, const std::string& label) {
                 baselinePath = decoder.path();
             }
             VideoDecoder decoder(device, asset(name));
-            std::optional<FrameConverter> converter;
-            int frames = 0;
-            while (std::optional<DecodedFrame> frame = decoder.next()) {
-                if (!converter) converter.emplace(device, *frame, kShaderDir);
-                waitReporting(device, converter->convert(*frame), "a frame on the device without the feature");
-                ++frames;
-            }
+            const int frames = drawRest(device, decoder);
             if (frames != baselineFrames || decoder.path() != baselinePath) {
                 std::fprintf(stderr,
                              "FAIL: %s: %s without samplerYcbcrConversion: %d frames on %s; with it: %d frames on %s\n",
@@ -1770,7 +2079,7 @@ void runNoYcbcrChecks(Device& device, const std::string& label) {
                              pathName(baselinePath));
                 fail("a device without samplerYcbcrConversion does not play the stream as one with it does");
             }
-            std::printf("%s: %s without samplerYcbcrConversion: %d frames converted on %s (with it: %d on %s)\n",
+            std::printf("%s: %s without samplerYcbcrConversion: %d frames drawn on %s (with it: %d on %s)\n",
                         label.c_str(), name, frames, pathName(decoder.path()), baselineFrames, pathName(baselinePath));
         } catch (const std::exception& e) {
             reportThrow(label, name, e);
@@ -1782,7 +2091,6 @@ void runNoYcbcrChecks(Device& device, const std::string& label) {
 // S13.54 -- frames that change shape or colour mid-stream
 // ------------------------------------------------------------------------- //
 
-// Expects convert() to throw exactly `Expected` and to submit nothing.
 // ------------------------------------------------------------------------- //
 // S13.68 -- VideoPipeline's target against the reference
 // ------------------------------------------------------------------------- //
@@ -1804,15 +2112,15 @@ void runPipelineColourChecks(Device& device, const std::string& label, bool onDe
 
     // GOAL: S13.68 -- what VideoPipeline leaves on a target the size of the picture is within one code
     //       of libswscale told the matrix and range explicitly, from host planes and from device images.
-    // WHY-THIS-SHAPE: colour-host and colour-device grade FrameConverter's image; this grades the
-    //       target after decode, convert and blit together, which they cannot: a blit ahead of its
-    //       conversion, or a stage showing another image, leaves the converter's image right. The
-    //       target is the visible size, so the blit is one to one and each pixel is the picture's.
-    //       The device fixtures are the converter's own; one that decodes in software here is a skip.
-    // CONTROL: each reverted. renderer/video/frame_converter.cpp BT.709 coefficients set to BT.601's:
-    //       every BT.709 fixture 32-33 codes off on both paths, the two BT.601 ones green.
-    //       renderer/video/video_pipeline.cpp renderNext() rendering before converting: every fixture
-    //       "differs from libswscale by 255 codes", the target black.
+    // WHY-THIS-SHAPE: colour-host and colour-device draw each picture through a YcbcrRenderer of
+    //       their own; this grades what the pipeline's decode, renderer choice and draw leave
+    //       together. The target is the visible size, so the draw is one to one and each pixel is
+    //       the picture's. The device fixtures are colour-device's; one that decodes in software here
+    //       is a skip.
+    // CONTROL: renderer/video/ycbcr_planes.cpp BT.709 coefficients set to BT.601's, through
+    //       control_batch.sh: "conv_709_tv.mp4 through the pipeline differs from libswscale by 32
+    //       codes" on the host entry and "conv_709_tv.mp4 through the pipeline differs" on the device
+    //       entry, restored green.
     // COVERAGE-ASSERT: gradeColour's own -- a quarter of the picture compared, wrong readings at least
     //       12 codes away -- plus each fixture's tags: red with a BT.601-tagged file under the BT.709
     //       name, "decoded with matrix smpte170m".
@@ -1877,13 +2185,14 @@ void runPipelineColourChecks(Device& device, const std::string& label, bool onDe
     }
 }
 
+// Expects show() to throw exactly `Expected` and to submit nothing; `frame` is left as it was.
 template <class Expected>
-bool refusedWithoutSubmitting(FrameConverter& converter, DecodedFrame& frame, const std::string& label,
+bool refusedWithoutSubmitting(YcbcrRenderer& renderer, DecodedFrame& frame, const std::string& label,
                               const char* what) {
     const int before = g_queueSubmits.load();
     bool threw = false;
     try {
-        (void)converter.convert(frame);
+        renderer.show(std::move(frame));
     } catch (const Expected&) {
         threw = true;
     } catch (const std::exception& e) {
@@ -1892,11 +2201,11 @@ bool refusedWithoutSubmitting(FrameConverter& converter, DecodedFrame& frame, co
     const bool submitted = g_queueSubmits.load() != before;
     if (!threw) {
         std::fprintf(stderr, "FAIL: %s: %s was not refused\n", label.c_str(), what);
-        fail("convert() did not refuse a frame its contract refuses");
+        fail("show() did not refuse a frame its contract refuses");
     }
     if (submitted) {
         std::fprintf(stderr, "FAIL: %s: %s submitted a batch before throwing\n", label.c_str(), what);
-        fail("convert() submitted work for a frame it then refused");
+        fail("show() submitted work for a frame it then refused");
     }
     return threw && !submitted;
 }
@@ -1905,48 +2214,55 @@ void runShapeResizeChecks(Device& device, const std::string& label) {
     if (!videoExtensionsHidden(device, label)) return;
     if (!haveAsset("shape_resize.h264", label)) return;
 
-    // GOAL: S13.54 -- a frame whose size differs from the converter's picture is refused with
-    //       std::invalid_argument before anything is submitted, and a converter built for the new
-    //       picture converts it: a resolution change needs a new converter, and gets a working one.
+    // GOAL: S13.54 -- a frame whose size differs from the renderer's shape is refused by show() with
+    //       std::invalid_argument before anything is submitted, and a renderer built for the new
+    //       picture draws it: a resolution change needs a new renderer, and gets a working one.
     // WHY-THIS-SHAPE: a real stream whose second half is a different size, decoded by the real
-    //       decoder, so what reaches convert() is what a mid-stream change produces rather than a
+    //       decoder, so what reaches show() is what a mid-stream change produces rather than a
     //       frame this probe could not build on its own. Submissions are counted at vkQueueSubmit
     //       so "nothing is submitted on a throw" is measured, not inferred from the exception.
-    //       Decoded in software: the refusal is the converter's and does not depend on the path, and
+    //       Decoded in software: the refusal is the renderer's and does not depend on the path, and
     //       a size change on the hardware path is graded by video_pipeline_probe's shape-device entry.
-    // CONTROL: renderer/video/frame_converter.cpp convert(), each reverted. An empty submit ahead of
-    //       the picture check: "submitted a batch before throwing". The refusal as std::runtime_error:
-    //       "raised the wrong exception". Harness: a single-size stream -> both coverage lines; video
-    //       extensions left visible -> "were not hidden".
+    // CONTROL: renderer/video/ycbcr_renderer.cpp show(), each through control_batch.sh and restored
+    //       green. An empty submit ahead of the shape check: "a frame of a different size submitted a
+    //       batch before throwing". The refusal as std::runtime_error: "a frame of a different size
+    //       raised the wrong exception". Harness, earlier: a single-size stream -> both coverage
+    //       lines; video extensions left visible -> "were not hidden".
     // COVERAGE-ASSERT: the stream must yield two sizes and at least one refusal, so a fixture that
     //       stopped changing size fails instead of passing with nothing refused.
     try {
         VideoDecoder decoder(device, asset("shape_resize.h264"));
-        std::optional<FrameConverter> converter;
-        int converted = 0;
+        OffscreenTargetManager targets(device);
+        const OffscreenTarget& target = targets.create(1, 64, 64);
+        std::optional<YcbcrRenderer> renderer;
+        int drawn = 0;
         int refused = 0;
         std::vector<uint32_t> widths;
         while (std::optional<DecodedFrame> frame = decoder.next()) {
             if (std::find(widths.begin(), widths.end(), frame->visible().extent.width) == widths.end()) {
                 widths.push_back(frame->visible().extent.width);
             }
-            if (!converter) converter.emplace(device, *frame, kShaderDir);
-            if (FrameConverter::pictureOf(*frame) != converter->picture()) {
-                if (refusedWithoutSubmitting<std::invalid_argument>(*converter, *frame, label,
+            if (!renderer) {
+                renderer.emplace(device, std::move(*frame), kShaderDir);
+            } else if (YcbcrRenderer::shapeOf(*frame) != renderer->shape()) {
+                if (refusedWithoutSubmitting<std::invalid_argument>(*renderer, *frame, label,
                                                                     "a frame of a different size")) {
                     ++refused;
                 }
                 device.waitForSubmissions();
-                converter.reset();
-                converter.emplace(device, *frame, kShaderDir);
+                renderer.reset();
+                renderer.emplace(device, std::move(*frame), kShaderDir);
+            } else {
+                renderer->show(std::move(*frame));
             }
-            waitReporting(device, converter->convert(*frame), "a frame of the resized stream");
-            ++converted;
+            targets.render(*renderer, target);
+            ++drawn;
         }
+        device.waitForSubmissions();
         check(widths.size() == 2, "the resize fixture did not decode to two picture sizes");
-        check(refused >= 1, "no frame of the resized stream was refused by the converter built for the first size");
-        std::printf("%s: resized stream -> %zu sizes on %s, %d frames converted, %d refused before a rebuild\n",
-                    label.c_str(), widths.size(), pathName(decoder.path()), converted, refused);
+        check(refused >= 1, "no frame of the resized stream was refused by the renderer built for the first size");
+        std::printf("%s: resized stream -> %zu sizes on %s, %d frames drawn, %d refused before a rebuild\n",
+                    label.c_str(), widths.size(), pathName(decoder.path()), drawn, refused);
     } catch (const std::exception& e) {
         reportThrow(label, "the resized stream", e);
     }
@@ -1955,31 +2271,43 @@ void runShapeResizeChecks(Device& device, const std::string& label) {
 void runShapeTagChecks(Device& device, const std::string& label) {
     if (!haveAsset("shape_tags.h264", label)) return;
 
-    // GOAL: S13.54 -- a frame whose colour tags change to ones this pass cannot render is refused by
-    //       convert() with WallpaperContentError, before anything is submitted, while the frames
-    //       before the change convert.
-    // CONTROL: renderer/video/frame_converter.cpp convert() with an empty submit ahead of its checks,
-    //       run on this GPU's device path: "a frame retagged as PQ submitted a batch before throwing"
-    //       for each of the five. Reverted.
+    // GOAL: S13.54 -- a frame whose colour tags change to ones this renderer cannot draw is refused
+    //       by show() with WallpaperContentError, before anything is submitted, while the frames
+    //       before the change are drawn.
+    // CONTROL: renderer/video/ycbcr_renderer.cpp show(), each through control_batch.sh and restored
+    //       green. An empty submit ahead of its checks: "a frame retagged as PQ submitted a batch
+    //       before throwing". show() reusing the shown picture's colour instead of asking colourMapFor:
+    //       "a frame retagged as PQ was not refused".
     try {
         VideoDecoder decoder(device, asset("shape_tags.h264"));
-        std::optional<FrameConverter> converter;
-        int converted = 0;
+        OffscreenTargetManager targets(device);
+        const OffscreenTarget& target = targets.create(1, 64, 64);
+        std::optional<YcbcrRenderer> renderer;
+        int drawn = 0;
         int refused = 0;
         while (std::optional<DecodedFrame> frame = decoder.next()) {
-            if (!converter) converter.emplace(device, *frame, kShaderDir);
             if (frame->colour().transfer == AVCOL_TRC_SMPTE2084) {
-                if (refusedWithoutSubmitting<WallpaperContentError>(*converter, *frame, label,
+                if (!renderer) {
+                    fail("the retagged stream's first picture is already tagged PQ, so no renderer was built");
+                    break;
+                }
+                if (refusedWithoutSubmitting<WallpaperContentError>(*renderer, *frame, label,
                                                                     "a frame retagged as PQ")) {
                     ++refused;
                 }
                 continue;
             }
-            waitReporting(device, converter->convert(*frame), "a frame before the retag");
-            ++converted;
+            if (!renderer) {
+                renderer.emplace(device, std::move(*frame), kShaderDir);
+            } else {
+                renderer->show(std::move(*frame));
+            }
+            targets.render(*renderer, target);
+            ++drawn;
         }
+        device.waitForSubmissions();
         check(refused >= 1, "the retagged stream produced no frame tagged PQ");
-        std::printf("%s: retagged stream -> %d converted, %d refused as PQ\n", label.c_str(), converted, refused);
+        std::printf("%s: retagged stream -> %d drawn, %d refused as PQ\n", label.c_str(), drawn, refused);
     } catch (const std::exception& e) {
         reportThrow(label, "the retagged stream", e);
     }
@@ -1996,19 +2324,18 @@ void runShapeFallbackChecks(Device& device, const std::string& label) {
     if (!haveAsset(file, label)) return;
 
     // GOAL: S13.55 -- when the hardware decoder fails part way through a stream on a device that
-    //       still answers, later frames arrive from host memory, the converter built for the device
-    //       frames refuses the first with std::invalid_argument before submitting, the path is
-    //       SoftwareRefused, and every picture of the stream is converted once, in order.
+    //       still answers, later frames arrive from host memory, the YcbcrRenderer built for the
+    //       device frames refuses the first with std::invalid_argument before submitting, the path is
+    //       SoftwareRefused, and every picture of the stream is drawn once, in order.
     // WHY-THIS-SHAPE: the failure is injected at avcodec_receive_frame after three device frames,
-    //       because no file makes a working hardware decoder fail mid-stream. Each conversion is read
+    //       because no file makes a working hardware decoder fail mid-stream. Each draw is read
     //       back and identified by the frame number the fixture draws into it, against libavcodec
     //       decoding the file directly. A frame count cannot tell a repeat and a skip that cancel, and
     //       the decoder's timestamps are what it decides from.
-    // CONTROL: each reverted. renderer/video/video_decoder.cpp admit()'s DropThrough test `<=` made `<`:
-    //       "21 pictures converted against 20 ... 1 converted more than once". DropThrough also dropping
-    //       the first picture past the resume point: "19 ... 1 never converted".
-    //       renderer/video/frame_converter.cpp's picture refusal as std::runtime_error: "raised the wrong
-    //       exception".
+    // CONTROL: through control_batch.sh, each restored green. renderer/video/video_decoder.cpp
+    //       admit()'s DropThrough test `<=` made `<`: "pictures drawn against ... 1 drawn more than
+    //       once". renderer/video/ycbcr_renderer.cpp show()'s shape refusal as std::runtime_error: "the
+    //       first host frame after the fallback raised the wrong exception".
     // COVERAGE-ASSERT: the injection consumed, three device frames seen first, and the independent
     //       decode naming every picture once -- red with the colour-bars fixture substituted, "does not
     //       name each picture once".
@@ -2024,31 +2351,40 @@ void runShapeFallbackChecks(Device& device, const std::string& label) {
             return;
         }
         VideoDecoder decoder(device, asset(file));
-        std::optional<FrameConverter> converter;
+        OffscreenTargetManager targets(device);
+        const OffscreenTarget* target = nullptr;
+        std::optional<YcbcrRenderer> renderer;
         std::vector<int> converted;
         int deviceFrames = 0;
         int hostFrames = 0;
         bool refusedTheSwitch = false;
-        auto identify = [&](DecodedFrame& frame) {
-            const std::vector<uint8_t> pixels = convertAndRead(device, *converter, frame);
-            converted.push_back(wallpaperx::testing::counterFromBgra(pixels, converter->frame().source.width,
-                                                                     converter->frame().source.height));
+        // Shows `frame` -- through a new renderer when there is none -- draws it one to one and
+        // reads which picture it is.
+        auto identify = [&](DecodedFrame&& frame) {
+            const VkExtent2D size = frame.visible().extent;
+            if (target == nullptr) target = &targets.create(1, size.width, size.height);
+            if (!renderer) {
+                renderer.emplace(device, std::move(frame), kShaderDir);
+            } else {
+                renderer->show(std::move(frame));
+            }
+            targets.render(*renderer, *target);
+            const std::vector<uint8_t> pixels = wallpaperx::testing::reclaimAndReadback(device, targets, *target);
+            converted.push_back(wallpaperx::testing::counterFromBgra(pixels, target->width, target->height));
         };
         while (std::optional<DecodedFrame> frame = decoder.next()) {
             if (frame->storage() == DecodedFrame::Storage::DeviceImage) {
-                if (!converter) converter.emplace(device, *frame, kShaderDir);
-                identify(*frame);
+                identify(std::move(*frame));
                 if (++deviceFrames == kDeviceFramesFirst) g_receiveExternalRemaining = 1;
                 continue;
             }
-            if (hostFrames++ == 0 && converter) {
+            if (hostFrames++ == 0 && renderer) {
                 refusedTheSwitch = refusedWithoutSubmitting<std::invalid_argument>(
-                    *converter, *frame, label, "the first host frame after the fallback");
+                    *renderer, *frame, label, "the first host frame after the fallback");
                 device.waitForSubmissions();
-                converter.reset();
+                renderer.reset();
             }
-            if (!converter) converter.emplace(device, *frame, kShaderDir);
-            identify(*frame);
+            identify(std::move(*frame));
             if (converted.size() > reference->ids.size() + 8) {
                 fail("the decoder went on returning pictures past the end of the stream");
                 break;
@@ -2065,7 +2401,7 @@ void runShapeFallbackChecks(Device& device, const std::string& label) {
         check(unconsumed == 0, "the injected hardware failure was never consumed");
         check(decoder.path() == VideoDecoder::Path::SoftwareRefused,
               "a hardware failure mid-stream did not leave the decoder on SoftwareRefused");
-        check(refusedTheSwitch, "the converter built for device frames did not refuse the first host frame");
+        check(refusedTheSwitch, "the renderer built for device frames did not refuse the first host frame");
         if (converted != reference->ids) {
             std::vector<int> times(1 << wallpaperx::testing::kCounterBits, 0);
             for (int id : converted) {
@@ -2076,12 +2412,12 @@ void runShapeFallbackChecks(Device& device, const std::string& label) {
             int missing = 0;
             for (int id : reference->ids) missing += times[static_cast<size_t>(id)] == 0 ? 1 : 0;
             std::fprintf(stderr,
-                         "FAIL: %s: %zu pictures converted against %zu in an independent decode: %d converted more "
-                         "than once, %d never converted\n",
+                         "FAIL: %s: %zu pictures drawn against %zu in an independent decode: %d drawn more "
+                         "than once, %d never drawn\n",
                          label.c_str(), converted.size(), reference->ids.size(), repeated, missing);
-            fail("the pictures converted across a mid-stream fallback are not the stream's, each once, in order");
+            fail("the pictures drawn across a mid-stream fallback are not the stream's, each once, in order");
         }
-        std::printf("%s: %d device frames, then the hardware failed; %d host frames followed, %zu pictures converted "
+        std::printf("%s: %d device frames, then the hardware failed; %d host frames followed, %zu pictures drawn "
                     "against %zu in the stream\n",
                     label.c_str(), deviceFrames, hostFrames, converted.size(), reference->ids.size());
     } catch (const std::exception& e) {
@@ -2112,7 +2448,7 @@ void runShaderReadChecks(const std::string& label) {
         return;
     }
     try {
-        const std::vector<uint32_t> words = wallpaperx::readSpirv(shader, "frame_converter_probe");
+        const std::vector<uint32_t> words = wallpaperx::readSpirv(shader, "video_draw_probe");
         check(words.size() * 4 == size, "a valid shader did not read to its full length");
         check(!words.empty() && words[0] == 0x07230203, "a valid shader did not read back its SPIR-V magic number");
     } catch (const std::exception& e) {
@@ -2125,13 +2461,489 @@ void runShaderReadChecks(const std::string& label) {
     }
     bool refused = false;
     try {
-        const std::vector<uint32_t> words = wallpaperx::readSpirv(kShortReadFile, "frame_converter_probe");
+        const std::vector<uint32_t> words = wallpaperx::readSpirv(kShortReadFile, "video_draw_probe");
         std::fprintf(stderr, "FAIL: %s: %s read as %zu words\n", label.c_str(), kShortReadFile, words.size());
     } catch (const std::runtime_error&) {
         refused = true;
     }
     check(refused, "readSpirv accepted a file that read short");
-    std::printf("%s: a valid shader read in full; a file that reads short was refused\n", label.c_str());
+
+    // GOAL: S13.51 -- a ShaderModule built from a file that reads short throws before the driver
+    //       is handed anything.
+    // WHY-THIS-SHAPE: built on a null VkDevice, so this entry still opens no driver; the
+    //       interposed vkCreateShaderModule counts the call and refuses a null device instead of
+    //       forwarding it, so a module that reaches the driver is reported, not a crash.
+    // CONTROL: renderer/vulkan/shader_module.cpp readSpirv's short-read test replaced by `false`,
+    //       through control_batch.sh: "a file that read short was handed to vkCreateShaderModule",
+    //       restored green.
+    const int before = g_shaderModulesCreated.load();
+    bool moduleRefused = false;
+    try {
+        wallpaperx::ShaderModule module(VK_NULL_HANDLE, kShortReadFile, "video_draw_probe");
+    } catch (const std::runtime_error&) {
+        moduleRefused = true;
+    }
+    check(moduleRefused, "a shader module was built from a file that read short");
+    check(g_shaderModulesCreated.load() == before, "a file that read short was handed to vkCreateShaderModule");
+    std::printf("%s: a valid shader read in full; a file that reads short was refused, by readSpirv and by "
+                "ShaderModule\n",
+                label.c_str());
+}
+
+// ------------------------------------------------------------------------- //
+// Placement -- where the picture lands on a target, and what a refusal leaves there
+// ------------------------------------------------------------------------- //
+//
+// The ramp fixtures (renderer/CMakeLists.txt, ramp_*) name their own positions: red rises with x,
+// green with y, blue is constant. A target pixel's red and green name the picture position it was
+// sampled from, so the region shown is recovered from the drawn frame rather than compared with a
+// stored image, which would make one driver's filter output the contract.
+
+constexpr int kRampBlue = 128;
+
+struct RecordedBarrier {
+    VkImage image = VK_NULL_HANDLE;
+    VkImageLayout oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout newLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    uint32_t srcFamily = VK_QUEUE_FAMILY_IGNORED;
+    uint32_t dstFamily = VK_QUEUE_FAMILY_IGNORED;
+};
+// Filled by the vkCmdPipelineBarrier interposer while g_recordingBarriers is on.
+std::mutex g_barrierMutex;
+std::vector<RecordedBarrier> g_barriers;
+bool g_recordingBarriers = false;
+
+void recordBarriers(bool on) {
+    std::lock_guard lock(g_barrierMutex);
+    if (on) g_barriers.clear();
+    g_recordingBarriers = on;
+}
+
+std::vector<RecordedBarrier> barriersOn(VkImage image) {
+    std::lock_guard lock(g_barrierMutex);
+    std::vector<RecordedBarrier> matching;
+    for (const RecordedBarrier& barrier : g_barriers) {
+        if (barrier.image == image) matching.push_back(barrier);
+    }
+    return matching;
+}
+
+std::vector<RecordedBarrier> ownershipTransfersOf(VkImage image) {
+    std::lock_guard lock(g_barrierMutex);
+    std::vector<RecordedBarrier> matching;
+    for (const RecordedBarrier& barrier : g_barriers) {
+        if (barrier.image == image && barrier.srcFamily != barrier.dstFamily) matching.push_back(barrier);
+    }
+    return matching;
+}
+
+std::string layoutName(VkImageLayout layout) {
+    switch (layout) {
+        case VK_IMAGE_LAYOUT_GENERAL: return "GENERAL";
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: return "SHADER_READ_ONLY_OPTIMAL";
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: return "TRANSFER_DST_OPTIMAL";
+        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: return "COLOR_ATTACHMENT_OPTIMAL";
+        case VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR: return "VIDEO_DECODE_DST_KHR";
+        case VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR: return "VIDEO_DECODE_DPB_KHR";
+        default: return "VkImageLayout(" + std::to_string(static_cast<int>(layout)) + ")";
+    }
+}
+
+// "Scaled to cover, cropped centrally" as the crop it takes from the picture, worked out here and
+// never through placedRegion(), which is under test. Exact edges, however thin: YcbcrRenderer
+// samples the exact crop, not one rounded to whole texels.
+struct CoverCrop {
+    double x0, y0, width, height;
+};
+CoverCrop exactCover(VkExtent2D picture, uint32_t targetWidth, uint32_t targetHeight) {
+    const double scale = std::max(static_cast<double>(targetWidth) / picture.width,
+                                  static_cast<double>(targetHeight) / picture.height);
+    const double width = targetWidth / scale;
+    const double height = targetHeight / scale;
+    return {(picture.width - width) / 2, (picture.height - height) / 2, width, height};
+}
+
+constexpr int kCoverAxisPoints = 5;
+constexpr int kCoverSamples = kCoverAxisPoints * kCoverAxisPoints;
+
+struct CoverReport {
+    int compared = 0, matchedX = 0, matchedY = 0, fromPicture = 0;
+    double worstX = 0, worstY = 0, toleranceX = 0, toleranceY = 0;
+};
+
+// For a 5x5 grid of target pixels, the picture position each was sampled from against the cover
+// rule. The tolerance is one target pixel's worth of picture (what a linear filter averages over),
+// half a code of the 8-bit target's ramp, and 1.5 pixels for the filter's taps; everything this
+// must catch -- a squeeze, an anchored crop, a quarter-size draw -- misses by tens of pixels.
+CoverReport sampleCover(const std::vector<uint8_t>& pixels, VkExtent2D picture, uint32_t targetWidth,
+                        uint32_t targetHeight) {
+    const CoverCrop crop = exactCover(picture, targetWidth, targetHeight);
+    CoverReport report;
+    report.toleranceX = 1.5 + crop.width / targetWidth + 0.5 * (picture.width - 1) / 255.0;
+    report.toleranceY = 1.5 + crop.height / targetHeight + 0.5 * (picture.height - 1) / 255.0;
+    constexpr double kFractions[kCoverAxisPoints] = {0.0, 0.25, 0.5, 0.75, 1.0};
+    for (const double fy : kFractions) {
+        for (const double fx : kFractions) {
+            const auto x = std::min(static_cast<uint32_t>(fx * (targetWidth - 1) + 0.5), targetWidth - 1);
+            const auto y = std::min(static_cast<uint32_t>(fy * (targetHeight - 1) + 0.5), targetHeight - 1);
+            const size_t offset = (static_cast<size_t>(y) * targetWidth + x) * 4;
+            if (offset + 4 > pixels.size()) return report;  // compared < kCoverSamples: the caller fails
+            ++report.compared;
+            // The picture position this pixel's centre maps to, as the index a linear filter reads.
+            const double u = crop.x0 + (x + 0.5) * crop.width / targetWidth;
+            const double v = crop.y0 + (y + 0.5) * crop.height / targetHeight;
+            const double expectedX = std::clamp(u - 0.5, 0.0, picture.width - 1.0);
+            const double expectedY = std::clamp(v - 0.5, 0.0, picture.height - 1.0);
+            const double gotX = pixels[offset + 2] * (picture.width - 1) / 255.0;
+            const double gotY = pixels[offset + 1] * (picture.height - 1) / 255.0;
+            report.worstX = std::max(report.worstX, std::abs(gotX - expectedX));
+            report.worstY = std::max(report.worstY, std::abs(gotY - expectedY));
+            if (std::abs(gotX - expectedX) <= report.toleranceX) ++report.matchedX;
+            if (std::abs(gotY - expectedY) <= report.toleranceY) ++report.matchedY;
+            // A cleared or letterboxed pixel did not come from the picture, and its blue says so.
+            if (std::abs(pixels[offset] - kRampBlue) <= 4 && pixels[offset + 3] >= 250) ++report.fromPicture;
+        }
+    }
+    return report;
+}
+
+// A ramp fixture's first picture, shown by a renderer of its own. Declared after the decoder, so
+// the renderer, which may hold one of its images, goes first.
+struct Ramp {
+    Opened opened;
+    VkExtent2D size{};
+    // The decoder's image as the decoder left it, for a picture on the device path.
+    std::optional<DecodedFrame::DeviceImage> deviceImage;
+    std::optional<YcbcrRenderer> renderer;
+};
+
+const char* const kRampFiles[] = {"ramp_512x256.mp4", "ramp_256x512.mp4", "ramp_256x256.mp4", "ramp_512x2.mp4",
+                                  "ramp_mirror_pq_512x256.mp4"};
+
+std::unique_ptr<Ramp> openRamp(Device& device, const std::string& label, const char* file) {
+    auto ramp = std::make_unique<Ramp>();
+    ramp->opened = openFirst(device, asset(file));
+    if (!ramp->opened.frame) {
+        fail(std::string(file) + " decoded to no frames");
+        return nullptr;
+    }
+    ramp->size = ramp->opened.frame->visible().extent;
+    if (ramp->opened.frame->storage() == DecodedFrame::Storage::DeviceImage) {
+        ramp->deviceImage = ramp->opened.frame->deviceImage();
+    }
+    std::printf("%s: %s, %ux%u, decoded on the %s path\n", label.c_str(), file, ramp->size.width,
+                ramp->size.height, pathName(ramp->opened.decoder->path()));
+    ramp->renderer.emplace(device, std::move(*ramp->opened.frame), kShaderDir);
+    return ramp;
+}
+
+int g_coverCasesGraded = 0;
+
+void gradeCover(Device& device, OffscreenTargetManager& targets, const Ramp& ramp, int monitorId,
+                uint32_t targetWidth, uint32_t targetHeight, const char* what) {
+    const OffscreenTarget& target = targets.create(monitorId, targetWidth, targetHeight);
+    targets.render(const_cast<YcbcrRenderer&>(*ramp.renderer), target);
+    const std::vector<uint8_t> pixels = wallpaperx::testing::reclaimAndReadback(device, targets, target);
+    targets.destroy(monitorId);
+    const CoverReport report = sampleCover(pixels, ramp.size, targetWidth, targetHeight);
+    ++g_coverCasesGraded;
+
+    check(report.compared == kCoverSamples, std::string("every sample point was read for: ") + what);
+    const bool held = report.matchedX == report.compared && report.matchedY == report.compared;
+    check(held, what);
+    if (!held) {
+        const CoverCrop crop = exactCover(ramp.size, targetWidth, targetHeight);
+        std::fprintf(stderr,
+                     "  %ux%u picture on a %ux%u target: expected x=[%.3f,%.3f) y=[%.3f,%.3f); %d of %d samples from "
+                     "the right column (worst miss %.1f, tolerance %.1f), %d of %d from the right row (worst miss "
+                     "%.1f, tolerance %.1f)\n",
+                     ramp.size.width, ramp.size.height, targetWidth, targetHeight, crop.x0, crop.x0 + crop.width,
+                     crop.y0, crop.y0 + crop.height, report.matchedX, report.compared, report.worstX,
+                     report.toleranceX, report.matchedY, report.compared, report.worstY, report.toleranceY);
+    }
+    check(report.fromPicture == report.compared,
+          std::string("every sampled pixel came from the picture rather than from a border, for: ") + what);
+}
+
+void runPlacementGeometry(Device& device, OffscreenTargetManager& targets, const std::string& label) {
+    // GOAL: S13.20, S13.22 -- a picture whose aspect differs from the target's is scaled to cover
+    //       and cropped centrally (never squeezed, letterboxed or cropped from a corner), and one
+    //       whose crop is a quarter of a texel wide still shows the picture's middle column.
+    // WHY-THIS-SHAPE: compared with the position each pixel names, not a stored image, which would
+    //       fix one driver's filter as the contract and could not say which region was read. Four
+    //       shapes: wider and taller take opposite arms of cover's scale, an equal aspect neither,
+    //       and 512x2 on 8x64 crops 0.25 texel wide. The expectation is the exact crop (exactCover);
+    //       a crop clamped to one whole texel was the blit's, which this renderer does not take.
+    // CONTROL: through control_batch.sh, card and Lavapipe, each restored green.
+    //       renderer/renderers/cover_crop.h placedRegion's cover scale `std::max(widthRatio,
+    //       heightRatio)` -> `widthRatio`: "FAIL: a picture wider than the target is cropped left
+    //       and right, not squeezed" (3 of 25 from the right column, worst miss 381.5) and the
+    //       512x2 case, also wider; the other three green. placedRegion's cover `left`/`top` -> 0,
+    //       an anchored crop: four cases red. ycbcr_renderer.cpp record()'s viewport halved: all
+    //       five "came from the picture rather than from a border" lines red. placeSpan's exact1
+    //       floored at exact0 + 64: the 512x2 case alone, "0 of 25 samples from the right column
+    //       (worst miss 61.0, tolerance 2.5)".
+    // COVERAGE-ASSERT: each case asserts all 25 samples were read, and g_coverCasesGraded below
+    //       that all five cases ran; the latter observed red by hand with one gradeCover call
+    //       removed. The 25-sample assert has no control: sampleCover has no input that stops
+    //       it short of a readback smaller than the target.
+    {
+        std::unique_ptr<Ramp> wide = openRamp(device, label, "ramp_512x256.mp4");
+        if (!wide) return;
+        gradeCover(device, targets, *wide, 1, 64, 64, "a picture wider than the target is cropped left and right, "
+                                                      "not squeezed");
+        // GOAL: S13.21 -- the crop is decided per target: one renderer showing one picture crops a
+        //       target of another shape on the other axis.
+        // WHY-THIS-SHAPE: the renderer above, reused: a second renderer would pass for one that
+        //       worked the crop out once, in show(), and kept it. A 2:1 picture is taller than a 4:1
+        //       target, so this takes the other arm of the branch through the same renderer.
+        // CONTROL: the anchored-crop break above reddens this case (on rows) while the case above
+        //       goes red on columns; the squeeze break leaves this case green, so it is not a copy
+        //       of the one above.
+        gradeCover(device, targets, *wide, 2, 128, 32, "the same picture on a wider target is cropped top and bottom "
+                                                       "instead");
+    }
+    {
+        std::unique_ptr<Ramp> tall = openRamp(device, label, "ramp_256x512.mp4");
+        if (!tall) return;
+        gradeCover(device, targets, *tall, 3, 64, 64, "a picture taller than the target is cropped top and bottom, "
+                                                      "not squeezed");
+    }
+    {
+        std::unique_ptr<Ramp> square = openRamp(device, label, "ramp_256x256.mp4");
+        if (!square) return;
+        gradeCover(device, targets, *square, 4, 64, 64, "a picture with the target's own aspect is shown whole");
+    }
+    {
+        // The x half carries this case: every pixel must come from columns 255.875 to 256.125. Its
+        // two rows are fewer than the tolerance, so its y half is graded by the cases above.
+        std::unique_ptr<Ramp> sliver = openRamp(device, label, "ramp_512x2.mp4");
+        if (!sliver) return;
+        gradeCover(device, targets, *sliver, 5, 8, 64,
+                   "a crop a quarter of a texel wide still shows the picture's middle column");
+    }
+    check(g_coverCasesGraded == 5, "all five placement cases were drawn and read back");
+}
+
+void runPlacementRepeat(Device& device, OffscreenTargetManager& targets, const std::string& label) {
+    std::unique_ptr<Ramp> ramp = openRamp(device, label, "ramp_256x256.mp4");
+    if (!ramp) return;
+    YcbcrRenderer& renderer = *ramp->renderer;
+
+    // GOAL: S13.24 -- drawing the shown picture again is legal and gives the same picture: the
+    //       renderer carries no state from one draw to the next.
+    // WHY-THIS-SHAPE: two targets, because reading a target back reclaims it. Compared row for
+    //       row with no tolerance: one picture, one placement, one pipeline, so any difference is
+    //       state carried between draws.
+    // CONTROL: renderer/video/ycbcr_renderer.cpp record() given `static int draws = 0; if
+    //       (draws++ % 2 == 1) push.srcOffset[0] += 8.0f;`, each draw shifted by the one before it,
+    //       through control_batch.sh: "FAIL: the shown picture drawn twice gives the same picture",
+    //       restored green. (Shifting every draw after the first does not redden it: by this phase
+    //       both draws are shifted alike.)
+    const OffscreenTarget& first = targets.create(10, 64, 64);
+    targets.render(renderer, first);
+    const OffscreenTarget& second = targets.create(11, 64, 64);
+    targets.render(renderer, second);
+    const std::vector<uint8_t> firstPixels = wallpaperx::testing::reclaimAndReadback(device, targets, first);
+    const std::vector<uint8_t> secondPixels = wallpaperx::testing::reclaimAndReadback(device, targets, second);
+    const size_t differing = wallpaperx::testing::countDifferingRows(firstPixels, secondPixels, 64, 64);
+    check(!firstPixels.empty() && differing == 0, "the shown picture drawn twice gives the same picture");
+    if (differing != 0) std::fprintf(stderr, "  %zu of 64 rows differ between the two draws\n", differing);
+    targets.destroy(10);
+    targets.destroy(11);
+
+    // GOAL: S13.25, restated for a draw -- a video draw leaves its target in kRenderedLayout, the
+    //       layout the shared render pass ends in, and says so: the target records that layout as
+    //       the one it was released from, and the next draw's acquire names the same layout.
+    // WHY-THIS-SHAPE: record()'s return value only matters through the pair it makes with the
+    //       release, so the release and the next acquire are read off the recorded barriers and
+    //       compared to each other and to kRenderedLayout. No validation layer checks this:
+    //       ownership transfers are not tracked.
+    // CONTROL: through control_batch.sh, each restored green. renderer/video/ycbcr_renderer.cpp
+    //       record() returning VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL instead of kRenderedLayout:
+    //       "FAIL: a video draw leaves the target in the layout the render pass ends in".
+    //       renderer/vulkan/offscreen.cpp recordAcquire given VK_IMAGE_LAYOUT_GENERAL as its old
+    //       layout instead of target.releasedFromLayout: "FAIL: the next acquire names the layout
+    //       the release named"; re-run 2026-10-26 (G6) after render() changed, the same line.
+    // COVERAGE-ASSERT: exactly three ownership transfers (release, acquire, release), so a run
+    //       whose second draw never happened cannot pass on the first release alone.
+    const OffscreenTarget& target = targets.create(20, 64, 64);
+    recordBarriers(true);
+    targets.render(renderer, target);
+    const VkImageLayout afterFirst = target.releasedFromLayout;
+    targets.render(renderer, target);
+    recordBarriers(false);
+    const std::vector<RecordedBarrier> transfers = ownershipTransfersOf(target.image.image);
+    check(transfers.size() == 3, "two draws on one target recorded a release, an acquire and a release");
+    if (transfers.size() != 3) std::fprintf(stderr, "  %zu ownership transfer(s), not 3\n", transfers.size());
+    check(afterFirst == wallpaperx::kRenderedLayout,
+          "a video draw leaves the target in the layout the render pass ends in");
+    if (afterFirst != wallpaperx::kRenderedLayout) {
+        std::fprintf(stderr, "  the target recorded %s as its release layout\n", layoutName(afterFirst).c_str());
+    }
+    if (transfers.size() == 3) {
+        check(transfers[0].oldLayout == wallpaperx::kRenderedLayout,
+              "the release hands the target over from the layout the draw left it in");
+        check(transfers[1].oldLayout == transfers[0].oldLayout, "the next acquire names the layout the release named");
+        if (transfers[1].oldLayout != transfers[0].oldLayout) {
+            std::fprintf(stderr, "  released from %s but acquired from %s\n", layoutName(transfers[0].oldLayout).c_str(),
+                         layoutName(transfers[1].oldLayout).c_str());
+        }
+    }
+    targets.destroy(20);
+
+    // GOAL: S13.228 -- a draw of a hardware-decoded picture hands the decoder's image back in the
+    //       layout the decoder left it in: exactly two barriers on that image, that layout to
+    //       SHADER_READ_ONLY_OPTIMAL and back, since the decoder's next barrier names it as old.
+    // WHY-THIS-SHAPE: read off the recorded barriers, because the validation layer cannot see this:
+    //       the image is the decoder's and its next use is recorded by ffmpeg in a later batch. The
+    //       decoder's layout is asserted to differ from the sampled one, or a renderer that never
+    //       returned the image would pass. Card only: Lavapipe has no hardware decoder.
+    // CONTROL: renderer/video/ycbcr_renderer.cpp record()'s return barrier given
+    //       VK_IMAGE_LAYOUT_GENERAL as its new layout instead of source->layout, through
+    //       control_batch.sh on the card: "FAIL: a draw of a hardware-decoded picture returns the
+    //       decoder's image to the layout the decoder left it in", the only failure; restored green.
+    if (!ramp->deviceImage) {
+        // A card with a hardware decoder must reach this check; one without cannot answer it.
+        check(device.info().videoDecodeOps == 0,
+              "a card with a hardware decoder decoded ramp_256x256.mp4 on the device path, so the return of "
+              "the decoder's image is graded");
+        std::printf("%s: ramp_256x256.mp4 was decoded on the %s path on %s, so the return of a decoder's image is "
+                    "not answerable here\n",
+                    label.c_str(), pathName(ramp->opened.decoder->path()), device.info().gpuName.c_str());
+        return;
+    }
+    const DecodedFrame::DeviceImage decoded = *ramp->deviceImage;
+    const OffscreenTarget& sampledFrom = targets.create(21, 64, 64);
+    recordBarriers(true);
+    targets.render(renderer, sampledFrom);
+    recordBarriers(false);
+    targets.destroy(21);
+    const std::vector<RecordedBarrier> onImage = barriersOn(decoded.image);
+    const bool distinguishable = decoded.layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    check(distinguishable, "the decoder leaves its image in a layout other than the sampled one, so a return to "
+                           "it can be told from no return");
+    const bool returned = onImage.size() == 2 && onImage[0].oldLayout == decoded.layout &&
+                          onImage[0].newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
+                          onImage[1].oldLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
+                          onImage[1].newLayout == decoded.layout;
+    check(returned, "a draw of a hardware-decoded picture returns the decoder's image to the layout the decoder "
+                    "left it in");
+    std::printf("%s: the decoder left its image in %s; the draw recorded %zu barrier(s) on it:", label.c_str(),
+                layoutName(decoded.layout).c_str(), onImage.size());
+    for (const RecordedBarrier& barrier : onImage) {
+        std::printf(" %s -> %s;", layoutName(barrier.oldLayout).c_str(), layoutName(barrier.newLayout).c_str());
+    }
+    std::printf("\n");
+}
+
+enum class Refusal { ContentError, InvalidArgument };
+
+// Whether `attempt` was refused with the type that names whose problem it is: the daemon routes
+// WallpaperContentError (the file) and std::invalid_argument (the caller) differently.
+void refusedAs(const std::string& what, Refusal expected, const std::function<void()>& attempt) {
+    try {
+        attempt();
+    } catch (const WallpaperContentError& e) {
+        check(expected == Refusal::ContentError, what);
+        if (expected != Refusal::ContentError) std::fprintf(stderr, "  refused as content: %s\n", e.what());
+        return;
+    } catch (const std::invalid_argument& e) {
+        check(expected == Refusal::InvalidArgument, what);
+        if (expected != Refusal::InvalidArgument) std::fprintf(stderr, "  refused as invalid: %s\n", e.what());
+        return;
+    } catch (const std::exception& e) {
+        check(false, what);
+        std::fprintf(stderr, "  refused with another exception: %s\n", e.what());
+        return;
+    }
+    check(false, what);
+    std::fprintf(stderr, "  it was accepted\n");
+}
+
+void runPlacementRefusals(Device& device, OffscreenTargetManager& targets, const std::string& label) {
+    std::unique_ptr<Ramp> ramp = openRamp(device, label, "ramp_512x256.mp4");
+    if (!ramp) return;
+    YcbcrRenderer& renderer = *ramp->renderer;
+    const OffscreenTarget& target = targets.create(30, 64, 64);
+    targets.render(renderer, target);
+    const std::vector<uint8_t> reference = wallpaperx::testing::reclaimAndReadback(device, targets, target);
+    // Without this the comparisons below could be between two readbacks of a target nothing drew.
+    check(wallpaperx::testing::variesInBothAxes(reference, 64, 64),
+          "the picture drawn before the refusals varies in both axes, so a later draw of anything else differs");
+
+    int examined = 0, stillShown = 0;
+    auto drawsAsBefore = [&](const std::string& after) {
+        ++examined;
+        targets.render(renderer, target);
+        const std::vector<uint8_t> pixels = wallpaperx::testing::reclaimAndReadback(device, targets, target);
+        const size_t differing = wallpaperx::testing::countDifferingRows(pixels, reference, 64, 64);
+        if (differing == 0) {
+            ++stillShown;
+        } else {
+            std::fprintf(stderr, "  after %s, %zu of 64 rows differ from what was drawn before\n", after.c_str(),
+                         differing);
+        }
+    };
+
+    // GOAL: S15.705 -- the video renderer refuses tile with std::invalid_argument and keeps drawing
+    //       the layout it had.
+    // WHY-THIS-SHAPE: the draw after the refusal is compared with the one before, so a place() that
+    //       stored the mode before throwing fails too, not only one that accepted it.
+    // CONTROL: renderer/video/ycbcr_renderer.cpp place()'s positionModeShowsVideo test made `if
+    //       (false)`, through control_batch.sh: "FAIL: a video renderer refuses tile", and every
+    //       draw after it differs in 64 of 64 rows, since the tile layout stays stored; restored
+    //       green.
+    refusedAs("a video renderer refuses tile", Refusal::InvalidArgument,
+              [&] { renderer.place({wallpaperx::PositionMode::Tile}); });
+    drawsAsBefore("refusing tile");
+
+    // GOAL: S13.27 -- a refused picture leaves the one shown before it on the target: nothing of
+    //       the refused picture is adopted.
+    // WHY-THIS-SHAPE: the refused same-shape picture is the ramp mirrored and tagged PQ, so taking
+    //       in its pixels before refusing its colour shows on the target; an identical picture
+    //       would hide that leak. A picture of another shape is refused too and graded the same
+    //       way, but no break is safe for it: drawing a 256x512 picture through planes made for
+    //       512x256 reads outside its rows.
+    // CONTROL: renderer/video/ycbcr_renderer.cpp show()'s colourMapFor call moved below the
+    //       storage branch, so the picture is uploaded or held before its colour is refused,
+    //       through control_batch.sh: "FAIL: a refused picture leaves the one shown before it on
+    //       the target", restored green.
+    // COVERAGE-ASSERT: the number of draws compared is asserted, so a refusal case that stopped
+    //       being drawn after cannot pass by grading less.
+    {
+        Opened other = openFirst(device, asset("ramp_256x512.mp4"));
+        if (!other.frame) {
+            fail("ramp_256x512.mp4 decoded to no frames");
+            return;
+        }
+        refusedAs("a picture of another shape is refused", Refusal::InvalidArgument,
+                  [&] { renderer.show(std::move(*other.frame)); });
+        drawsAsBefore("refusing a picture of another shape");
+    }
+    {
+        Opened pq = openFirst(device, asset("ramp_mirror_pq_512x256.mp4"));
+        if (!pq.frame) {
+            fail("ramp_mirror_pq_512x256.mp4 decoded to no frames");
+            return;
+        }
+        refusedAs("a same-shape picture tagged PQ is refused as content", Refusal::ContentError,
+                  [&] { renderer.show(std::move(*pq.frame)); });
+        drawsAsBefore("refusing a picture tagged PQ");
+    }
+    check(examined == 3, "every refusal was followed by a draw");
+    check(stillShown == examined, "a refused picture leaves the one shown before it on the target");
+    targets.destroy(30);
+}
+
+void runPlacementChecks(Device& device, const std::string& label) {
+    for (const char* file : kRampFiles) {
+        if (!haveAsset(file, label)) return;
+    }
+    OffscreenTargetManager targets(device);
+    runPlacementGeometry(device, targets, label);
+    runPlacementRepeat(device, targets, label);
+    runPlacementRefusals(device, targets, label);
 }
 
 }  // namespace
@@ -2146,7 +2958,7 @@ template <class Fn>
 Fn realSymbol(const char* name) {
     const Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, name));
     if (real == nullptr) {
-        std::fprintf(stderr, "frame_converter_probe: cannot resolve the real %s\n", name);
+        std::fprintf(stderr, "video_draw_probe: cannot resolve the real %s\n", name);
         std::abort();
     }
     return real;
@@ -2180,6 +2992,7 @@ extern "C" void vkGetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDe
     using Fn = void (*)(VkPhysicalDevice, VkFormat, VkFormatProperties2*);
     static const Fn real = realSymbol<Fn>("vkGetPhysicalDeviceFormatProperties2");
     real(physicalDevice, format, properties);
+    if (g_proposalWindow.load()) g_queriesInWindow.fetch_add(1);
     if (!g_stripX6LinearFilter) return;
     if (format != VK_FORMAT_R10X6_UNORM_PACK16 && format != VK_FORMAT_R10X6G10X6_UNORM_2PACK16) return;
     properties->formatProperties.optimalTilingFeatures &= ~VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
@@ -2189,6 +3002,26 @@ extern "C" void vkGetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDe
                 ~VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
         }
     }
+}
+
+extern "C" void vkCmdPipelineBarrier(VkCommandBuffer cmd, VkPipelineStageFlags srcStages, VkPipelineStageFlags dstStages,
+                                     VkDependencyFlags flags, uint32_t memoryCount, const VkMemoryBarrier* memory,
+                                     uint32_t bufferCount, const VkBufferMemoryBarrier* buffers, uint32_t imageCount,
+                                     const VkImageMemoryBarrier* images) {
+    {
+        std::lock_guard lock(g_barrierMutex);
+        if (g_recordingBarriers) {
+            for (uint32_t i = 0; i < imageCount; ++i) {
+                g_barriers.push_back({images[i].image, images[i].oldLayout, images[i].newLayout,
+                                      images[i].srcQueueFamilyIndex, images[i].dstQueueFamilyIndex});
+            }
+        }
+    }
+    using Fn = void (*)(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, uint32_t,
+                        const VkMemoryBarrier*, uint32_t, const VkBufferMemoryBarrier*, uint32_t,
+                        const VkImageMemoryBarrier*);
+    static const Fn real = realSymbol<Fn>("vkCmdPipelineBarrier");
+    real(cmd, srcStages, dstStages, flags, memoryCount, memory, bufferCount, buffers, imageCount, images);
 }
 
 extern "C" VkResult vkQueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
@@ -2203,6 +3036,8 @@ extern "C" VkResult vkCreateShaderModule(VkDevice device, const VkShaderModuleCr
     using Fn = VkResult (*)(VkDevice, const VkShaderModuleCreateInfo*, const VkAllocationCallbacks*, VkShaderModule*);
     static const Fn real = realSymbol<Fn>("vkCreateShaderModule");
     g_shaderModulesCreated.fetch_add(1, std::memory_order_relaxed);
+    // shader-read builds a module on no device at all, to stay driver-free.
+    if (device == VK_NULL_HANDLE) return VK_ERROR_INITIALIZATION_FAILED;
     return real(device, info, allocator, module);
 }
 
@@ -2216,7 +3051,12 @@ extern "C" int avcodec_get_hw_frames_parameters(AVCodecContext* context, AVBuffe
     proposal.result = result;
     if (result >= 0 && hwFormat == AV_PIX_FMT_VULKAN && out != nullptr && *out != nullptr) {
         const auto* frames = reinterpret_cast<AVHWFramesContext*>((*out)->data);
-        const auto* vk = static_cast<AVVulkanFramesContext*>(frames->hwctx);
+        auto* vk = static_cast<AVVulkanFramesContext*>(frames->hwctx);
+        if (g_proposeLinearTiling.load()) {
+            vk->tiling = VK_IMAGE_TILING_LINEAR;
+            g_linearProposals.fetch_add(1);
+        }
+        g_proposalWindow = true;
         proposal.swFormat = frames->sw_format;
         proposal.imageFormat = vk->format[0];
         proposal.singleImage = vk->format[0] != VK_FORMAT_UNDEFINED && vk->format[1] == VK_FORMAT_UNDEFINED;
@@ -2238,7 +3078,68 @@ extern "C" int avcodec_receive_frame(AVCodecContext* context, AVFrame* frame) {
     }
     const int err = real(context, frame);
     if (err == 0) g_lastReceivedFormat = static_cast<AVPixelFormat>(frame->format);
+    if (err == 0 && frame->format == AV_PIX_FMT_VULKAN && frame->hw_frames_ctx != nullptr) {
+        auto* vk = reinterpret_cast<AVVkFrame*>(frame->data[0]);
+        auto* pool = reinterpret_cast<AVHWFramesContext*>(frame->hw_frames_ctx->data);
+        std::lock_guard lock(g_receivedMutex);
+        bool known = false;
+        for (ReceivedVkFrame& received : g_receivedVkFrames) {
+            if (received.image == vk->img[0]) {
+                received = {vk->img[0], vk, pool};
+                known = true;
+            }
+        }
+        if (!known) g_receivedVkFrames.push_back({vk->img[0], vk, pool});
+    }
     return err;
+}
+
+extern "C" int av_hwframe_ctx_init(AVBufferRef* ref) {
+    using Fn = int (*)(AVBufferRef*);
+    static const Fn real = realSymbol<Fn>("av_hwframe_ctx_init");
+    if (ref != nullptr && g_proposalWindow.exchange(false)) {
+        const auto* frames = reinterpret_cast<AVHWFramesContext*>(ref->data);
+        if (frames->device_ctx->type == AV_HWDEVICE_TYPE_VULKAN) {
+            const auto* vk = static_cast<const AVVulkanFramesContext*>(frames->hwctx);
+            std::lock_guard lock(g_poolInitMutex);
+            g_poolInit.calls += 1;
+            g_poolInit.usage = vk->usage;
+            g_poolInit.flags = vk->img_flags;
+        }
+    }
+    return real(ref);
+}
+
+// The decoder loads its video-format query through vkGetInstanceProcAddr; this hands it a wrapper.
+namespace {
+std::atomic<PFN_vkGetPhysicalDeviceVideoFormatPropertiesKHR> g_realVideoFormatProperties{nullptr};
+
+VKAPI_ATTR VkResult VKAPI_CALL videoFormatProperties(VkPhysicalDevice physicalDevice,
+                                                     const VkPhysicalDeviceVideoFormatInfoKHR* info, uint32_t* count,
+                                                     VkVideoFormatPropertiesKHR* properties) {
+    const VkResult result = g_realVideoFormatProperties.load()(physicalDevice, info, count, properties);
+    if (!g_proposalWindow.load()) return result;
+    g_queriesInWindow.fetch_add(1);
+    if (g_hideMutableFormat.load() && properties != nullptr && (result == VK_SUCCESS || result == VK_INCOMPLETE)) {
+        for (uint32_t i = 0; i < *count; ++i) {
+            if (properties[i].imageCreateFlags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) {
+                properties[i].imageCreateFlags &= ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+                g_mutableStripped.fetch_add(1);
+            }
+        }
+    }
+    return result;
+}
+}  // namespace
+
+extern "C" PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char* name) {
+    static const auto real = realSymbol<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
+    const PFN_vkVoidFunction found = real(instance, name);
+    if (found == nullptr || name == nullptr || std::strcmp(name, "vkGetPhysicalDeviceVideoFormatPropertiesKHR") != 0) {
+        return found;
+    }
+    g_realVideoFormatProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceVideoFormatPropertiesKHR>(found);
+    return reinterpret_cast<PFN_vkVoidFunction>(&videoFormatProperties);
 }
 
 #if WALLPAPERX_ALLOCATION_INSTRUMENT
@@ -2289,17 +3190,17 @@ void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); 
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "";
     const std::vector<std::string> modes = {"colour-host", "colour-device", "edges-host", "edges-device",
-                                            "siting",      "refusal",       "output",     "allocation",
+                                            "siting",      "refusal",       "allocation",
                                             "gate",        "no-ycbcr",      "shape-resize", "shape-tags",
                                             "shape-fallback", "shader-read", "pipeline-colour-host",
-                                            "pipeline-colour-device"};
+                                            "pipeline-colour-device", "placement"};
     if (std::find(modes.begin(), modes.end(), mode) == modes.end()) {
         std::fprintf(stderr, "usage: %s <mode>, one of:", argv[0]);
         for (const std::string& m : modes) std::fprintf(stderr, " %s", m.c_str());
         std::fprintf(stderr, "\n");
         return 1;
     }
-    const std::string label = "frame_converter_probe (" + mode + ")";
+    const std::string label = "video_draw_probe (" + mode + ")";
 
     bool graded = true;
     if (mode == "shader-read") {
@@ -2334,15 +3235,21 @@ int main(int argc, char** argv) {
                     if (mode == "edges-device") runEdgeChecks(*device, label, /*onDevice=*/true);
                     if (mode == "siting") runSitingChecks(*device, label);
                     if (mode == "refusal") runRefusalChecks(*device, label);
-                    if (mode == "output") runOutputChecks(*device, label);
-                    if (mode == "allocation") runAllocationChecks(*device, label);
-                    if (mode == "gate") runGateChecks(*device, label);
+                    if (mode == "allocation") {
+                        runSubmitScopeChecks(*device, label);
+                        runAllocationChecks(*device, label);
+                    }
+                    if (mode == "gate") {
+                        runGateChecks(*device, label);
+                        runDecodePoolChecks(*device, label);
+                    }
                     if (mode == "no-ycbcr") runNoYcbcrChecks(*device, label);
                     if (mode == "shape-resize") runShapeResizeChecks(*device, label);
                     if (mode == "shape-tags") runShapeTagChecks(*device, label);
                     if (mode == "shape-fallback") runShapeFallbackChecks(*device, label);
                     if (mode == "pipeline-colour-host") runPipelineColourChecks(*device, label, /*onDevice=*/false);
                     if (mode == "pipeline-colour-device") runPipelineColourChecks(*device, label, /*onDevice=*/true);
+                    if (mode == "placement") runPlacementChecks(*device, label);
                     device->waitForSubmissions();
                 } catch (const std::exception& e) {
                     // Reported, not rethrown: an escaping exception would skip the reconciliation
@@ -2358,7 +3265,7 @@ int main(int argc, char** argv) {
         });
     }
 
-    const int failures = wallpaperx::testing::reportFailures("frame_converter_probe");
+    const int failures = wallpaperx::testing::reportFailures("video_draw_probe");
     if (!graded || failures > 0) return 1;
     if (g_notVerified) {
         std::printf("%s: NOT VERIFIED here -- reported to ctest as a skip, not a pass\n", label.c_str());

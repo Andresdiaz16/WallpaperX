@@ -2,11 +2,12 @@
 
 #pragma once
 
-#include "../renderers/video_renderer.h"
 #include "decode_ahead.h"
-#include "frame_converter.h"
 #include "picture_source.h"
 #include "video_decoder.h"
+#include "ycbcr_renderer.h"
+
+#include "wallpaper_position.h"
 
 #include <chrono>
 #include <cstdint>
@@ -23,24 +24,27 @@ class Device;
 class OffscreenTargetManager;
 struct OffscreenTarget;
 
-// Takes one video file onto offscreen targets a picture per call: decode, convert, blit. Paces
+// Takes one video file onto offscreen targets a picture per call: decode, then one draw per target. Paces
 // nothing -- each call shows the next picture whenever it is made. A looping pipeline shows the
-// first picture in the call after the last, on the same stage when their shape matches.
+// first picture in the call after the last, on the same renderer when their shape matches.
 //
 // Each picture the decoder returns is shown once, in its output order; the decoder is what keeps
 // a hardware failure from returning one twice. The picture after a failure comes once software has
 // caught up, and the target keeps the last picture shown until then.
 //
-// A picture of a different shape -- a new size or crop, or host planes after device images --
-// gets a new converter, built before the old one is freed, in the call that shows it. The target
-// goes from the last picture of one shape straight to the first of the next and is never shown
-// black. That rebuild waits for the GPU; a steady picture adds no wait beyond its parts' own.
+// A picture of a different shape -- a new size or crop, decode images of another size, or host
+// planes after device images -- gets a new renderer, built before the old one is freed, in the call
+// that shows it. The target goes from the last picture of one shape straight to the first of the
+// next and is never shown black. That rebuild waits for the GPU, as does the first picture of a new
+// decode-image pool of the same size, which keeps the renderer; a steady picture adds no wait
+// beyond its parts' own.
 //
 // A picture decodeWithin() returns is held as decoded until it is converted, by convert() or the
 // draw() that shows it, or until the next decode replaces it unconverted -- so a picture decoded
-// only to be passed over costs no conversion. The conversion copies it out, and its batch is
-// ordered against the decoder's next write of that image by the frame's semaphore. The blit
-// needs nothing beyond submission order: both batches go to the graphics queue, blit second.
+// only to be passed over costs nothing on the GPU. Converting a device picture makes it the one
+// shown and keeps it until the next is converted; every draw of it is ordered against the
+// decoder's next write of that image by the frame's semaphore. Converting a host picture uploads
+// its planes, ordered before the draws by submission order on the graphics queue.
 //
 // Pictures are decoded on a thread of its own, a few ahead (DecodeAhead), when the device's queues are
 // internally synchronised and the thread can be had: from the second picture on for a stream the device
@@ -90,12 +94,12 @@ public:
 
     // The two halves of that call, for a caller that must decide between them whether this picture
     // may be shown at all: decodeNext() touches no target, so a caller holding a picture may still
-    // abandon it, and draw() of a converted picture is one blit.
+    // abandon it, and draw() of a converted picture is one draw.
     //
     // decodeNext() decodes and converts, and answers as renderNext() does and throws as it does.
     // draw() shows the picture decoded last laid out as `placement` says, converting it first if it
     // is not yet, throws std::logic_error when there is none, std::invalid_argument for a placement
-    // VideoRenderer::place() refuses, and otherwise throws as renderNext() does.
+    // YcbcrRenderer::place() refuses, and otherwise throws as renderNext() does.
     bool decodeNext();
     void draw(OffscreenTargetManager& targets, const OffscreenTarget& target, const Placement& placement);
 
@@ -115,7 +119,8 @@ public:
     Decode takeReady(PictureSkip skip);
 
     // Converts the picture decoded last unless it already is. A caller that draws under a lock calls
-    // it first, so the lock waits on a blit alone. Throws as decodeNext() does.
+    // it first, so the lock waits on the draws alone. Throws as decodeNext() does, leaving the
+    // picture and what is shown as they were.
     void convert();
 
     // When the picture draw() shows belongs on screen, as the decoder reported it. Throws
@@ -157,13 +162,6 @@ private:
     void hold(PictureSource::Picture picture);
     void decodeAheadIfSafe();
 
-    // Built and replaced together, so the renderer never outlives the image it shows.
-    struct Stage {
-        Stage(Device& device, const DecodedFrame& first, const std::string& shaderDir);
-        FrameConverter converter;
-        VideoRenderer renderer;
-    };
-
     Device& m_device;
     std::string m_shaderDir;
     DecodeHooks m_hooks;
@@ -176,7 +174,7 @@ private:
     // Where every ShowGrid for this file is laid from, read before a decode thread owns the decoder.
     std::chrono::nanoseconds m_origin;
     // Null until the first picture is converted.
-    std::unique_ptr<Stage> m_stage;
+    std::unique_ptr<YcbcrRenderer> m_renderer;
     // The picture decoded last, while it is not converted yet.
     std::optional<DecodedFrame> m_unconverted;
     // The picture decoded last's; empty before the first.

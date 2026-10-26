@@ -325,6 +325,7 @@ extern "C" void vkCmdCopyImageToBuffer(VkCommandBuffer commandBuffer, VkImage sr
 // CONTROL: renderer/vulkan/offscreen.cpp -- the release's vkCmdPipelineBarrier wrapped in a
 //          nested m_device.immediateSubmit() of its own -> red with "11 command buffer(s)
 //          published only (expected 3), 0 acquired and republished (expected 4)". Reverted.
+//          Re-run 2026-10-26 (G6), render() now submitting through IRenderer::submit: the same line.
 //          The export half is controlled separately, in run().
 extern "C" VkResult vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence) {
     {
@@ -406,7 +407,8 @@ void analyse(const std::vector<TransferBarrier>& recorded, uint32_t graphics, co
     // CONTROL: renderer/vulkan/offscreen.cpp -- the `vkCmdPipelineBarrier` recording the
     //          release moved into a nested `m_device.immediateSubmit()` -> red with eleven
     //          command buffers instead of seven, four of them "a command buffer carrying one
-    //          ownership barrier carries a release, not an unpaired acquire". Reverted.
+    //          ownership barrier carries a release, not an unpaired acquire". Reverted. Re-run
+    //          2026-10-26 (G6): the same four lines.
     // COVERAGE-ASSERT: the two group counts below. A grouping that collapsed (every
     //          barrier landing in one group, or each in its own) leaves both zero.
     size_t publishOnlyRenders = 0;
@@ -534,7 +536,7 @@ void analyse(const std::vector<TransferBarrier>& recorded, uint32_t graphics, co
         // CONTROL: kRenderedLayout in renderer/vulkan/offscreen.h set to
         //          VK_IMAGE_LAYOUT_GENERAL -- red four times with "the release it pairs with
         //          names a layout transition, so matching it is a real constraint".
-        //          Reverted.
+        //          Reverted. Re-run 2026-10-26 (G6), the pass now made by createOffscreenRenderPass(): held.
         check(releaseHalf.oldLayout != releaseHalf.newLayout,
               where + "the release it pairs with names a layout transition, so matching it is a real constraint");
         ++pairsCompared;

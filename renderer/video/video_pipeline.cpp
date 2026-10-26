@@ -13,9 +13,6 @@
 
 namespace wallpaperx {
 
-VideoPipeline::Stage::Stage(Device& device, const DecodedFrame& first, const std::string& shaderDir)
-    : converter(device, first, shaderDir), renderer(device, converter.frame()) {}
-
 VideoPipeline::VideoPipeline(Device& device, const std::string& file, const std::string& shaderDir,
                              Playback playback, std::optional<StreamPosition> startAt, DecodeHooks hooks)
     : m_device(device),
@@ -56,14 +53,16 @@ VideoPipeline::Decode VideoPipeline::takeReady(PictureSkip skip) {
 void VideoPipeline::convert() {
     m_device.assertGpuThread("VideoPipeline::convert");
     if (!m_unconverted) return;
-    // The new stage is complete before the old one is freed, so a picture it refuses leaves the
-    // old stage and the target as they were. The old converter's destructor then finds its
-    // readers finished: the new one's constructor waited for a batch submitted after them.
-    if (!m_stage || FrameConverter::pictureOf(*m_unconverted) != m_stage->converter.picture()) {
-        m_stage = std::make_unique<Stage>(m_device, *m_unconverted, m_shaderDir);
+    const std::optional<StreamPosition> position = m_unconverted->position();
+    // The new renderer is complete before the old one is freed, so a picture it refuses leaves the
+    // old renderer, the picture and the target as they were. The old renderer's destructor waits
+    // for the draws still reading the picture it holds.
+    if (!m_renderer || YcbcrRenderer::shapeOf(*m_unconverted) != m_renderer->shape()) {
+        m_renderer = std::make_unique<YcbcrRenderer>(m_device, std::move(*m_unconverted), m_shaderDir);
+    } else {
+        m_renderer->show(std::move(*m_unconverted));
     }
-    static_cast<void>(m_stage->converter.convert(*m_unconverted));
-    m_convertedPosition = m_unconverted->position();
+    m_convertedPosition = position;
     m_unconverted.reset();
 }
 
@@ -141,9 +140,9 @@ bool VideoPipeline::shows(std::span<const std::chrono::nanoseconds> spacings) co
 }
 
 bool VideoPipeline::shownFromSoftware() const {
-    // The stage is the one the last picture drawn was converted into: draw() converts before it shows.
-    if (!m_stage) throw std::logic_error("VideoPipeline::shownFromSoftware: no picture has been drawn");
-    return m_stage->converter.picture().storage == DecodedFrame::Storage::HostPlanes;
+    // The renderer is the one the last picture drawn was converted into: draw() converts before it shows.
+    if (!m_renderer) throw std::logic_error("VideoPipeline::shownFromSoftware: no picture has been drawn");
+    return m_renderer->shape().storage == DecodedFrame::Storage::HostPlanes;
 }
 
 VideoPipeline::PictureTiming VideoPipeline::timing() const {
@@ -154,11 +153,11 @@ VideoPipeline::PictureTiming VideoPipeline::timing() const {
 void VideoPipeline::draw(OffscreenTargetManager& targets, const OffscreenTarget& target, const Placement& placement) {
     m_device.assertGpuThread("VideoPipeline::draw");
     convert();
-    // A stage exists exactly once a picture has been converted into it, so this is the one state
-    // that has nothing to show.
-    if (!m_stage) throw std::logic_error("VideoPipeline::draw: no picture has been decoded");
-    m_stage->renderer.place(placement);
-    targets.render(m_stage->renderer, target);
+    // A renderer exists exactly once a picture has been converted into it, so this is the one
+    // state that has nothing to show.
+    if (!m_renderer) throw std::logic_error("VideoPipeline::draw: no picture has been decoded");
+    m_renderer->place(placement);
+    targets.render(*m_renderer, target);
     m_shownPosition = m_convertedPosition;
 }
 

@@ -818,41 +818,48 @@ Device::SubmitTicket Device::submit(const std::function<void(VkCommandBuffer)>& 
     // Binary entries first, then timeline ones, in every array: Vulkan wants one flat list
     // per direction, with a value for each entry once any is a timeline. A binary entry's
     // value is ignored, so zero stands in for it.
-    std::vector<VkSemaphore> waits;
-    std::vector<VkPipelineStageFlags> waitStages;
-    std::vector<uint64_t> waitValues;
+    constexpr size_t kMost = 2 * SubmitScope::kCapacity;
+    std::array<VkSemaphore, kMost> waits;
+    std::array<VkPipelineStageFlags, kMost> waitStages;
+    std::array<uint64_t, kMost> waitValues;
+    uint32_t waitCount = 0;
     for (const SubmitScope::Wait& entry : scope.wait) {
-        waits.push_back(entry.semaphore);
-        waitStages.push_back(entry.stage);
-        waitValues.push_back(0);
+        waits[waitCount] = entry.semaphore;
+        waitStages[waitCount] = entry.stage;
+        waitValues[waitCount++] = 0;
     }
     for (const SubmitScope::TimelineWait& entry : scope.timelineWait) {
-        waits.push_back(entry.semaphore);
-        waitStages.push_back(entry.stage);
-        waitValues.push_back(entry.value);
+        waits[waitCount] = entry.semaphore;
+        waitStages[waitCount] = entry.stage;
+        waitValues[waitCount++] = entry.value;
     }
-    std::vector<VkSemaphore> signals = scope.signal;
-    std::vector<uint64_t> signalValues(scope.signal.size(), 0);
+    std::array<VkSemaphore, kMost> signals;
+    std::array<uint64_t, kMost> signalValues;
+    uint32_t signalCount = 0;
+    for (const VkSemaphore semaphore : scope.signal) {
+        signals[signalCount] = semaphore;
+        signalValues[signalCount++] = 0;
+    }
     for (const SubmitScope::TimelineSignal& entry : scope.timelineSignal) {
-        signals.push_back(entry.semaphore);
-        signalValues.push_back(entry.value);
+        signals[signalCount] = entry.semaphore;
+        signalValues[signalCount++] = entry.value;
     }
 
     VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
-    timeline.waitSemaphoreValueCount = static_cast<uint32_t>(waitValues.size());
-    timeline.pWaitSemaphoreValues = waitValues.empty() ? nullptr : waitValues.data();
-    timeline.signalSemaphoreValueCount = static_cast<uint32_t>(signalValues.size());
-    timeline.pSignalSemaphoreValues = signalValues.empty() ? nullptr : signalValues.data();
+    timeline.waitSemaphoreValueCount = waitCount;
+    timeline.pWaitSemaphoreValues = waitCount == 0 ? nullptr : waitValues.data();
+    timeline.signalSemaphoreValueCount = signalCount;
+    timeline.pSignalSemaphoreValues = signalCount == 0 ? nullptr : signalValues.data();
 
     VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     if (!scope.timelineWait.empty() || !scope.timelineSignal.empty()) submitInfo.pNext = &timeline;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmd;
-    submitInfo.waitSemaphoreCount = static_cast<uint32_t>(waits.size());
-    submitInfo.pWaitSemaphores = waits.empty() ? nullptr : waits.data();
-    submitInfo.pWaitDstStageMask = waitStages.empty() ? nullptr : waitStages.data();
-    submitInfo.signalSemaphoreCount = static_cast<uint32_t>(signals.size());
-    submitInfo.pSignalSemaphores = signals.empty() ? nullptr : signals.data();
+    submitInfo.waitSemaphoreCount = waitCount;
+    submitInfo.pWaitSemaphores = waitCount == 0 ? nullptr : waits.data();
+    submitInfo.pWaitDstStageMask = waitCount == 0 ? nullptr : waitStages.data();
+    submitInfo.signalSemaphoreCount = signalCount;
+    submitInfo.pSignalSemaphores = signalCount == 0 ? nullptr : signals.data();
 
     if (const VkResult r = observe(vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, fence)); r != VK_SUCCESS) {
         throwVkFailure("Device::submit: vkQueueSubmit", r);

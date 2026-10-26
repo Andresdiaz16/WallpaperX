@@ -173,6 +173,9 @@ CallGate g_freeCodecGate;        // the decoder's codec context being freed: a s
 CallGate g_submitFailGate;       // a queue submission, failed
 CallGate g_closeFileGate;        // a wallpaper file's descriptor being closed, by path: a session's end
 CallGate g_imageGate;            // an image created at the armed extent ("40x30"): a still's decode, by its size
+// The descriptor pool of a video picture's source (see isVideoSourcePool): a renderer first reading a decoded
+// picture, or a pool image shown for the first time. Armed unfiltered.
+CallGate g_videoSourceGate;
 
 // Queue submissions to be failed as VK_ERROR_DEVICE_LOST -- which the daemon sorts as the GPU's
 // own fault, where the shortage g_submitFailGate injects is sorted as a resource running out. The
@@ -185,9 +188,12 @@ std::atomic<int> g_submitFailAfter{-1};
 
 // Image creations to be failed as VK_ERROR_OUT_OF_DEVICE_MEMORY. Only the daemon's own: ffmpeg
 // reaches Vulkan through a function table it fetched from the loader, which no definition here can
-// interpose, so an armed count is spent on the picture converter's image inside the decode that
-// opens a session -- which is the shortage the retry-once path exists for.
+// interpose. A device-decoded video's open creates no image of the daemon's own, so this is for stills.
 std::atomic<int> g_failImageCreates{0};
+// Video sources (isVideoSourcePool) to be failed as VK_ERROR_OUT_OF_DEVICE_MEMORY: the first source is built
+// when the renderer takes the open's first picture, on the device path and the processor path alike, which is
+// the shortage inside a session's open that the retry-once path exists for.
+std::atomic<int> g_failVideoSources{0};
 
 // Images created at this extent (width << 32 | height) since the last reset. A still of a size nothing
 // else has is decoded into exactly one image of it, so this counts decodes.
@@ -719,6 +725,28 @@ extern "C" VkResult vkCreateImage(VkDevice device, const VkImageCreateInfo* info
         g_extentCreates.fetch_add(1);
     }
     return real(device, info, allocator, image);
+}
+
+// YcbcrRenderer's per-source pool, one set of three sampled planes; no other renderer the daemon runs makes
+// that shape (the still's classic allocator pairs one sampler with a uniform buffer).
+static bool isVideoSourcePool(const VkDescriptorPoolCreateInfo* info) {
+    return info != nullptr && info->maxSets == 1 && info->poolSizeCount == 1 && info->pPoolSizes != nullptr &&
+           info->pPoolSizes[0].type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+           info->pPoolSizes[0].descriptorCount == 3;
+}
+
+extern "C" VkResult vkCreateDescriptorPool(VkDevice device, const VkDescriptorPoolCreateInfo* info,
+                                           const VkAllocationCallbacks* allocator, VkDescriptorPool* pool) {
+    using Fn = VkResult (*)(VkDevice, const VkDescriptorPoolCreateInfo*, const VkAllocationCallbacks*, VkDescriptorPool*);
+    static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "vkCreateDescriptorPool"));
+    if (real == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
+    if (isVideoSourcePool(info)) {
+        g_videoSourceGate.enter();
+        for (int armed = g_failVideoSources.load(); armed > 0;) {
+            if (g_failVideoSources.compare_exchange_weak(armed, armed - 1)) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
+    }
+    return real(device, info, allocator, pool);
 }
 
 static std::string extentOf(uint32_t width, uint32_t height) {
@@ -2057,13 +2085,14 @@ void runSessionChecks(const WallpaperManager::Config& config, const std::vector<
     // CONTROL: (a) dropStaleVideoSessionLocked() in backend/daemon/wallpaper_manager.cpp made to
     //       drop every session (`&& false` on its keep-it test) -> "FAIL: a size report of a video
     //       monitor opens, decodes and closes nothing", printing "committed, 1 open(s), 1 close(s), 1
-    //       packet(s)" (11 packets on Lavapipe). (b) the crop in renderer/renderers/video_renderer.cpp's
-    //       render() made `static`, so a session keeps the crop of the first size it drew -> "FAIL: after
+    //       packet(s)" (11 packets on Lavapipe). (b) the placed region in renderer/video/ycbcr_renderer.cpp's
+    //       record() made `static`, so a session keeps the crop of the first size it drew -> "FAIL: after
     //       a size report the monitor shows the video, cover-cropped at the new size", printing "8 of 36
     //       sampled rows show the wrong band; first: monitor row 0 samples clip row 41.7, which is red
     //       (255,0,0), but reads (19,206,2)", on video_wallpaper (NVIDIA, opaque fd read through the GL
     //       importer) and video_wallpaper_lavapipe alike. (a) observed 2026-09-16; (b) via
-    //       control_batch.sh, --phase '^session$', 2026-10-08. Reverted.
+    //       control_batch.sh, --phase '^session$', 2026-10-08, then on the old renderer's crop; re-pointed and
+    //       re-run 2026-10-26 (G6) on video_wallpaper only: the same FAIL line. Reverted.
     reportUnless(resize(v0, kResizedWidth, kResizedHeight), "a new size is owed to the video monitor",
                  "setOutputSize did not name it for a redraw");
     const PassCost resized = renderCounted(manager, v0);
@@ -2382,8 +2411,10 @@ struct WorkerUnblock {
     ~WorkerUnblock() {
         g_playbackFailure.disarm();
         g_failImageCreates.store(0);
+        g_failVideoSources.store(0);
         g_submitDeviceLost.store(0);
         g_framebufferGate.release();
+        g_videoSourceGate.release();
         g_framebufferFailGate.release();
         g_framebufferLostGate.release();
         g_submitFailGate.release();
@@ -7244,7 +7275,7 @@ void runMemoryRetryChecks(const WallpaperManager::Config& config, const std::vec
     WallpaperManager manager(config);
     CaptureGradeOnExit captureGrade{grade, manager};
     struct Disarm {
-        ~Disarm() { g_failImageCreates.store(0); }
+        ~Disarm() { g_failVideoSources.store(0); }
     } disarm;
 
     const auto draw = [&](size_t i) {
@@ -7275,19 +7306,24 @@ void runMemoryRetryChecks(const WallpaperManager::Config& config, const std::vec
     //       closes a session nothing is showing and opens again, and that second attempt commits.
     //       False for a daemon that reports the shortage to the user, which would refuse a wallpaper
     //       the machine has room for as soon as another screen's decoder had taken the last of it.
-    // WHY-THIS-SHAPE: the shortage is injected into the daemon's own image creation, which on this
-    //       path is the picture converter's image inside the decode that opens the session. The
-    //       signature graded is that the FILE WAS OPENED TWICE: "it committed" alone is also true of
-    //       an attempt that never ran out, and the injection being spent is asserted separately.
+    // WHY-THIS-SHAPE: the shortage is injected into the renderer's first video source (g_failVideoSources),
+    //       built when the open hands its first picture to the renderer -- on the device path the daemon creates no
+    //       image of its own during an open, so an image-creation shortage would land on the screen's target
+    //       instead, outside the open. The signature graded is that the FILE WAS OPENED TWICE: "it committed" alone
+    //       is also true of an attempt that never ran out, and the injection being spent is asserted separately.
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, retryOnShortageLocked()'s
     //       `if (!classifyFailure().exhausted) throw;` made `throw;`, so no shortage is ever retried ->
     //       "FAIL: an open that runs out of memory frees an idle session and commits on the retry", and the
-    //       checks after it. Via control_batch.sh 2026-10-18, phase memoryRetry. Reverted.
+    //       checks after it. Re-run on this injection via control_batch.sh 2026-10-25 (T20a), phase memoryRetry,
+    //       NVIDIA and Lavapipe: the same lines red, green restored. Reverted.
     // COVERAGE-ASSERT: the armed shortage is asserted to have been spent, so a run where the
-    //       injection never landed fails instead of grading an ordinary open.
-    g_failImageCreates.store(1);
+    //       injection never landed fails instead of grading an ordinary open. Control, control_batch.sh 2026-10-25,
+    //       both entries, reverted: YcbcrRenderer::makeSource()'s pool given `maxSets = 2`
+    //       (renderer/video/ycbcr_renderer.cpp), which the hook no longer recognises -> "FAIL: the injected memory
+    //       shortage was spent on the renderer's video source" and every check after it.
+    g_failVideoSources.store(1);
     const PassCost retried = draw(4);
-    check(g_failImageCreates.load() == 0, "the injected memory shortage was spent on the daemon's own image");
+    check(g_failVideoSources.load() == 0, "the injected memory shortage was spent on the renderer's video source");
     reportUnless(retried.outcome.rendered && retried.opens == 2,
                  "an open that runs out of memory frees an idle session and commits on the retry", describe(retried));
     const std::multiset<std::string> afterRetry = g_files.live();
@@ -7310,13 +7346,14 @@ void runMemoryRetryChecks(const WallpaperManager::Config& config, const std::vec
     //       `next = Next::Nothing;` made `next = Next::IdleVideo;`, so sessions are freed while any is idle
     //       -> "FAIL: a second shortage in a row is reported rather than answered by freeing another
     //       session", and the check after it. Via control_batch.sh 2026-10-18, phase memoryRetry. Reverted.
+    //       Re-run on this injection 2026-10-25 (T20a), NVIDIA: the same line and the S15.780 lines below red.
     // COVERAGE-ASSERT: the shortages left unspent are printed beside the failure, so a run where
     //       only one of the two landed is visible rather than graded as a bound that held.
-    g_failImageCreates.store(2);
+    g_failVideoSources.store(2);
     const PassCost twice = draw(5);
     reportUnless(!twice.outcome.rendered && twice.opens == 2,
                  "a second shortage in a row is reported rather than answered by freeing another session",
-                 describe(twice) + ", " + std::to_string(g_failImageCreates.load()) + " shortage(s) left unspent");
+                 describe(twice) + ", " + std::to_string(g_failVideoSources.load()) + " shortage(s) left unspent");
     reportUnless(g_files.closes(clips[2]) == 1 && g_files.closes(clips[3]) == 0 &&
                      g_files.live().count(clips[0]) == 1 && g_files.live().count(clips[4]) == 1,
                  "exactly one session was freed for it, and neither of the two that are showing a video",
@@ -7335,8 +7372,8 @@ void runMemoryRetryChecks(const WallpaperManager::Config& config, const std::vec
         return manager.renderPending(kStill).rendered;
     };
     for (const int id : {kStill, kLadder, kBound}) wallpaperx::testing::nameScreen(manager, id, screenOf(id));
-    // A shortage the checks above left unspent would fail the still instead.
-    g_failImageCreates.store(0);
+    // A shortage the checks above left unspent would fail the next video's open instead.
+    g_failVideoSources.store(0);
     if (!keepStill()) {
         check(false, "a still is drawn and kept beside the idle session (the premise of the relief-order checks)");
         return;
@@ -7350,15 +7387,16 @@ void runMemoryRetryChecks(const WallpaperManager::Config& config, const std::vec
     // CONTROL: control_batch.sh 2026-10-18, phase memoryRetry, reverted: in retryOnShortageLocked()
     //       (backend/daemon/wallpaper_manager.cpp) the still step's `next = relief == ... ? Next::IdleVideo :
     //       Next::Nothing;` made `next = Next::Nothing;` -> this line, and S13.139's lines above (no still kept there).
+    //       Re-run on this injection 2026-10-25 (T20a), NVIDIA: the same lines red, green restored.
     // COVERAGE-ASSERT: both shortages are asserted spent.
     manager.requestWallpaper("video", clips[6], kLadder);
-    g_failImageCreates.store(2);
+    g_failVideoSources.store(2);
     const PassCost ladder = renderCounted(manager, kLadder);
-    reportUnless(g_failImageCreates.load() == 0 && ladder.outcome.rendered && ladder.opens == 3 &&
+    reportUnless(g_failVideoSources.load() == 0 && ladder.outcome.rendered && ladder.opens == 3 &&
                      g_files.closes(clips[3]) == 1,
                  "a shortage the kept stills do not relieve closes the idle session and commits on the second retry",
                  describe(ladder) + ", idle session closed " + std::to_string(g_files.closes(clips[3])) + " time(s), " +
-                     std::to_string(g_failImageCreates.load()) + " shortage(s) unspent");
+                     std::to_string(g_failVideoSources.load()) + " shortage(s) unspent");
 
     // GOAL: S15.780's bound -- at most two retries, one per kind of relief: a third shortage is reported even
     //       with a second idle session to close. False for a ladder that keeps closing sessions.
@@ -7376,13 +7414,13 @@ void runMemoryRetryChecks(const WallpaperManager::Config& config, const std::vec
         return;
     }
     manager.requestWallpaper("video", clips[8], kBound);
-    g_failImageCreates.store(3);
+    g_failVideoSources.store(3);
     const PassCost bound = renderCounted(manager, kBound);
     const int idleClosed = g_files.closes(clips[0]) + g_files.closes(clips[4]);
-    reportUnless(g_failImageCreates.load() == 0 && !bound.outcome.rendered && bound.opens == 3 && idleClosed == 1,
+    reportUnless(g_failVideoSources.load() == 0 && !bound.outcome.rendered && bound.opens == 3 && idleClosed == 1,
                  "a third shortage in a row is reported: one kept-still retry and one idle-session retry, no more",
                  describe(bound) + ", " + std::to_string(idleClosed) + " idle session(s) closed, " +
-                     std::to_string(g_failImageCreates.load()) + " shortage(s) unspent");
+                     std::to_string(g_failVideoSources.load()) + " shortage(s) unspent");
 }
 
 // --------------------------------------------------------------------------- //
@@ -11346,6 +11384,7 @@ void runResumeHealthChecks(const WallpaperManager::Config& base, const std::stri
             g_sendDelayMs.store(0);
             g_framebufferGate.release();
             g_framebufferLostGate.release();
+            g_videoSourceGate.release();
         }
     } undo;
 
@@ -11477,25 +11516,30 @@ void runResumeHealthChecks(const WallpaperManager::Config& base, const std::stri
 
     // GOAL: S15.428's later-round half -- the same when the catch-up finishes in a round that cannot draw (the
     //       screen stopped being drawn meanwhile), so the resumed picture is drawn in a later round.
-    // WHY-THIS-SHAPE: the render thread is held at the conversion's framebuffer (the clip's own extent), which
-    //       exists only in the catch-up's last step; the screen is hidden there, so that round's draw check finds
-    //       it not playing and leaves the picture undrawn. A flag read at the start of the catch-up round would
-    //       have been spent by then.
-    // CONTROL: via control_batch.sh, --phase '^resumeHealth$', re-run 2026-10-16, NVIDIA at half speed, reverted: the
-    //       condition guarding `delivered = healthCheck(...)` in advanceSessionLocked()
-    //       (backend/daemon/wallpaper_manager.cpp) made `resuming && session.openedAt` -- read at the start of the
-    //       round -> only this line red, "gpu health still: OffscreenTargetManager: vkCreateFramebuffer failed with
-    //       VK_ERROR_DEVICE_LOST"; the same-round line above stayed green.
+    // WHY-THIS-SHAPE: the render thread is held where the renderer builds its first video source (its descriptor
+    //       pool), which happens only when the catch-up's last step hands the resumed picture to the reopened
+    //       session's new renderer; the screen is hidden there, so that round's draw check finds it not playing and
+    //       leaves the picture undrawn. A flag read at the start of the catch-up round would have been spent by then.
+    //       Not the old hold on a framebuffer of the clip's extent: no such framebuffer exists since the renderer
+    //       draws the decoded image straight into the screen's target.
+    // CONTROL: via control_batch.sh, --phase '^resumeHealth$', 2026-10-25 (T20a), NVIDIA, reverted: the condition
+    //       guarding `delivered = healthCheck(...)` in advanceSessionLocked() (backend/daemon/wallpaper_manager.cpp)
+    //       given `resuming &&`, so it holds only in the round the catch-up finishes -> only this line red, "FAIL: the
+    //       resumed picture, drawn a round after its catch-up finished, clears a GPU failure recorded since the
+    //       kept-frame render"; the same-round line above stayed green. Green restored.
     // COVERAGE-ASSERT: the hold was reached, and nothing was committed or released before the screen was shown
-    //       again (the committed generation, not the bus's, which can lag).
+    //       again (the committed generation, not the bus's, which can lag). The hold's own control,
+    //       control_batch.sh 2026-10-25, both entries, reverted: YcbcrRenderer::makeSource()'s pool given
+    //       `maxSets = 2` (renderer/video/ycbcr_renderer.cpp), which the hook no longer recognises -> "FAIL: the
+    //       resumed video's catch-up reaches its last step (the premise)", the same-round half green.
     {
         const std::optional<uint64_t> frozen = stopPastKeyframe();
         if (!frozen) return;
-        g_framebufferGate.arm(CallGate::Mode::Hold, extentOf(320, 240));
+        g_videoSourceGate.arm(CallGate::Mode::Hold);
         setOutputVisible(proxy, screen, true);
-        const bool held = g_framebufferGate.waitFired(std::chrono::seconds(20));
+        const bool held = g_videoSourceGate.waitFired(std::chrono::seconds(20));
         if (held) setOutputVisible(proxy, screen, false);
-        g_framebufferGate.release();
+        g_videoSourceGate.release();
         check(held, "the resumed video's catch-up reaches its last step (the premise)");
         if (!held) return;
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -11503,7 +11547,8 @@ void runResumeHealthChecks(const WallpaperManager::Config& base, const std::stri
         const bool failed = slipped && failStill(kFaultWidth + 8, kFaultHeight + 8, *frozen).beforePicture;
         // CONTROL: via control_batch.sh, --phase '^resumeHealth$', 2026-10-16, NVIDIA: advanceSessionLocked()'s draw
         //       check (backend/daemon/wallpaper_manager.cpp) dropping its `playingSeqLocked(...) != playing` term, so the
-        //       caught-up picture is drawn on a hidden screen -> only this line red. Reverted.
+        //       caught-up picture is drawn on a hidden screen -> only this line red. Reverted. Re-run on the source-pool
+        //       hold 2026-10-25 (T20a): the same, only this line red, green restored.
         check(slipped && failed, "the caught-up picture was left undrawn, and a still's render then records a GPU failure "
                                  "(the premise)");
         if (!slipped || !failed) return;
