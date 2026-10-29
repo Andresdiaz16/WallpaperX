@@ -78,6 +78,11 @@ WallpaperItem {
     readonly property int monitorId:
         (root.reply && typeof root.reply.monitor_id === "number") ? root.reply.monitor_id : -1
 
+    // This screen's pause mode, which decides whether a fullscreen window hides it. Empty from a
+    // daemon that does not say.
+    readonly property string pauseMode:
+        (root.reply && typeof root.reply.pause === "string") ? root.reply.pause : ""
+
     // Each state needs a different action from whoever reads it, so they are told apart
     // rather than merged. Order matters: a refusal only means anything once something answered.
     readonly property string screenState:
@@ -281,6 +286,7 @@ WallpaperItem {
             // The name monitorId was resolved from, so the size the renderer reports is filed
             // under the same screen.
             item.output = root.connector;
+            item.pauseMode = root.pauseMode;
         }
         // State from an item that is going away would otherwise outlive it.
         onStatusChanged: {
@@ -300,6 +306,9 @@ WallpaperItem {
             }
             function onConnectorChanged() {
                 if (surface.item !== null) surface.item.output = root.connector;
+            }
+            function onPauseModeChanged() {
+                if (surface.item !== null) surface.item.pauseMode = root.pauseMode;
             }
         }
 

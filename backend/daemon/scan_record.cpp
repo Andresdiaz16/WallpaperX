@@ -26,6 +26,7 @@ constexpr const char* kKeyInode = "inode";
 constexpr const char* kKeySize = "size";
 constexpr const char* kKeyModified = "modified_ns";
 constexpr const char* kKeyMissingReference = "missing_reference";
+constexpr const char* kKeyThroughout = "missing_reference_throughout";
 constexpr const char* kKeyParameterSets = "parameter_set_change";
 
 // An entry per video file shown, each a path and a few numbers: far below this.
@@ -56,6 +57,7 @@ std::string writeScanRecord(const std::filesystem::path& stateDir, const std::ve
                         {kKeySize, scan.file.size},
                         {kKeyModified, scan.file.modifiedNs},
                         {kKeyMissingReference, scan.found.missingReference},
+                        {kKeyThroughout, scan.found.missingReferenceThroughout},
                         {kKeyParameterSets, scan.found.parameterSetsChangeOffReset}});
     }
     const nlohmann::json root{{kKeyRule, kSoftwareScanRule},
@@ -87,6 +89,7 @@ std::vector<SavedScan> readScanRecord(const std::filesystem::path& stateDir) {
             !readNumber(entry, kKeySize, scan.file.size) || scan.file.size < 0 ||
             !readNumber(entry, kKeyModified, scan.file.modifiedNs) ||
             !readFlag(entry, kKeyMissingReference, scan.found.missingReference) ||
+            !readFlag(entry, kKeyThroughout, scan.found.missingReferenceThroughout) ||
             !readFlag(entry, kKeyParameterSets, scan.found.parameterSetsChangeOffReset)) {
             continue;
         }

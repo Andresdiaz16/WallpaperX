@@ -1739,14 +1739,17 @@ void runPropertiesWireChecksOn(wallpaperx::WallpaperManager& manager, const std:
         check(asRepeat == 4, "a repeated key whose second value is malformed is refused as a repeat by both methods");
     }
 
-    // GOAL: S15.97's limits -- 64 entries whose keys are 64 characters are accepted and kept whole,
-    //       so every refusal below is of its bad entry.
+    // GOAL: S15.97's limits (S15.997: 65 entries since the app reserves one for "paused") -- 65 entries
+    //       whose keys are 64 characters are accepted and kept whole, so every refusal below is of its bad entry.
+    // WHY-THIS-SHAPE: the counts are literals, not kMaxProperties, so lowering the daemon's constant is red
+    //       here instead of moving the test with it.
     // CONTROL: `key.size() > kMaxPropertyKeyBytes` in propertyError (backend/daemon/
-    //       wallpaper_properties.cpp) made `>=` -> "FAIL: a call with 64 entries whose keys are 64
-    //       characters is accepted and kept whole".
+    //       wallpaper_properties.cpp) made `>=` -> "FAIL: a call with 65 entries whose keys are 64
+    //       characters is accepted and kept whole". kMaxProperties (backend/daemon/wallpaper_properties.h)
+    //       back to 64 -> this line (see the "66 entries" control below).
     {
         WireProperties atLimits;
-        for (int i = 0; i < 64; ++i) {
+        for (int i = 0; i < 65; ++i) {
             std::string key = "k" + std::to_string(i);
             key.resize(64, 'x');
             atLimits.emplace(key, Variant(static_cast<double>(i)));
@@ -1754,8 +1757,8 @@ void runPropertiesWireChecksOn(wallpaperx::WallpaperManager& manager, const std:
         const std::string limitsError = withProperties(kMonitorPropsLimits, atLimits);
         const nlohmann::json entry = entryOf(kMonitorPropsLimits);
         const bool kept = limitsError.empty() && entry.is_object() && entry.contains("properties") &&
-                          entry["properties"].size() == 64;
-        check(kept, "a call with 64 entries whose keys are 64 characters is accepted and kept whole");
+                          entry["properties"].size() == 65;
+        check(kept, "a call with 65 entries whose keys are 64 characters is accepted and kept whole");
         if (!kept) std::fprintf(stderr, "  it answered '%s'; entry: %s\n", limitsError.c_str(), entry.dump().c_str());
     }
 
@@ -1773,8 +1776,11 @@ void runPropertiesWireChecksOn(wallpaperx::WallpaperManager& manager, const std:
     //       propertyError (backend/daemon/wallpaper_properties.cpp): keyCharacter() accepting ' ', or any
     //       byte past 0x7f; the isfinite() test, the speed rule,
     //       the mute rule, `key.empty() ||`, or the 65-character test deleted. The count bound deleted
-    //       from both fromWire and propertiesError -> the "65 entries" lines (fromWire's alone stays
-    //       green: the wire bound has no check of its own). propertiesError() deleted from
+    //       from both fromWire and propertiesError -> the "66 entries" lines, with the replace, held-set
+    //       and config-file lines (re-run 2026-10-28) (fromWire's alone stays
+    //       green: the wire bound has no check of its own). For S15.997, S15.998: kMaxProperties
+    //       (backend/daemon/wallpaper_properties.h) made 66 -> the "66 entries" lines; the paused rule in
+    //       propertyError deleted -> the "paused as a number" and "paused as a colour" lines. propertiesError() deleted from
     //       WallpaperManager::requestWallpaper -> its 16 lines, the error-text check, "creates no monitor",
     //       the file, held-set and replace checks; from WallpaperManager::setWallpaperProperties -> its 16
     //       lines, the error-text, file and held-set checks (re-run via control_batch.sh, --phase
@@ -1788,12 +1794,14 @@ void runPropertiesWireChecksOn(wallpaperx::WallpaperManager& manager, const std:
     const double inf = std::numeric_limits<double>::infinity();
     const Variant good(2.0);
     WireProperties tooMany{{"speed", good}};
-    for (int i = 0; i < 64; ++i) tooMany.emplace("k" + std::to_string(i), Variant(1.0));
+    for (int i = 0; i < 65; ++i) tooMany.emplace("k" + std::to_string(i), Variant(1.0));
     const std::vector<std::pair<const char*, WireProperties>> refusals{
         {"a value of D-Bus type i", {{"level", Variant(int32_t{3})}, {"speed", good}}},
         {"a value of D-Bus type as", {{"list", Variant(std::vector<std::string>{"a"})}, {"speed", good}}},
         {"a string that is not #rrggbb", {{"tint", Variant(std::string("#12345g"))}, {"speed", good}}},
-        {"65 entries", tooMany},
+        {"66 entries", tooMany},
+        {"paused as a number", {{"paused", Variant(1.0)}, {"speed", good}}},
+        {"paused as a colour", {{"paused", Variant(std::string("#000000"))}, {"speed", good}}},
         {"an empty key", {{"", Variant(1.0)}, {"speed", good}}},
         {"a 65-character key", {{std::string(65, 'k'), Variant(1.0)}, {"speed", good}}},
         {"a key with a space", {{"wave height", Variant(1.0)}, {"speed", good}}},
@@ -1827,7 +1835,7 @@ void runPropertiesWireChecksOn(wallpaperx::WallpaperManager& manager, const std:
         }
         driven += 2;
     }
-    check(driven == 2 * 20, "every refusal case in the table was driven through both methods");
+    check(driven == 2 * 22, "every refusal case in the table was driven through both methods");
 
     // GOAL: S15.105 -- a speed refusal tells the caller the rule: the D-Bus error text of both methods names
     //       "property speed must be 0.5, 1 or 2" for 0.25, 0.75, 1.5, 3, 0 and a bool.
@@ -1924,6 +1932,54 @@ void runPropertiesWireChecksOn(wallpaperx::WallpaperManager& manager, const std:
         if (!accepted) {
             std::fprintf(stderr, "  SetWallpaperWithProperties answered '%s', SetWallpaperProperties '%s'; entry: %s\n",
                          viaSet.c_str(), viaReplace.c_str(), afterReplace.dump().c_str());
+        }
+    }
+
+    // GOAL: S15.993, S15.1092 -- each accepted SetWallpaperProperties that changes the held set writes exactly
+    //       one stdout line naming the monitor and only the keys that changed, with their values, a dropped key
+    //       as null; an accepted call that changes nothing, and a refused call, write no such line.
+    // WHY-THIS-SHAPE: whole lines are matched, so a log of the full set instead of the change, or of
+    //       the old value, is red; the per-monitor count (3 of 5 calls) catches a line for the no-op or the
+    //       refusal, which no `has()` match can see.
+    // CONTROL: control_batch.sh, phase propertiesWire, in backend/daemon/wallpaper_properties.cpp
+    //       changedPropertiesText: the dropped-key loop deleted -> "FAIL: S15.993: a dropped key is logged as null".
+    //       In backend/daemon/dbus_service.cpp `if (replaced != next)` made `if (true)` -> "FAIL: S15.993: exactly
+    //       one line per call that changes the set"; the printf deleted -> the same line.
+    // COVERAGE-ASSERT: the number of lines for the monitor is asserted.
+    {
+        const std::string head = "wallpaperx-daemon: SetWallpaperProperties(monitor=" + std::to_string(kMonitorPropsCap) + ", changed=";
+        const std::string from = withProperties(kMonitorPropsCap, {{"speed", Variant(2.0)}, {"mute", Variant(true)}});
+        bool captured = false;
+        std::string answers, text;
+        int lines = -1;
+        {
+            wallpaperx::testing::StreamCapture out(STDOUT_FILENO);
+            if (out.ok() && from.empty()) {
+                captured = true;
+                answers += replaceProperties(kMonitorPropsCap, {{"speed", Variant(2.0)}, {"mute", Variant(true)}, {"volume", Variant(0.5)}});
+                answers += replaceProperties(kMonitorPropsCap, {{"mute", Variant(true)}, {"volume", Variant(0.5)}});
+                answers += replaceProperties(kMonitorPropsCap, {{"mute", Variant(true)}, {"volume", Variant(0.5)}});
+                answers += replaceProperties(kMonitorPropsCap, {{"mute", Variant(true)}, {"volume", Variant(0.5)}, {"paused", Variant(true)}});
+                const std::string refused = replaceProperties(kMonitorPropsCap, {{"speed", Variant(3.0)}});
+                if (refused != kInvalidArgs) answers += "speed 3 answered '" + refused + "'";
+                lines = out.count(head);
+                text = out.text();
+            }
+        }
+        // A refused setup call is the daemon's answer, so it is red; only an uncapturable stdout is ungraded.
+        if (!from.empty()) {
+            check(false, "S15.993: the setup SetWallpaperWithProperties call was accepted");
+            std::fprintf(stderr, "  setup answered '%s'\n", from.c_str());
+        } else if (!captured) {
+            wallpaperx::testing::notVerified("S15.993", "stdout could not be captured");
+        } else {
+            const auto has = [&](const char* changed) { return text.find(head + changed + ")\n") != std::string::npos; };
+            check(answers.empty(), "S15.993: the four accepted calls were accepted and the refused one refused");
+            check(has(R"({"volume":0.5})"), "S15.993: an added key is logged with its value, and only it");
+            check(has(R"({"speed":null})"), "S15.993: a dropped key is logged as null");
+            check(has(R"({"paused":true})"), "S15.993: paused set true is logged");
+            check(lines == 3, "S15.993: exactly one line per call that changes the set, none for the no-op or the refused one");
+            if (!answers.empty() || lines != 3) std::fprintf(stderr, "  answers '%s'; %d lines:\n%s\n", answers.c_str(), lines, text.c_str());
         }
     }
 
@@ -3147,27 +3203,69 @@ void runConfigChangedWireChecks(const wallpaperx::WallpaperManager::Config& base
             return;
         }
 
-        // GOAL: S15.396 -- a screen's reports and a monitor's settings announce nothing: SetOutputSize,
-        //       SetOutputVisible, SetOutputFocus, SetMonitorPause, SetWallpaperProperties. And S15.394's
-        //       other half: moving a name to another monitor announces once.
+        // GOAL: S15.396 -- a screen's reports and a wallpaper's properties announce nothing: SetOutputSize,
+        //       SetOutputVisible, SetOutputFocus, SetWallpaperProperties. And S15.394's other half: moving a
+        //       name to another monitor announces once. (SetMonitorPause announces: S15.1034 below.)
         // CONTROL: `announceConfigChanged();` added at the end of DbusService::setOutputSize
-        //       (backend/daemon/dbus_service.cpp) -> "a screen's reports and a monitor's settings announce
-        //       nothing" red.
-        // COVERAGE-ASSERT: all five must have been accepted, so their silence is not a refusal's.
+        //       (backend/daemon/dbus_service.cpp) -> "a screen's reports and a wallpaper's properties announce
+        //       nothing" red. Re-run via control_batch.sh 2026-10-28: red.
+        // COVERAGE-ASSERT: all four must have been accepted, so their silence is not a refusal's.
         const std::string reports = errorNameFrom([&] {
             setOutputSize(proxy, kName, 800, 600);
             setOutputVisible(proxy, kName, false);
             setOutputFocus(proxy, kName, true, false);
-            setMonitorPause(proxy, kMonitorNoticeFirst, "paused_while_focused");
             setWallpaperProperties(proxy, kMonitorNoticeFirst, {{"speed", Variant(0.5)}});
         });
-        check(reports.empty(), "the five report and setting calls were accepted");
+        check(reports.empty(), "the four report and property calls were accepted");
         if (!reports.empty()) std::fprintf(stderr, "  one answered '%s'\n", reports.c_str());
         const std::string moved = errorNameFrom([&] { setMonitorOutput(proxy, kMonitorNoticeSecond, kName); });
         check(moved.empty() && announced.waitFor(4), "moving a name to another monitor announces ConfigChanged");
         const bool reportsSettled = announcementsSettled(*listener);
-        check(reportsSettled && announced.count() == 4, "a screen's reports and a monitor's settings announce nothing");
+        check(reportsSettled && announced.count() == 4, "a screen's reports and a wallpaper's properties announce nothing");
         if (announced.count() != 4) std::fprintf(stderr, "  %d announcement(s)\n", announced.count());
+
+        // GOAL: S15.1034 -- SetMonitorPause announces ConfigChanged exactly once per change of the mode,
+        //       never for a repeat of the mode in force or for a refused call.
+        // WHY-THIS-SHAPE: each count read after announcementsSettled(), as S15.451's; "at least N" would pass
+        //       a repeat's late signal. Its own steps, not folded into the four above, so a regression to
+        //       silence and one to announcing every call are told apart.
+        // CONTROL: via control_batch.sh 2026-10-28, --phase configChangedWire, each alone, reverted, in
+        //       DbusService::setMonitorPause (backend/daemon/dbus_service.cpp): announceConfigChanged() deleted,
+        //       and the `if` made `|| true` -> both this line and the step-count line red.
+        // COVERAGE-ASSERT: all four steps must have been compared.
+        struct PauseStep {
+            const char* what;
+            const char* mode;
+            bool refused;
+            int expected;
+        };
+        const PauseStep pauseSteps[] = {
+            {"SetMonitorPause(paused_while_focused), a change", "paused_while_focused", false, 1},
+            {"SetMonitorPause(paused_while_focused) again", "paused_while_focused", false, 0},
+            {"SetMonitorPause(not_a_mode), refused", "not_a_mode", true, 0},
+            {"SetMonitorPause(play), a change", "play", false, 1},
+        };
+        int pauseCompared = 0;
+        bool pauseExact = reportsSettled;
+        int pauseBefore = announced.count();
+        for (const PauseStep& step : pauseSteps) {
+            if (!pauseExact) break;
+            const std::string answer = errorNameFrom([&] { setMonitorPause(proxy, kMonitorNoticeFirst, step.mode); });
+            if (answer.empty() == step.refused || !announcementsSettled(*listener)) {
+                std::fprintf(stderr, "  %s answered '%s'\n", step.what, answer.c_str());
+                pauseExact = false;
+                break;
+            }
+            ++pauseCompared;
+            const int after = announced.count();
+            if (after - pauseBefore != step.expected) {
+                pauseExact = false;
+                std::fprintf(stderr, "  %s announced %d time(s), expected %d\n", step.what, after - pauseBefore, step.expected);
+            }
+            pauseBefore = after;
+        }
+        check(pauseExact, "SetMonitorPause announces ConfigChanged once per change, never for a repeat or a refusal");
+        check(pauseCompared == 4, "every SetMonitorPause announcement step was compared");
         });
     }
 

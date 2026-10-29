@@ -104,7 +104,11 @@ public:
     Q_INVOKABLE bool setPropertyValue(const QString& key, const QVariant& value);
     // Every value at once, one change: false, changing nothing, if any is refused.
     Q_INVOKABLE bool setPropertyValues(const QVariantMap& values);
+    // Every value back to its default, Paused off included.
     Q_INVOKABLE void resetPropertyValues();
+    // Every value replaced by what `values` holds, those the selected wallpaper does not take left at
+    // their default, in one change: the values a screen showing it has, for the controls to show.
+    void adoptPropertyValues(const QVariantMap& values);
 
 signals:
     void stateChanged();

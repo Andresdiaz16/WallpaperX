@@ -507,16 +507,17 @@ void manifestDepthLimit() {
     }
 }
 
-// The position keys at their defaults, written out rather than read from the app, since the app
-// sends them beside every wallpaper's own properties.
-void addPositionDefaults(std::vector<std::pair<std::string, DaemonValue>>& set) {
+// The keys the app sends beside every wallpaper's own properties (the four position keys and a video's
+// "paused"), written out rather than read from the app.
+void addAppSentDefaults(std::vector<std::pair<std::string, DaemonValue>>& set) {
     set.emplace_back("position", std::string("cover"));
     set.emplace_back("position.zoom", 1.0);
     set.emplace_back("position.x", 0.0);
     set.emplace_back("position.y", 0.0);
+    set.emplace_back("paused", true);
 }
 
-// What the daemon makes of a wallpaper.json's properties as declared, sent with the position keys:
+// What the daemon makes of a wallpaper.json's properties as declared, sent with the app-sent defaults:
 // its own propertiesError() on every default, and on a "volume"'s min and max, the two ends its
 // slider can reach. Empty: accepted.
 std::string daemonVerdict(const OrderedJson& properties) {
@@ -539,7 +540,7 @@ std::string daemonVerdict(const OrderedJson& properties) {
             defaults.emplace_back(key, spec.at("default").get<std::string>());
         }
     }
-    addPositionDefaults(defaults);
+    addAppSentDefaults(defaults);
     const std::string why = daemonPropertiesError(defaults);
     return why.empty() ? extremes : why;
 }
@@ -555,7 +556,7 @@ DaemonValue toDaemon(const QVariant& value) {
 }
 
 // What the daemon makes of everything the app can send for a usable wallpaper: the whole set of
-// defaults as the app stored them with the position keys, then that set with each offered choice in
+// defaults as the app stored them with the app-sent defaults, then that set with each offered choice in
 // its property's place, so rules on the whole set (the property count) apply to every probe. Empty:
 // all accepted.
 std::string daemonVerdictOnOffered(const QList<WallpaperProperty>& properties) {
@@ -563,7 +564,7 @@ std::string daemonVerdictOnOffered(const QList<WallpaperProperty>& properties) {
     for (const WallpaperProperty& property : properties) {
         set.emplace_back(property.key.toStdString(), toDaemon(property.defaultValue));
     }
-    addPositionDefaults(set);
+    addAppSentDefaults(set);
     if (std::string why = daemonPropertiesError(set); !why.empty()) {
         return why;
     }
@@ -607,7 +608,7 @@ void daemonPropertyRules() {
     //       that reason; a key of 64 allowed characters, and keys using every allowed character, are
     //       usable.
     // GOAL: S15.720 -- at most 60 properties of a wallpaper's own: 60 are usable, 61 list it broken
-    //       saying so, so the four position keys sent beside them stay within the daemon's 64.
+    //       saying so, so the four position keys and "paused" sent beside them stay within the daemon's 65.
     // GOAL: S15.223 -- "speed" is refused, naming its declared range, exactly when no playback speed
     //       (0.5, 1 or 2) lies inside that range; a range holding at least one is usable, however far
     //       it reaches past them; "Speed" is another key and is not restricted.
@@ -680,7 +681,7 @@ void daemonPropertyRules() {
     }
     // GOAL: S15.225 -- everything the app can send for a usable wallpaper passes the daemon's own
     //       propertiesError() (backend/daemon/wallpaper_properties.cpp, compiled in): every default as
-    //       the app stored it with the four position keys, and every choice it offers; and a wallpaper
+    //       the app stored it with the four position keys and "paused" (S15.997), and every choice it offers; and a wallpaper
     //       the app lists broken is one whose declared defaults, so sent, the daemon refuses too.
     // WHY-THIS-SHAPE: graded against the daemon's code rather than this table, so a rule changed on
     //       either side alone is red here even where the table above was changed to match. The usable
@@ -690,10 +691,12 @@ void daemonPropertyRules() {
     //       (control_batch, 2026-10-04) -> red, "S15.225: a 65-character key: the app lists it usable,
     //       the daemon would refuse it (property name "kkk..." must be 1 to 64 ASCII letters, digits,
     //       '_', '-' or '.')"; each break above gave its own S15.225 line beside its row's. The count
-    //       and the cap (the whole set is sent, position keys included, so the daemon's 64 applies):
-    //       kMaxWallpaperProperties (app/library/wpx_package.h) one higher (control_batch 2026-10-18) ->
-    //       red, "S15.720: 61 properties was accepted" and "S15.225: 61 properties: the app lists it usable, the
-    //       daemon would refuse it (at most 64 properties, got 65)". Choices:
+    //       and the cap (the whole set is sent, position keys and "paused" included, so the daemon's 65
+    //       applies): control_batch: kMaxWallpaperProperties (app/library/wpx_package.h) without
+    //       its `- 1` for "paused" -> red, "S15.720: 61 properties was accepted" and "S15.225: 61 properties:
+    //       the app lists it usable, the daemon would refuse it (at most 65 properties, got 66)"; the daemon's
+    //       kMaxProperties (backend/daemon/wallpaper_properties.h) back to 64 -> red, "S15.225: 60 properties:
+    //       the app lists it usable, the daemon would refuse it". Choices:
     //       both sides read kPlaybackSpeeds from shared/playback_speed.h, so the list cannot differ; what can
     //       is choices() (app/library/wpx_package.cpp) offering a value off it. Its `within.append(speed)`
     //       made `within.append(speed == 2.0 ? 1.5 : speed)` (control_batch 2026-10-15) -> red, "S15.225:
@@ -2335,7 +2338,7 @@ void positionValues(const QString& root) {
     // COVERAGE-ASSERT: the row count.
     const OrderedJson aFloat = OrderedJson::parse(R"({"type": "float", "default": 1, "min": 0.1, "max": 2})");
     const char* reservedKeys[] = {"position", "position.zoom", "position.x", "position.y", "position.foo", "position."};
-    const char* freeKeys[] = {"positions", "Position", "my.position", "positionx"};
+    const char* freeKeys[] = {"positions", "Position", "my.position", "positionx", "Paused", "pausedx"};
     int keysChecked = 0;
     for (const char* key : reservedKeys) {
         ++keysChecked;
@@ -2349,7 +2352,19 @@ void positionValues(const QString& root) {
         const auto parsed = parseManifest(edited([&](OrderedJson& j) { j["properties"][key] = aFloat; }));
         expect(parsed.has_value(), QStringLiteral("S15.724: declaring \"%1\" was refused: %2").arg(QLatin1StringView(key), parsed ? QString() : parsed.error()));
     }
-    expect(keysChecked == 10, QStringLiteral("S15.724: %1 keys checked, not 10").arg(keysChecked));
+    // GOAL: S15.998 -- a wallpaper.json declaring "paused" is refused with the paused reserved-key sentence;
+    //       "Paused" and "pausedx" (above) are usable. False if a package could declare the key the app sets itself.
+    // CONTROL: control_batch: parseProperty's kPausedKey refusal (app/library/wpx_package.cpp) made
+    //       `if (false)` -> red, "S15.998: declaring "paused" was accepted".
+    {
+        const auto parsed = parseManifest(edited([&](OrderedJson& j) {
+            j["properties"]["paused"] = OrderedJson::parse(R"({"type": "bool", "default": false})");
+        }));
+        const QString want = QStringLiteral("Property \"paused\" in wallpaper.json is reserved: WallpaperX pauses a wallpaper itself.");
+        expect(!parsed && parsed.error() == want,
+               QStringLiteral("S15.998: declaring \"paused\" was %1").arg(parsed ? QStringLiteral("accepted") : QStringLiteral("refused with: ") + parsed.error()));
+    }
+    expect(keysChecked == 12, QStringLiteral("S15.724: %1 keys checked, not 12").arg(keysChecked));
     OrderedJson reservedJson = planManifest();
     reservedJson["properties"]["position.zoom"] = aFloat;
     const QString folder = root + QStringLiteral("/reserved");

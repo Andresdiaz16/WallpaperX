@@ -272,4 +272,16 @@ void LibraryManager::resetPropertyValues()
     changeSelection([&] { m_edits.clear(); });
 }
 
+void LibraryManager::adoptPropertyValues(const QVariantMap& values)
+{
+    const Wallpaper selected = selectedWallpaper();
+    QVariantMap accepted;
+    for (auto it = values.cbegin(); it != values.cend(); ++it) {
+        if (const auto value = selected.accept(it.key(), it.value())) {
+            accepted.insert(it.key(), *value);
+        }
+    }
+    changeSelection([&] { m_edits = std::move(accepted); });
+}
+
 } // namespace wallpaperx

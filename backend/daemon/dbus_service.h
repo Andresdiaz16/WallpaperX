@@ -92,15 +92,15 @@ private:
     // Records whether the screen named `outputName` is being drawn at all -- not behind a lock
     // screen, a fullscreen window or another session. The daemon cannot see any of that, and a
     // video whose screen is not drawn stops until this says otherwise, so the worker is woken
-    // either way: it is what recomputes what plays.
-    void setOutputVisible(const std::string& outputName, bool visible);
+    // either way: it is what recomputes what plays. `client` is the sender's unique name.
+    void setOutputVisible(const std::string& client, const std::string& outputName, bool visible);
 
     // A monitor's pause setting, by name. Saved and waited on like SetWallpaper; wakes the worker,
-    // which is what stops or resumes the video.
+    // which is what stops or resumes the video. A change announces ConfigChanged.
     void setMonitorPause(int32_t monitorId, const std::string& mode);
 
-    // Sound on or off for every screen, and for one monitor. Saved and waited on like
-    // SetMonitorPause; a change announces ConfigChanged.
+    // Sound on or off for every screen, and for one monitor. Saved, waited on and announced like
+    // SetMonitorPause.
     void setSound(bool on);
     void setMonitorSound(int32_t monitorId, bool on);
 

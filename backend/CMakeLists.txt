@@ -958,7 +958,9 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
             "wallpaper_tone_rate240.mp4@0.5*sin(2*PI*440*t)@4@4@240"
             "wallpaper_tone_rate120.mp4@0.5*sin(2*PI*440*t)@4@4@120"
             "wallpaper_one_picture_tone.mp4@0.5*sin(2*PI*440*t)@3@1@1"
-            "wallpaper_beeps_rate240.mp4@0.5*sin(2*PI*1000*t)*lt(mod(t,0.5),0.04)@2@2@240")
+            "wallpaper_beeps_rate240.mp4@0.5*sin(2*PI*1000*t)*lt(mod(t,0.5),0.04)@2@2@240"
+            # One beep in a 0.3 s loop, under kShortestHandedPass: every loop is handed on as its first picture waits.
+            "wallpaper_beeps_300ms.mp4@0.5*sin(2*PI*1000*t)*lt(mod(t,0.5),0.04)@0.3@0.3@30")
         string(REPLACE "@" ";" sound "${sound}")
         list(GET sound 0 sound_name)
         list(GET sound 1 sound_expr)
@@ -1185,7 +1187,8 @@ target_link_libraries(wallpaperx-audio-playback-test PRIVATE wallpaperx-daemon-l
 # The test's own view of clock rounds and session turns (its `turns` namespace); the daemon's code is unchanged.
 target_link_options(wallpaperx-audio-playback-test PRIVATE
     "LINKER:--wrap=_ZN10wallpaperx16WallpaperManager12advanceVideoENSt6chrono10time_pointINS1_3_V212steady_clockENS1_8durationIlSt5ratioILl1ELl1000000000EEEEEE"
-    "LINKER:--wrap=_ZN10wallpaperx12PlayingBlameC1ERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE")
+    "LINKER:--wrap=_ZN10wallpaperx12PlayingBlameC1ERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE"
+    "LINKER:--wrap=_ZN10wallpaperx10AudioTrack4playERKNS0_6AnchorE")
 target_include_directories(wallpaperx-audio-playback-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests ${CMAKE_CURRENT_SOURCE_DIR}/../renderer)
 set_target_properties(wallpaperx-audio-playback-test PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)

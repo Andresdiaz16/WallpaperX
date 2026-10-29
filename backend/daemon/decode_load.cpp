@@ -96,8 +96,8 @@ void DecodeLoad::add(std::chrono::nanoseconds took, std::chrono::nanoseconds sho
                        2.0 * std::max({m_everyPicture.value, span(std::min(m_level, deepestAt)).value_or(1.0), 1.0}),
                        weight);
     if (decodedAt == std::min(skip(), deepest) && previousAt == decodedAt) {
-        // One a picture, not weighted: decoderBehind() then lasts kSettled pictures into a level, which
-        // lets the pictures it inherited late from the last one catch up without the sound being moved.
+        // One a picture, not weighted: whether this level keeps pace is judged on kSettled of its own
+        // pictures, not on the late ones it inherited from the last.
         m_asRun.add(against(covered));
         if (decodedAt != PictureSkip::Nothing) {
             m_spans[static_cast<size_t>(decodedAt) - 1].add(intervals, read);

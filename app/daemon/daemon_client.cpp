@@ -143,9 +143,11 @@ std::expected<DaemonStatus, QString> parseDaemonStatus(const QByteArray& json)
             }
             status.occupied.insert(*id);
             if (std::string_view(field) == "wallpapers") {
-                status.wallpapers.insert(*id);
                 const QJsonObject wallpaper = it.value().toObject();
                 const QJsonValue path = wallpaper.value(QStringLiteral("path_literal"));
+                const QVariantMap properties = wallpaper.value(QStringLiteral("properties")).toObject().toVariantMap();
+                status.wallpapers.insert(
+                    *id, DaemonStatus::Shown{wallpaper.value(QStringLiteral("type")).toString(), path.toString(), properties});
                 const QString decoding =
                     wallpaper.value(QStringLiteral("processor_decoding")).toObject().value(QStringLiteral("state")).toString();
                 // Any other state, a later daemon's included, shows nothing.
@@ -561,6 +563,7 @@ void DaemonClient::settleRead(std::expected<DaemonStatus, QString> status)
 {
     if (status) {
         settle(State::Ready, {}, std::move(*status));
+        emit statusRead();
     } else {
         settle(State::Unavailable, std::move(status.error()), {});
     }

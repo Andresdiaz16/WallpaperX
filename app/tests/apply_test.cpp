@@ -223,6 +223,22 @@ struct Rig {
     }
 
     QList<FakeCall> sent(const char* member) const { return daemonFake->named(QString::fromLatin1(member)); }
+
+    // Every call queued has reached the stand-in, and every reply owed has been handled, so a call made on one
+    // has reached it too.
+    bool settled() { return daemonDrained() && repliesHandled() && daemonDrained(); }
+
+    // A GetStatus read that has landed, without waiting for replies a test is holding.
+    bool readLanded() {
+        bool read = false;
+        const auto c = QObject::connect(client.get(), &DaemonClient::statusRead, [&] { read = true; });
+        client->refresh();
+        const bool ok = waitUntil([&] { return read; }, kWaitMs);
+        QObject::disconnect(c);
+        return ok && daemonDrained();
+    }
+    // A GetStatus read that has landed and been acted on.
+    bool reread() { return readLanded() && settled(); }
 };
 
 // Builds a rig; on failure the phase's goals are reported not verified, naming why.
@@ -847,7 +863,7 @@ void liveEdits() {
     // CONTROL: app/daemon/apply_controller.cpp, control_batch, re-run 2026-10-15: `startLive(...)` added
     //       right after apply()'s Working state (live before the daemon accepted) -> red, "S15.237:
     //       after a refused Apply an edit sent 1 call(s), live on "DP-1""; sendLive()'s setProperties
-    //       given only `speed` (re-run 2026-10-18) -> red, "S15.237: with Plasma refusing (live on "DP-1"),
+    //       given only `speed` (re-run 2026-10-18 and 2026-10-28) -> red, "S15.237: with Plasma refusing (live on "DP-1"),
     //       the edit after Apply sent [ia{sv} 0 {speed=0.5(double)}] (1 call(s))".
     rig.library->setPropertyValue(QStringLiteral("speed"), 0.5);
     const bool beforeDrained = rig.daemonDrained();
@@ -890,8 +906,8 @@ void liveEdits() {
     //       mid-burst. "Exactly one more" is read once the app has handled the reply to that one
     //       (repliesHandled) and any call it sent then has arrived (daemonDrained) -- not once it
     //       re-reads the status, which is S15.242's business and would blame a break there on this.
-    // CONTROL: app/daemon/apply_controller.cpp, sendLive()'s `if (m_sending != Sending::No)` made
-    //       `if (false)` (control_batch, 2026-10-04) -> red, "S15.238: a burst of 10 edits made while a
+    // CONTROL: app/daemon/apply_controller.cpp, sendLive()'s `inFlight != m_sending.end()` made `false`
+    //       (control_batch T6a, reverted) -> red, "S15.238: a burst of 10 edits made while a
     //       call was unanswered sent 10 call(s)" and "after the reply 10 call(s) were sent".
     rig.daemonFake->calls.clear();
     for (int i = 1; i <= 10; ++i) {
@@ -913,7 +929,7 @@ void liveEdits() {
     // GOAL: S15.241 -- a refused edit is shown, naming the screen and the daemon's reason, and the
     //       next accepted edit clears it.
     // CONTROL: app/daemon/apply_controller.cpp, `m_liveError = error;` in sendLive's reply made
-    //       `m_liveError = QString();` (control_batch, re-run 2026-10-15) -> red, "S15.241: the refused edit
+    //       `m_liveError = QString();` (control_batch, re-run 2026-10-15 and 2026-10-28) -> red, "S15.241: the refused edit
     //       showed """.
     rig.daemonFake->refuse.insert(QStringLiteral("SetWallpaperProperties"),
                                   {QStringLiteral("org.freedesktop.DBus.Error.InvalidArgs"), QStringLiteral("monitor 0 holds no wallpaper")});
@@ -934,7 +950,7 @@ void liveEdits() {
     //       no help from the speed edit below. It is drained first: the marker follows it on the same
     //       connection, so it was answered "ok" before the failure is set. The status must then be
     //       read again after the flip. The wait's deadline fails the check.
-    // CONTROL: app/daemon/apply_controller.cpp, control_batch, re-run 2026-10-17: sendLive()'s
+    // CONTROL: app/daemon/apply_controller.cpp, control_batch, re-run 2026-10-17 and 2026-10-28: sendLive()'s
     //       `m_daemon.refresh();` in the idle branch deleted -> red, "S15.242: after an accepted edit
     //       the persistence problem reads "" (settled 1, 0 status read(s) since the failure)"; the
     //       refresh moved inside `if (m_liveError != error)` (re-read only when the shown error
@@ -955,20 +971,24 @@ void liveEdits() {
     // GOAL: S15.239 -- the link ends when the wallpaper is closed or another is opened: reopening it
     //       without Apply, or editing the other one, sends nothing.
     // WHY-THIS-SHAPE: drained before the call log is cleared, so a call S15.242's edit queued cannot
-    //       land after the clear and read as an edit made after reopening.
-    // CONTROL: app/daemon/apply_controller.cpp, `endLiveUnlessOpen();` in the selectionChanged
-    //       handler deleted (control_batch, re-run 2026-10-15) -> red, "S15.239: closed and reopened, live on
-    //       "DP-1", an edit sent 0 call(s)" (the edit queued behind the in-flight send of the cleared
-    //       values) and "with another wallpaper opened, live on "DP-1", its edit sent 1 call(s)".
+    //       land after the clear and read as an edit made after reopening. DP-1 is shown another file while
+    //       Ocean is closed: reopening Ocean with DP-1 still showing it relinks by design (S15.994).
+    // CONTROL: app/daemon/apply_controller.cpp linkSelected() keeping the link while nothing is open
+    //       (control_batch 2026-10-28, reverted) -> red, "S15.239: closed (ended 0) and reopened,
+    //       live on "", an edit sent 0 call(s)"; its early return not comparing the wallpaper -> red, "S15.239: with
+    //       another wallpaper opened, live on "DP-1", its edit sent 1 call(s)".
     rig.library->clearSelection();
     const bool closedEnded = rig.applier->liveOutput().isEmpty();
+    rig.daemonFake->screens[rig.daemonFake->outputs.value(QStringLiteral("DP-1"))].path = QStringLiteral("/elsewhere/other.mp4");
+    const bool elsewhere = rig.reread();
     rig.library->select(rig.ocean);
     const bool earlierArrived = rig.daemonDrained();
     rig.daemonFake->calls.clear();
     rig.library->setPropertyValue(QStringLiteral("speed"), 2.0);
     const bool reopenDrained = rig.daemonDrained();
-    expect(earlierArrived && closedEnded && reopenDrained && rig.applier->liveOutput().isEmpty() && edits().isEmpty(),
-           QStringLiteral("S15.239: closed and reopened, live on \"%1\", an edit sent %2 call(s)").arg(rig.applier->liveOutput()).arg(edits().size()));
+    expect(elsewhere && earlierArrived && closedEnded && reopenDrained && rig.applier->liveOutput().isEmpty() && edits().isEmpty(),
+           QStringLiteral("S15.239: closed (ended %1) and reopened, live on \"%2\", an edit sent %3 call(s)")
+               .arg(closedEnded).arg(rig.applier->liveOutput()).arg(edits().size()));
     const bool reapplied = rig.apply();
     rig.library->select(rig.river);
     rig.daemonFake->calls.clear();
@@ -979,9 +999,15 @@ void liveEdits() {
 
     // GOAL: S15.240 -- an edit made while Apply is running is sent once the daemon accepts it.
     // WHY-THIS-SHAPE: the daemon's reply to SetWallpaperWithProperties is held, so the edit is
-    //       provably made while Apply is running.
+    //       provably made while Apply is running. DP-1 is shown another file first, so opening Ocean links
+    //       nothing and the edit can only reach the daemon through the Apply landing.
     // CONTROL: app/daemon/apply_controller.cpp, startLive()'s `sendLive();` deleted (control_batch,
-    //       re-run 2026-10-15) -> red, "S15.240: the edit made during Apply was sent as [] (held 1, landed 1)".
+    //       re-run 2026-10-28) -> red, "S15.240: the edit made during Apply was sent as [] (held 1, landed 1)".
+    rig.daemonFake->screens[rig.daemonFake->outputs.value(QStringLiteral("DP-1"))].path = QStringLiteral("/elsewhere/other.mp4");
+    if (!rig.reread()) {
+        harnessFailure(std::string(goals) + ": S15.240: DP-1 could not be shown another file to start from");
+        return;
+    }
     rig.library->select(rig.ocean);
     rig.daemonFake->hold.insert(QStringLiteral("SetWallpaperWithProperties"));
     rig.applier->apply();
@@ -1030,9 +1056,8 @@ void positionOnTheWire() {
     //       and the set is one the daemon's own rules would show a video with.
     // WHY-THIS-SHAPE: compared as text naming each type, since QVariant's == takes an int for a double;
     //       the daemon cross-check refuses any type but double, bool and string, as the wire does.
-    // CONTROL: app/library/wpx_package.cpp Wallpaper::accept() keeping `value` for a number (control_batch
-    //       2026-10-18, reverted) -> red, "S15.732: Apply sent {..., position.zoom=2(int), ...} (1 call(s)), not
-    //       {..., position.zoom=2(double), ...}", and the S15.733 and S15.734 lines likewise.
+    // CONTROL: app/library/wpx_package.cpp Wallpaper::accept() returning `value` instead of `*number` for a position
+    //       key (control_batch 2026-10-28, reverted) -> red, "S15.732: Apply sent {..., position.zoom=2(int), ...} (1 call(s)), not {..., position.zoom=2(double), ...}".
     const bool applied = rig.apply();
     const QVariantMap sent = lastOf(withProperties(), 3);
     const QVariantMap wantApplied = framed("free", 2.0, -0.25, 0.0);
@@ -1047,8 +1072,8 @@ void positionOnTheWire() {
 
     // GOAL: S15.733 -- while live, a position edit sends SetWallpaperProperties(id, the whole set) with the
     //       new value typed for the daemon: an integer offset as a double, a mode as a string.
-    // CONTROL: the same break -> red, "S15.733: the live edit sent {..., position.y=1(int), position.zoom=2(int),
-    //       ...} (1 call(s)), not {..., position.y=1(double), position.zoom=2(double), ...}".
+    // CONTROL: the same break (2026-10-28) -> red, "S15.733: the live edit sent {..., position.y=1(int), position.zoom=2(int), ...} (1 call(s)), not
+    //       {..., position.y=1(double), position.zoom=2(double), ...}".
     const bool settled = rig.repliesHandled() && rig.daemonDrained();
     rig.daemonFake->calls.clear();
     rig.library->setPropertyValue(QStringLiteral("position.y"), 1);
@@ -1065,8 +1090,8 @@ void positionOnTheWire() {
     //       SetWallpaperWithProperties re-send, the framing kept beside it.
     // WHY-THIS-SHAPE: graded on the call the returned stand-in received, as S15.647 is; the wait's deadline
     //       fails the check.
-    // CONTROL: app/daemon/daemon_client.cpp `emit serviceStarted();` deleted (control_batch 2026-10-18,
-    //       reverted) -> red, "S15.734: after the daemon returned it received {} (0 call(s)), not {..., position=fit(QString), ...}".
+    // CONTROL: app/daemon/daemon_client.cpp `emit serviceStarted();` deleted (control_batch 2026-10-18 and
+    //       2026-10-28, reverted) -> red, "S15.734: after the daemon returned it received {} (0 call(s)), not {..., position=fit(QString), ...}".
     const bool quiet = rig.repliesHandled() && rig.daemonDrained();
     rig.daemonFake->stop();
     const bool gone = waitUntil([&] { return rig.client->state() == DaemonClient::State::Unavailable; }, kWaitMs);
@@ -1107,8 +1132,11 @@ void failureSentences() {
     //       plasmashell gave "WallpaperX has Ocean Waves ready for DP-1, ... Plasma could not run the
     //       script that switches the desktop: The name ... was not provided by any .service files"".
     //       app/daemon/apply_controller.cpp apply() resetting the live link before the bind
-    //       (control_batch, 2026-10-04) -> red, the four daemon rows, e.g. "S15.244: daemon not
-    //       running gave "..." (state 3, live on "" before "DP-1")".
+    //       (control_batch, 2026-10-04) -> red, the four daemon rows; re-run 2026-10-28 -> red, the
+    //       "daemon not running" row only: the bind's GetStatus relinked DP-1 in the other three. So each daemon
+    //       row now stores another speed for DP-1 in the stand-in, which only a rebuilt link adopts; re-run
+    //       (control_batch T7a, reverted) -> red, all four daemon rows, e.g. "S15.244: daemon refusing gave "..."
+    //       (state 3, live on "DP-1" before "DP-1", panel speed 0.5 before 2, marked 1)".
     // COVERAGE-ASSERT: all eight rows ran.
     const QString daemonHalf = QStringLiteral("Ocean Waves was not applied to DP-1. ");
     const QString plasmaHalf = QStringLiteral("WallpaperX has Ocean Waves ready for DP-1, but the desktop there was not switched to WallpaperX. ");
@@ -1147,17 +1175,33 @@ void failureSentences() {
             break;
         }
         const QString liveBefore = rig.applier->liveOutput();
+        // A daemon row stores another speed for DP-1 than the panel shows: a kept link ignores it, a link
+        // rebuilt from the bind's GetStatus adopts it, so the panel tells the two apart.
+        const int dp1 = d.outputs.value(QStringLiteral("DP-1"), -1);
+        const QVariantMap panelBefore = rig.library->propertyValues();
+        const QVariantMap storedBefore = d.screens.value(dp1).properties;
+        const bool marked = !row.daemonAccepted && d.screens.contains(dp1);
+        if (marked) {
+            d.screens[dp1].properties.insert(QStringLiteral("speed"), panelBefore.value(QStringLiteral("speed")).toDouble() == 0.5 ? 2.0 : 0.5);
+        }
         row.arrange();
         const bool finished = rig.apply();
         ++ran;
         const QString liveAfter = rig.applier->liveOutput();
-        const bool liveRight = row.daemonAccepted ? liveAfter == u"DP-1" : liveAfter == liveBefore;
-        expect(finished && rig.applier->applyState() == Progress::Failed && rig.applier->applyMessage() == row.sentence && liveRight,
-               QStringLiteral("S15.244: %1 gave \"%2\" (state %3, live on \"%4\" before \"%5\"), not \"%6\"")
+        const bool liveRight = row.daemonAccepted ? liveAfter == u"DP-1" : liveAfter == liveBefore && marked;
+        const bool panelKept = row.daemonAccepted || rig.library->propertyValues() == panelBefore;
+        expect(finished && rig.applier->applyState() == Progress::Failed && rig.applier->applyMessage() == row.sentence && liveRight && panelKept,
+               QStringLiteral("S15.244: %1 gave \"%2\" (state %3, live on \"%4\" before \"%5\", panel speed %7 before %8, marked %9), not \"%6\"")
                    .arg(QLatin1StringView(row.what), rig.applier->applyMessage())
                    .arg(int(rig.applier->applyState()))
-                   .arg(liveAfter, liveBefore, row.sentence));
+                   .arg(liveAfter, liveBefore, row.sentence)
+                   .arg(rig.library->propertyValues().value(QStringLiteral("speed")).toDouble())
+                   .arg(panelBefore.value(QStringLiteral("speed")).toDouble())
+                   .arg(marked));
         d.release();
+        if (marked) {
+            d.screens[dp1].properties = storedBefore;
+        }
     }
     expect(ran == 8, QStringLiteral("S15.244: %1 of 8 rows ran").arg(ran));
 }
@@ -1288,7 +1332,7 @@ void daemonReturn() {
     //       while the daemon plays the old speed. The wallpaper is named because a restarted daemon may
     //       hold another one on that monitor. The wait's deadline fails the check.
     // CONTROL: control_batch, 2026-10-17, each reverted: app/daemon/daemon_client.cpp, `emit
-    //       serviceStarted();` deleted -> red, "S15.647: after the daemon returned it received [] naming the
+    //       serviceStarted();` deleted (re-run 2026-10-28) -> red, "S15.647: after the daemon returned it received [] naming the
     //       wallpaper and 0 SetWallpaperProperties, the app shows "... is not running.""; app/daemon/
     //       apply_controller.cpp sendLive()'s `if (m_live->sent)` made `if (true)` (re-sent by monitor alone)
     //       -> red, "... received [] naming the wallpaper and 1 SetWallpaperProperties ...".
@@ -1333,7 +1377,7 @@ void daemonReturn() {
     // WHY-THIS-SHAPE: the second restart follows an accepted change, which is the case an app keeping
     //       "what the daemon accepted" across the restart would skip as already sent.
     // CONTROL: app/daemon/apply_controller.cpp, `m_live->sent.reset();` in the serviceStarted handler
-    //       deleted (control_batch, re-run 2026-10-17) -> red, "S15.648: after a restart following an accepted
+    //       deleted (control_batch, re-run 2026-10-17 and 2026-10-28) -> red, "S15.648: after a restart following an accepted
     //       change the daemon received [] naming the wallpaper and 0 SetWallpaperProperties", beside S15.647's.
     const bool drained = rig.repliesHandled() && rig.daemonDrained();
     rig.daemonFake->stop();
@@ -1374,9 +1418,8 @@ void persistenceSignal() {
     // WHY-THIS-SHAPE: the app is idle when the stand-in's status flips -- every reply handled -- so the
     //       signal is the only thing that can make it read GetStatus again; the read is asserted to have
     //       happened. The wait's deadline fails the check.
-    // CONTROL: control_batch, 2026-10-17, each reverted: app/daemon/daemon_client.cpp, the constructor's
-    //       PersistenceChanged connection deleted -> red, "S15.689: after PersistenceChanged announcing a
-    //       failed write the app shows "" (0 status read(s))"; DaemonClient::refresh() returning at once while
+    // CONTROL: control_batch, each reverted: app/daemon/daemon_client.cpp, the constructor's PersistenceChanged
+    //       connection deleted (re-run 2026-10-28) -> red, "S15.689: after PersistenceChanged announcing a failed write the app shows \"\" (0 status read(s))"; (2026-10-17) DaemonClient::refresh() returning at once while
     //       persistence reads "fail" -> red, "S15.689: after PersistenceChanged announcing a cleared failure
     //       the app shows "The WallpaperX service could not save its settings, ...: the disk is full"".
     rig.daemonFake->calls.clear();
@@ -1728,9 +1771,6 @@ void liveAcrossApplies() {
         return;
     }
     FakeDaemon& d = *rig.daemonFake;
-    // Every call an edit made has reached the stand-in, and every reply the app was owed has been
-    // handled, so a resend it made on one has reached the stand-in too.
-    const auto settled = [&] { return rig.daemonDrained() && rig.repliesHandled() && rig.daemonDrained(); };
     const auto edits = [&] { return rig.sent("SetWallpaperProperties"); };
     if (!rig.apply() || rig.applier->applyState() != Progress::Done || rig.applier->liveOutput() != u"DP-1") {
         harnessFailure(std::string(goals) + ": Ocean Waves could not be applied to DP-1 to start from: " +
@@ -1739,17 +1779,16 @@ void liveAcrossApplies() {
     }
     const int dp1 = d.outputs.value(QStringLiteral("DP-1"), -1);
 
-    // GOAL: S15.256 -- an Apply to another screen that fails, at the bind or at the daemon, leaves
-    //       the live link where it was: DP-1 stays live, and an edit then sends exactly one
+    // GOAL: S15.256 -- an Apply to
+    //       HDMI-A-1, which shows nothing, that fails at the bind or at the daemon leaves HDMI-A-1 unlinked
+    //       (live ""), and selecting DP-1 again links it from GetStatus: an edit then sends exactly one
     //       SetWallpaperProperties, to DP-1's id.
-    // WHY-THIS-SHAPE: both failure points, because the link could be dropped before the bind or
-    //       only once the daemon is reached. The count is read once every reply has been handled,
-    //       so a second call the edit caused would have arrived.
-    // CONTROL: app/daemon/apply_controller.cpp, `if (m_live) { m_live.reset(); m_liveError.clear();
-    //       emit liveChanged(); }` put back before `m_applyWallpaper = ...` in apply() (control_batch,
-    //       re-run 2026-10-15) -> red, "S15.256: after an Apply to HDMI-A-1 refused at SetMonitorOutput
-    //       (failed 1), live on "" and an edit on DP-1 sent [], not [0]" and the same at
-    //       SetWallpaperWithProperties.
+    // WHY-THIS-SHAPE: both failure points, because a failed Apply could still link the screen it aimed at.
+    //       The stand-in reports each screen's file, so DP-1's link can only come back
+    //       from GetStatus. The count is read once every reply has been handled.
+    // CONTROL: control_batch: in linkSelected (app/daemon/apply_controller.cpp) the GetStatus
+    //       relink made `return;` -> red, "S15.256: after an Apply to HDMI-A-1 refused at SetMonitorOutput
+    //       (failed 1), live on "" and an edit on DP-1 sent [], not [0]" and the same at SetWallpaperWithProperties.
     struct Refusal {
         const char* at;
         double speed;
@@ -1761,15 +1800,15 @@ void liveAcrossApplies() {
         d.refuse.clear();
         const QString live = rig.applier->liveOutput();
         rig.kscreen->select(QStringLiteral("DP-1"));
-        const bool quiet = settled();
+        const bool quiet = rig.settled();
         d.calls.clear();
         rig.library->setPropertyValue(QStringLiteral("speed"), r.speed);
-        const bool after = settled();
+        const bool after = rig.settled();
         QStringList sent;
         for (const FakeCall& c : edits()) {
             sent.append(c.args.value(0).toString());
         }
-        expect(failed && quiet && after && live == u"DP-1" && sent == QStringList{QString::number(dp1)},
+        expect(failed && quiet && after && live.isEmpty() && sent == QStringList{QString::number(dp1)},
                QStringLiteral("S15.256: after an Apply to HDMI-A-1 refused at %1 (failed %2), live on \"%3\" and an edit on DP-1 "
                               "sent [%4], not [%5]")
                    .arg(QLatin1StringView(r.at)).arg(failed).arg(live, joined(sent)).arg(dp1));
@@ -1783,10 +1822,10 @@ void liveAcrossApplies() {
     rig.kscreen->select(QStringLiteral("HDMI-A-1"));
     const bool moved = rig.apply() && rig.applier->applyState() == Progress::Done;
     const int hdmi = d.outputs.value(QStringLiteral("HDMI-A-1"), -1);
-    const bool quiet = settled();
+    const bool quiet = rig.settled();
     d.calls.clear();
     rig.library->setPropertyValue(QStringLiteral("speed"), 0.5);
-    const bool after = settled();
+    const bool after = rig.settled();
     QStringList sentTo;
     for (const FakeCall& c : edits()) {
         sentTo.append(c.args.value(0).toString());
@@ -1815,7 +1854,7 @@ void liveAcrossApplies() {
     const bool editFirst = waitUntil([&] { return !edits().isEmpty(); }, kWaitMs);
     d.hold.clear();
     d.release();
-    const bool landed = waitUntil([&] { return rig.applier->applyState() != Progress::Working; }, kWaitMs) && settled();
+    const bool landed = waitUntil([&] { return rig.applier->applyState() != Progress::Working; }, kWaitMs) && rig.settled();
     const QStringList calls = wallpaperCalls(d);
     const auto applyCall = std::ranges::find_if(calls, [](const QString& c) { return c.startsWith(u"SetWallpaperWithProperties "); });
     const qsizetype applyAt = applyCall == calls.end() ? -1 : applyCall - calls.begin();
@@ -1823,6 +1862,905 @@ void liveAcrossApplies() {
                !calls.isEmpty() && calls.back().endsWith(QStringLiteral(" 2")),
            QStringLiteral("S15.258: the daemon received [%1]; the last should carry speed 2 (bind held %2, edit first %3, landed %4)")
                .arg(calls.join(QStringLiteral(", "))).arg(bindHeld).arg(editFirst).arg(landed));
+}
+
+// Every SetWallpaperProperties and SetWallpaperWithProperties the daemon stand-in received, as
+// "Member id paused=<true|false|unset> speed=<speed>", sorted: which order two screens' sends leave in is
+// not part of any contract here.
+QStringList pausedCalls(const FakeDaemon& daemon) {
+    QStringList out;
+    for (const FakeCall& c : daemon.calls) {
+        const bool replace = c.member == u"SetWallpaperProperties";
+        if (!replace && c.member != u"SetWallpaperWithProperties") {
+            continue;
+        }
+        const QVariantMap values = c.args.value(replace ? 1 : 3).toMap();
+        const QVariant paused = values.value(QStringLiteral("paused"));
+        out.append(QStringLiteral("%1 %2 paused=%3 speed=%4")
+                       .arg(c.member, c.args.value(replace ? 0 : 2).toString(),
+                            paused.isValid() ? (paused.toBool() ? QStringLiteral("true") : QStringLiteral("false")) : QStringLiteral("unset"),
+                            values.value(QStringLiteral("speed")).toString()));
+    }
+    out.sort();
+    return out;
+}
+
+void selectedScreenEdits() {
+    constexpr const char* goals = "S15.994, S15.995, S15.1014, S15.1072-S15.1075, S15.1079, S15.1083";
+    Rig rig;
+    if (!build(rig, goals, QStringLiteral("selected"))) {
+        return;
+    }
+    FakeDaemon& d = *rig.daemonFake;
+    const QString hdmiName = QStringLiteral("HDMI-A-1");
+    const QString dpName = QStringLiteral("DP-1");
+    const QString pausedKey = QStringLiteral("paused");
+    const QString speedKey = QStringLiteral("speed");
+    const auto shownPaused = [&] { return rig.library->propertyValues().value(pausedKey).toBool(); };
+    const auto shownSpeed = [&] { return rig.library->propertyValues().value(speedKey).toDouble(); };
+    // Ocean on DP-1 at 2x, then on HDMI-A-1 at 0.5x, each set as a draft before its Apply.
+    rig.library->setPropertyValue(speedKey, 2.0);
+    const bool onDp = rig.apply() && rig.applier->applyState() == Progress::Done;
+    rig.kscreen->select(hdmiName);
+    rig.library->setPropertyValue(speedKey, 0.5);
+    const bool onHdmi = rig.apply() && rig.applier->applyState() == Progress::Done;
+    const int dp1 = d.outputs.value(dpName, -1);
+    const int hdmi = d.outputs.value(hdmiName, -1);
+    if (!onDp || !onHdmi || dp1 < 0 || hdmi < 0 || !rig.reread() || rig.client->status().wallpapers.size() != 2) {
+        harnessFailure(std::string(goals) + ": Ocean Waves could not be put on both screens to start from: " +
+                       rig.applier->applyMessage().toStdString());
+        return;
+    }
+    const QString dp = QString::number(dp1);
+    const QString hd = QString::number(hdmi);
+
+    // GOAL: S15.994 -- selecting a screen that shows the open wallpaper links it and shows its own values,
+    //       sending nothing; an edit then goes to that screen's id only, and another screen keeps its value.
+    // WHY-THIS-SHAPE: the two screens hold different speeds, so showing the other screen's value, or the
+    //       last Apply's, is red; "nothing sent" is read once every reply has been handled.
+    // CONTROL: control_batch, app/daemon/apply_controller.cpp linkSelected: the GetStatus relink made
+    //       `return;` -> red, "S15.994: selecting DP-1 linked "" ..."; adoptPropertyValues(...) deleted -> red,
+    //       "S15.994: selecting DP-1 linked "DP-1", showed speed 0.5".
+    d.calls.clear();
+    rig.kscreen->select(dpName);
+    bool quiet = rig.settled();
+    expect(quiet && rig.applier->liveOutput() == dpName && shownSpeed() == 2.0 && pausedCalls(d).isEmpty(),
+           QStringLiteral("S15.994: selecting DP-1 linked \"%1\", showed speed %2 and sent [%3]; expected DP-1, 2, []")
+               .arg(rig.applier->liveOutput()).arg(shownSpeed()).arg(joined(pausedCalls(d))));
+    rig.kscreen->select(hdmiName);
+    quiet = rig.settled();
+    expect(quiet && rig.applier->liveOutput() == hdmiName && shownSpeed() == 0.5 && pausedCalls(d).isEmpty(),
+           QStringLiteral("S15.994: selecting HDMI-A-1 linked \"%1\", showed speed %2 and sent [%3]; expected HDMI-A-1, 0.5, []")
+               .arg(rig.applier->liveOutput()).arg(shownSpeed()).arg(joined(pausedCalls(d))));
+    rig.library->setPropertyValue(speedKey, 1.0);
+    bool afterEdit = rig.settled();
+    const QStringList toHdmi = pausedCalls(d);
+    rig.kscreen->select(dpName);
+    afterEdit = rig.settled() && afterEdit;
+    expect(afterEdit && toHdmi == QStringList{QStringLiteral("SetWallpaperProperties %1 paused=unset speed=1").arg(hd)} && shownSpeed() == 2.0,
+           QStringLiteral("S15.994: a speed edit on HDMI-A-1 sent [%1], and DP-1 then shows speed %2; expected one call to %3, and 2")
+               .arg(joined(toHdmi)).arg(shownSpeed()).arg(hd));
+
+    // GOAL: S15.1072 (D12-a) -- with the open video on both screens, Paused on while DP-1 is selected sends one
+    //       SetWallpaperProperties to DP-1's id only, carrying DP-1's values; HDMI-A-1 is sent nothing and stays playing.
+    // WHY-THIS-SHAPE: the screens hold different speeds, so a send built from the other screen's values is red;
+    //       HDMI-A-1's paused is read from the stand-in, where a send to it would have landed.
+    // CONTROL: app/daemon/apply_controller.cpp sendLive()'s `if (values == m_live->sent)` made `if (true)` (control_batch
+    //       T6a, reverted) -> red, "D12-a: Paused on with DP-1 selected sent [] ...".
+    const QString other = QStringLiteral("/elsewhere/other.mp4");
+    d.calls.clear();
+    rig.library->setPropertyValue(pausedKey, true);
+    bool sent = rig.settled();
+    const auto hdmiPaused = [&] { return d.screens.value(hdmi).properties.value(pausedKey).toBool(); };
+    expect(sent && pausedCalls(d) == QStringList{QStringLiteral("SetWallpaperProperties %1 paused=true speed=2").arg(dp)} && !hdmiPaused() &&
+               shownPaused(),
+           QStringLiteral("D12-a: Paused on with DP-1 selected sent [%1], left HDMI-A-1 paused %2 and shows %3; expected only "
+                          "[SetWallpaperProperties %4 paused=true speed=2], false and true")
+               .arg(joined(pausedCalls(d))).arg(hdmiPaused()).arg(shownPaused()).arg(dp));
+
+    // GOAL: S15.1073 (D12-b) -- with DP-1 paused and HDMI-A-1 playing, selecting each shows that screen's own Paused and speed,
+    //       and sends nothing.
+    // CONTROL: app/daemon/apply_controller.cpp linkSelected()'s `m_library.adoptPropertyValues(status.wallpapers.value(*id).properties);`
+    //       deleted (control_batch T6a, reverted) -> red, "D12-b: selecting HDMI-A-1 showed paused 1, speed 1 ..."
+    //       (S15.994 goes red under the same break).
+    d.calls.clear();
+    rig.kscreen->select(hdmiName);
+    quiet = rig.settled();
+    const bool hdmiOwn = !shownPaused() && shownSpeed() == 1.0 && rig.applier->liveOutput() == hdmiName;
+    const QString hdmiSeen = QStringLiteral("paused %1, speed %2").arg(shownPaused()).arg(shownSpeed());
+    rig.kscreen->select(dpName);
+    quiet = rig.settled() && quiet;
+    const bool dpOwn = shownPaused() && shownSpeed() == 2.0 && rig.applier->liveOutput() == dpName;
+    expect(quiet && hdmiOwn && dpOwn && pausedCalls(d).isEmpty(),
+           QStringLiteral("D12-b: selecting HDMI-A-1 showed %1, then DP-1 paused %2, speed %3, sending [%4]; expected HDMI-A-1's "
+                          "false and 1, DP-1's true and 2, and []").arg(hdmiSeen).arg(shownPaused()).arg(shownSpeed()).arg(joined(pausedCalls(d))));
+    rig.library->setPropertyValue(pausedKey, false);
+    quiet = rig.settled();
+
+    // GOAL: S15.1014 -- while a screen is linked the switch shows that screen's own Paused value, not another
+    //       screen's, and an unrelated live edit carries that value.
+    // WHY-THIS-SHAPE: DP-1 (linked) plays while HDMI-A-1 is paused behind the app; the edit is graded on the wire,
+    //       where a false record shows.
+    // CONTROL: app/daemon/apply_controller.cpp linkSelected()'s already-linked `return;` preceded by an adopt of
+    //       HDMI-A-1's GetStatus properties (control_batch T6a, reverted) -> red, "S15.1014: with DP-1 linked and playing,
+    //       HDMI-A-1 paused, the switch shows 1 ...".
+    d.screens[hdmi].properties.insert(pausedKey, true);
+    bool read = rig.reread();
+    const bool linkedOwn = !shownPaused();
+    d.calls.clear();
+    rig.library->setPropertyValue(speedKey, 1.0);
+    bool after = rig.settled();
+    expect(quiet && read && linkedOwn,
+           QStringLiteral("S15.1014: with DP-1 linked and playing, HDMI-A-1 paused, the switch shows %1; expected DP-1's own false").arg(!linkedOwn));
+    expect(read && after && pausedCalls(d) == QStringList{QStringLiteral("SetWallpaperProperties %1 paused=false speed=1").arg(dp)},
+           QStringLiteral("S15.1014: a speed edit on playing DP-1, HDMI-A-1 paused, sent [%1]; expected paused=false with it").arg(joined(pausedCalls(d))));
+
+    // GOAL: S15.1079 (D12-h) -- Reset to defaults clears Paused, and the resulting send goes to the linked screen only.
+    // WHY-THIS-SHAPE: DP-1 is paused first, so a Reset that kept Paused shows true and sends paused=true;
+    //       HDMI-A-1 is paused behind the app, so a send reaching it would turn it off.
+    // CONTROL: app/library/library_manager.cpp resetPropertyValues() made to keep `paused` in m_edits (control_batch
+    //       T6a, reverted) -> red, "D12-h: after Reset the switch shows 1 and sent [... paused=true ...]".
+    rig.library->setPropertyValue(pausedKey, true);
+    quiet = rig.settled();
+    d.calls.clear();
+    rig.library->resetPropertyValues();
+    after = rig.settled();
+    const QStringList resetSent = pausedCalls(d);
+    expect(quiet && after && !shownPaused() && resetSent.size() == 1 &&
+               resetSent.value(0).startsWith(QStringLiteral("SetWallpaperProperties %1 ").arg(dp)) && !resetSent.value(0).contains(u"paused=true") &&
+               hdmiPaused(),
+           QStringLiteral("D12-h: after Reset the switch shows %1 and sent [%2], HDMI-A-1 paused %3; expected false, one call to %4 "
+                          "without paused=true, and HDMI-A-1 still paused").arg(shownPaused()).arg(joined(resetSent)).arg(hdmiPaused()).arg(dp));
+
+    // GOAL: S15.1083 (D12) -- a refused Paused change shows as the live error, naming the screen.
+    // CONTROL: app/daemon/apply_controller.cpp sendTo()'s error made `QString()` whatever the reply (control_batch T6a,
+    //       reverted) -> red, "D12: a refused Paused on left the live error \"\" ...".
+    d.refuse.insert(QStringLiteral("SetWallpaperProperties"), {QStringLiteral("org.freedesktop.DBus.Error.InvalidArgs"), QStringLiteral("no")});
+    rig.library->setPropertyValue(pausedKey, true);
+    after = rig.settled();
+    d.refuse.clear();
+    const QString refusal = rig.applier->liveError();
+    expect(after && refusal.contains(dpName),
+           QStringLiteral("D12: a refused Paused on left the live error \"%1\"; expected one naming DP-1").arg(refusal));
+    rig.library->setPropertyValue(pausedKey, false);
+    quiet = rig.settled();
+
+    // GOAL: S15.995 -- with no screen showing the open video, Paused is a draft: nothing is sent, and the next
+    //       Apply carries it.
+    // CONTROL: app/daemon/apply_controller.cpp apply()'s `const QVariantMap values = m_library.propertyValues();` made
+    //       an empty map (control_batch T6a, reverted) -> red, "S15.995: Paused on River, shown nowhere, sent [] and the Apply sent
+    //       [SetWallpaperProperties 0 paused=true speed=1,SetWallpaperWithProperties 0 paused=unset speed=]".
+    if (!rig.library->select(rig.river)) {
+        harnessFailure(std::string(goals) + ": River could not be opened");
+        return;
+    }
+    quiet = rig.settled() && quiet;
+    d.calls.clear();
+    rig.library->setPropertyValue(pausedKey, true);
+    after = rig.settled();
+    const QStringList draftSent = pausedCalls(d);
+    const bool applied = rig.apply() && rig.applier->applyState() == Progress::Done && rig.settled();
+    const QStringList applySent = pausedCalls(d);
+    expect(quiet && after && applied && draftSent.isEmpty() && applySent.size() == 1 &&
+               applySent.value(0).startsWith(QStringLiteral("SetWallpaperWithProperties %1 paused=true").arg(dp)),
+           QStringLiteral("S15.995: Paused on River, shown nowhere, sent [%1] and the Apply sent [%2]; expected [] and paused=true to %3")
+               .arg(joined(draftSent), joined(applySent), dp));
+
+    // GOAL: S15.1074 (D12-c) -- a screen that does not show the open wallpaper shows its declared defaults, coming from a
+    //       linked screen with other values and from another unlinked screen with a draft; nothing is sent.
+    // WHY-THIS-SHAPE: River is linked on DP-1 paused, and HDMI-A-1 then holds a speed-2 draft, so keeping either
+    //       screen's values is red; the defaults are River's own declared ones, compared as a whole map.
+    // CONTROL: app/daemon/apply_controller.cpp linkSelected()'s `fresh` made always false (control_batch T6a, reverted)
+    //       -> red, "D12-c: HDMI-A-1, coming from linked DP-1, showed {... paused=true ...}".
+    const QVariantMap defaults = rig.library->selectedWallpaper().defaultValues();
+    const auto shown = [&] { return rig.library->propertyValues(); };
+    d.calls.clear();
+    rig.kscreen->select(hdmiName);
+    quiet = rig.settled();
+    const QVariantMap fromLinked = shown();
+    rig.library->setPropertyValue(speedKey, 2.0);
+    d.screens[dp1].path = other;
+    read = rig.reread();
+    rig.kscreen->select(dpName);
+    quiet = rig.settled() && quiet;
+    const QVariantMap fromDraft = shown();
+    expect(applied && quiet && read && fromLinked == defaults && fromDraft == defaults && rig.applier->liveOutput().isEmpty() && pausedCalls(d).isEmpty(),
+           QStringLiteral("D12-c: HDMI-A-1, coming from linked DP-1, showed %1; DP-1, showing another file, coming from HDMI-A-1's "
+                          "draft, showed %2 (live \"%3\", sent [%4]); expected the defaults %5 both times and nothing sent")
+               .arg(describeMap(fromLinked), describeMap(fromDraft), rig.applier->liveOutput(), joined(pausedCalls(d)), describeMap(defaults)));
+
+    // GOAL: S15.1075 (D12-d; the KScreen-rename case is not graded here) -- a draft on an unlinked selected screen survives status reads and a failed Apply, and the next
+    //       Apply sends it; leaving the screen and coming back shows the defaults.
+    // CONTROL: app/daemon/apply_controller.cpp linkSelected()'s `fresh` made always true (control_batch T6a, reverted)
+    //       -> red, "D12-d: the draft speed 0.5 on DP-1 became 1 ...".
+    rig.library->setPropertyValue(speedKey, 0.5);
+    read = rig.reread() && rig.reread();
+    d.refuse.insert(QStringLiteral("SetWallpaperWithProperties"), {QStringLiteral("org.freedesktop.DBus.Error.InvalidArgs"), QStringLiteral("no")});
+    const bool refused = rig.apply() && rig.applier->applyState() == Progress::Failed;
+    d.refuse.clear();
+    read = rig.settled() && rig.reread() && read;
+    const double kept = shownSpeed();
+    d.calls.clear();
+    const bool draftApplied = rig.apply() && rig.applier->applyState() == Progress::Done && rig.settled();
+    const auto applies = rig.sent("SetWallpaperWithProperties");
+    const double appliedSpeed = applies.isEmpty() ? -1 : applies.back().args.value(3).toMap().value(speedKey).toDouble();
+    expect(read && refused && draftApplied && kept == 0.5 && applies.size() == 1 && appliedSpeed == 0.5,
+           QStringLiteral("D12-d: the draft speed 0.5 on DP-1 became %1 after reads and a failed Apply (refused %2, read %3), "
+                          "and the next Apply sent speed %4 in %5 call(s); expected 0.5 and 0.5 in one")
+               .arg(kept).arg(refused).arg(read).arg(appliedSpeed).arg(applies.size()));
+    d.screens[dp1].path = other;
+    read = rig.reread() && rig.applier->liveOutput().isEmpty();
+    rig.library->setPropertyValue(speedKey, 2.0);
+    rig.kscreen->select(hdmiName);
+    quiet = rig.settled();
+    rig.kscreen->select(dpName);
+    quiet = rig.settled() && quiet;
+    expect(read && quiet && shown() == defaults,
+           QStringLiteral("D12-d: leaving DP-1's draft and coming back showed %1 (unlinked %2); expected the defaults %3")
+               .arg(describeMap(shown())).arg(read).arg(describeMap(defaults)));
+}
+
+// Puts Ocean Waves on DP-1 at 2x and HDMI-A-1 at 0.5x, then selects DP-1 and links it; false on a harness fault.
+bool oceanOnBoth(Rig& rig, int& dp1, int& hdmi) {
+    const QString speedKey = QStringLiteral("speed");
+    rig.library->setPropertyValue(speedKey, 2.0);
+    const bool onDp = rig.apply() && rig.applier->applyState() == Progress::Done;
+    rig.kscreen->select(QStringLiteral("HDMI-A-1"));
+    rig.library->setPropertyValue(speedKey, 0.5);
+    const bool onHdmi = rig.apply() && rig.applier->applyState() == Progress::Done;
+    rig.kscreen->select(QStringLiteral("DP-1"));
+    dp1 = rig.daemonFake->outputs.value(QStringLiteral("DP-1"), -1);
+    hdmi = rig.daemonFake->outputs.value(QStringLiteral("HDMI-A-1"), -1);
+    return onDp && onHdmi && dp1 >= 0 && hdmi >= 0 && rig.reread() && rig.applier->liveOutput() == u"DP-1";
+}
+
+// Edits queued behind a send, and links held back while a send or this app's own Apply runs.
+void linkHandOver() {
+    constexpr const char* goals = "S15.1015, S15.1082";
+    Rig rig;
+    if (!build(rig, goals, QStringLiteral("handover"))) {
+        return;
+    }
+    FakeDaemon& d = *rig.daemonFake;
+    const QString hdmiName = QStringLiteral("HDMI-A-1");
+    const QString speedKey = QStringLiteral("speed");
+    const QString other = QStringLiteral("/elsewhere/other.mp4");
+    const auto shownSpeed = [&] { return rig.library->propertyValues().value(speedKey).toDouble(); };
+    const QString volumeKey = QStringLiteral("volume");
+    const auto live = [&] { return rig.applier->liveOutput(); };
+    const auto shownVolume = [&] { return rig.library->propertyValues().value(volumeKey).toDouble(); };
+    // Every SetWallpaper* call since the log was cleared, as "Member id volume=v", sorted.
+    const auto volumeCalls = [&] {
+        QStringList out;
+        for (const FakeCall& c : d.calls) {
+            const bool replace = c.member == u"SetWallpaperProperties";
+            if (replace || c.member == u"SetWallpaperWithProperties") {
+                out.append(QStringLiteral("%1 %2 volume=%3").arg(c.member, c.args.value(replace ? 0 : 2).toString(),
+                                                                c.args.value(replace ? 1 : 3).toMap().value(volumeKey).toString()));
+            }
+        }
+        out.sort();
+        return out;
+    };
+    int dp1 = -1;
+    int hdmi = -1;
+    if (!oceanOnBoth(rig, dp1, hdmi)) {
+        harnessFailure(std::string(goals) + ": Ocean Waves could not be put on both screens with DP-1 linked to start from");
+        return;
+    }
+    const QString dp = QString::number(dp1);
+    const QString hd = QString::number(hdmi);
+
+    // GOAL: S15.1082 (D11 c1-3) -- with a send to DP-1 in flight, selecting HDMI-A-1 (showing Ocean) links it at once with its own
+    //       values, and an edit made then reaches HDMI-A-1 and survives the following read. S15.1015 -- the screen
+    //       left still gets the last value set there.
+    // WHY-THIS-SHAPE: SetWallpaperProperties is held, so the second DP-1 edit provably queues, and the selection and
+    //       the HDMI-A-1 edit provably happen while DP-1's send is in flight; the screen left is graded on the wire.
+    // CONTROL: app/daemon/apply_controller.cpp, control_batch T6a, each reverted: sendTo()'s reply
+    //       `else if (next && next->values != next->live.sent)` made `else if (false)` -> red, "S15.1015: edits on DP-1 then
+    //       HDMI-A-1 ... sent [...]"; linkSelected()'s `m_sending.constFind(*monitor)` made to find any screen's send
+    //       -> red, "c1-3: with a send to DP-1 in flight, selecting HDMI-A-1 linked \"\" ...".
+    d.calls.clear();
+    d.hold.insert(QStringLiteral("SetWallpaperProperties"));
+    rig.library->setPropertyValue(volumeKey, 0.25);
+    const bool firstHeld = waitUntil([&] { return d.held.size() == 1; }, kWaitMs);
+    rig.library->setPropertyValue(volumeKey, 0.75);
+    rig.kscreen->select(hdmiName);
+    const QString liveDuring = live();
+    const double speedDuring = shownSpeed();
+    rig.library->setPropertyValue(volumeKey, 0.6);
+    const bool drained = rig.daemonDrained();
+    const qsizetype heldDuring = d.held.size();
+    d.hold.clear();
+    d.release();
+    const bool linked = rig.settled() && rig.reread();
+    expect(firstHeld && drained && liveDuring == hdmiName && speedDuring == 0.5 && heldDuring == 2,
+           QStringLiteral("c1-3: with a send to DP-1 in flight, selecting HDMI-A-1 linked \"%1\" showing speed %2 (held %3, first held %4); "
+                          "expected HDMI-A-1 at once, 0.5, and its edit sent beside DP-1's (2 held)")
+               .arg(liveDuring).arg(speedDuring).arg(heldDuring).arg(firstHeld));
+    QStringList leftWith{QStringLiteral("SetWallpaperProperties %1 volume=0.25").arg(dp), QStringLiteral("SetWallpaperProperties %1 volume=0.75").arg(dp),
+                         QStringLiteral("SetWallpaperProperties %1 volume=0.6").arg(hd)};
+    leftWith.sort();
+    expect(linked && volumeCalls() == leftWith && live() == hdmiName && shownVolume() == 0.6,
+           QStringLiteral("S15.1015: edits on DP-1 then HDMI-A-1, around a held send, sent [%1], left live on \"%2\" showing volume %3; "
+                          "expected [%4], HDMI-A-1 and 0.6").arg(joined(volumeCalls()), live()).arg(shownVolume()).arg(joined(leftWith)));
+
+    // GOAL: S15.1015 -- an edit queued behind a send is dropped when the link ends because the screen shows another
+    //       wallpaper: it would land on that wallpaper.
+    // CONTROL: app/daemon/apply_controller.cpp followStatus()'s `inFlight.next.reset();` deleted (control_batch
+    //       T6a, reverted) -> red, "S15.1015: with HDMI-A-1 found showing another file while an edit was queued, it was sent
+    //       [SetWallpaperProperties 1 volume=0.3,SetWallpaperProperties 1 volume=0.4] (live \"\"); expected only the first edit".
+    d.calls.clear();
+    d.hold.insert(QStringLiteral("SetWallpaperProperties"));
+    rig.library->setPropertyValue(volumeKey, 0.3);
+    const bool secondHeld = waitUntil([&] { return d.held.size() == 1; }, kWaitMs);
+    rig.library->setPropertyValue(volumeKey, 0.4);
+    d.screens[hdmi].path = other;
+    const bool otherRead = rig.readLanded();
+    const QString liveOther = live();
+    d.hold.clear();
+    d.release();
+    const bool quiet = rig.settled();
+    expect(secondHeld && otherRead && quiet && liveOther.isEmpty() &&
+               volumeCalls() == QStringList{QStringLiteral("SetWallpaperProperties %1 volume=0.3").arg(hd)},
+           QStringLiteral("S15.1015: with HDMI-A-1 found showing another file while an edit was queued, it was sent [%1] "
+                          "(live \"%2\"); expected only the first edit").arg(joined(volumeCalls()), liveOther));
+
+    // GOAL: S15.1015 -- no link forms from a read during this app's own Apply of the open wallpaper to the selected
+    //       screen, so the edits made meanwhile are not replaced, and they reach the screen once the Apply lands.
+    //       D12-e -- HDMI-A-1's link ended above, so the Apply carries the defaults (volume 1), not 0.4.
+    // WHY-THIS-SHAPE: the Apply's SetWallpaperWithProperties is held, and the stand-in shows Ocean on HDMI-A-1 from
+    //       its arrival, so the read provably shows the wallpaper there while the Apply runs.
+    // CONTROL: app/daemon/apply_controller.cpp linkSelected()'s `if (applying) {` made `if (false) {` (control_batch T6a,
+    //       reverted) -> red, "S15.1015: a read during this app's Apply of Ocean to HDMI-A-1 (held 1, read 1) linked \"HDMI-A-1\" ...".
+    d.calls.clear();
+    d.hold.insert(QStringLiteral("SetWallpaperWithProperties"));
+    rig.applier->apply();
+    const bool applyHeld = waitUntil([&] { return !d.held.isEmpty(); }, kWaitMs);
+    rig.library->setPropertyValue(volumeKey, 0.9);
+    const bool readDuring = rig.readLanded();
+    const QString liveApplying = live();
+    const double volumeApplying = shownVolume();
+    d.hold.clear();
+    d.release();
+    const bool landed = waitUntil([&] { return rig.applier->applyState() != Progress::Working; }, kWaitMs) && rig.settled();
+    expect(applyHeld && readDuring && liveApplying.isEmpty() && volumeApplying == 0.9,
+           QStringLiteral("S15.1015: a read during this app's Apply of Ocean to HDMI-A-1 (held %1, read %2) linked \"%3\" and showed "
+                          "volume %4; expected \"\" and the 0.9 set meanwhile").arg(applyHeld).arg(readDuring).arg(liveApplying).arg(volumeApplying));
+    const QStringList applied{QStringLiteral("SetWallpaperProperties %1 volume=0.9").arg(hd),
+                              QStringLiteral("SetWallpaperWithProperties %1 volume=1").arg(hd)};
+    expect(landed && live() == hdmiName && volumeCalls() == applied,
+           QStringLiteral("S15.1015: the Apply to HDMI-A-1 with an edit made meanwhile sent [%1] and left live on \"%2\"; expected [%3]")
+               .arg(joined(volumeCalls()), live(), joined(applied)));
+
+    // GOAL: S15.1015 -- after a failed Apply, a selected screen that already shows the open wallpaper links.
+    // WHY-THIS-SHAPE: refuseAt answers the held call after the stand-in applied it, so the read taken during the
+    //       Apply shows Ocean on HDMI-A-1; no read follows the failure, so only the Apply's own end can link.
+    // CONTROL: app/daemon/apply_controller.cpp settleApply()'s `linkSelected();` deleted (control_batch
+    //       T6a, reverted) -> red, "S15.1015: after a failed Apply to HDMI-A-1, which shows Ocean (unlinked first 1, held 1, read 1), it ended 3
+    //       with live \"\"; expected Failed and HDMI-A-1".
+    d.screens[hdmi].path = other;
+    const bool unlinked = rig.reread() && live().isEmpty();
+    d.hold.insert(QStringLiteral("SetWallpaperWithProperties"));
+    rig.applier->apply();
+    const bool failHeld = waitUntil([&] { return !d.held.isEmpty(); }, kWaitMs);
+    const bool readBefore = rig.readLanded() && live().isEmpty();
+    d.hold.clear();
+    d.refuseAt(0, QStringLiteral("org.freedesktop.DBus.Error.InvalidArgs"), QStringLiteral("no"));
+    const bool failed = waitUntil([&] { return rig.applier->applyState() != Progress::Working; }, kWaitMs) && rig.daemonDrained();
+    expect(unlinked && failHeld && readBefore && failed && rig.applier->applyState() == Progress::Failed && live() == hdmiName,
+           QStringLiteral("S15.1015: after a failed Apply to HDMI-A-1, which shows Ocean (unlinked first %1, held %2, read %3), it ended "
+                          "%4 with live \"%5\"; expected Failed and HDMI-A-1").arg(unlinked).arg(failHeld).arg(readBefore)
+               .arg(int(rig.applier->applyState())).arg(live()));
+}
+
+// Coming back to a screen while this app's Apply to it runs, and an Apply landing while another screen is selected.
+void applyReturn() {
+    constexpr const char* goals = "S15.1077, S15.1078, S15.1081";
+    Rig rig;
+    if (!build(rig, goals, QStringLiteral("applyreturn"))) {
+        return;
+    }
+    FakeDaemon& d = *rig.daemonFake;
+    const QString dpName = QStringLiteral("DP-1");
+    const QString hdmiName = QStringLiteral("HDMI-A-1");
+    const QString speedKey = QStringLiteral("speed");
+    const auto shownSpeed = [&] { return rig.library->propertyValues().value(speedKey).toDouble(); };
+    const auto live = [&] { return rig.applier->liveOutput(); };
+    int dp1 = -1;
+    int hdmi = -1;
+    if (!oceanOnBoth(rig, dp1, hdmi)) {
+        harnessFailure(std::string(goals) + ": Ocean Waves could not be put on both screens with DP-1 linked to start from");
+        return;
+    }
+    const QString dp = QString::number(dp1);
+    const QString hd = QString::number(hdmi);
+
+    // GOAL: S15.1077 (D12-f) -- during this app's Apply of the open wallpaper to DP-1, selecting HDMI-A-1 and then
+    //       DP-1 again shows the values the Apply sent, and an edit made then reaches DP-1 once the Apply lands.
+    // WHY-THIS-SHAPE: the Apply's SetWallpaperWithProperties is held, so both selections provably land while it runs;
+    //       the Apply sends DP-1's speed 2 and HDMI-A-1 holds 0.5, so carrying HDMI-A-1's values back is red, as is the defaults' speed 1.
+    // CONTROL: app/daemon/apply_controller.cpp linkSelected()'s `draft(m_applyValues);` made `draft();` (control_batch
+    //       T6a, reverted) -> red, "S15.1077: back on DP-1 during its Apply the controls showed speed 1 ...".
+    d.calls.clear();
+    d.hold.insert(QStringLiteral("SetWallpaperWithProperties"));
+    rig.applier->apply();
+    const bool held = waitUntil([&] { return !d.held.isEmpty(); }, kWaitMs);
+    rig.kscreen->select(hdmiName);
+    const bool away = rig.daemonDrained() && live() == hdmiName && shownSpeed() == 0.5;
+    rig.kscreen->select(dpName);
+    const double back = shownSpeed();
+    rig.library->setPropertyValue(speedKey, 1.0);
+    d.hold.clear();
+    d.release();
+    const bool landed = waitUntil([&] { return rig.applier->applyState() != Progress::Working; }, kWaitMs) && rig.settled();
+    const QStringList sent = pausedCalls(d);
+    const QString edit = QStringLiteral("SetWallpaperProperties %1 paused=unset speed=1").arg(dp);
+    expect(held && away && landed && back == 2.0 && sent.contains(edit) && live() == dpName && shownSpeed() == 1.0,
+           QStringLiteral("S15.1077: back on DP-1 during its Apply the controls showed speed %1 (held %2, HDMI-A-1 linked at 0.5 %3); "
+                          "after it landed it sent [%4], live \"%5\"; expected 2, then [%6] among them and DP-1")
+               .arg(back).arg(held).arg(away).arg(joined(sent), live(), edit));
+
+    // GOAL: S15.1078 (D12-g) -- an Apply that lands while another screen is selected neither links nor changes the
+    //       controls, and the link the selected screen holds is kept.
+    // WHY-THIS-SHAPE: the Apply to DP-1 is held while HDMI-A-1 is selected and edited, so it provably lands after;
+    //       the edit is sent first, so a landing that relinked would leave live on DP-1.
+    // CONTROL: app/daemon/apply_controller.cpp startLive()'s selection test made `if (false)` (control_batch T6a,
+    //       reverted) -> red, "S15.1078: an Apply to DP-1 landing with HDMI-A-1 selected ... sent [...SetWallpaperProperties 0 ...".
+    //       The end state alone cannot show it: the Apply's own end relinks the selected screen.
+    d.calls.clear();
+    d.hold.insert(QStringLiteral("SetWallpaperWithProperties"));
+    rig.applier->apply();
+    const bool heldAgain = waitUntil([&] { return !d.held.isEmpty(); }, kWaitMs);
+    rig.kscreen->select(hdmiName);
+    rig.library->setPropertyValue(speedKey, 2.0);
+    const bool edited = rig.daemonDrained();
+    d.hold.clear();
+    d.release();
+    const bool landedAway = waitUntil([&] { return rig.applier->applyState() != Progress::Working; }, kWaitMs) && rig.settled();
+    const bool noneToDp = std::ranges::none_of(pausedCalls(d), [&](const QString& c) { return c.startsWith(QStringLiteral("SetWallpaperProperties %1 ").arg(dp)); });
+    expect(heldAgain && edited && landedAway && live() == hdmiName && shownSpeed() == 2.0 && noneToDp &&
+               pausedCalls(d).contains(QStringLiteral("SetWallpaperProperties %1 paused=unset speed=2").arg(hd)),
+           QStringLiteral("S15.1078: an Apply to DP-1 landing with HDMI-A-1 selected left live on \"%1\" showing speed %2 and sent [%3] "
+                          "(held %4); expected HDMI-A-1, 2 and only its edit to %5, nothing to DP-1").arg(live()).arg(shownSpeed()).arg(joined(pausedCalls(d)))
+               .arg(heldAgain).arg(hd));
+
+    // GOAL: S15.1081 (D11 c1-2) -- values queued on a link that has ended are not sent once an Apply to that screen
+    //       has started: they would land on the wallpaper the Apply put there.
+    // WHY-THIS-SHAPE: the first edit's send is held so the second provably queues behind it; opening River ends the
+    //       link while HDMI-A-1 still shows Ocean, so without the Apply the queue would rightly be sent (r1-4). River's
+    //       SetWallpaperWithProperties stays held while the edit's reply is released alone, so no status read showing
+    //       River can drop the queue instead (that is followStatus's guard, graded in linkHandOver).
+    // CONTROL: app/daemon/apply_controller.cpp apply()'s `inFlight.next.reset();` at the Apply's start deleted
+    //       (control_batch T6a; re-run T7a beside the later drop at success, reverted) -> red, "S15.1081: an edit queued
+    //       on HDMI-A-1 before River's Apply there sent [...speed=0.5,...speed=1,SetWallpaperWithProperties 1 ...]".
+    d.calls.clear();
+    d.hold = {QStringLiteral("SetWallpaperProperties"), QStringLiteral("SetWallpaperWithProperties")};
+    rig.library->setPropertyValue(speedKey, 0.5);
+    const bool firstHeld = waitUntil([&] { return d.held.size() == 1; }, kWaitMs);
+    rig.library->setPropertyValue(speedKey, 1.0);
+    const bool river = rig.library->select(rig.river);
+    rig.applier->apply();
+    const bool riverSent = waitUntil([&] { return d.held.size() == 2; }, kWaitMs) && rig.daemonDrained();
+    d.releaseAt(0);
+    const bool editReplied = rig.repliesHandled() && rig.daemonDrained();
+    const QStringList afterRiver = pausedCalls(d);
+    d.hold.clear();
+    d.release();
+    const bool riverDone = waitUntil([&] { return rig.applier->applyState() != Progress::Working; }, kWaitMs) && rig.settled() && editReplied;
+    const auto propertySends = std::ranges::count_if(afterRiver, [](const QString& c) { return c.startsWith(u"SetWallpaperProperties "); });
+    expect(firstHeld && river && riverSent && riverDone && propertySends == 1,
+           QStringLiteral("S15.1081: an edit queued on HDMI-A-1 before River's Apply there sent [%1] (held %2, River opened %3, "
+                          "applied %4); expected only the first SetWallpaperProperties").arg(joined(afterRiver)).arg(firstHeld).arg(river).arg(riverDone));
+}
+
+// Re-selecting a screen or a wallpaper while a send or this app's Apply is still in flight.
+void applyReopen() {
+    constexpr const char* goals = "S15.1130-S15.1133";
+    Rig rig;
+    if (!build(rig, goals, QStringLiteral("applyreopen"))) {
+        return;
+    }
+    FakeDaemon& d = *rig.daemonFake;
+    const QString dpName = QStringLiteral("DP-1");
+    const QString hdmiName = QStringLiteral("HDMI-A-1");
+    const QString speedKey = QStringLiteral("speed");
+    const QString withProps = QStringLiteral("SetWallpaperWithProperties");
+    const QString props = QStringLiteral("SetWallpaperProperties");
+    const auto shownSpeed = [&] { return rig.library->propertyValues().value(speedKey).toDouble(); };
+    const auto live = [&] { return rig.applier->liveOutput(); };
+    const auto applied = [&] { return waitUntil([&] { return rig.applier->applyState() != Progress::Working; }, kWaitMs) && rig.settled(); };
+    int dp1 = -1;
+    int hdmi = -1;
+    if (!oceanOnBoth(rig, dp1, hdmi)) {
+        harnessFailure(std::string(goals) + ": Ocean Waves could not be put on both screens with DP-1 linked to start from");
+        return;
+    }
+    // Every SetWallpaper* call to DP-1 logged from index `from` on, in arrival order, as "Member speed".
+    const auto toDp = [&](qsizetype from) {
+        QStringList out;
+        for (qsizetype i = from; i < d.calls.size(); ++i) {
+            const FakeCall& c = d.calls.at(i);
+            const bool replace = c.member == props;
+            if ((replace || c.member == withProps) && c.args.value(replace ? 0 : 2).toInt() == dp1) {
+                out.append(c.member + u' ' + c.args.value(replace ? 1 : 3).toMap().value(speedKey).toString());
+            }
+        }
+        return out;
+    };
+
+    // GOAL: S15.1133 (D11 c1-3, second sentence) -- re-selecting a screen whose send for the open wallpaper is
+    //       still in flight shows the values that send sets, not what the last status read holds there.
+    // WHY-THIS-SHAPE: the send is held, so GetStatus provably still says speed 2 on DP-1 while it carries 0.5; going
+    //       via HDMI-A-1 makes the return a real relink, which an unchanged selection would not be.
+    // CONTROL: app/daemon/apply_controller.cpp linkSelected()'s in-flight branch adopting the status's properties
+    //       instead of `latest.values` (control_batch T7a, reverted) -> red, "S15.1133: back on DP-1 ... showed speed 2 ...".
+    d.calls.clear();
+    d.hold.insert(props);
+    rig.library->setPropertyValue(speedKey, 0.5);
+    const bool sendHeld = waitUntil([&] { return d.held.size() == 1; }, kWaitMs);
+    rig.kscreen->select(hdmiName);
+    const bool away = rig.daemonDrained() && live() == hdmiName;
+    rig.kscreen->select(dpName);
+    const double back = shownSpeed();
+    const QString backLive = live();
+    d.hold.clear();
+    d.release();
+    const bool sendDone = rig.settled();
+    expect(sendHeld && away && sendDone && back == 0.5 && backLive == dpName,
+           QStringLiteral("S15.1133: back on DP-1 while its send of speed 0.5 was in flight the controls showed speed %1 linked \"%2\" "
+                          "(held %3, away %4, done %5); expected 0.5 and DP-1").arg(back).arg(backLive).arg(sendHeld).arg(away).arg(sendDone));
+
+    // GOAL: S15.1130 (D13-e) -- during this app's Apply of Ocean to DP-1 at a non-default speed, opening River and
+    //       then Ocean again shows the Apply's values, and nothing sends the defaults to DP-1 once the Apply lands.
+    // WHY-THIS-SHAPE: the Apply's SetWallpaperWithProperties is held so both openings land while it runs; the library
+    //       drops Ocean's edits when River opens, so a draft keyed on the screen alone comes back at the defaults
+    //       (speed 1) and the landing link then sends them. Selecting another screen instead is S15.1077.
+    // CONTROL: app/daemon/apply_controller.cpp linkSelected()'s `DraftFor selected{connector, open.filePath}` keyed on
+    //       the connector alone (control_batch T7a, reverted) -> red, "S15.1130: reopened during its Apply ... speed 1 ...".
+    d.calls.clear();
+    d.hold.insert(withProps);
+    rig.applier->apply();
+    const bool applyHeld = waitUntil([&] { return !d.held.isEmpty(); }, kWaitMs);
+    const qsizetype afterApply = d.calls.size();
+    const bool reopened = rig.library->select(rig.river) && rig.library->select(rig.ocean);
+    const double reopenedSpeed = shownSpeed();
+    d.hold.clear();
+    d.release();
+    const bool reopenLanded = applied();
+    const QStringList laterToDp = toDp(afterApply);
+    expect(applyHeld && reopened && reopenLanded && reopenedSpeed == 0.5 && laterToDp.isEmpty() && live() == dpName && shownSpeed() == 0.5,
+           QStringLiteral("S15.1130: reopened during its Apply of speed 0.5 to DP-1, Ocean showed speed %1, and after it landed DP-1 was "
+                          "sent [%2], live \"%3\" at %4 (held %5, reopened %6, landed %7); expected 0.5, nothing, DP-1 at 0.5")
+               .arg(reopenedSpeed).arg(laterToDp.join(u", "), live()).arg(shownSpeed()).arg(applyHeld).arg(reopened).arg(reopenLanded));
+
+    // GOAL: S15.1131 (D12-g, other-wallpaper case) -- an Apply that lands while another wallpaper is open neither
+    //       links nor changes that wallpaper's controls, and sends DP-1 nothing after it.
+    // WHY-THIS-SHAPE: River is opened and edited while the Apply of Ocean is held, so it provably lands after; the end
+    //       state alone cannot show a wrong link (the Apply's end relinks the selection), the stray send can.
+    // CONTROL: app/daemon/apply_controller.cpp startLive()'s selection test made `if (false)` (control_batch T7a,
+    //       reverted) -> red, "S15.1131: an Apply of Ocean landing with River open ... sent [SetWallpaperProperties 2] ...".
+    d.calls.clear();
+    d.hold.insert(withProps);
+    rig.applier->apply();
+    const bool otherHeld = waitUntil([&] { return !d.held.isEmpty(); }, kWaitMs);
+    const qsizetype afterOther = d.calls.size();
+    const bool riverOpen = rig.library->select(rig.river);
+    rig.library->setPropertyValue(speedKey, 2.0);
+    const bool riverEdited = rig.daemonDrained();
+    d.hold.clear();
+    d.release();
+    const bool otherLanded = applied();
+    const QStringList otherToDp = toDp(afterOther);
+    expect(otherHeld && riverOpen && riverEdited && otherLanded && live().isEmpty() && shownSpeed() == 2.0 &&
+               rig.library->selectedPath() == rig.river && otherToDp.isEmpty(),
+           QStringLiteral("S15.1131: an Apply of Ocean landing with River open left live \"%1\", River at speed %2, and sent DP-1 [%3] "
+                          "(held %4, opened %5, landed %6); expected no link, 2 and nothing")
+               .arg(live()).arg(shownSpeed()).arg(otherToDp.join(u", ")).arg(otherHeld).arg(riverOpen).arg(otherLanded));
+
+    if (!rig.library->select(rig.ocean) || !rig.reread() || live() != dpName || shownSpeed() != 0.5) {
+        harnessFailure(std::string(goals) + ": Ocean Waves could not be linked again on DP-1 at speed 0.5 before S15.1132");
+        return;
+    }
+
+    // GOAL: S15.1132 (D13-f) -- with an edit queued behind a send in flight on the current link to DP-1, an Apply to
+    //       DP-1 whose selection moves away before it lands is the last SetWallpaper* DP-1 receives: nothing queued
+    //       before it is sent after it.
+    // WHY-THIS-SHAPE: the edit's send stays held until after the Apply's reply, so the queue is still pending when the
+    //       Apply lands (released first, by index); the Apply's start exempts the current link's queue, so only the drop
+    //       at success can stop it. With HDMI-A-1 selected, startLive() queues nothing afresh, so any later call is the stale one.
+    // CONTROL: app/daemon/apply_controller.cpp apply()'s drop loop at success deleted (control_batch T7a, reverted)
+    //       -> red, "S15.1132: ... DP-1 was sent [SetWallpaperProperties 1] after the Apply ...".
+    d.calls.clear();
+    d.hold = {props, withProps};
+    rig.library->setPropertyValue(speedKey, 2.0);
+    const bool editHeld = waitUntil([&] { return d.held.size() == 1; }, kWaitMs);
+    rig.library->setPropertyValue(speedKey, 1.0);
+    rig.applier->apply();
+    const bool bothHeld = waitUntil([&] { return d.held.size() == 2; }, kWaitMs) && d.held.at(1).member() == withProps;
+    const qsizetype afterQueued = d.calls.size();
+    rig.kscreen->select(hdmiName);
+    const bool movedAway = rig.daemonDrained() && live() == hdmiName;
+    d.releaseAt(1);
+    const bool queuedLanded = waitUntil([&] { return rig.applier->applyState() != Progress::Working; }, kWaitMs);
+    d.hold.clear();
+    d.release();
+    const bool queuedSettled = rig.settled();
+    const QStringList staleToDp = toDp(afterQueued);
+    expect(editHeld && bothHeld && movedAway && queuedLanded && queuedSettled && staleToDp.isEmpty() &&
+               rig.applier->applyState() == Progress::Done,
+           QStringLiteral("S15.1132: with speed 1 queued behind a held send to DP-1, DP-1 was sent [%1] after the Apply there "
+                          "(held %2, both held %3, moved away %4, landed %5, settled %6, state %7); expected nothing")
+               .arg(staleToDp.join(u", ")).arg(editHeld).arg(bothHeld).arg(movedAway).arg(queuedLanded).arg(queuedSettled)
+               .arg(int(rig.applier->applyState())));
+}
+
+// The live link follows what GetStatus says the linked screen shows.
+void liveFollowsStatus() {
+    constexpr const char* goals = "S15.1008-S15.1014, S15.1017, S15.1076";
+    Rig rig;
+    if (!build(rig, goals, QStringLiteral("follow"))) {
+        return;
+    }
+    FakeDaemon& d = *rig.daemonFake;
+    const QString dpName = QStringLiteral("DP-1");
+    const QString speedKey = QStringLiteral("speed");
+    const QString volumeKey = QStringLiteral("volume");
+    const QString pausedKey = QStringLiteral("paused");
+    const QString other = QStringLiteral("/elsewhere/other.mp4");
+    const auto value = [&](const QString& key) { return rig.library->propertyValues().value(key); };
+    const auto live = [&] { return rig.applier->liveOutput(); };
+    // Every SetWallpaper* call since the log was cleared, as "Member id".
+    const auto targets = [&] {
+        QStringList out;
+        for (const FakeCall& c : d.calls) {
+            if (c.member == u"SetWallpaperProperties" || c.member == u"SetWallpaperWithProperties") {
+                out.append(c.member + u' ' + c.args.value(c.member == u"SetWallpaperProperties" ? 0 : 2).toString());
+            }
+        }
+        return out;
+    };
+
+    // GOAL: S15.1011 -- right after an Apply lands, before any read that follows it, the link holds: an edit
+    //       made in that gap is sent to the applied screen's id.
+    // WHY-THIS-SHAPE: GetStatus is held from the moment the Apply's SetWallpaperWithProperties reached the stand-in,
+    //       so the client's last read provably predates the Apply (checked: it shows nothing on DP-1). Unheld, the
+    //       re-read the reply asks for shows Ocean there and hides a controller that judges the new link on the stale read.
+    // CONTROL: app/daemon/apply_controller.cpp startLive()'s `m_live = std::move(live);` deleted (control_batch T6a,
+    //       reverted) -> red, "S15.1011: an edit right after the Apply landed ...".
+    d.hold.insert(QStringLiteral("SetWallpaperWithProperties"));
+    rig.applier->apply();
+    const bool setHeld = waitUntil([&] { return !d.held.isEmpty(); }, kWaitMs);
+    d.hold = {QStringLiteral("GetStatus")};
+    d.release();
+    const bool landed = waitUntil([&] { return rig.applier->applyState() != Progress::Working; }, kWaitMs);
+    const int dp1 = d.outputs.value(dpName, -1);
+    const bool stale = !rig.client->status().wallpapers.contains(dp1);
+    const QString liveLanded = live();
+    d.calls.clear();
+    rig.library->setPropertyValue(speedKey, 2.0);
+    const bool gapSent = waitUntil([&] { return !targets().isEmpty(); }, kWaitMs) && rig.daemonDrained();
+    expect(setHeld && landed && stale && gapSent && liveLanded == dpName &&
+               targets() == QStringList{QStringLiteral("SetWallpaperProperties %1").arg(dp1)},
+           QStringLiteral("S15.1011: an edit right after the Apply landed (held %1, landed %2, read predates it %3) was sent [%4] "
+                          "with live \"%5\"; expected one SetWallpaperProperties to %6")
+               .arg(setHeld).arg(landed).arg(stale).arg(joined(targets()), liveLanded).arg(dp1));
+    d.hold.clear();
+    d.release();
+    if (dp1 < 0 || !rig.settled() || !rig.reread() || live() != dpName) {
+        harnessFailure(std::string(goals) + ": Ocean Waves could not be left live on DP-1 to start from");
+        return;
+    }
+    const FakeDaemon::Shown ocean = d.screens.value(dp1);
+
+    // GOAL: S15.1008 -- with DP-1 linked, a read showing another file, another type or nothing there empties
+    //       liveOutput, and the next speed, volume and Paused edits send no SetWallpaper* call.
+    //       S15.1076 (D12-e) -- that read leaves the controls showing the wallpaper's declared defaults.
+    // WHY-THIS-SHAPE: each row relinks from GetStatus first, so every row starts linked at values other than the
+    //       defaults (checked); "nothing sent" is read once every reply has been handled (settled).
+    // CONTROL: control_batch 2026-10-28, each reverted, app/daemon/apply_controller.cpp: followStatus()'s unlink
+    //       made `if (false && ...)` -> red, "S15.1008: with DP-1 showing another file, speed, volume and Paused edits sent
+    //       [SetWallpaperProperties 0,SetWallpaperProperties 0]" (every row); showing() without its path test -> red, "... showing another file, the read
+    //       left live on "DP-1""; without its type test -> red, "... showing another type, ..."; returning the id when the
+    //       monitor shows nothing -> red, "... showing nothing, ..."; unlink()'s `m_draftFor.reset();` deleted
+    //       (control_batch T6a; re-run T7a with the draft keyed on screen and wallpaper, reverted) -> red, all three
+    //       rows, "D12-e: with DP-1 showing another file, the read left the controls at {... speed=2 ...}".
+    // COVERAGE-ASSERT: all three rows graded.
+    struct Row {
+        const char* what;
+        std::function<void()> change;
+    };
+    const Row rows[] = {
+        {"another file", [&] { d.screens[dp1].path = other; }},
+        {"another type", [&] { d.screens[dp1].type = QStringLiteral("image"); }},
+        {"nothing", [&] { d.screens.remove(dp1); d.wallpapers.remove(dp1); }},
+    };
+    int graded = 0;
+    for (const Row& row : rows) {
+        d.wallpapers.insert(dp1);
+        d.screens.insert(dp1, ocean);
+        if (!rig.reread() || live() != dpName) {
+            harnessFailure(std::string(goals) + ": DP-1 could not be linked again before the \"" + row.what + "\" row");
+            break;
+        }
+        const QVariantMap before = rig.library->propertyValues();
+        const QVariantMap defaults = rig.library->selectedWallpaper().defaultValues();
+        row.change();
+        const bool read = rig.reread();
+        const QString after = live();
+        const QVariantMap kept = rig.library->propertyValues();
+        expect(read && after.isEmpty(), QStringLiteral("S15.1008: with DP-1 showing %1, the read left live on \"%2\" (read %3); expected \"\"")
+                                             .arg(QLatin1StringView(row.what), after).arg(read));
+        expect(read && before != defaults && kept == defaults,
+               QStringLiteral("D12-e: with DP-1 showing %1, the read left the controls at %2 (linked at %3); expected the defaults %4")
+                   .arg(QLatin1StringView(row.what), describeMap(kept), describeMap(before), describeMap(defaults)));
+        d.calls.clear();
+        const bool edited = rig.library->setPropertyValue(speedKey, 0.5) && rig.library->setPropertyValue(volumeKey, 0.25);
+        const bool paused = rig.library->setPropertyValue(pausedKey, true);
+        const bool quiet = paused && rig.settled();
+        expect(edited && quiet && value(pausedKey).toBool() && targets().isEmpty(),
+               QStringLiteral("S15.1008: with DP-1 showing %1, speed, volume and Paused edits sent [%2] (edited %3, settled %4); expected []")
+                   .arg(QLatin1StringView(row.what), joined(targets())).arg(edited).arg(quiet));
+        ++graded;
+    }
+    expect(graded == 3, QStringLiteral("S15.1008: %1 of 3 rows graded").arg(graded));
+
+    // GOAL: S15.1009 -- edits made while unlinked stay through a later read, and the next Apply sends them.
+    // CONTROL: control_batch 2026-10-28, reverted: app/daemon/apply_controller.cpp linkSelected() calling
+    //       m_library.resetPropertyValues() after its unlink() -> red, "S15.1009: after another read while unlinked ..."
+    //       and (separate run, same break) "S15.1009: the Apply after the unlinked edits sent ...".
+    const bool readAgain = rig.reread();
+    expect(readAgain && live().isEmpty() && value(speedKey).toDouble() == 0.5 && value(volumeKey).toDouble() == 0.25 && value(pausedKey).toBool(),
+           QStringLiteral("S15.1009: after another read while unlinked the controls show speed %1, volume %2, paused %3 (live \"%4\"); "
+                          "expected 0.5, 0.25, true")
+               .arg(value(speedKey).toString(), value(volumeKey).toString(), value(pausedKey).toString(), live()));
+    d.calls.clear();
+    const bool applied = rig.apply() && rig.applier->applyState() == Progress::Done && rig.settled();
+    const auto applies = rig.sent("SetWallpaperWithProperties");
+    const QVariantMap applySent = applies.isEmpty() ? QVariantMap() : applies.back().args.value(3).toMap();
+    // D12-e: the defaults the link ended at, plus the edits made after.
+    QVariantMap wantSent = rig.library->selectedWallpaper().defaultValues();
+    wantSent.insert(speedKey, 0.5);
+    wantSent.insert(volumeKey, 0.25);
+    wantSent.insert(pausedKey, true);
+    expect(applied && applies.size() == 1 && describeMap(applySent) == describeMap(wantSent),
+           QStringLiteral("S15.1009/D12-e: the Apply after the unlinked edits sent %1 (%2 call(s), applied %3); expected %4")
+               .arg(describeMap(applySent)).arg(applies.size()).arg(applied).arg(describeMap(wantSent)));
+
+    // GOAL: S15.1010 -- a later read showing the open wallpaper on DP-1 again relinks it, shows DP-1's own values
+    //       and sends nothing; the next edit goes to DP-1's id only.
+    //       S15.1017 -- a draft made while unlinked and never sent is dropped for the screen's values.
+    // WHY-THIS-SHAPE: DP-1 comes back at values the controls do not show (speed 2, volume 0.75), so showing the
+    //       draft instead of the screen's values is red.
+    // CONTROL: control_batch 2026-10-28, reverted, app/daemon/apply_controller.cpp: followStatus()'s
+    //       `linkSelected();` deleted (re-run T6a) -> red, "S15.1010: with Ocean back on DP-1 ..., the read linked """;
+    //       linkSelected()'s adoptPropertyValues(...) deleted (re-run 2026-10-28 with an unsent draft of speed 1 standing in the controls) -> red, "S15.1010: with Ocean back on DP-1 at speed 2 (unlinked first 1), the read linked \"DP-1\", showed speed 1, volume 0.25 ...";
+    //       sendLive()'s setProperties given `m_live->monitorId + 1` -> red, "S15.1010: the next edit sent [SetWallpaperProperties 1]".
+    d.screens[dp1].path = other;
+    const bool unlinkedRead = rig.reread() && live().isEmpty();
+    // An unsent draft made while unlinked; the screen's values must replace it.
+    const bool drafted = rig.library->setPropertyValue(speedKey, 1.0);
+    FakeDaemon::Shown back = d.screens.value(dp1);
+    back.path = ocean.path;
+    back.properties.insert(speedKey, 2.0);
+    back.properties.insert(volumeKey, 0.75);
+    d.screens.insert(dp1, back);
+    d.calls.clear();
+    const bool backRead = rig.reread();
+    expect(unlinkedRead && drafted && backRead && live() == dpName && value(speedKey).toDouble() == 2.0 && value(volumeKey).toDouble() == 0.75 &&
+               targets().isEmpty(),
+           QStringLiteral("S15.1010: with Ocean back on DP-1 at speed 2 (unlinked first %1), the read linked \"%2\", showed speed %3, "
+                          "volume %4 and sent [%5]; expected DP-1, 2, 0.75, []")
+               .arg(unlinkedRead).arg(live(), value(speedKey).toString(), value(volumeKey).toString(), joined(targets())));
+    rig.library->setPropertyValue(speedKey, 1.0);
+    const bool editSettled = rig.settled();
+    expect(editSettled && targets() == QStringList{QStringLiteral("SetWallpaperProperties %1").arg(dp1)},
+           QStringLiteral("S15.1010: the next edit sent [%1]; expected one SetWallpaperProperties to %2").arg(joined(targets())).arg(dp1));
+
+    // GOAL: S15.1012 -- after a daemon restart, the read that lands while the app is setting the linked wallpaper
+    //       again does not end the link, nor does the read after an accepted re-send.
+    // WHY-THIS-SHAPE: the restarted stand-in holds nothing, and the client's own read on the restart is sent before
+    //       the re-send on the same connection, so it provably predates it; the re-send's reply is held, so that
+    //       read provably lands while the send runs. Reads are counted, and every wait's deadline fails the check.
+    // CONTROL: app/daemon/apply_controller.cpp followStatus(): `if (m_live->sent || replaced)` made `if (true)`
+    //       (control_batch 2026-10-28, reverted) -> red, "S15.1012: a read landing while the restarted daemon was being sent Ocean again (read 1, nothing on DP-1 1)
+    //       left live on \"\"; expected DP-1".
+    int reads = 0;
+    const auto counter = QObject::connect(rig.client.get(), &DaemonClient::statusRead, [&] { ++reads; });
+    const auto restart = [&] {
+        const bool quiet = rig.settled();
+        d.stop();
+        const bool gone = waitUntil([&] { return rig.client->state() == DaemonClient::State::Unavailable; }, kWaitMs);
+        d.wallpapers.clear();
+        d.screens.clear();
+        d.calls.clear();
+        reads = 0;
+        return quiet && gone && d.start().isEmpty();
+    };
+    d.hold.insert(QStringLiteral("SetWallpaperWithProperties"));
+    const bool restarted = restart();
+    const bool resendHeld = waitUntil([&] { return !d.held.isEmpty(); }, kWaitMs);
+    const bool readDuring = waitUntil([&] { return reads >= 1; }, kWaitMs) && rig.repliesHandled();
+    const bool shownNothing = !rig.client->status().wallpapers.contains(dp1);
+    const QString liveDuring = live();
+    d.hold.clear();
+    d.release();
+    if (!restarted || !resendHeld) {
+        QObject::disconnect(counter);
+        harnessFailure(std::string(goals) + ": the daemon's restart could not be staged");
+        return;
+    }
+    expect(readDuring && shownNothing && liveDuring == dpName,
+           QStringLiteral("S15.1012: a read landing while the restarted daemon was being sent Ocean again (read %1, nothing on DP-1 %2) "
+                          "left live on \"%3\"; expected DP-1").arg(readDuring).arg(shownNothing).arg(liveDuring));
+    const bool acceptedRead = waitUntil([&] { return reads >= 2; }, kWaitMs) && rig.settled();
+    expect(acceptedRead && live() == dpName,
+           QStringLiteral("S15.1012: after the re-send was accepted the next read (landed %1) left live on \"%2\"; expected DP-1")
+               .arg(acceptedRead).arg(live()));
+    // GOAL: S15.1014 -- after a refused re-send: a read showing the monitor empty keeps the link, and the next edit
+    //       sets the wallpaper again (SetWallpaperWithProperties); a read showing the wallpaper there takes what the
+    //       screen holds as sent, so the next edit is a SetWallpaperProperties; another wallpaper there ends the link.
+    // WHY-THIS-SHAPE: `refuse` answers before the stand-in changes anything, so the restarted daemon provably holds
+    //       nothing on DP-1; the wallpaper is then put there behind the app's back, as only that read can explain it.
+    // CONTROL: app/daemon/apply_controller.cpp, control_batch 2026-10-28, each reverted: followStatus()'s
+    //       `if (m_live->sent || replaced)` made `if (true)` -> red, "S15.1014: after the re-send was refused, the read showing DP-1 empty (2 read(s)) left live on \"\"; ..."; sendTo()'s `if (to.sent)` made
+    //       `if (true)` -> red, "S15.1014: an edit on DP-1 left empty by a refused re-send sent [SetWallpaperProperties 0] ..." (`if (true)` alone
+    //       stopped the restart's own re-send, a harness fault, so the break sends by monitor only once the read shows the
+    //       monitor empty: `if (to.sent || (m_daemon.state() == Ready && !status.wallpapers.contains(to.monitorId)))`); followStatus()'s `m_live->sent = status.wallpapers...` deleted -> red,
+    //       "S15.1014: with Ocean found on DP-1 after a refused re-send, the read sent [SetWallpaperWithProperties 0] ..."; `replaced`'s `|| status.wallpapers.contains(*id)` dropped -> red, "S15.1014: with another file found on DP-1 after a refused re-send (still linked first 1), the read left live
+    //       on \"DP-1\"; expected \"\"".
+    const QString refused = QStringLiteral("org.freedesktop.DBus.Error.InvalidArgs");
+    d.refuse.insert(QStringLiteral("SetWallpaperWithProperties"), {refused, QStringLiteral("no")});
+    bool restartedAgain = restart();
+    const bool refusedRead = restartedAgain && waitUntil([&] { return reads >= 2; }, kWaitMs) && rig.settled();
+    expect(refusedRead && !rig.sent("SetWallpaperWithProperties").isEmpty() && live() == dpName,
+           QStringLiteral("S15.1014: after the re-send was refused, the read showing DP-1 empty (%1 read(s)) left live on \"%2\"; expected DP-1")
+               .arg(reads).arg(live()));
+    d.calls.clear();
+    rig.library->setPropertyValue(speedKey, 0.5);
+    const bool emptyEdit = rig.settled();
+    expect(emptyEdit && targets() == QStringList{QStringLiteral("SetWallpaperWithProperties %1").arg(dp1)} && live() == dpName,
+           QStringLiteral("S15.1014: an edit on DP-1 left empty by a refused re-send sent [%1] with live \"%2\"; expected one "
+                          "SetWallpaperWithProperties to %3").arg(joined(targets()), live()).arg(dp1));
+    d.refuse.clear();
+    d.wallpapers.insert(dp1);
+    d.screens.insert(dp1, FakeDaemon::Shown{ocean.type, ocean.path, rig.library->propertyValues()});
+    d.calls.clear();
+    const bool shownRead = rig.reread();
+    const QStringList onRead = targets();
+    rig.library->setPropertyValue(speedKey, 2.0);
+    const bool shownEdit = rig.settled();
+    expect(shownRead && shownEdit && onRead.isEmpty() && targets() == QStringList{QStringLiteral("SetWallpaperProperties %1").arg(dp1)},
+           QStringLiteral("S15.1014: with Ocean found on DP-1 after a refused re-send, the read sent [%1] and the next edit [%2]; "
+                          "expected [] and one SetWallpaperProperties to %3").arg(joined(onRead), joined(targets())).arg(dp1));
+    d.refuse.insert(QStringLiteral("SetWallpaperWithProperties"), {refused, QStringLiteral("no")});
+    restartedAgain = restart();
+    const bool refusedAgain = restartedAgain && waitUntil([&] { return reads >= 2; }, kWaitMs) && rig.settled() && live() == dpName;
+    d.refuse.clear();
+    d.wallpapers.insert(dp1);
+    d.screens.insert(dp1, FakeDaemon::Shown{ocean.type, other, {}});
+    const bool otherRead = rig.reread();
+    QObject::disconnect(counter);
+    expect(refusedAgain && otherRead && live().isEmpty(),
+           QStringLiteral("S15.1014: with another file found on DP-1 after a refused re-send (still linked first %1), the read "
+                          "left live on \"%2\"; expected \"\"").arg(refusedAgain).arg(live()));
+
+    // GOAL: S15.1013 -- when the linked connector is re-bound to another monitor id that does not show the open
+    //       wallpaper, the read ends the link, though the old id still shows it.
+    // CONTROL: control_batch 2026-10-28, reverted, app/daemon/apply_controller.cpp followStatus() judging the
+    //       link by its monitor id alone (`status.wallpapers.value(m_live->monitorId).path`) -> red, "S15.1013: ...".
+    d.wallpapers.insert(dp1);
+    d.screens.insert(dp1, ocean);
+    if (!rig.reread() || live() != dpName) {
+        harnessFailure(std::string(goals) + ": DP-1 could not be linked again before the re-bind");
+        return;
+    }
+    const int rebound = dp1 + 5;
+    d.outputs.insert(dpName, rebound);
+    const bool reboundRead = rig.reread();
+    expect(reboundRead && rig.client->status().outputs.value(dpName) == rebound && rig.client->status().wallpapers.contains(dp1) && live().isEmpty(),
+           QStringLiteral("S15.1013: with DP-1 re-bound to monitor %1, which shows nothing, the read (landed %2) left live on \"%3\"; expected \"\"")
+               .arg(rebound).arg(reboundRead).arg(live()));
 }
 
 void bindReadFails() {
@@ -2296,7 +3234,6 @@ void processorNotice() {
         return;
     }
     const int monitorId = set.last().args.value(2).toInt();
-    const QString asset = set.last().args.value(1).toString();
     // The approved sentences, written out here rather than taken from the app.
     const QString parts = QStringLiteral(
         "Parts of this video can't be played by your graphics card, so WallpaperX will use the processor for them, which "
@@ -2313,7 +3250,7 @@ void processorNotice() {
     const auto label = [&] { return told.isEmpty() ? QStringLiteral("(never told)") : told.last(); };
     // Reports `state` for the applied video and waits until the label is told something other than `from`.
     const auto report = [&](const QString& state, const QString& from) {
-        rig.daemonFake->processorDecoding.insert(monitorId, {asset, state});
+        rig.daemonFake->processorDecoding.insert(monitorId, state);
         const bool sent = rig.daemonFake->announceProcessorDecodingChanged();
         return sent && waitUntil([&] { return !told.isEmpty() && told.last() != from; }, kWaitMs);
     };
@@ -2325,7 +3262,7 @@ void processorNotice() {
     //       signal can make it read GetStatus again.
     // CONTROL: control_batch.sh 2026-10-24 (T18a), --phase '^processorNotice$', each alone, reverted (bytes restored,
     //       green again): in app/daemon/apply_controller.cpp, the statusChanged -> processorNoticeChanged connect deleted
-    //       -> "FAIL: S15.951: after "parts" the label is told "(never told)"" while the getter was right; the Share::All
+    //       (re-run 2026-10-28, same result) -> "FAIL: S15.951: after "parts" the label is told "(never told)"" while the getter was right; the Share::All
     //       branch disabled -> "FAIL: S15.951: after "all" the label is told "Parts of this video ...". In
     //       app/daemon/daemon_client.cpp: "all" mapped to Share::Parts -> the same "all" line; the ProcessorDecodingChanged
     //       subscription deleted, and separately the onProcessor insert deleted -> the "(never told)" line.
@@ -2361,7 +3298,7 @@ void processorNotice() {
     // CONTROL: control_batch.sh 2026-10-24 (T18a), --phase '^processorNotice$', each alone, reverted, all in
     //       app/daemon/apply_controller.cpp: the library lambda's `emit processorNoticeChanged();` deleted -> "FAIL:
     //       S15.951: with river open the label is told "(not told)""; the screen lambda's -> "... with HDMI-A-1 selected
-    //       the label is told "(not told)""; `use->path != assetPath` dropped -> "... with river open the label is told
+    //       the label is told "(not told)""; `use->path != assetPath` dropped (re-run 2026-10-28) -> "... with river open the label is told
     //       "Parts ..."; onProcessor looked up at cbegin() instead of the monitor -> "... with HDMI-A-1 selected the label
     //       is told "Parts ..."" (green until HDMI-A-1 was given a monitor above).
     // HDMI-A-1 is given a monitor of its own, so the step to it reaches the per-monitor lookup rather than ending at a
@@ -2688,6 +3625,11 @@ int main(int argc, char* argv[]) {
     runPhase("bindAndRefresh", bindAndRefresh);
     runPhase("longConnectors", longConnectors);
     runPhase("liveAcrossApplies", liveAcrossApplies);
+    runPhase("selectedScreenEdits", selectedScreenEdits);
+    runPhase("liveFollowsStatus", liveFollowsStatus);
+    runPhase("linkHandOver", linkHandOver);
+    runPhase("applyReturn", applyReturn);
+    runPhase("applyReopen", applyReopen);
     runPhase("bindReadFails", bindReadFails);
     runPhase("errorText", errorText);
     runPhase("slowStatusRefresh", slowStatusRefresh);

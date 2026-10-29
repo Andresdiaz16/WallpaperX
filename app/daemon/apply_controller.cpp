@@ -8,6 +8,7 @@
 #include "plasma_controller.h"
 
 #include <algorithm>
+#include <memory>
 #include <utility>
 
 namespace wallpaperx {
@@ -32,6 +33,26 @@ QString outputRefusal(const QString& connector)
     return {};
 }
 
+bool shows(const DaemonStatus::Shown& shown, const QString& type, const QString& path)
+{
+    return shown.path == path && shown.type == type;
+}
+
+// The monitor `status` says `connector` answers to, while it shows the file `path` of `type` there.
+std::optional<int> showing(const DaemonStatus& status, const QString& connector, const QString& type,
+                          const QString& path)
+{
+    const auto id = status.outputs.constFind(connector);
+    if (id == status.outputs.cend()) {
+        return std::nullopt;
+    }
+    const auto shown = status.wallpapers.constFind(*id);
+    if (shown == status.wallpapers.cend() || !shows(*shown, type, path)) {
+        return std::nullopt;
+    }
+    return *id;
+}
+
 } // namespace
 
 ApplyController::ApplyController(KScreenClient& kscreen, LibraryManager& library, DaemonClient& daemon,
@@ -43,7 +64,7 @@ ApplyController::ApplyController(KScreenClient& kscreen, LibraryManager& library
     , m_plasma(plasma)
 {
     connect(&m_library, &LibraryManager::selectionChanged, this, [this] {
-        endLiveUnlessOpen();
+        linkSelected();
         emit blockedReasonChanged();
         emit applyChanged();
         emit processorNoticeChanged();
@@ -58,6 +79,7 @@ ApplyController::ApplyController(KScreenClient& kscreen, LibraryManager& library
         }
     });
     connect(&m_kscreen, &KScreenClient::selectionChanged, this, [this] {
+        linkSelected();
         emit blockedReasonChanged();
         emit applyChanged();
         emit pauseChanged();
@@ -67,6 +89,7 @@ ApplyController::ApplyController(KScreenClient& kscreen, LibraryManager& library
     });
     connect(&m_daemon, &DaemonClient::statusChanged, this, &ApplyController::frameRateNoticeChanged);
     connect(&m_daemon, &DaemonClient::statusChanged, this, &ApplyController::processorNoticeChanged);
+    connect(&m_daemon, &DaemonClient::statusRead, this, &ApplyController::followStatus);
 }
 
 QString ApplyController::applyMessage() const
@@ -111,10 +134,18 @@ void ApplyController::apply()
     const QString title = wallpaper.displayTitle();
     const QString where = monitorName(monitor);
 
-    // What the last Apply put live stays live until this one takes effect (startLive): until then
-    // the daemon still shows it there.
+    // Values queued on a link that has ended there would land after this Apply, on what it puts there.
+    for (InFlight& inFlight : m_sending) {
+        if (inFlight.next && inFlight.next->live.connector == connector &&
+            !(m_live && inFlight.next->live.id == m_live->id)) {
+            inFlight.next.reset();
+        }
+    }
+    // What is live stays live until this Apply takes effect (startLive): until then the daemon still
+    // shows it there.
     m_applyWallpaper = wallpaper.filePath;
     m_applyOutput = connector;
+    m_applyValues = values;
     settleApply(Progress::Working, tr("Applying %1 to %2…").arg(title, where));
     m_daemon.bindMonitor(this, connector, [=, this](std::expected<int, QString> monitorId) {
         if (!monitorId) {
@@ -126,6 +157,13 @@ void ApplyController::apply()
             if (!set) {
                 settleApply(Progress::Failed, tr("%1 was not applied to %2. %3").arg(title, where, set.error()));
                 return;
+            }
+            // The daemon holds this Apply's values there now, so nothing queued for that screen before it may
+            // land after it, the current link's included: startLive() queues the controls' values afresh.
+            for (auto inFlight = m_sending.begin(); inFlight != m_sending.end(); ++inFlight) {
+                if (inFlight->next && (inFlight.key() == id || inFlight->next->live.connector == connector)) {
+                    inFlight->next.reset();
+                }
             }
             // Live from here: the daemon holds the wallpaper whatever Plasma answers.
             startLive(Live{0, wallpaper.filePath, wallpaper.type, wallpaper.assetPath, connector, id, values});
@@ -311,9 +349,13 @@ void ApplyController::settleApply(Progress state, QString message)
     if (m_apply == state && m_applyMessage == message) {
         return;
     }
+    const bool ended = m_apply == Progress::Working && state != Progress::Working;
     m_apply = state;
     m_applyMessage = std::move(message);
     emit applyChanged();
+    if (ended) {
+        linkSelected();
+    }
 }
 
 void ApplyController::settle(Change& change, ChangeSignal changed, Progress state, QString message)
@@ -326,21 +368,121 @@ void ApplyController::settle(Change& change, ChangeSignal changed, Progress stat
 void ApplyController::startLive(Live live)
 {
     live.id = ++m_lastLiveId;
+    // Closed, or another screen selected, while the daemon was answering: the controls are that one's now.
+    if (m_library.selectedPath() != live.wallpaperPath || m_kscreen.selectedOutput() != live.connector) {
+        return;
+    }
     m_live = std::move(live);
     m_liveError.clear();
     emit liveChanged();
-    // Closed while the daemon was answering, or edited meanwhile.
-    endLiveUnlessOpen();
+    // Edited meanwhile.
     sendLive();
 }
 
-void ApplyController::endLiveUnlessOpen()
+bool ApplyController::contradicted(const Live& link) const
 {
-    if (m_live && m_library.selectedPath() != m_live->wallpaperPath) {
+    const DaemonStatus& status = m_daemon.status();
+    if (showing(status, link.connector, link.type, link.assetPath) == link.monitorId) {
+        return false;
+    }
+    // While the daemon may not hold the wallpaper there, an empty screen is what the next send fills;
+    // only another wallpaper, or the connector naming another monitor, says otherwise.
+    const auto id = status.outputs.constFind(link.connector);
+    const bool replaced =
+        id != status.outputs.cend() && (*id != link.monitorId || status.wallpapers.contains(*id));
+    return link.sent || replaced;
+}
+
+void ApplyController::followStatus()
+{
+    // Values queued on a link would land on whatever its screen shows now, the link ended or not.
+    const bool linkEnds = m_live && contradicted(*m_live);
+    for (InFlight& inFlight : m_sending) {
+        if (inFlight.next && (m_live && inFlight.next->live.id == m_live->id ? linkEnds
+                                                                              : contradicted(inFlight.next->live))) {
+            inFlight.next.reset();
+        }
+    }
+    if (linkEnds) {
+        unlink();
+    } else if (m_live && !m_live->sent && !m_sending.contains(m_live->monitorId)) {
+        // A link whose wallpaper was being set again, and that failed: the screen shows it after all, so
+        // what it holds stands for what was sent, and the controls' difference goes by monitor.
+        const DaemonStatus& status = m_daemon.status();
+        if (showing(status, m_live->connector, m_live->type, m_live->assetPath) == m_live->monitorId) {
+            m_live->sent = status.wallpapers.value(m_live->monitorId).properties;
+            sendLive();
+        }
+    }
+    linkSelected();
+}
+
+void ApplyController::unlink()
+{
+    if (m_live) {
         m_live.reset();
+        m_draftFor.reset();
         m_liveError.clear();
         emit liveChanged();
     }
+}
+
+void ApplyController::linkSelected()
+{
+    const Wallpaper open = m_library.selectedWallpaper();
+    const QString connector = m_kscreen.selectedOutput();
+    if (m_live && open.usable() && m_live->wallpaperPath == open.filePath && m_live->connector == connector) {
+        return;
+    }
+    unlink();
+    // Unlinked, the controls hold a draft for the selected screen and wallpaper: kept while both stay
+    // selected, else started from `values`, the defaults when empty. Nothing set on another screen carries
+    // over, and the library has already dropped the edits of a wallpaper closed since.
+    const DraftFor selected{connector, open.filePath};
+    const bool fresh = std::exchange(m_draftFor, selected) != selected;
+    const auto draft = [this, fresh](const QVariantMap& values = {}) {
+        if (fresh) {
+            m_library.adoptPropertyValues(values);
+        }
+    };
+    if (!open.usable() || open.assetPath.isEmpty() || m_daemon.state() != DaemonClient::State::Ready) {
+        draft();
+        return;
+    }
+    // An Apply there links as it lands.
+    const bool applying =
+        m_apply == Progress::Working && m_applyOutput == connector && m_applyWallpaper == open.filePath;
+    if (applying) {
+        draft(m_applyValues);
+        return;
+    }
+    const DaemonStatus& status = m_daemon.status();
+    if (const auto monitor = status.outputs.constFind(connector); monitor != status.outputs.cend()) {
+        if (const auto inFlight = m_sending.constFind(*monitor); inFlight != m_sending.cend()) {
+            // GetStatus may predate what lands there. A send for this wallpaper is the link going on, and the
+            // controls show what it sets; for another, the read after it links.
+            const Queued& latest = inFlight->next ? *inFlight->next : inFlight->now;
+            const Live& link = latest.live;
+            if (link.wallpaperPath == open.filePath && link.type == open.type && link.assetPath == open.assetPath &&
+                link.connector == connector && !contradicted(link)) {
+                m_library.adoptPropertyValues(latest.values);
+                m_live = link;
+                emit liveChanged();
+            } else {
+                draft();
+            }
+            return;
+        }
+    }
+    const auto id = showing(status, connector, open.type, open.assetPath);
+    if (!id) {
+        draft();
+        return;
+    }
+    // Adopted while nothing is live, so the change sends nothing back.
+    m_library.adoptPropertyValues(status.wallpapers.value(*id).properties);
+    m_live = Live{++m_lastLiveId, open.filePath, open.type, open.assetPath, connector, *id, m_library.propertyValues()};
+    emit liveChanged();
 }
 
 void ApplyController::sendLive()
@@ -348,18 +490,24 @@ void ApplyController::sendLive()
     if (!m_live) {
         return;
     }
-    // One at a time, the latest values next: a slider moves faster than the daemon answers.
-    if (m_sending != Sending::No) {
-        m_sending = Sending::YesThenAgain;
+    // One at a time to a screen, the latest values next: a slider moves faster than the daemon answers.
+    if (const auto inFlight = m_sending.find(m_live->monitorId); inFlight != m_sending.end()) {
+        inFlight->next = Queued{*m_live, m_library.propertyValues()};
         return;
     }
     const QVariantMap values = m_library.propertyValues();
     if (values == m_live->sent) {
         return;
     }
-    m_sending = Sending::Yes;
-    const quint64 id = m_live->id;
-    auto done = [this, id, values](std::expected<void, QString> set) {
+    sendTo(*m_live, values);
+}
+
+void ApplyController::sendTo(const Live& to, const QVariantMap& values)
+{
+    m_sending.insert(to.monitorId, InFlight{Queued{to, values}, std::nullopt});
+    const quint64 id = to.id;
+    const int monitorId = to.monitorId;
+    auto done = [this, id, monitorId, values](std::expected<void, QString> set) {
         if (m_live && m_live->id == id) {
             const QString error = set ? QString()
                                       : tr("A change was not applied to %1. %2").arg(m_live->connector, set.error());
@@ -371,19 +519,26 @@ void ApplyController::sendLive()
                 emit liveChanged();
             }
         }
-        if (std::exchange(m_sending, Sending::No) == Sending::YesThenAgain) {
+        std::optional<Queued> next = m_sending.take(monitorId).next;
+        if (next && set && next->live.id == id) {
+            next->live.sent = values;
+        }
+        if (next && m_live && next->live.id == m_live->id) {
             sendLive();
+        } else if (next && next->values != next->live.sent) {
+            // The link it was asked on has ended: its screen still gets the last values the user set there.
+            sendTo(next->live, next->values);
         } else {
             // A save the daemon could not queue is in its persistence health now; one it queued is
             // announced by PersistenceChanged once written.
             m_daemon.refresh();
         }
     };
-    if (m_live->sent) {
-        m_daemon.setProperties(this, m_live->monitorId, values, std::move(done));
+    if (to.sent) {
+        m_daemon.setProperties(this, to.monitorId, values, std::move(done));
     } else {
         // Addressed by wallpaper: a monitor addressed alone may hold another one now.
-        m_daemon.setWallpaper(this, m_live->type, m_live->assetPath, m_live->monitorId, values, std::move(done));
+        m_daemon.setWallpaper(this, to.type, to.assetPath, to.monitorId, values, std::move(done));
     }
 }
 

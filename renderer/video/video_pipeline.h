@@ -154,6 +154,10 @@ public:
     // when true every picture shown was decoded in software.
     bool softwareFromSetup() const { return m_softwareFromSetup; }
 
+    // As VideoDecoder's, read when the pipeline is opened.
+    std::chrono::nanoseconds timelineStart() const { return m_origin; }
+    std::optional<std::chrono::nanoseconds> declaredEnd() const { return m_declaredEnd; }
+
 private:
     enum class Waiting { ForPicture, Never };
     // No `skip` decodes the whole stream on this thread and leaves a decode thread's level as it is.
@@ -173,6 +177,7 @@ private:
     bool m_softwareFromSetup = false;
     // Where every ShowGrid for this file is laid from, read before a decode thread owns the decoder.
     std::chrono::nanoseconds m_origin;
+    std::optional<std::chrono::nanoseconds> m_declaredEnd;
     // Null until the first picture is converted.
     std::unique_ptr<YcbcrRenderer> m_renderer;
     // The picture decoded last, while it is not converted yet.

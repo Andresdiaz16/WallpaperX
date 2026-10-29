@@ -61,6 +61,7 @@ TestCase {
             property int monitorId: -1
             property string output: ""
             property string unavailableReason: ""
+            property string pauseMode: "unset by main.qml"
             // The real item reports this only once a frame is on screen. The stand-in draws
             // nothing, so a check that wants the backdrop hidden must set it.
             property bool frameShown: false
@@ -976,6 +977,35 @@ TestCase {
         compare(item.screenState, "set", "renaming the screen leaves it drawing");
         verify(surface.item !== null, "the renderer is still loaded after the rename");
         compare(surface.item.output, "DP-9", "a renamed screen's new connector name reaches the loaded renderer");
+    }
+
+    // GOAL: S15.1036 -- main.qml hands the reply's `pause` to the renderer when it loads and
+    //       whenever a later reply changes it, and an empty mode when the field is missing or not a string.
+    // WHY-THIS-SHAPE: the stand-in starts with a sentinel, so a load that never assigned the mode cannot
+    //       pass as an empty one; the change and the bad-type cases are driven on the one loaded item.
+    // CONTROL: via control_batch.sh 2026-10-28, each alone, reverted, in
+    //       backend/kde/kpackage/contents/ui/main.qml: onLoaded's `item.pauseMode = ...` deleted -> "...when it
+    //       loads" red; onPauseModeChanged's assignment deleted -> "a later reply's pause mode..." red; the
+    //       `typeof ... === "string"` test made `!== undefined` -> "...not a string..." red (actual 7).
+    function test_the_renderer_is_told_its_pause_mode() {
+        const item = loadPlugin(suite.namedScreen);
+        const surface = childNamed(item, "wallpaperxSurface");
+        verify(surface !== null, "the plugin has a surface");
+        surface.sourceComponent = standInRenderer;
+
+        item.apply(200, '{"output":"DP-3","known":true,"path":"/w.png","monitor_id":0,"pause":"paused_while_focused"}');
+        compare(surface.status, Loader.Ready, "the stand-in renderer loaded, which is what lets this check fail");
+        compare(surface.item.pauseMode, "paused_while_focused", "the renderer is told its pause mode when it loads");
+
+        item.apply(200, '{"output":"DP-3","known":true,"path":"/w.png","monitor_id":0,"pause":"play"}');
+        compare(surface.item.pauseMode, "play", "a later reply's pause mode reaches the loaded renderer");
+
+        item.apply(200, '{"output":"DP-3","known":true,"path":"/w.png","monitor_id":0,"pause":7}');
+        compare(surface.item.pauseMode, "", "a pause field that is not a string reaches the renderer as an empty mode");
+
+        item.apply(200, '{"output":"DP-3","known":true,"path":"/w.png","monitor_id":0,"pause":"play"}');
+        item.apply(200, '{"output":"DP-3","known":true,"path":"/w.png","monitor_id":0}');
+        compare(surface.item.pauseMode, "", "a reply with no pause field reaches the renderer as an empty mode");
     }
 
     // The one configuration where main.qml hides the backdrop: a stand-in renderer loaded on a

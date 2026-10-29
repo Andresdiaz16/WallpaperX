@@ -24,8 +24,8 @@ namespace wallpaperx {
 // picture's cost over span(): the file time each picture that level returns spans. Entered at 1
 // and left under kKeepsUp, so a file decoding at about one level's cost does not flip between two
 // every few pictures. Past the last level is a file that even its key pictures cannot keep up
-// with: they are shown as they are decoded, and the sound, never moved to them, stops at the file's
-// end and is silent until the next pass's first picture starts it again. A decoder that applies
+// with: they are shown as they are decoded, and its sound, never handed on, waits silent at the file's end
+// for each pass's first picture to start it again (WallpaperManager::steerSoundLocked). A decoder that applies
 // fewer levels goes from its deepest straight past the last, still skipping only what it applies.
 //
 // Holds no clock and no decoder: every input is a value from PictureTiming and the pipeline. One
@@ -61,9 +61,6 @@ public:
     // What the decoder is asked for; it applies no more than its deepest.
     PictureSkip skip() const { return static_cast<PictureSkip>(std::min(m_level, kLevels - 1)); }
     bool unpaced() const { return m_level == kUnpaced; }
-    // Skipping, and not yet seen to keep pace at this level: late pictures may be the decoder's.
-    // A level seen not to is left in the add() that sees it.
-    bool decoderBehind() const { return m_level > 0 && m_asRun.samples < kSettled; }
     // `decodedAt` is the level the picture was decoded at, `previousAt` the picture's before it. Only
     // a picture decoded at the current level, after one that was too, measures it: a decoder's frames
     // in flight still return the last level's for a while, and `covered` reaches back to that one.

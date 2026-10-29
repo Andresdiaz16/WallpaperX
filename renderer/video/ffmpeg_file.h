@@ -6,16 +6,22 @@
 // FFmpeg and say why one failed, so the two refuse the same files in the same words. Renderer only:
 // it throws the renderer's error types. The app's audio probe shares ffmpeg_fd_io.h instead.
 
+#include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 
 struct AVFormatContext;
+struct AVRational;
 struct AVIOContext;
 struct AVPacket;
 
 namespace wallpaperx::ffmpeg_file {
 
 std::string avErrorString(int err);
+
+// `value` in `base` units -- a stream's time base -- or nothing for an unset value or an unusable base.
+std::optional<std::chrono::nanoseconds> inNanoseconds(int64_t value, AVRational base);
 
 [[noreturn]] void throwOutOfMemory(const char* component);
 

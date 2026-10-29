@@ -58,6 +58,9 @@ constexpr double kMarkSlackNs = 2'000'000;
 // The least of what is queued that a change of rate leaves to play: the output thread decodes the new rate
 // from there while the stream plays up to it.
 constexpr uint64_t kCutLeadFrames = 1024;
+// How far from a joining play's `at` the sound before it may end and still be joined: past an AAC frame's
+// length, by which a file's sound and pictures commonly differ, and under a sound genuinely cut shorter.
+constexpr int64_t kJoinWithinNs = 30'000'000;
 
 int64_t steadyNs(TimePoint at) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(at.time_since_epoch()).count();
@@ -165,18 +168,23 @@ struct Segment {
     // in the file.
     bool timed = false;
     RateMarks marks;
+    // How far from startsAt the segment before it may run out and be followed on from its last frame;
+    // 0 for a segment that never joins. Set only where that segment was decoded to the file's end.
+    int64_t joinWithin = 0;
 };
 
 // Everything one track shares between its owner, the output's thread and its stream's realtime
 // callback. Each group below is written by one of them.
 struct AudioTrackState {
     AudioTrackState(std::string path, std::string owner, std::string shownAs, int wake)
-        : file(std::move(path)), tag(std::move(owner)), name(std::move(shownAs)), wakeFd(wake),
+        : file(std::move(path)), tag(std::make_shared<const std::string>(std::move(owner))),
+          name(std::make_shared<const std::string>(std::move(shownAs))), wakeFd(wake),
           ring(new float[kRingFrames * kChannels]) {}
 
     const std::string file;
-    const std::string tag;
-    const std::string name;
+    // Owner -> output thread, each replaced whole by AudioTrack::rename().
+    std::atomic<std::shared_ptr<const std::string>> tag;
+    std::atomic<std::shared_ptr<const std::string>> name;
     const int wakeFd;
 
     // Owner -> output thread. The mutex is held for a copy and nothing else.
@@ -189,8 +197,6 @@ struct AudioTrackState {
 
     // Output thread -> owner: whether the file has sound to play, known once it has been opened.
     std::atomic<AudioTrack::Content> content{AudioTrack::Content::Unknown};
-    // Output thread -> owner: the request last taken up.
-    std::atomic<uint64_t> takenSerial{0};
 
     // Output thread -> callback. Frames are written at writePos and read at readPos; writePos only grows
     // but where a change of rate cuts it back, on the stream's thread between two cycles. A segment
@@ -234,6 +240,10 @@ struct AudioTrackState {
         uint64_t skipTo = 0;
         // The silence owed before any is played, the segment's start being still to come.
         uint64_t holdFrames = 0;
+        // When the segment it plays last had no frame to give, for as long as that lasts.
+        std::optional<int64_t> dryAt;
+        // When the server's next cycle was due to start, as it timed the last one.
+        std::optional<int64_t> nextCycleAt;
         // writePos when it last asked for more. It asks again only once something has been
         // written since, so a stalled or finished decoder is not woken on every callback.
         uint64_t askedAt = 0;
@@ -248,6 +258,8 @@ struct AudioTrackState {
     std::unique_ptr<AudioDecoder> decoder;
     pw_stream* stream = nullptr;
     spa_hook listener{};
+    // The name `stream` was last given.
+    std::shared_ptr<const std::string> streamName;
     bool active = false;
     // The request last acted on.
     uint64_t serviced = 0;
@@ -261,7 +273,10 @@ struct AudioTrackState {
         AudioDecoder::Position first;
     };
     std::vector<Placed> placed;
-    bool filling = false;
+    // Whether the segment being written still takes the decoder's frames: Ended once it has had the
+    // file's last, Stopped after a stop, a failure, or a play begun past it.
+    enum class Feed { Stopped, Running, Ended };
+    Feed feed = Feed::Stopped;
     bool stopping = false;
     // A request left without a stream -- no server, or the server failed this track's -- acted on
     // again from then on, once the server may be asked.
@@ -270,6 +285,8 @@ struct AudioTrackState {
     // The segment being filled loops, in the decoder, so it has no marks.
     bool looping = false;
 };
+
+using Feed = AudioTrackState::Feed;
 
 struct AudioCoreListener {
     std::atomic<bool>* broken = nullptr;
@@ -351,33 +368,71 @@ void render(AudioTrackState& t, float* out, uint32_t frames, const BufferTiming&
     const float volume = std::clamp(t.volume.load(std::memory_order_relaxed), 0.0f, 1.0f);
     uint64_t position = t.readPos.load(std::memory_order_relaxed);
 
+    // The first frame past what is written of the segment it plays; final once a later one is published.
+    const auto writtenEnd = [&] {
+        const uint64_t next = playingEnd > p.current.ringStart ? playingEnd : newestStart;
+        return next > p.current.ringStart ? std::min(written, next - 1) : written;
+    };
+    const auto enter = [&](uint64_t start) {
+        p.current = candidate;
+        p.marksValidTo = marked;
+        t.playingStart.store(start, std::memory_order_release);
+        position = std::max(position, start);
+        p.skipTo = start;
+        p.holdFrames = 0;
+        p.dryAt.reset();
+    };
+    // A joining segment waits past its start for the sound before it to run out, unless that already
+    // ran out too early to be joined.
+    const auto switchAtOf = [&](const Segment& s) {
+        const bool awaitsEnd =
+            s.joinWithin > 0 && p.current.audible && !(p.dryAt && *p.dryAt < s.startsAt - s.joinWithin);
+        return s.switchAt + (awaitsEnd ? s.joinWithin : 0);
+    };
+
+    // The server went on without asking -- stopped, or skipped this stream's cycles: the sound owed for that
+    // time is passed over, as a late start's is, so it keeps to its own time and the pictures that follow it
+    // do not wait out the gap. It comes back in over the ramp. Told by when the cycles start, not by when
+    // they are heard: a rise in the stream's delay moves the latter with no time missed.
+    if (timing.cycleAt && p.nextCycleAt && p.current.audible && p.holdFrames == 0 &&
+        *timing.cycleAt - *p.nextCycleAt > kClockSlackNs) {
+        p.skipTo = std::max(p.skipTo, position) + static_cast<uint64_t>(framesIn(*timing.cycleAt - *p.nextCycleAt));
+        p.gain = 0.0f;
+    }
+    p.nextCycleAt.reset();
+    if (timing.cycleAt) {
+        p.nextCycleAt = *timing.cycleAt + static_cast<int64_t>(frames) * 1'000'000'000 / AudioDecoder::kRate;
+    }
+
     for (uint32_t i = 0; i < frames; ++i) {
         const int64_t frameAt = heardAt + static_cast<int64_t>(i) * 1'000'000'000 / AudioDecoder::kRate;
+        // The file's last frame played out near a new pass's start: the pass goes on from the next frame,
+        // at the gain the last one had, and its clock says where.
+        if (candidate.serial != p.current.serial && candidate.joinWithin > 0 && p.current.audible &&
+            p.holdFrames == 0 && std::max(position, p.skipTo) >= writtenEnd() &&
+            p.dryAt.value_or(frameAt) >= candidate.startsAt - candidate.joinWithin &&
+            frameAt <= candidate.startsAt + candidate.joinWithin) {
+            enter(candidate.ringStart);
+        }
         // The sound before a switch fades out over the ramp ending at it, so the new one starts on time.
-        const bool switchDue = candidate.serial != p.current.serial && frameAt + kRampNs >= candidate.switchAt;
+        const bool switchDue = candidate.serial != p.current.serial && frameAt + kRampNs >= switchAtOf(candidate);
         if (switchDue && (p.gain <= 0.0f || !p.current.audible)) {
-            p.current = candidate;
-            p.marksValidTo = marked;
-            t.playingStart.store(candidate.ringStart, std::memory_order_release);
+            enter(candidate.ringStart);
             p.gain = 0.0f;
-            position = std::max(position, candidate.ringStart);
-            p.skipTo = candidate.ringStart;
-            p.holdFrames = 0;
             if (candidate.audible) {
                 const int64_t late = framesIn(frameAt - candidate.startsAt);
                 if (late > 0) p.skipTo += static_cast<uint64_t>(late);
                 if (late < 0) p.holdFrames = static_cast<uint64_t>(-late);
             }
         }
-        const bool fadingToSwitch = candidate.serial != p.current.serial && frameAt + kRampNs >= candidate.switchAt;
+        const bool fadingToSwitch = candidate.serial != p.current.serial && frameAt + kRampNs >= switchAtOf(candidate);
         // Nothing while it holds back to its start, so the ramp up begins with its first frame.
         const float target = p.current.audible && !fadingToSwitch && p.holdFrames == 0 ? volume : 0.0f;
 
         float left = 0.0f;
         float right = 0.0f;
         if (p.current.audible) {
-            const uint64_t next = playingEnd > p.current.ringStart ? playingEnd : newestStart;
-            const uint64_t end = next > p.current.ringStart ? std::min(written, next - 1) : written;
+            const uint64_t end = writtenEnd();
             if (p.holdFrames > 0) {
                 --p.holdFrames;
             } else {
@@ -388,9 +443,11 @@ void render(AudioTrackState& t, float* out, uint32_t frames, const BufferTiming&
                     left = frame[0];
                     right = frame[1];
                     ++position;
+                    p.dryAt.reset();
                 } else {
                     // Late or ended: the frame this one stood for is owed, so the sound keeps to its time.
                     p.skipTo = std::max(p.skipTo, position) + 1;
+                    if (!p.dryAt) p.dryAt = frameAt;
                 }
             }
         }
@@ -554,6 +611,14 @@ void AudioTrack::setRate(double rate) noexcept {
 
 double AudioTrack::rate() const noexcept { return m_state->rate.load(std::memory_order_relaxed); }
 
+void AudioTrack::rename(std::string name, std::string tag) {
+    auto shownAs = std::make_shared<const std::string>(std::move(name));
+    auto owner = std::make_shared<const std::string>(std::move(tag));
+    m_state->tag.store(std::move(owner));
+    m_state->name.store(std::move(shownAs));
+    m_output.wake();
+}
+
 AudioTrack::Content AudioTrack::content() const noexcept { return m_state->content.load(std::memory_order_acquire); }
 
 std::optional<AudioTrack::Clock> AudioTrack::clock(std::chrono::steady_clock::time_point now) const noexcept {
@@ -579,10 +644,6 @@ std::optional<AudioTrack::Clock> AudioTrack::clock(std::chrono::steady_clock::ti
 
 // requestSerial is written only on this thread, so it is read here without its lock.
 uint64_t AudioTrack::request() const noexcept { return m_state->requestSerial; }
-
-bool AudioTrack::taken() const noexcept {
-    return m_state->takenSerial.load(std::memory_order_acquire) == m_state->requestSerial;
-}
 
 // noexcept is truthful: the anchor copies without allocating, and the lock is one this class never
 // misuses, which is the only way std::mutex::lock throws.
@@ -636,8 +697,9 @@ void AudioOutput::wake() noexcept { signalWake(m_wakeFd); }
 template <typename Work>
 void AudioOutput::onContent(const AudioTrackState& t, Work&& work) {
     if (!m_scope) return work();
+    const std::shared_ptr<const std::string> tag = t.tag.load();
     // By reference: std::function holds a reference_wrapper without allocating.
-    m_scope(t.tag, std::function<void()>(std::ref(work)));
+    m_scope(*tag, std::function<void()>(std::ref(work)));
 }
 
 void AudioOutput::closeDecoder(AudioTrackState& t) noexcept {
@@ -815,13 +877,31 @@ void AudioOutput::service(AudioTrackState& t, TimePoint now) {
         t.retryAt.reset();
         t.serviced = 0;
     }
+    if (t.stream != nullptr) {
+        std::shared_ptr<const std::string> name = t.name.load();
+        if (name != t.streamName) {
+            const spa_dict_item items[] = {{PW_KEY_NODE_DESCRIPTION, name->c_str()}, {PW_KEY_MEDIA_NAME, name->c_str()}};
+            const spa_dict dict = SPA_DICT_INIT_ARRAY(items);
+            pw_thread_loop_lock(m_loop);
+            pw_stream_update_properties(t.stream, &dict);
+            pw_thread_loop_unlock(m_loop);
+            t.streamName = std::move(name);
+        }
+    }
     // Also once a file's sound has ended: what it still has queued is decoded again from the cut.
-    if (followRate(t)) t.filling = true;
-    // A play far off waits while the sound before it is fed, so that sound lasts until it.
-    const bool later = play && t.filling && now < play->at - kBeginAhead;
+    if (followRate(t)) t.feed = Feed::Running;
+    // A play far off waits while the sound before it is fed, so that sound lasts until it; one that may
+    // join that sound waits until it is fed to the file's end or past where the join could land.
+    const auto fedUntil = [&] {
+        const uint64_t written = t.writePos.load(std::memory_order_relaxed);
+        const uint64_t ahead = written - std::min(written, t.readPos.load(std::memory_order_acquire));
+        return now + std::chrono::nanoseconds(static_cast<int64_t>(ahead) * 1'000'000'000 / AudioDecoder::kRate);
+    };
+    const bool later = play && t.feed == Feed::Running &&
+                       (now < play->at - kBeginAhead ||
+                        (play->joins && fedUntil() < play->at + std::chrono::nanoseconds(kJoinWithinNs)));
     if (serial != t.serviced && !later) {
         t.serviced = serial;
-        t.takenSerial.store(serial, std::memory_order_release);
         t.retryAt.reset();
         if (play) {
             begin(t, serial, *play);
@@ -829,7 +909,7 @@ void AudioOutput::service(AudioTrackState& t, TimePoint now) {
             end(t, serial);
         }
     }
-    if (t.filling) fill(t);
+    if (t.feed == Feed::Running) fill(t);
     if (t.stopping && t.quietSerial.load(std::memory_order_acquire) == t.serviced) {
         t.stopping = false;
         setActive(t, false);
@@ -844,16 +924,21 @@ std::optional<AudioOutput::TimePoint> AudioOutput::nextPassAt(AudioTrackState& t
     // A play put off while the sound before it was fed, whether or not that sound has since ended:
     // the callback stops asking for passes once nothing more is written.
     std::lock_guard<std::mutex> lock(t.requestMutex);
-    if (t.requestSerial != t.serviced && t.requestPlay) next = earlier(next, t.requestPlay->at - kBeginAhead);
+    if (t.requestSerial != t.serviced && t.requestPlay) {
+        const std::chrono::nanoseconds joinWait(t.requestPlay->joins ? kJoinWithinNs : 0);
+        next = earlier(next, t.requestPlay->at - kBeginAhead + joinWait);
+    }
     return next;
 }
 
 void AudioOutput::begin(AudioTrackState& t, uint64_t serial, const AudioTrack::Anchor& anchor) {
     int64_t at = steadyNs(anchor.at);
     // The sound before this one plays until `at`, on what it has decoded by now.
-    if (t.filling && at > steadyNs(SteadyClock::now())) fill(t);
+    if (t.feed == Feed::Running && at > steadyNs(SteadyClock::now())) fill(t);
+    // Only onto a sound decoded to the file's end, and from `from` itself.
+    const bool joins = anchor.joins && t.feed == Feed::Ended && at > steadyNs(SteadyClock::now());
     t.stopping = false;
-    t.filling = false;
+    t.feed = Feed::Stopped;
     const AudioTrack::Content content = t.content.load(std::memory_order_relaxed);
     if (content == AudioTrack::Content::None || content == AudioTrack::Content::Failed) return;
     try {
@@ -882,6 +967,7 @@ void AudioOutput::begin(AudioTrackState& t, uint64_t serial, const AudioTrack::A
         onContent(t, [&] {
             t.decoder->setRate(rate);
             t.decoder->setLoop(anchor.loop ? std::optional(anchor.from) : std::nullopt);
+            t.decoder->setNext(anchor.loop ? std::nullopt : anchor.next);
             t.decoder->seek(fileAt);
         });
     } catch (const std::exception& e) {
@@ -898,17 +984,17 @@ void AudioOutput::begin(AudioTrackState& t, uint64_t serial, const AudioTrack::A
     t.marks = {};
     t.placed.clear();
     t.looping = anchor.loop;
-    t.filling = true;
+    t.feed = Feed::Running;
     fill(t);
     {
         std::lock_guard<std::mutex> lock(t.segmentMutex);
-        t.newest = Segment{serial, ringStart, at, startsAt, true, !anchor.loop, t.marks};
+        t.newest = Segment{serial, ringStart, at, startsAt, true, !anchor.loop, t.marks, joins ? kJoinWithinNs : 0};
     }
     if (!t.active) setActive(t, true);
 }
 
 void AudioOutput::end(AudioTrackState& t, uint64_t serial) {
-    t.filling = false;
+    t.feed = Feed::Stopped;
     const uint64_t ringStart = newSegment(t);
     {
         std::lock_guard<std::mutex> lock(t.segmentMutex);
@@ -936,7 +1022,7 @@ uint64_t AudioOutput::newSegment(AudioTrackState& t) {
 }
 
 void AudioOutput::fill(AudioTrackState& t) {
-    while (t.filling) {
+    while (t.feed == Feed::Running) {
         const uint64_t written = t.writePos.load(std::memory_order_relaxed);
         const uint64_t read = t.readPos.load(std::memory_order_acquire);
         const uint64_t ahead = written - std::min(written, std::max(read, t.segmentStart));
@@ -959,7 +1045,7 @@ void AudioOutput::fill(AudioTrackState& t) {
             });
         } catch (const std::exception& e) {
             closeAfterFailure(t);
-            t.filling = false;
+            t.feed = Feed::Stopped;
             m_log(std::string("AudioOutput: a wallpaper's sound stopped: ") + e.what());
             return;
         }
@@ -967,7 +1053,7 @@ void AudioOutput::fill(AudioTrackState& t) {
         if (got > 0 && !t.looping) markRate(t, written, first.file, first.rate);
         t.writePos.store(written + got, std::memory_order_release);
         // The end of the stream: the callback plays silence after it until the next anchor.
-        if (ended) t.filling = false;
+        if (ended) t.feed = Feed::Ended;
     }
 }
 
@@ -1015,7 +1101,7 @@ bool AudioOutput::followRate(AudioTrackState& t) {
         });
     } catch (const std::exception& e) {
         closeAfterFailure(t);
-        t.filling = false;
+        t.feed = Feed::Stopped;
         m_log(std::string("AudioOutput: a wallpaper's sound stopped: ") + e.what());
         return false;
     }
@@ -1153,13 +1239,14 @@ bool AudioOutput::ensureStream(AudioTrackState& t) {
         dropStream(t, SteadyClock::now());
         return false;
     }
+    std::shared_ptr<const std::string> name = t.name.load();
     pw_thread_loop_lock(m_loop);
     pw_properties* properties =
         pw_properties_new(PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Playback", PW_KEY_MEDIA_ROLE, "Music",
-                          PW_KEY_NODE_NAME, "wallpaperx", PW_KEY_NODE_DESCRIPTION, t.name.c_str(), PW_KEY_MEDIA_NAME,
-                          t.name.c_str(), nullptr);
+                          PW_KEY_NODE_NAME, "wallpaperx", PW_KEY_NODE_DESCRIPTION, name->c_str(), PW_KEY_MEDIA_NAME,
+                          name->c_str(), nullptr);
     // Takes the properties, even when it fails.
-    pw_stream* stream = properties != nullptr ? pw_stream_new(m_core, t.name.c_str(), properties) : nullptr;
+    pw_stream* stream = properties != nullptr ? pw_stream_new(m_core, name->c_str(), properties) : nullptr;
     int err = stream == nullptr ? -errno : 0;
     if (stream != nullptr) {
         t.listener = spa_hook{};
@@ -1197,6 +1284,7 @@ bool AudioOutput::ensureStream(AudioTrackState& t) {
         return false;
     }
     t.stream = stream;
+    t.streamName = std::move(name);
     t.active = false;
     return true;
 }
@@ -1233,7 +1321,7 @@ void AudioOutput::destroyStream(AudioTrackState& t) noexcept {
 
 void AudioOutput::dropStream(AudioTrackState& t, TimePoint retryAt) noexcept {
     destroyStream(t);
-    t.filling = false;
+    t.feed = Feed::Stopped;
     t.stopping = false;
     // Whatever the request: one that ended the sound is acted on again harmlessly.
     t.retryAt = retryAt;

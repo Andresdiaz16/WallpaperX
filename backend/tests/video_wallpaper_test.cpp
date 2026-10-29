@@ -4013,10 +4013,10 @@ void runVisibilityChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const
     //       kQuietWindow, six of this file's picture intervals; a correct daemon shows nothing in it
     //       however long it is.
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, recordDeliveredLocked() given a loop that
-    //       also erases this monitor's screen from m_outputsNotDrawn -- "the hand-over is evidence
+    //       also erases this monitor's screen's reports from m_outputsDrawn -- "the hand-over is evidence
     //       the screen is being drawn", which is the shape this check exists to forbid -> "FAIL: a
     //       covered screen's video is not restarted by a consumer that keeps fetching". Observed via
-    //       control_batch.sh, --phase '^visibility$', 2026-10-05. Reverted.
+    //       control_batch.sh, --phase '^visibility$', 2026-10-29. Reverted.
     //       Deleting watchedLocked()'s `if (!screenDrawnLocked(monitorId)) return false;` is NOT a
     //       usable control here: the video then never stops, so the phase abandons at the check
     //       above and this line is never reached.
@@ -4124,11 +4124,10 @@ void runVisibilityChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const
     //       Nothing is fetched anywhere in the window -- that is the whole point, since a fetch is
     //       the evidence being forged -- and the starting generation is read after the monitor has
     //       been quiesced, so pictures the resume above was still publishing are not charged here.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, setOutputVisible()'s credit replaced by the
-    //       pre-fix line `it->second.uncollectedSince.reset();` -> "FAIL: saying a screen is hidden
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, noteDrawnChangeLocked()'s final credit assignment
+    //       replaced by `it->second.uncollectedSince.reset();` -> "FAIL: saying a screen is hidden
     //       and then shown again does not keep its video playing for a consumer that collects
-    //       nothing", printing "40 picture(s) over 20 edges, where 13 is the most the one-picture
-    //       credit allows" against 5-6 with the fix. Reverted.
+    //       nothing". control_batch.sh, --phase '^visibility$', 2026-10-29. Reverted.
     // COVERAGE-ASSERT: the number of edges actually driven is asserted, so a loop that stopped
     //       early -- which would make "few pictures appeared" true for the wrong reason -- fails
     //       here instead of reading as a bound that held.
@@ -4180,11 +4179,10 @@ void runVisibilityChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const
         // WHY-THIS-SHAPE: the same window the upper bound above is read from, so the two bounds
         //       are about one behaviour and cannot both be met by different ones. The floor is HALF
         //       what the interval allows, so a slow machine cannot cross it; the defect gives one.
-        // CONTROL: backend/daemon/wallpaper_manager.cpp, setOutputVisible()'s early return for a
+        // CONTROL: backend/daemon/wallpaper_manager.cpp, noteDrawnChangeLocked()'s early return for a
         //       pending or unspent credit deleted, so every report re-dates it -> "FAIL: a screen that
-        //       keeps reporting it is drawn again goes on getting a picture about once per interval",
-        //       printing "+1 picture(s), where at least 2 were due over 3.96 s"; the genuine-resume
-        //       line below went red with it, its credit pushed out of reach. Reverted.
+        //       keeps reporting it is drawn again goes on getting a picture about once per interval".
+        //       control_batch.sh, --phase '^visibility$', 2026-10-29. Reverted.
         const uint64_t expectedAtLeast = static_cast<uint64_t>(forgeSpan / config.unwatchedAfter) / 2;
         reportUnless(expectedAtLeast >= 2 && forged >= expectedAtLeast,
                      "a screen that keeps reporting it is drawn again goes on getting a picture about once per "
@@ -4200,12 +4198,10 @@ void runVisibilityChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const
         //       separate monitor would leave open that the one above had stopped for some other
         //       reason. The bound it must beat is the forged allowance recomputed over ITS OWN
         //       span, so the two halves cannot both be satisfied by the same behaviour.
-        // CONTROL: in backend/daemon/wallpaper_manager.cpp, setOutputVisible()'s
-        //       `if (!visible || wasDrawn) return;` changed to `if (true) return;`, so no edge ever
-        //       grants a credit -> "FAIL: while a screen that comes back AND has its picture
-        //       collected goes on playing", printing "0 picture(s), 0 collected", with S13.157's
-        //       own resume line red above it. The forged half stays green at +0, which is why both
-        //       halves are needed. Reverted.
+        // CONTROL: in backend/daemon/wallpaper_manager.cpp, noteDrawnChangeLocked() given `if (drawn) return;`
+        //       after its hidden branch, so no edge ever grants a credit -> "FAIL: while a screen that comes
+        //       back AND has its picture collected goes on playing". control_batch.sh, --phase '^visibility$',
+        //       2026-10-29. The forged half stays green, which is why both halves are needed. Reverted.
         // A credit is granted at most once per unwatchedAfter, and the forged loop above left one
         // a fraction of an interval old. Waiting past the interval is what makes the edge below a
         // grantable one, so this half grades the feature rather than the rate limit above.
@@ -4753,13 +4749,12 @@ void runWatchEvidenceChecks(const WallpaperManager::Config& config, const std::s
     //       the whole claim; reading it on the monitor that lost the name would be satisfied by a
     //       daemon that simply forgot both. The still is there so the new monitor has a status
     //       entry to read at all -- GetStatus lists wallpapers.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the
-    //       `m_outputsNotDrawn.erase(existing->first);` line deleted from bindOutputLocked() ->
-    //       "FAIL: a screen name rebound to another monitor does not carry its old not-drawn
-    //       verdict", printing screen_visible false. Observed 2026-09-20. Reverted.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `m_outputsDrawn.erase(existing->first);` line
+    //       deleted from bindOutputLocked() -> "FAIL: a screen name rebound to another monitor does not carry its
+    //       old not-drawn verdict", printing screen_visible false. control_batch.sh 2026-10-29, --phase watchEvidence.
     {
         const std::string name = screenOf(kMonitorEvidence);
-        manager.setOutputVisible(name, false);
+        manager.setOutputVisible(name, false, "test");
         const std::optional<wallpaperx::MonitorStatus> covered = monitorStatus(manager, kMonitorEvidence);
         check(covered && !covered->screenVisible, "a screen that says it is not being drawn is recorded as such");
         manager.requestWallpaper("static", still, kMonitorRebound);
@@ -4769,6 +4764,28 @@ void runWatchEvidenceChecks(const WallpaperManager::Config& config, const std::s
         reportUnless(rebound && rebound->screenVisible,
                      "a screen name rebound to another monitor does not carry its old not-drawn verdict",
                      rebound ? "screen_visible: false" : std::string("no status for the monitor that took the name"));
+
+        // GOAL: S15.1090 -- visibility is kept per reporter: with one connection reporting a screen hidden and
+        //       another drawn, it is drawn; the "drawn" one leaving the bus makes it hidden; a reporter's later
+        //       report replaces its own earlier one.
+        // WHY-THIS-SHAPE: read through screenVisible, which is what decides whether the video runs; the hidden
+        //       reporter speaks first, so a daemon keeping only the latest report overall is red on the first
+        //       line, and one that ignores the reporter on leaving is red on the second.
+        // CONTROL: control_batch.sh 2026-10-29, --phase watchEvidence, each alone, reverted, in
+        //       backend/daemon/wallpaper_manager.cpp: outputDrawnLocked's any_of made all_of -> the first line;
+        //       forgetOutputVisibility's `reports.erase(client)` made `0` -> the second line.
+        auto status = [&] { return monitorStatus(manager, kMonitorRebound); };
+        manager.setOutputVisible(name, false, ":1.greeter");
+        manager.setOutputVisible(name, true, ":1.shell");
+        const auto both = status();
+        check(both && both->screenVisible, "S15.1090 one reporter hidden and another drawn: the screen counts as drawn");
+        const bool forgot = manager.forgetOutputVisibility(":1.shell");
+        const auto left = status();
+        check(forgot && left && !left->screenVisible, "S15.1090 the drawn reporter leaving the bus leaves the screen hidden");
+        manager.setOutputVisible(name, true, ":1.greeter");
+        const auto replaced = status();
+        check(replaced && replaced->screenVisible, "S15.1090 a reporter's later report replaces its own earlier one");
+        manager.forgetOutputVisibility(":1.greeter");
     }
 
     // GOAL: S15.346 -- a consumer refused for holding too many descriptors is neither collecting the
@@ -5362,8 +5379,8 @@ void runResumeCreditChecks(const WallpaperManager::Config& config, const std::st
     WorkerUnblock unblock{worker};
 
     const auto edge = [&manager, &worker](int monitorId) {
-        manager.setOutputVisible(screenOf(monitorId), false);
-        manager.setOutputVisible(screenOf(monitorId), true);
+        manager.setOutputVisible(screenOf(monitorId), false, "test");
+        manager.setOutputVisible(screenOf(monitorId), true, "test");
         // What the bus method does after the manager call, and the only thing that runs a round.
         worker.wake();
     };
@@ -6886,7 +6903,7 @@ void runEvictionWatchChecks(const WallpaperManager::Config& config, const std::v
     //       drawn gives its session up for the ninth video", because nothing is then evictable and
     //       the ninth is refused again. Re-run via control_batch.sh, --phase '^evictionWatch$',
     //       2026-10-18, NVIDIA. Reverted.
-    manager.setOutputVisible(screenOf(kEvictionWatchMonitors[2]), false);
+    manager.setOutputVisible(screenOf(kEvictionWatchMonitors[2]), false, "test");
     // Asked for again, not merely re-rendered: a pass that failed marks the request serviced, so
     // renderPending() on its own would answer "nothing to do" and this check would read a no-op.
     manager.requestWallpaper("video", clips[ninth], kEvictionWatchMonitors[ninth]);
@@ -7577,8 +7594,9 @@ void runKeptStillChecks(const WallpaperManager::Config& base, const std::vector<
 
     // GOAL: S15.746 -- a pass that fails keeps nothing: the redraw after it decodes the unchanged file again.
     // WHY-THIS-SHAPE: the redraw is a resize; a new request would make a new wallpaperSeq, whose stale-image
-    //       drop decodes afresh whether the failure kept anything or not.
-    // CONTROL: control_batch.sh 2026-10-18 (T2), phase keptStill, NVIDIA and Lavapipe, reverted: the erase is
+    //       drop decodes afresh whether the failure kept anything or not. Nothing touches the file between the
+    //       failure and this redraw: a changed identity would force the decode whatever the failure kept.
+    // CONTROL: control_batch.sh 2026-10-29, phase keptStill, reverted: the erase is
     //       one line inside renderPassLocked()'s `tearDownFailed` (backend/daemon/wallpaper_manager.cpp), called
     //       before and after the commit block; the call AFTER it deleted -> this line (a failed submission is
     //       inside the commit block, which the earlier call misses). S15.802 is the earlier call's.
@@ -7591,6 +7609,70 @@ void runKeptStillChecks(const WallpaperManager::Config& base, const std::vector<
     const std::optional<bool> fitAfterFailure = leftEdgeBlack(manager, kA, edgeReason);
     reportUnless(fitAfterFailure.value_or(false), "a layout set while the last render had failed draws the layout at the next redraw",
                  fitAfterFailure ? "the left edge is not black" : "unreadable: " + edgeReason);
+
+    // GOAL: S15.1037 -- a still whose render failed for a device or daemon fault (here the submission) is not
+    //       redrawn by a layout change after its file changes: no file change answers such a fault.
+    // WHY-THIS-SHAPE: its own failed draw, after S15.746's redraw, because the touch changes the file's identity
+    //       and would hide what S15.746 grades. The touch alone is what makes a file-fault still owed a redraw
+    //       (S15.991); both layout moves are graded. A resize then redraws it, so S15.991 starts from a drawn still.
+    // CONTROL: control_batch.sh 2026-10-29, --phase keptStill, reverted: `state.lastErrorFault !=
+    //       Fault::File ||` deleted from setWallpaperProperties (backend/daemon/wallpaper_manager.cpp) -> this line.
+    {
+        const bool faultOwed = layOut(PositionMode::Stretch);
+        g_submitFailGate.arm(CallGate::Mode::Fail);
+        const StillPass faulted = drawCounted(manager, kA);
+        g_submitFailGate.release();
+        check(faultOwed && !faulted.rendered, "S15.1037 setup: an owed draw failed at its submission commits nothing");
+        std::filesystem::last_write_time(a, std::filesystem::last_write_time(a) + std::chrono::seconds(11));
+        const bool faultAwayOwed = layOut(PositionMode::Fit);
+        const bool faultBackOwed = layOut(PositionMode::Stretch);
+        check(!faultAwayOwed && !faultBackOwed && !owesRender(manager, kA),
+              "S15.1037 a still failed by a device fault is not redrawn by a layout change after its file changes");
+        owed.clear();
+        manager.setOutputSize(screenOf(kA), kResizedWidth, kResizedHeight, owed);
+        const StillPass redrawn = drawCounted(manager, kA);
+        check(contains(owed, kA) && redrawn.rendered, "S15.1037 setup: a resize draws the still again before S15.991");
+    }
+
+    // GOAL: S15.991 -- a still whose render failed on its file is redrawn by the next layout change once the path names
+    //       other bytes (a new size, or only a new modification time), and an unchanged broken file is not: a file
+    //       read half-written and finished since is shown without a re-apply.
+    // WHY-THIS-SHAPE: the failure is a real half-written PNG, not the submit gate above, so the identity recorded is
+    //       the one the failed pass read. The touched-but-still-broken step moves only the time, so an identity that
+    //       dropped the time fails it; the finish moves the size too. Each "unchanged" step follows a failed draw.
+    // CONTROL: control_batch.sh 2026-10-28, each alone, reverted, backend/daemon/wallpaper_manager.cpp
+    //       setWallpaperProperties(): `stillFile == state.failedStillFile` made `true` -> "S15.991 ... touched" and
+    //       "... finished"; made `false` -> "S15.991 a layout change on an unchanged half-written still posts no
+    //       redraw"; backend/daemon/record_file.h FileIdentity::operator== made to ignore modifiedNs -> "... touched".
+    {
+        const std::string half = original.substr(0, original.size() / 2);
+        std::ofstream(a, std::ios::binary | std::ios::trunc) << half;
+        const bool halfOwed = relayout();
+        const StillPass halfPass = drawCounted(manager, kA);
+        const bool setUp = halfOwed && !halfPass.rendered;
+        check(setUp, "S15.991 setup: a half-written still is owed a redraw and its draw fails");
+        if (setUp) {
+            const bool unchangedOwed = relayout();
+            reportUnless(!unchangedOwed && !owesRender(manager, kA),
+                         "S15.991 a layout change on an unchanged half-written still posts no redraw", "a redraw was posted");
+            std::filesystem::last_write_time(a, std::filesystem::last_write_time(a) + std::chrono::seconds(7));
+            const bool touchedOwed = relayout();
+            const StillPass touchedPass = drawCounted(manager, kA);
+            reportUnless(touchedOwed && !touchedPass.rendered,
+                         "S15.991 a broken still touched since its failed draw is drawn again by a layout change",
+                         touchedOwed ? describe(touchedPass) : "no redraw posted");
+            const bool againOwed = relayout();
+            check(!againOwed && !owesRender(manager, kA), "S15.991 the touched, still-broken file is not drawn again unchanged");
+            std::ofstream(a, std::ios::binary | std::ios::trunc) << original;
+            const bool finishedOwed = relayout();
+            const StillPass finished = drawCounted(manager, kA);
+            reportUnless(finishedOwed && finished.rendered && finished.decodes == 1,
+                         "S15.991 a half-written still finished since its failed draw is shown by the next layout change",
+                         finishedOwed ? describe(finished) : "no redraw posted (stuck)");
+        } else {
+            std::ofstream(a, std::ios::binary | std::ios::trunc) << original;
+        }
+    }
 
     // GOAL: S15.747 -- setting the same path again decodes it afresh.
     // CONTROL: control_batch.sh 2026-10-18, phase keptStill, reverted: dropStaleKeptStillLocked's
@@ -7731,12 +7813,23 @@ void runPositionVideoChecks(const WallpaperManager::Config& base, const std::str
     //       for a layout change, in the new layout.
     // CONTROL: control_batch.sh 2026-10-18, phase positionVideo, reverted: setWallpaperProperties's
     //       `++state.requestSeq; return true;` made `return false;` (backend/daemon/wallpaper_manager.cpp) -> this line.
+    //       control_run.sh 2026-10-29 (T8), both entries, reverted: setWallpaperProperties's clip test made
+    //       `motionLocked(...) != Motion::Stopped` (a parked session taken as playing) -> this line, "not owed,
+    //       generation 1 -> 1, left edge not black", the suite run's failure; green restored.
     manager.requestWallpaper("video", onePicture, kStopped);
     if (!renderCounted(manager, kStopped).outcome.rendered) {
         check(false, "the parked video monitor is drawn");
         return;
     }
-    for (int round = 0; round < 3; ++round) manager.advanceVideo(std::chrono::steady_clock::now());
+    // WHY-THIS-SHAPE: the session parks only in a round that finds its decode thread's restarted picture, and
+    //       that thread runs on its own: three rounds back to back left it still playing under a loaded suite
+    //       run ("not owed"). Rounds 5 ms apart for 300 ms give the thread that time; the session cannot be read
+    //       as parked from outside, so a premise failure still reads as this line's.
+    for (const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+         std::chrono::steady_clock::now() < until;) {
+        manager.advanceVideo(std::chrono::steady_clock::now());
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
     const bool stoppedOwed = manager.setWallpaperProperties(kStopped, {{"position", PositionMode::Fit}});
     const uint64_t before = monitorStatus(manager, kStopped) ? monitorStatus(manager, kStopped)->generation : 0;
     const bool redrawn = manager.renderPending(kStopped).rendered;
@@ -8434,7 +8527,7 @@ constexpr int kBlameChildSetupFailed = 4;
             for (const int id : wallpaperx::testing::nameScreen(manager, monitorId, "DP-BLAME")) worker.post(id);
             if (!signals.waitAtLeast(monitorId, kBlameResumeAfterPictures)) std::_Exit(kBlameChildSetupFailed);
             g_files.resetCounts();
-            manager.setOutputVisible("DP-BLAME", false);
+            manager.setOutputVisible("DP-BLAME", false, "test");
             worker.post(monitorId);
             const Clock::time_point releasedBy = Clock::now() + std::chrono::seconds(20);
             while (g_files.closes(path) < 1) {
@@ -8442,7 +8535,7 @@ constexpr int kBlameChildSetupFailed = 4;
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
             armCrash(scenario == "resume-seek" ? CrashOn::Seek : CrashOn::CatchUp, path);
-            manager.setOutputVisible("DP-BLAME", true);
+            manager.setOutputVisible("DP-BLAME", true, "test");
             worker.post(monitorId);
         } else {
             if (!signals.wait(monitorId, 1)) std::_Exit(kBlameChildSetupFailed);
@@ -8452,7 +8545,7 @@ constexpr int kBlameChildSetupFailed = 4;
                 worker.post(monitorId);
             } else if (scenario == "evict") {
                 wallpaperx::testing::nameScreen(manager, monitorId, "DP-BLAME");
-                manager.setOutputVisible("DP-BLAME", false);
+                manager.setOutputVisible("DP-BLAME", false, "test");
                 // Two: the request's own open is a shortage it accepts, the render's is the one
                 // that frees a session to try again.
                 // GOAL: both staged shortages land on the request's and the render's opens, never on the scan's.
@@ -8806,13 +8899,13 @@ void runCleanPlayHideChecks(const WallpaperManager::Config& base, const std::str
 
     const Clock::time_point firstShown = Clock::now();
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-    manager.setOutputVisible(screen, false);
+    manager.setOutputVisible(screen, false, "test");
     const double visibleBefore = std::chrono::duration<double>(Clock::now() - firstShown).count();
     g_files.resetCounts();
     std::this_thread::sleep_for(hide);
     const int releasedDuringHide = g_files.closes(clip);
     const Clock::time_point shownAgain = Clock::now();
-    manager.setOutputVisible(screen, true);
+    manager.setOutputVisible(screen, true, "test");
     worker.wake();
     const size_t before = signals.countFor(kMonitorClean);
     const bool resumed = settlesWithin(std::chrono::seconds(10),
@@ -9992,6 +10085,56 @@ void runPauseChecks(const WallpaperManager::Config& base, const std::string& cli
     const bool resumed = playsPast(pausedAt, std::chrono::seconds(10));
     check(resumed && !pausedNow(), "setting it back to play starts it again, with nothing else asked for");
 
+    // GOAL: S15.999 -- the wallpaper's own `paused` stops a playing video and holds it under every pause mode; turned
+    //       off (false, not just unset) it falls back to the mode: held by always_paused, playing under play.
+    // WHY-THIS-SHAPE: each mode change is followed by a quiescence while the consumer keeps collecting, so a mode
+    //       that let the video run shows new pictures; `paused=false` is sent explicitly, so a rule that let the key's
+    //       presence override the mode is caught where an unset key would pass.
+    // CONTROL: control_batch.sh 2026-10-28, each alone, reverted: pausedLocked() (backend/daemon/
+    //       wallpaper_manager.cpp) counting `paused` only under play -> "S15.999 a paused wallpaper stays held when its
+    //       mode is set to paused_while_focused"; pausedLocked() letting a present `paused` key decide -> "S15.999 turned
+    //       off under always_paused"; wallpaperPaused() (backend/daemon/wallpaper_properties.cpp) `return false` ->
+    //       "S15.999 paused=true stops"; `return paused != nullptr` -> "S15.999 turned off under play".
+    if (resumed) {
+        setWallpaperProperties(proxy, kMonitorPause, {{"paused", sdbus::Variant(true)}});
+        const bool held = collectUntilQuiet(std::chrono::seconds(25)) && pausedNow();
+        check(held, "S15.999 paused=true stops a video playing under play, and GetStatus says paused");
+        const uint64_t heldAt = latestGeneration(rig.pictures, kMonitorPause);
+        int modesGraded = 0;
+        for (const char* mode : {"paused_while_focused", "paused_while_maximized", "always_paused", "play"}) {
+            if (!held) break;
+            setMonitorPause(proxy, kMonitorPause, mode);
+            const bool quiet = collectUntilQuiet(std::chrono::seconds(10));
+            const uint64_t now = latestGeneration(rig.pictures, kMonitorPause);
+            check(quiet && now == heldAt && pausedNow(),
+                  (std::string("S15.999 a paused wallpaper stays held when its mode is set to ") + mode).c_str());
+            ++modesGraded;
+        }
+        // COVERAGE-ASSERT: every mode was graded once the premise held.
+        check(!held || modesGraded == 4, "S15.999 all four pause modes were graded");
+        if (held) {
+            setMonitorPause(proxy, kMonitorPause, "always_paused");
+            setWallpaperProperties(proxy, kMonitorPause, {{"paused", sdbus::Variant(false)}});
+            const bool quiet = collectUntilQuiet(std::chrono::seconds(10));
+            check(quiet && latestGeneration(rig.pictures, kMonitorPause) == heldAt && pausedNow(),
+                  "S15.999 turned off under always_paused, the video stays held by its mode");
+            setMonitorPause(proxy, kMonitorPause, "play");
+            setWallpaperProperties(proxy, kMonitorPause, {{"paused", sdbus::Variant(true)}});
+            // The premise is graded, not assumed: a stream that never went quiet would give a moving `before`,
+            // and playsPast() would then pass on a video that was never held.
+            const bool heldAgain = collectUntilQuiet(std::chrono::seconds(25)) && pausedNow();
+            check(heldAgain, "S15.999 paused=true under play holds the video again (the premise of the next line)");
+            if (heldAgain) {
+                const uint64_t before = latestGeneration(rig.pictures, kMonitorPause);
+                setWallpaperProperties(proxy, kMonitorPause, {{"paused", sdbus::Variant(false)}});
+                check(playsPast(before, std::chrono::seconds(10)) && !pausedNow(),
+                      "S15.999 turned off under play, the video plays again with nothing else asked for");
+            }
+        }
+        setMonitorPause(proxy, kMonitorPause, "play");
+        setWallpaperProperties(proxy, kMonitorPause, {});
+    }
+
     // GOAL: S15.147 -- a focus report ending because its sender left the bus starts a video it had
     //       paused again, with no other call.
     // WHY-THIS-SHAPE: the report comes from a second connection; the video is stopped by it, and the
@@ -10101,13 +10244,17 @@ void runStoppedRelayoutChecks(const WallpaperManager::Config& base) {
             if (shown < 3) std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         bool decodedAhead = false;
-        for (int attempt = 0; shown >= 3 && attempt < 20 && !decodedAhead; ++attempt) {
+        // Spaced 2 ms apart for up to 2 s: back to back, 20 attempts all came before a loaded machine's decode
+        // thread delivered, and the premise failed with nothing wrong.
+        for (const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+             shown >= 3 && !decodedAhead && std::chrono::steady_clock::now() < until;) {
             g_decodeCalls.store(0);
             bool showedAgain = false;
             for (const wallpaperx::ClockRound::Shown& s : manager.advanceVideo(std::chrono::steady_clock::now()).shown) {
                 showedAgain = showedAgain || s.monitorId == kStopped;
             }
             decodedAhead = !showedAgain && g_decodeCalls.load() > 0;
+            if (!decodedAhead) std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         if (v.pause) manager.setMonitorPause(kStopped, "always_paused");
         std::string reason;
@@ -11827,7 +11974,7 @@ void runSharedReleaseChecks(const WallpaperManager::Config& base, const std::str
         check(false, "two screens share a decoder before the release checks");
         return;
     }
-    manager.setOutputVisible(screenOf(kHidden), false);
+    manager.setOutputVisible(screenOf(kHidden), false, "test");
     g_files.resetCounts();
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < 4; ++i) manager.advanceVideo(t0 + i * std::chrono::seconds(5));
@@ -11850,7 +11997,7 @@ void runSharedReleaseChecks(const WallpaperManager::Config& base, const std::str
     if (closesPastPaused != 1) return;
 
     g_farRead.arm(0.0, 0, false);
-    manager.setOutputVisible(screenOf(kHidden), true);
+    manager.setOutputVisible(screenOf(kHidden), true, "test");
     const bool reopened = rounds([&](const std::set<int>&) { return liveCount(released) == 1; });
     const int seeks = g_farRead.farSeeks();
     g_farRead.disarm();
@@ -11914,7 +12061,7 @@ void runSharedEvictionChecks(const WallpaperManager::Config& base, const std::ve
     // CONTROL: control_batch.sh 2026-10-18, phase sharedEviction, both entries, reverted:
     //       evictIdleVideoSessionLocked()'s any_of (backend/daemon/wallpaper_manager.cpp) over the first
     //       member only -> "...not the shared one with a screen still showing".
-    manager.setOutputVisible(screenOf(kHiddenFirst), false);
+    manager.setOutputVisible(screenOf(kHiddenFirst), false, "test");
     std::vector<int> owed;
     manager.setOutputSize(screenOf(2), kResizedWidth, kResizedHeight, owed);
     manager.requestWallpaper("video", clips[8], kNinth);

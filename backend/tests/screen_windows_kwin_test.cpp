@@ -56,6 +56,7 @@ using wallpaperx::testing::ReportStub;
 
 // The focus report: SetOutputFocusState(name, "window" | "desktop" | "none", maximized).
 const QString kFocus = QStringLiteral("SetOutputFocusState");
+const QString kVisible = QStringLiteral("SetOutputVisible");
 const QString kOutput = QStringLiteral("WPX-KWIN");
 constexpr int kSettleLimitMs = 8000;
 // Long enough for KWin to map and place a new window, so the client's answer names its output.
@@ -76,8 +77,9 @@ private:
 
 // One command per line on stdin, each answered "done <command>" once asked for:
 //   open                  a window, which KWin places on the first output
-//   max, full, normal, min  that window
+//   max, full, normal, min, close  that window
 //   full-second           a second window, fullscreen on the second output
+//   close-second          that second window
 //   where                 answered "at <first window's output> <second window's output>"
 int runClient(int argc, char** argv) {
     QGuiApplication app(argc, argv);
@@ -111,6 +113,10 @@ int runClient(int argc, char** argv) {
                 first.showNormal();
             } else if (command == "min") {
                 first.showMinimized();
+            } else if (command == "close") {
+                first.hide();
+            } else if (command == "close-second") {
+                second.hide();
             } else if (command == "full-second") {
                 // Shown first: Qt names the output in the fullscreen request only for a window that
                 // already exists, and KWin places a new one on the first output.
@@ -208,6 +214,27 @@ Window {
     };
     const auto settlesOn = [&](const Facts& want) { return pumpUntil([&] { return last() == want; }, kSettleLimitMs); };
     const auto history = [&](std::size_t mark) { return ReportStub::describe(stub.calls(kFocus, kOutput, mark)); };
+    const auto watcherOf = [&]() -> QObject* {
+        QObject* loader = surface->findChild<QObject*>(QStringLiteral("wallpaperxWindows"));
+        return loader != nullptr ? loader->property("item").value<QObject*>() : nullptr;
+    };
+    // The visibility the stub last accepted for this screen. Every uncover arms the item's paint watch, which
+    // reports the screen hidden if no scene-graph pass runs for this window within about 1.25 s, so a hide
+    // here can come from the cover or from a compositor that stopped drawing the wallpaper; a failed
+    // visibility check prints the watcher's anyFullScreen to tell the two apart.
+    const auto shown = [&]() -> std::optional<bool> {
+        const std::vector<ReportStub::Call> calls = stub.calls(kVisible, kOutput);
+        if (calls.empty()) return std::nullopt;
+        return calls.back().args.value(1).toBool();
+    };
+    const auto visibleCheck = [&](bool want, const char* what) {
+        const bool settled = pumpUntil([&] { return shown() == want; }, kSettleLimitMs);
+        check(settled, what);
+        if (!settled) std::fprintf(stderr, "  visibility: %s\n", ReportStub::describe(stub.calls(kVisible, kOutput)).c_str());
+        if (!settled && watcherOf()) {
+            std::fprintf(stderr, "  the watcher's anyFullScreen is %s\n", watcherOf()->property("anyFullScreen").toBool() ? "true" : "false");
+        }
+    };
 
     // The precondition every step is measured from: the wallpaper reports no window, and its watcher
     // is on a real output whose name the client's answers can be compared with.
@@ -292,9 +319,9 @@ Window {
     // WHY-THIS-SHAPE: the open step asks where KWin put the window before grading it, so a window
     //       placed on the other output is the skip the file header promises, not a FAIL against the
     //       plugin; asked after the placement wait, since a window not yet mapped reports Qt's guess.
-    // CONTROL: the IsFullScreen term dropped from ScreenWindows.qml's recount
-    //       (backend/kde/kpackage/contents/ui/ScreenWindows.qml) -> "making it fullscreen reports a
-    //       maximized window" red. This file's controls observed 2026-10-01 through control_batch.sh,
+    // CONTROL: the IsFullScreen term (`full ||`) dropped from the maximized expression in ScreenWindows.qml's
+    //       recount (backend/kde/kpackage/contents/ui/ScreenWindows.qml) -> "making it fullscreen reports a
+    //       maximized window" red; re-run 2026-10-27 via control_batch.sh, reverted. This file's controls observed 2026-10-01 through control_batch.sh,
     //       each under its own nested KWin, and reverted. The placement order observed by hand: the
     //       client made to put its window fullscreen on the second output at "open" -> NOT VERIFIED,
     //       "KWin put the client's window on 'Virtual-1'", Skipped, no FAIL line.
@@ -320,6 +347,10 @@ Window {
         settleCheck(mark, focusedWindow(false), "a window opened on this screen is reported focused");
     }
     step("max", focusedWindow(true), "maximizing it reports a maximized window");
+    // GOAL: S15.977 -- a maximized window does not hide the screen; only a fullscreen one does.
+    // CONTROL: via control_batch.sh 2026-10-27, `root.anyFullScreen = fullScreen;` changed to `= maximized;`
+    //       in ScreenWindows.qml's recount (backend/kde/kpackage/contents/ui/ScreenWindows.qml) -> this line red.
+    visibleCheck(true, "a maximized window does not hide the screen");
 
     // GOAL: "show desktop" turns both facts off while it is on: windows are hidden, not minimized.
     // CONTROL: `!KWindowSystem.showingDesktop &&` dropped from both bindings in ScreenWindows.qml ->
@@ -339,12 +370,31 @@ Window {
 
     step("normal", focusedWindow(false), "restoring it reports a window that is not maximized");
     step("full", focusedWindow(true), "making it fullscreen reports a maximized window");
+    // GOAL: S15.977 -- a fullscreen window on this screen reports it hidden, with nothing being drawn;
+    //       "show desktop" shows it while on; restoring the window shows it.
+    // CONTROL: via control_batch.sh 2026-10-27, in backend/kde/kpackage/contents/ui/ScreenWindows.qml:
+    //       `fullScreen = fullScreen || full;` made `fullScreen = false;` -> the first line red;
+    //       `!KWindowSystem.showingDesktop &&` dropped from `covered` -> the show-desktop line red;
+    //       `root.anyFullScreen = fullScreen;` made `= fullScreen || root.anyFullScreen;` -> the restore,
+    //       minimize and close lines red. Reverted.
+    visibleCheck(false, "making a window fullscreen on this screen hides the screen");
+    if (desktop != nullptr) {
+        QMetaObject::invokeMethod(desktop.get(), "show", Q_ARG(QVariant, true));
+        visibleCheck(true, "showing the desktop over a fullscreen window shows the screen");
+        QMetaObject::invokeMethod(desktop.get(), "show", Q_ARG(QVariant, false));
+        visibleCheck(false, "and leaving it hides the screen again");
+    }
     step("normal", focusedWindow(false), "restoring it from fullscreen reports a window that is not maximized");
+    visibleCheck(true, "restoring the fullscreen window shows the screen");
     step("max", focusedWindow(true), "maximizing it again");
     // GOAL: a minimized window counts nowhere, though it is still maximized.
     // CONTROL: `filterMinimized: false` in ScreenWindows.qml -> this line red, and the other-output
     //       line below with it (the minimized maximized window still counts here).
     step("min", {}, "minimizing a maximized window reports no window");
+    step("full", focusedWindow(true), "making the minimized window fullscreen again");
+    visibleCheck(false, "fullscreen again, the screen is hidden");
+    step("min", {}, "minimizing the fullscreen window reports no window");
+    visibleCheck(true, "minimizing the fullscreen window shows the screen");
 
     // GOAL: a window confirmed fullscreen and focused on the other output does not count on this
     //       one: this screen settles on no window, and once settled no report claims one.
@@ -375,10 +425,32 @@ Window {
                 }
                 check(settled && !claimed && last() == Facts{},
                       "a fullscreen window on the other output does not count here");
+                // GOAL: S15.977 -- a fullscreen window on the other output leaves this screen visible.
+                // CONTROL: via control_batch.sh 2026-10-27, `filterByScreen: false` in ScreenWindows.qml
+                //       (backend/kde/kpackage/contents/ui/ScreenWindows.qml) -> this line red. Reverted.
+                bool hid = false;
+                for (const ReportStub::Call& call : stub.calls(kVisible, kOutput, mark)) {
+                    if (!call.args.value(1).toBool()) hid = true;
+                }
+                check(!hid && shown() == true, "a fullscreen window on the other output leaves this screen visible");
+                if ((hid || shown() != true) && watcherOf()) {
+                    std::fprintf(stderr, "  the watcher's anyFullScreen is %s (false: the hide was the paint watch's)\n",
+                                 watcherOf()->property("anyFullScreen").toBool() ? "true" : "false");
+                }
                 if (!settled || claimed) std::fprintf(stderr, "  this screen saw %s\n", history(before).c_str());
             }
         }
     }
+
+    // Closed whatever the step above concluded: one KWin left on this output would keep it covered
+    // and blame the steps below for the placement.
+    // CONTROL: by hand 2026-10-28, test-side, reverted: full-second's setScreen made output 0 ->
+    //       other-output step NOT VERIFIED, entry Skipped; with this send also removed -> "FAIL: closing the
+    //       fullscreen window shows the screen".
+    send("close-second");
+    step("full", focusedWindow(true), "the first window fullscreen once more");
+    visibleCheck(false, "which hides the screen");
+    if (send("close")) visibleCheck(true, "closing the fullscreen window shows the screen");
 
     send("quit");
     client.closeWriteChannel();

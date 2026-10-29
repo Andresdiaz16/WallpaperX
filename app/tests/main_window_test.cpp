@@ -321,7 +321,8 @@ void applyAndPause(Window& w, QQuickItem* root, LibraryManager& library, Service
     //       "S15.243: with the shader open Apply is enabled and the reason shown is none";
     //       app/qml/WallpaperDetail.qml Apply's `onClicked: root.applier.apply()` deleted -> red,
     //       "S15.243: Apply for ocean on DP-1 is enabled; clicking it sent 0 SetWallpaperWithProperties"
-    //       (both control_batch, 2026-10-02).
+    //       (both control_batch, 2026-10-02; both re-run T7a against the stand-in that reports what was applied,
+    //       red with the same lines, reverted).
     const QString shaderReason = QStringLiteral("WallpaperX cannot draw shader wallpapers yet, so this one cannot be applied.");
     if (!library.select(ocean) || !settle(w.window)) {
         expect(false, QStringLiteral("S15.243: ocean could not be opened"));

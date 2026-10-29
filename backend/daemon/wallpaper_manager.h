@@ -625,8 +625,11 @@ public:
     // Idempotent.
     //
     // Returns whether the monitor is now owed a render, which the caller posts: a changed layout on
-    // anything but a playing video, whose next picture shows it.
-    bool setWallpaperProperties(int monitorId, const WallpaperProperties& properties);
+    // anything but a playing video, whose next picture shows it; and on a still whose last render
+    // failed, only once its file has changed since. `replaced`, when given, receives the properties
+    // an accepted call replaced.
+    bool setWallpaperProperties(int monitorId, const WallpaperProperties& properties,
+                                WallpaperProperties* replaced = nullptr);
 
     // Records the connector name a monitor is known by -- "DP-3". Throws InvalidRequest for a
     // bad id or a name outputNameError() rejects, and std::runtime_error when the name did not
@@ -657,9 +660,13 @@ public:
     // picture; nothing a consumer does starts it again while that stands, so the caller wakes the
     // render worker whatever the answer. Throws InvalidRequest for a name the shared validator
     // rejects and UnknownOutput for one no monitor answers to. Idempotent: only the change from
-    // covered to drawn credits the monitor with having been seen. Returns whether the report
-    // changed what was recorded for that screen.
-    bool setOutputVisible(const std::string& outputName, bool visible);
+    // covered to drawn credits the monitor with having been seen. Returns whether the screen's
+    // answer changed.
+    //
+    // `reporter` is the caller's bus name. Each reporter's latest report stands until it leaves the
+    // bus, and the screen is drawn while any of them says so: the lock screen draws a screen the
+    // desktop beneath it reports hidden.
+    bool setOutputVisible(const std::string& outputName, bool visible, const std::string& reporter);
 
     // Sets when this monitor's video stops on the picture it shows, by PauseMode name. Throws
     // InvalidRequest for a bad id or an unknown name. Survives every wallpaper change. All or
@@ -681,6 +688,8 @@ public:
     // Drops every focus report `client` made, because it left the bus. Returns whether any went,
     // which may have ended a pause, so the caller wakes the render worker.
     bool forgetOutputFocus(const std::string& client);
+    // Likewise its visibility reports. Returns whether a screen's answer changed.
+    bool forgetOutputVisibility(const std::string& client);
 
     // Switches sound on or off for every screen, above each screen's own setting. Persisted, saved
     // and waited on as setMonitorPause() does, all or nothing up to the queued save. Returns whether
@@ -1089,6 +1098,9 @@ private:
         Placement shownPlacement;
         std::string lastError;
         Fault lastErrorFault = Fault::File;  // meaningless while lastError is empty
+        // What a still's path named when its failed pass began, nothing when it could not be asked.
+        // Meaningless while lastError is empty, and for a failure that was not a still's pass.
+        std::optional<FileIdentity> failedStillFile;
 
         // The saved request was not applied because the last run died applying it, or because
         // kPlaybackDeaths deaths were caught while playing it, and no pass may decode it -- a
@@ -1179,6 +1191,8 @@ private:
             uint64_t forSeq = 0;
             StreamPosition shown;
             std::optional<FileIdentity> file;
+            // VideoSession::passStart() then: a session opened at `shown` never sees the first picture.
+            std::optional<std::chrono::nanoseconds> passFirst;
         };
         std::optional<ReleasedAt> releasedAt;
 
@@ -1269,7 +1283,9 @@ private:
     uint64_t commitFrameLocked(MonitorState& state, const OffscreenTarget& target, const Placement& drawnWith);
     // Whether every request since `seq` was a layout change alone. Caller must hold m_stateMutex.
     static bool relaidOnlySince(const MonitorState& state, uint64_t seq);
-    static void recordFailureLocked(MonitorState& state, const std::string& error, Fault fault);
+    // `stillFile` is a still's pass's, for MonitorState::failedStillFile.
+    static void recordFailureLocked(MonitorState& state, const std::string& error, Fault fault,
+                                    std::optional<FileIdentity> stillFile = std::nullopt);
 
     // What a failed render or picture was: the message, and who answers for it. Built by
     // rethrowing, so every site sorts the same three kinds the same way rather than carrying its
@@ -1392,12 +1408,18 @@ private:
     // screen the decoder it is visibly playing. Caller must hold m_stateMutex.
     std::optional<uint64_t> playingSeqLocked(int monitorId, uint64_t wallpaperSeq) const;
 
-    // Whether this monitor's pause setting, against what its screen last reported, stops its video
-    // now. Caller must hold m_stateMutex.
+    // Whether this monitor's wallpaper is set "paused", or its pause setting, against what its screen
+    // last reported, stops its video now. Caller must hold m_stateMutex.
     bool pausedLocked(int monitorId) const;
 
     // MonitorSoundStatus::heard for this monitor. Caller must hold m_stateMutex.
     bool soundHeardLocked(int monitorId) const;
+    // Whether this monitor would be heard but for its focus, which it lost less than kFocusHandOver
+    // before `now` with no screen taking it since. Caller must hold m_stateMutex.
+    bool soundLingersLocked(int monitorId, std::chrono::steady_clock::time_point now) const;
+    // The sound switches and the wallpaper's own mute let this monitor be heard. Caller must hold
+    // m_stateMutex.
+    bool soundAllowedLocked(int monitorId) const;
 
     // Ends the clean-play stretch of a monitor that is paused now. Called by every change that can
     // pause one, so a pause and its end landing between two clock rounds is not counted as played.
@@ -1785,6 +1807,8 @@ private:
             // spent: the screen has been kept on its picture since, to land on the sound rather than
             // run through late ones. Ends when the picture is no longer behind, or is drawn.
             std::optional<std::chrono::steady_clock::time_point> catchingUpSince;
+            // A short pass's sound has been handed on to the pass this picture starts.
+            bool handedOn = false;
 
             // Re-times the rest of the wait from `now` when `speed` differs. A picture already
             // due stays due where it was.
@@ -1804,19 +1828,25 @@ private:
         std::optional<std::chrono::steady_clock::time_point> idleSince;
 
         // The file's sound, made the first time one of its screens is heard and kept, silent, while
-        // none is; made again when another of its screens is heard. It follows the session's one
-        // clock. Its anchor is the one record of where the sound was told to be.
+        // none is; it moves on, playing, to another of its screens heard. While it plays it is the
+        // session's clock. Its anchor is the one record of where the sound was told to be.
         std::unique_ptr<AudioTrack> audio;
-        // The monitor `audio` was made for, is named after and blames: it plays only while that
-        // screen is heard.
+        // The monitor `audio` was last heard on, is named after and blames.
         int audioScreen = -1;
-        // Where every pass through the file starts and ends in its own time, from the first loop on,
-        // for a pass long enough that its sound is handed to the next ahead of time.
+        // Where every pass through the file starts and ends in its own time, for a pass long enough that
+        // its sound is handed to the next ahead of time: until the first loop, from a first picture seen to
+        // the end the container declares; as measured from then on.
         struct Pass {
+            enum class Source { Declared, Measured };
             std::chrono::nanoseconds first{};
             std::chrono::nanoseconds end{};
+            Source source = Source::Measured;
         };
         std::optional<Pass> pass;
+        // Where the file's next pass starts, as far as is known, for every play's AudioTrack::Anchor::next.
+        std::optional<std::chrono::nanoseconds> passStart() const {
+            return pass ? std::optional(pass->first) : std::nullopt;
+        }
         // The sound's last clock reading -- the file's time `file` heard at `at` -- and the track
         // request it was read for: where the sound is known to be while its clock is missing. A newer
         // request makes it no one's.
@@ -1879,8 +1909,8 @@ private:
         bool audible() const { return heard && volume > 0.0f; }
     };
     // The session's track, made if need be and at the wanted volume, or null -- having stopped any
-    // -- when its sound is not to be heard. Throws only on making a track. Caller holds m_gpuMutex
-    // and not m_stateMutex.
+    // -- when its sound is not to be heard. Throws only on making or renaming a track. Caller holds
+    // m_gpuMutex and not m_stateMutex.
     AudioTrack* heardTrackLocked(int monitorId, VideoSession& session, const SoundWanted& wanted);
     // What steering the sound made of the waiting picture.
     struct SoundPace {
@@ -1888,30 +1918,34 @@ private:
         bool timesPicture = false;
         // A round wanted before the picture is due, to hand the sound to the next pass.
         std::optional<std::chrono::steady_clock::time_point> roundAt;
-        // A play for a picture drawn this round, made at the draw: the file's `from` heard `after` the
-        // picture's place on screen, which only the draw settles. With `restart` that place is the draw
-        // itself, and the pictures' schedule starts again there.
+        // A sound starting with a picture drawn this round: the file's `from` is heard where the picture
+        // is placed on screen, which only the draw settles. With `restart` that place is the draw itself,
+        // and the pictures' schedule starts again there.
         struct DrawPlay {
             std::chrono::nanoseconds from{};
-            std::chrono::nanoseconds after{};
             bool restart = false;
         };
         std::optional<DrawPlay> playAtDraw;
     };
-    // Whether the waiting picture's catch-up hold has run out with the pictures still behind the sound.
-    enum class CatchUp { Chasing, HoldRunOut };
     // Starts a playing session's sound on the picture schedule `waiting` belongs to, hands it to each
-    // new pass, or silences it. While the sound is heard playing, `waiting` is moved to it, so the
-    // pictures follow the sound card; a sound that falls behind the pictures is moved to them instead,
-    // as is one too far ahead of them once `catchUp` says they failed to reach it or no clock lets
-    // them chase it, judged while it is not heard playing from where it was last heard. A file that its
-    // decoder's deepest skip cannot keep up with is neither: its sound is never handed on, and starts again where
-    // a new pass's first picture is drawn, unless it already plays that pass.
-    // Never fails the session: sound is lost before a picture is. Caller holds m_gpuMutex and not
-    // m_stateMutex.
+    // new pass, or silences it. Once started the sound is the session's clock: it is never moved for the
+    // pictures, only handed to the next pass where it ends the one it plays -- ahead of time for a pass of
+    // kShortestHandedPass or more once its length is known (VideoSession::pass), else as the next pass's
+    // first picture waits -- and while it is heard playing `waiting` is moved onto it, so the pictures follow
+    // the sound card. Two exceptions put the sound on a pass's first picture instead. A file that its
+    // decoder's deepest skip cannot keep up with shows its pictures as they are decoded, and its sound,
+    // never handed on, waits silent at the file's end for each pass's first picture. And a declared pass
+    // the first loop measures more than kCatchUpHold off has handed the sound on at the wrong time, which
+    // is put right once there. Never fails the session: sound is lost before a picture is. Caller holds
+    // m_gpuMutex and not m_stateMutex.
     SoundPace steerSoundLocked(int monitorId, VideoSession& session, VideoSession::Waiting& waiting,
-                               const SoundWanted& wanted, std::chrono::steady_clock::time_point now,
-                               CatchUp catchUp) noexcept;
+                               const SoundWanted& wanted, std::chrono::steady_clock::time_point now) noexcept;
+    // Hands a session's playing sound to the next pass once the one it plays ends within kHandOverLead,
+    // and says when to look again; nothing for no pass known, no sound playing, or a file whose pictures
+    // cannot keep up, whose sound waits for theirs. Run without a picture waiting too, so a slow decode
+    // never holds the sound up. Caller holds m_gpuMutex.
+    static std::optional<std::chrono::steady_clock::time_point> handSoundOn(
+        VideoSession& session, std::chrono::steady_clock::time_point now) noexcept;
     // Plays a parked session's sound on its own, looping, when it would be heard, and returns its
     // track; null, with the sound stopped, otherwise. Caller holds m_gpuMutex and not m_stateMutex.
     AudioTrack* loopParkedSoundLocked(int monitorId, VideoSession& session, const SoundWanted& wanted,
@@ -1935,12 +1969,18 @@ private:
     // and bound again, so it never sends it twice. Guarded by m_stateMutex.
     std::map<std::string, OutputSize> m_outputSizes;
 
-    // The screens that reported they are not being drawn -- behind a lock screen, a fullscreen
-    // window, or a session switched away. By name for the same reason a size is, and not on the
+    // What each reporter said about whether a screen is drawn; it is not behind a lock screen, under a
+    // fullscreen window, or in a session switched away. By name for the same reason a size is, and not on the
     // monitor: a screen can be named before a wallpaper is chosen for it, and a report dropped
-    // there would be answered with success and never sent again. Absent means drawn, which is what
-    // a screen that has never reported is taken to be. Guarded by m_stateMutex.
-    std::set<std::string> m_outputsNotDrawn;
+    // there would be answered with success and never sent again. Name -> reporter -> its report; a
+    // screen is drawn while no reporter holds a report or any says drawn (outputDrawnLocked()).
+    // Guarded by m_stateMutex.
+    std::map<std::string, std::map<std::string, bool>> m_outputsDrawn;
+    bool outputDrawnLocked(const std::string& outputName) const;
+    // On every hidden answer, repeats included, and when a screen becomes drawn again: hidden ends its
+    // stretch of clean play, drawn again credits it with being seen (MonitorState::ResumeCredit). The
+    // hidden side must stay safe to repeat.
+    void noteDrawnChangeLocked(int monitorId, bool drawn);
 
     // Monitor id -> its pause setting as the config row carries it, JSON text; absent means play.
     // Text so a setting a newer build wrote is kept as read -- pauseModeFromJson() says which mode
@@ -1970,7 +2010,7 @@ private:
     // screen's refresh rate when that is known and no higher rate is kept. Caller must hold m_stateMutex.
     double targetRateLocked(int monitorId) const;
 
-    // What each screen reported about its windows, by name for m_outputsNotDrawn's reason, and who
+    // What each screen reported about its windows, by name for m_outputsDrawn's reason, and who
     // reported it, so the report dies with its reporter. Only a report of some focus or a maximized
     // window is held: absent means neither. At most one holds a focus (setOutputFocus()). Every key
     // is a bound name -- bindOutputLocked() drops a name's report with its binding. Guarded by
@@ -1981,6 +2021,13 @@ private:
         bool windowMaximized = false;
     };
     std::map<std::string, FocusReport> m_outputFocus;
+    // The screen whose focus was last withdrawn while its sound could be heard, and when; emptied
+    // when any screen takes the focus. Guarded by m_stateMutex.
+    struct FocusLeft {
+        std::string output;
+        std::chrono::steady_clock::time_point at;
+    };
+    std::optional<FocusLeft> m_focusLeft;
 
     // The report for the screen bound to this monitor, or null. Caller must hold m_stateMutex.
     const FocusReport* focusReportLocked(int monitorId) const;

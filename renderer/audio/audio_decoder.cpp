@@ -275,11 +275,8 @@ void AudioDecoder::decodeMore() {
         matchResampler(*m_frame);
         if (m_alignTo) {
             const AVStream& audio = *m_format->streams[m_stream];
-            const int64_t timestamp = m_frame->best_effort_timestamp;
-            if (timestamp != AV_NOPTS_VALUE) {
-                const std::chrono::nanoseconds start(
-                    av_rescale_q(timestamp, audio.time_base, AVRational{1, 1'000'000'000}));
-                const int64_t gap = framesIn(start - *m_alignTo);
+            if (const auto start = ffmpeg_file::inNanoseconds(m_frame->best_effort_timestamp, audio.time_base)) {
+                const int64_t gap = framesIn(*start - *m_alignTo);
                 if (gap < 0) m_dropFrames = static_cast<uint64_t>(-gap);
                 if (gap > 0) m_silence = std::min(static_cast<uint64_t>(gap), kMaxLeadingSilence);
             }
@@ -327,13 +324,14 @@ size_t AudioDecoder::fetch(size_t frames) {
         }
         if (!wrapsAtEnd()) return 0;
         const uint64_t at = heldEnd();
-        seekStream(*m_loop);
-        m_passes.push_back(Pass{at, *m_loop, true});
+        const std::chrono::nanoseconds from = m_loop ? *m_loop : *m_next;
+        seekStream(from);
+        m_passes.push_back(Pass{at, from, m_loop ? Begun::Wrap : Begun::Waits});
     }
 }
 
 bool AudioDecoder::wrapsAtEnd() const {
-    return m_loop && !(m_passes.back().wrap && m_passes.back().from == heldEnd());
+    return (m_loop || m_next) && !(m_passes.back().begun != Begun::Seek && m_passes.back().from == heldEnd());
 }
 
 size_t AudioDecoder::pull(float* out, size_t frames) {
@@ -361,7 +359,23 @@ size_t AudioDecoder::passOf(double frame) const {
     return pass;
 }
 
+std::optional<size_t> AudioDecoder::nextPass() const {
+    if (stretchedFrames() > 0) return passOf(m_stretchedFrom[m_stretchedAt]);
+    if (!stretches(m_applied)) return passOf(static_cast<double>(m_pulled));
+    return std::nullopt;
+}
+
 void AudioDecoder::seek(std::chrono::nanoseconds at) {
+    // read() never hands out a Waits pass, so standing in one is standing at its start.
+    if (const std::optional<size_t> next = nextPass();
+        next && m_passes[*next].begun == Begun::Waits && m_passes[*next].at == at && m_rate == m_applied && !m_change) {
+        m_passes[*next].begun = Begun::Wrap;
+        return;
+    }
+    seekAnew(at);
+}
+
+void AudioDecoder::seekAnew(std::chrono::nanoseconds at) {
     freeStretcher();
     m_stretched.clear();
     m_stretchedFrom.clear();
@@ -415,7 +429,7 @@ void AudioDecoder::seekStream(std::chrono::nanoseconds at) {
 }
 
 void AudioDecoder::seek(std::chrono::nanoseconds at, std::vector<float> onward, double onwardRate) {
-    seek(at);
+    seekAnew(at);
     if (onward.empty()) return;
     onward.resize(std::min(onward.size(), kJoinFrames * kChannels));
     // The run before: what is played on from `onward` is placed at its rate.
@@ -593,6 +607,7 @@ size_t AudioDecoder::read(float* out, size_t frames, Position* first) {
         if (const size_t available = stretchedFrames(); available > 0) {
             const double* from = m_stretchedFrom.data() + m_stretchedAt;
             if (!pass) pass = passOf(from[0]);
+            if (m_passes[*pass].begun == Begun::Waits) break;
             const double end = passEnd();
             while (take < std::min(available, limit) && from[take] < end) ++take;
             if (take == 0) break;
@@ -612,8 +627,13 @@ size_t AudioDecoder::read(float* out, size_t frames, Position* first) {
             continue;
         } else {
             const uint64_t at = m_pulled;
-            if (!pass) pass = passOf(static_cast<double>(at));
             take = pull(out + written * kChannels, limit);
+            // After the pull, which may have begun the pass `at` starts.
+            if (!pass) pass = passOf(static_cast<double>(at));
+            if (m_passes[*pass].begun == Begun::Waits) {
+                unpull(take);
+                break;
+            }
             const double end = passEnd();
             if (static_cast<double>(at + take) > end) {
                 const size_t past = take - static_cast<size_t>(std::max(end - static_cast<double>(at), 0.0));

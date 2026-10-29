@@ -156,6 +156,9 @@ std::expected<WallpaperProperty, QString> parseProperty(const QString& key, cons
     if (const QString reserved = QString::fromLatin1(kPositionKey); key == reserved || key.startsWith(reserved + u'.')) {
         return refuse(QStringLiteral("is reserved: WallpaperX sets a wallpaper's position itself."));
     }
+    if (key == QLatin1StringView(kPausedKey)) {
+        return refuse(QStringLiteral("is reserved: WallpaperX pauses a wallpaper itself."));
+    }
 
     WallpaperProperty property;
     property.key = key;
@@ -738,6 +741,9 @@ std::optional<QVariant> Wallpaper::accept(const QString& key, const QVariant& va
 {
     if (!usable()) {
         return std::nullopt;
+    }
+    if (key == QLatin1StringView(kPausedKey)) {
+        return type == u"video" && value.typeId() == QMetaType::Bool ? std::optional(value) : std::nullopt;
     }
     if (!isPositionKey(key)) {
         const auto it = std::ranges::find(properties, key, &WallpaperProperty::key);

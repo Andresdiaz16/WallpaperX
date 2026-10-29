@@ -47,12 +47,12 @@ using WallpaperProperties = std::map<std::string, PropertyValue>;
 // Bounds on what a client can make the daemon store and write into every save: 32 monitors at
 // these limits stay far under the config file's 1 MiB read cap, past which the whole file is
 // refused at the next start.
-constexpr std::size_t kMaxProperties = 64;
+constexpr std::size_t kMaxProperties = 65;
 constexpr std::size_t kMaxPropertyKeyBytes = 64;
 
 // Why `properties` cannot be stored, or empty when it can. Keys are 1 to kMaxPropertyKeyBytes of
 // ASCII letters, digits, '_', '-' and '.', so they are safe to log and publish unescaped; numbers
-// are finite; "speed" is one of kPlaybackSpeeds, "mute" a bool, "volume" a number from 0 to 1,
+// are finite; "speed" is one of kPlaybackSpeeds, "mute" and "paused" bools, "volume" a number from 0 to 1,
 // "position" a mode, "position.zoom" and "position.x"/"position.y" numbers within Free mode's bounds,
 // the keys the daemon gives a meaning. A mode under any other key is refused.
 //
@@ -85,6 +85,9 @@ double playbackSpeed(const WallpaperProperties& properties);
 // The wallpaper's own sound level: "mute" switches it off, unset means on.
 bool wallpaperMuted(const WallpaperProperties& properties);
 
+// Whether "paused" holds the wallpaper on its picture, whatever its screen's pause mode; unset plays.
+bool wallpaperPaused(const WallpaperProperties& properties);
+
 // What "volume" says the sound plays at, 0 to 1: 1 without one.
 float wallpaperVolume(const WallpaperProperties& properties);
 
@@ -94,6 +97,9 @@ nlohmann::json toJson(const WallpaperProperties& properties);
 
 // toJson() as text, the form a config row carries; empty when there are no properties.
 std::string toJsonText(const WallpaperProperties& properties);
+
+// The entries `after` adds or changes over `before`, and those it drops as null, as a JSON object; "{}" for none.
+std::string changedPropertiesText(const WallpaperProperties& before, const WallpaperProperties& after);
 
 // The reverse: each value by its JSON type, adding to `dropped` one for each value no PropertyValue
 // can hold and one for text that is not an object. Types only; usableProperties() applies the rules.

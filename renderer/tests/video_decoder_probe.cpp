@@ -61,6 +61,7 @@ extern "C" {
 #include <map>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -2036,7 +2037,111 @@ void runThinnedMismatchCheck(Device& device) {
                            std::to_string(missed) + " of " + std::to_string(wanted) + " were not)");
 }
 
+// The video stream's own duration and the container's, read straight from libavformat, so a fixture
+// that does not have the shape a check needs is reported as the fixture's fault.
+struct DeclaredDurations {
+    bool streamHasDuration = false;
+    double containerSeconds = -1;
+    double containerStartSeconds = 0;
+};
+std::optional<DeclaredDurations> declaredDurations(const std::string& file) {
+    AVFormatContext* format = nullptr;
+    if (avformat_open_input(&format, file.c_str(), nullptr, nullptr) < 0) return std::nullopt;
+    std::optional<DeclaredDurations> out;
+    if (avformat_find_stream_info(format, nullptr) >= 0) {
+        const int video = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+        if (video >= 0) {
+            const AVStream& stream = *format->streams[video];
+            out = DeclaredDurations{stream.duration != AV_NOPTS_VALUE && stream.duration > 0,
+                                    format->duration > 0 ? double(format->duration) / AV_TIME_BASE : -1,
+                                    format->start_time == AV_NOPTS_VALUE ? 0 : double(format->start_time) / AV_TIME_BASE};
+        }
+    }
+    avformat_close_input(&format);
+    return out;
+}
+
+// GOAL: S15.1152 (D13-c) -- a Matroska file whose video stream declares no duration gets a declared end at the
+//       container's start plus its duration; a stream that declares its own duration keeps it, even
+//       where the container's (here, a longer sound track's) is longer.
+// WHY-THIS-SHAPE: the MP4's sound runs 1 s past its video, so taking the container's length shows as
+//       3 s instead of 2 s. Each fixture's shape is read first from libavformat, so a recipe that stops
+//       producing it is a harness failure, not a verdict. The Matroska fixture starts at 0: FFmpeg's own
+//       muxer, given a start offset, writes a duration that already includes it, so start plus duration
+//       overshoots and no consistent offset file could be made (see the T7b report).
+// CONTROL: renderer/video/video_decoder.cpp declaredEnd(), control_batch.sh 2026-10-29, each alone,
+//       reverted: (1) the container branch's first line made `return std::nullopt;` -> "FAIL: D13-c: a
+//       Matroska file with no stream duration declares the container's end"; (2) the stream branch's
+//       condition prefixed `false &&` -> "FAIL: D13-c: a stream's own duration wins over a longer
+//       container's".
+void runDeclaredEndChecks(Device& device) {
+    if (!haveAssets({"declared_container_end.mkv", "declared_stream_wins.mp4"})) {
+        g_notVerified = true;
+        return;
+    }
+    const auto endOf = [&device](const char* name) -> std::optional<std::optional<double>> {
+        try {
+            VideoDecoder decoder(device, asset(name));
+            const std::optional<std::chrono::nanoseconds> end = decoder.declaredEnd();
+            return end ? std::optional<double>(std::chrono::duration<double>(*end).count()) : std::nullopt;
+        } catch (const std::exception& e) {
+            std::printf("video_decoder_probe: %s could not be opened here (%s) -- its declared end is not answerable\n",
+                        name, e.what());
+            g_notVerified = true;
+            return std::nullopt;
+        }
+    };
+    const auto near = [](const std::optional<double>& got, double want) { return got && std::abs(*got - want) < 0.002; };
+    const auto shown = [](const std::optional<double>& got) { return got ? std::to_string(*got) + " s" : std::string("none"); };
+
+    const std::optional<DeclaredDurations> mkv = declaredDurations(asset("declared_container_end.mkv"));
+    if (!mkv || mkv->streamHasDuration || std::abs(mkv->containerStartSeconds) > 0.002 ||
+        std::abs(mkv->containerSeconds - 2.0) > 0.002) {
+        fail("D13-c (harness): declared_container_end.mkv is not a 2 s container starting at 0 whose video stream "
+             "declares no duration");
+    } else if (const auto end = endOf("declared_container_end.mkv")) {
+        if (!near(*end, 2.0)) std::fprintf(stderr, "  declared end %s, want 2 s\n", shown(*end).c_str());
+        check(near(*end, 2.0), "D13-c: a Matroska file with no stream duration declares the container's end");
+    }
+
+    const std::optional<DeclaredDurations> mp4 = declaredDurations(asset("declared_stream_wins.mp4"));
+    if (!mp4 || !mp4->streamHasDuration || std::abs(mp4->containerSeconds - 3.0) > 0.002) {
+        fail("D13-c (harness): declared_stream_wins.mp4 is not a 3 s container holding a video stream with its own "
+             "duration");
+    } else if (const auto end = endOf("declared_stream_wins.mp4")) {
+        if (!near(*end, 2.0)) std::fprintf(stderr, "  declared end %s, want 2 s\n", shown(*end).c_str());
+        check(near(*end, 2.0), "D13-c: a stream's own duration wins over a longer container's");
+    }
+
+    // GOAL: S15.1190 (D14) -- a Matroska (and a WebM) file that starts at 5 s and runs 2 s declares its end at
+    //       7 s, the last picture's end, not at start plus the container duration (12 s).
+    // WHY-THIS-SHAPE: the 0-start fixture above cannot tell "duration" from "start + duration"; only a
+    //       non-zero start can. Its shape (start 5 s, container 7 s, no stream duration) is read from
+    //       libavformat first, so a muxer that stops writing it is reported as the fixture's fault. WebM is
+    //       the same demuxer under a second name, so it gets its own file.
+    // CONTROL: renderer/video/video_decoder.cpp declaredEnd(), control_batch.sh 2026-10-29 (T7d), reverted:
+    //       `fromZero` made `false` (the start added again) -> "FAIL: D14: a Matroska file starting at 5 s
+    //       declares its end at its last picture's end" (12 s) and the WebM line likewise; green restored.
+    for (const char* name : {"declared_offset_end.mkv", "declared_offset_end.webm"}) {
+        if (!haveAssets({name})) {
+            g_notVerified = true;
+            continue;
+        }
+        const std::string kind = std::string(name).ends_with(".webm") ? "WebM" : "Matroska";
+        const std::optional<DeclaredDurations> offset = declaredDurations(asset(name));
+        if (!offset || offset->streamHasDuration || std::abs(offset->containerStartSeconds - 5.0) > 0.002 ||
+            std::abs(offset->containerSeconds - 7.0) > 0.002) {
+            fail(std::string("D14 (harness): ") + name + " is not a container starting at 5 s with a 7 s duration "
+                 "whose video stream declares no duration");
+        } else if (const auto end = endOf(name)) {
+            if (!near(*end, 7.0)) std::fprintf(stderr, "  %s: declared end %s, want 7 s\n", name, shown(*end).c_str());
+            check(near(*end, 7.0), "D14: a " + kind + " file starting at 5 s declares its end at its last picture's end");
+        }
+    }
+}
+
 void runContentChecks(Device& device) {
+    runDeclaredEndChecks(device);
     if (!haveAssets({"h264_raw.h264", "audio_only.m4a"})) {
         g_notVerified = true;
         return;

@@ -19,6 +19,7 @@
 
 #include <QDir>
 #include <QGuiApplication>
+#include <QStyleHints>
 #include <QPointer>
 #include <QQmlComponent>
 #include <QQmlContext>
@@ -443,6 +444,41 @@ void detail(QQmlEngine& engine, QQuickWindow& window, LibraryManager& library, A
     library.resetPropertyValues();
     settleEvents(window);
     expect(!toggle->property("checked").toBool(), QStringLiteral("S15.46: after a click and a reset the Sound switch is on"));
+
+    // GOAL: S15.1080 (D12-i) -- on a video the Paused switch is shown, enabled, and a click sets the library's
+    //       paused to true; a second click sets it back to false.
+    // WHY-THIS-SHAPE: found by its "Paused" label in the same row, since the switch has no key of its own; both
+    //       clicks are graded, so a switch stuck on either value is red. "Only for videos" is S15.1134, in
+    //       positionControls, which opens a still.
+    // CONTROL: app/qml/WallpaperDetail.qml, control_batch T6a, each reverted: the Switch given `enabled: false` ->
+    //       red, "S15.1080: the Paused switch is shown 1, enabled 0 ..."; its onToggled made `{}` -> red, the same line
+    //       with "library paused false then false".
+    QQuickItem* pausedSwitch = nullptr;
+    for (QQuickItem* candidate : allInheriting(view.get(), "QQuickSwitch")) {
+        for (QQuickItem* text : allInheriting(candidate->parentItem(), "QQuickText")) {
+            if (text->parentItem() == candidate->parentItem() && text->property("text").toString() == u"Paused") {
+                pausedSwitch = candidate;
+            }
+        }
+    }
+    if (!pausedSwitch) {
+        expect(false, QStringLiteral("S15.1080: no switch labelled Paused in Ocean's detail view"));
+        return;
+    }
+    const bool pausedShown = pausedSwitch->isVisible();
+    const bool pausedEnabled = pausedSwitch->isEnabled();
+    const auto pausedValue = [&] { return library.propertyValues().value(QStringLiteral("paused")).toBool(); };
+    QTest::mouseClick(&window, Qt::LeftButton, {}, centreOf(pausedSwitch));
+    settleEvents(window);
+    const bool firstClick = pausedValue();
+    QTest::mouseClick(&window, Qt::LeftButton, {}, centreOf(pausedSwitch));
+    settleEvents(window);
+    const bool secondClick = pausedValue();
+    expect(pausedShown && pausedEnabled && firstClick && !secondClick,
+           QStringLiteral("S15.1080: the Paused switch is shown %1, enabled %2, library paused %3 then %4 after two clicks; "
+                          "expected shown, enabled, true then false").arg(pausedShown).arg(pausedEnabled).arg(firstClick).arg(secondClick));
+    library.resetPropertyValues();
+    settleEvents(window);
 }
 
 // S15.52, S15.55: a library too long to fit, scrolled to its end.
@@ -737,6 +773,24 @@ void positionControls(QQmlEngine& engine, QQuickWindow& window, const QString& s
         notVerified(goals, "the detail view did not load or was never laid out");
         return;
     }
+    // The Paused switch, found by its "Paused" label in the same row: -1 if none, else whether it is shown.
+    const auto pausedShown = [&] {
+        for (QQuickItem* candidate : allInheriting(view.get(), "QQuickSwitch")) {
+            for (QQuickItem* text : allInheriting(candidate->parentItem(), "QQuickText")) {
+                if (text->parentItem() == candidate->parentItem() && text->property("text").toString() == u"Paused") {
+                    return int(candidate->isVisible());
+                }
+            }
+        }
+        return -1;
+    };
+    // GOAL: S15.1134 (D12-i, "only for videos") -- the Paused switch is hidden on a still and shown on a video.
+    // WHY-THIS-SHAPE: the switch must be found (not -1) on the still too, so a missing switch cannot pass as hidden;
+    //       the video half is graded at the end of this phase, where the video is opened.
+    // CONTROL: app/qml/WallpaperDetail.qml the Paused row's `visible: root.chosen.type === "video"` made `visible: true`
+    //       (control_batch T7a, reverted) -> red, "S15.1134: on the still the Paused switch is 1 ...".
+    const int pausedOnStill = pausedShown();
+    expect(pausedOnStill == 0, QStringLiteral("S15.1134: on the still the Paused switch is %1; expected 0 (hidden; -1 is not found)").arg(pausedOnStill));
     const auto buttonText = [&](const QString& text) -> QQuickItem* {
         for (QQuickItem* b : allInheriting(view.get(), "QQuickAbstractButton")) {
             if (b->property("text").toString() == text) {
@@ -877,12 +931,78 @@ void positionControls(QQmlEngine& engine, QQuickWindow& window, const QString& s
                     QLatin1StringView(value("position.y").typeName()))
                .arg(coverNotices));
 
+    // GOAL: S15.1000 -- a wheel notch over the settings scrolls them 60 px at once, and a click on Frame as Cover
+    //       sent as soon as the wheel has brought it on screen resets the framing on that first click.
+    // WHY-THIS-SHAPE: the page is shortened so the settings overflow and Frame as Cover is reached by wheeling, as on
+    //       the desktop. The click goes the moment the button is on screen, with no settle, which is when a gliding
+    //       view swallowed it. Real QWheelEvent and mouse events through the window, not contentY set by the test.
+    // CONTROL: control_batch.sh 2026-10-28, each alone, reverted, app/qml/WallpaperDetail.qml: the WheelHandler
+    //       deleted (re-run 2026-10-28 with the Flickable-clip visibility test) -> "S15.1000: a notch scrolled 0 px" and
+    //       "... (on screen 0, view moving 0) reads "free zoom 2 x 0.3 y 0""; its `* 20` made `* 10` -> "S15.1000: a notch scrolled 30 px". LIMIT: offscreen, the view without the
+    //       handler did not move on these wheel events at all, so the glide that swallowed a click is not reproduced
+    //       here; the click half is graded only as "the wheel brings the button on screen and one click takes".
+    {
+        const QSizeF fullSize = view->size();
+        // Pinned: the step is this desktop setting times 20 px, so 60 px below holds by construction.
+        const int wheelLines = QGuiApplication::styleHints()->wheelScrollLines();
+        QGuiApplication::styleHints()->setWheelScrollLines(3);
+        view->setHeight(160);
+        const bool framed = library.setPropertyValue(QStringLiteral("position.zoom"), 2.0) &&
+                            library.setPropertyValue(QStringLiteral("position.x"), 0.3) && settleEvents(window);
+        QQuickItem* cover = buttonText(QStringLiteral("Frame as Cover"));
+        QQuickItem* flick = cover;
+        while (flick && !flick->inherits("QQuickFlickable")) {
+            flick = flick->parentItem();
+        }
+        const double room = flick ? flick->property("contentHeight").toDouble() - flick->height() : 0;
+        if (!framed || !cover || !flick || room < 60) {
+            notVerified(goals, QStringLiteral("S15.1000: the settings did not overflow a 160 px page (room %1 px), so no wheel reaches Frame as Cover").arg(room).toStdString());
+        } else {
+            flick->setProperty("contentY", 0.0);
+            settleEvents(window);
+            const QPointF over = flick->mapToScene(QPointF(flick->width() / 2, flick->height() / 2));
+            const auto notch = [&] {
+                QWheelEvent wheel(over, window.mapToGlobal(over), QPoint(), QPoint(0, -120), Qt::NoButton, Qt::NoModifier,
+                                  Qt::NoScrollPhase, false);
+                QCoreApplication::sendEvent(&window, &wheel);
+            };
+            notch();
+            const double firstStep = flick->property("contentY").toDouble();
+            for (int i = 0; i < 40 && flick->property("contentY").toDouble() < room - 0.5; ++i) {
+                notch();
+            }
+            const auto coverAt = [&] { return cover->mapToScene(QPointF(cover->width() / 2, cover->height() / 2)); };
+            // The Flickable's own clip in the scene: a centre inside it is what a click there reaches.
+            const QRectF shown = flick->mapRectToScene(QRectF(0, 0, flick->width(), flick->height()));
+            const auto visibleNow = [&] { return shown.contains(coverAt()); };
+            // A gliding view brings it on screen later; the wait has its own failure: onScreen false below.
+            for (int waited = 0; waited < 2000 && !visibleNow(); waited += 5) {
+                QTest::qWait(5);
+            }
+            const bool onScreen = visibleNow();
+            const bool moving = flick->property("moving").toBool();
+            QTest::mouseClick(&window, Qt::LeftButton, {}, coverAt().toPoint());
+            settleEvents(window);
+            expect(std::abs(firstStep - 60) < 0.5,
+                   QStringLiteral("S15.1000: a notch scrolled %1 px; expected 60").arg(firstStep));
+            expect(onScreen && framing() == u"free zoom 1 x 0 y 0",
+                   QStringLiteral("S15.1000: Frame as Cover clicked as soon as the wheel showed it (on screen %1, view moving %2) reads \"%3\" after one click")
+                       .arg(onScreen).arg(moving).arg(framing()));
+        }
+        QGuiApplication::styleHints()->setWheelScrollLines(wheelLines);
+        view->setSize(fullSize);
+        settleEvents(window);
+    }
+
     // GOAL: S15.727 for a video -- no Tile button, the other five shown.
     // CONTROL: app/qml/WallpaperDetail.qml the mode Repeater's `model: root.chosen.positionModes` made a
     //       literal list of all six (control_batch 2026-10-18, reverted) -> red, "S15.727: the video (opened 1)
     //       shows [Cover,Fit,Center,Tile,Stretch,Free]".
     const bool video = library.select(dir + QStringLiteral("/clip")) && settleEvents(window);
     expect(video && shownModes() == u"Cover,Fit,Center,Stretch,Free", QStringLiteral("S15.727: the video (opened %1) shows [%2]").arg(video).arg(shownModes()));
+    // GOAL: S15.1134, video half. CONTROL: the Paused row's `visible:` made `false` (control_batch T7a, reverted)
+    //       -> red, "S15.1134: on the video ... the Paused switch is 0".
+    expect(video && pausedShown() == 1, QStringLiteral("S15.1134: on the video (opened %1) the Paused switch is %2; expected 1 (shown)").arg(video).arg(pausedShown()));
 }
 
 } // namespace

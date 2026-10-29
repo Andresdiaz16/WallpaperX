@@ -96,6 +96,13 @@ class WallpaperXItem : public QQuickItem {
     // Whether this screen's desktop window -- the one this item is drawn in -- has the focus.
     Q_PROPERTY(bool desktopFocused READ desktopFocused WRITE setDesktopFocused NOTIFY desktopFocusedChanged)
     Q_PROPERTY(bool windowMaximized READ windowMaximized WRITE setWindowMaximized NOTIFY windowMaximizedChanged)
+    // Whether a fullscreen window covers this screen, desktop and all. Set from QML like the three
+    // above; a covered screen is reported not visible whatever the compositor goes on drawing,
+    // unless pauseMode is "play".
+    Q_PROPERTY(bool desktopCovered READ desktopCovered WRITE setDesktopCovered NOTIFY desktopCoveredChanged)
+    // This screen's pause mode as /config names it, set by main.qml. Empty while unknown, which a
+    // fullscreen window hides as it does every mode but "play".
+    Q_PROPERTY(QString pauseMode READ pauseMode WRITE setPauseMode NOTIFY pauseModeChanged)
     // Why nothing is being drawn, when nothing is. Empty while the wallpaper is showing, so QML
     // can fall back to the message states main.qml already derives rather than inventing its own.
     Q_PROPERTY(QString unavailableReason READ unavailableReason NOTIFY unavailableReasonChanged)
@@ -169,6 +176,10 @@ public:
     void setDesktopFocused(bool focused);
     bool windowMaximized() const { return m_windows.maximized; }
     void setWindowMaximized(bool maximized);
+    bool desktopCovered() const { return m_covered; }
+    void setDesktopCovered(bool covered);
+    QString pauseMode() const { return m_pauseMode; }
+    void setPauseMode(const QString& mode);
 
     QString unavailableReason() const { return m_unavailableReason; }
     bool frameShown() const { return m_frameShown; }
@@ -199,6 +210,8 @@ signals:
     void windowFocusedChanged();
     void desktopFocusedChanged();
     void windowMaximizedChanged();
+    void desktopCoveredChanged();
+    void pauseModeChanged();
     void unavailableReasonChanged();
     void frameShownChanged();
     void importCountsChanged();
@@ -356,9 +369,29 @@ private:
     // GUI thread.
     void reportVisible();
 
+    // Whether something other than the compositor's drawing says nobody can see this screen: a
+    // fullscreen window over it, unless the screen never pauses, or the session's screen locker. A
+    // paused wallpaper hands nothing over, so its paint watch never runs, and KWin goes on drawing a
+    // desktop under a fullscreen window; neither would ever be reported from the drawing alone.
+    // Never in the lock screen's own process.
+    bool hiddenByState() const;
+    // Acts on a change of any of those facts, whether or not the answer moved. GUI thread.
+    void hiddenByStateChanged();
+    // Runs `change` and acts if it moved hiddenByState(): acting on an unmoved answer would
+    // re-arm the paint watch as though the screen had just come back. GUI thread.
+    template <typename Change>
+    void changeHiddenInput(Change&& change);
+
+    // Reads whether the window holding this process's keyboard focus is on this item's screen, and
+    // reports a change. GUI thread.
+    void updateShellFocus();
+
     struct Windows {
         bool focused = false;
         bool desktopFocused = false;
+        // A window of this process other than the desktop's own may hold the focus: a panel, an
+        // applet's popup, Kickoff. They are the desktop's too, so this counts as the desktop's focus.
+        bool shellFocused = false;
         bool maximized = false;
         bool operator==(const Windows&) const = default;
     };
@@ -402,10 +435,15 @@ private:
 
     // Whether this item is in a window and visible, which is Qt's answer, and whether the scene
     // graph is actually painting it, which is the compositor's -- Qt goes on calling an occluded
-    // window's item visible. What the daemon is told is the two together: a wallpaper nobody can
-    // see is one it need not keep decoding. GUI thread only.
+    // window's item visible. What the daemon is told is the two together, less hiddenByState(): a
+    // wallpaper nobody can see is one it need not keep decoding. GUI thread only.
     bool m_onScreen = false;
     bool m_painting = true;
+    bool m_covered = false;  // as QML last set it
+    QString m_pauseMode;     // as main.qml last set it
+    // The focus window's screenChanged, followed while it is focused: Wayland names a popup's
+    // screen only once the surface has entered an output, which can come after the focus.
+    QMetaObject::Connection m_focusScreenWatch;
     // The last answer the daemon accepted, so an unchanged one is not sent again. Empty wherever
     // the daemon may have lost it, as the size report is.
     std::optional<bool> m_visibleReported;

@@ -23,6 +23,9 @@
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QDBusConnection>
+#include <QDBusMessage>
+#include <QDBusVirtualObject>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QGuiApplication>
 #include <QQmlComponent>
@@ -30,11 +33,13 @@
 #include <QQmlError>
 #include <QQuickItem>
 #include <QQuickWindow>
+#include <QScreen>
 #include <QString>
 #include <QTemporaryDir>
 #include <QUrl>
 #include <QVariant>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -74,6 +79,11 @@ constexpr int kArrivalLimitMs = 5000;
 constexpr int kQuietSpanMs = 6000;
 // Long enough for the item's zero-delay report timer and a bus round trip, many times over.
 constexpr int kTurnMs = 300;
+// Under the paint watch's first tick after arming, kPaintDeadlineMs (1 s) in wallpaperx_item.cpp:
+// that tick re-reads hiddenByState() and reports whatever it now says, and the one 250 ms later
+// reports the screen dark on its own. A hide seen within this of the arming is not the watch's.
+// The never phase measures when the watch's own dark report arrives and fails if that is inside this.
+constexpr int kPaintWatchFloorMs = 800;
 // A refusal run's first two waits, 2 s and 4 s, plus kArrivalLimitMs-worth of slack.
 constexpr int kBackoffLimitMs = 2000 + 4000 + 3000;
 // Between the base wait (2 s) and the 8 s an item that kept a two-refusal run's pace would use: a
@@ -211,6 +221,56 @@ bool focusAccepted(ReportStub& stub, const Scene& scene, const QString& out) {
         kArrivalLimitMs);
 }
 
+// The session's screen locker on its own connection, as KDE's answers org.freedesktop.ScreenSaver.
+// Registered before any item exists: the plugin's lock watch is process-wide and starts with the
+// first item, so what GetActive answers then is what the lock-start phase grades.
+class LockerStub : public QDBusVirtualObject {
+public:
+    bool active = false;
+    // The next this many GetActive calls are answered with a plain failure, as a lost reply is.
+    int failNext = 0;
+    // The next GetActive is left unanswered and kept here.
+    bool holdNext = false;
+    std::optional<QDBusMessage> held;
+    // When each GetActive arrived, on `clock`.
+    std::vector<qint64> asks;
+    QElapsedTimer clock;
+    LockerStub() { clock.start(); }
+    QString introspect(const QString&) const override { return QString(); }
+    bool handleMessage(const QDBusMessage& message, const QDBusConnection& connection) override {
+        if (message.interface() != QLatin1String("org.freedesktop.ScreenSaver") ||
+            message.member() != QLatin1String("GetActive")) {
+            return false;
+        }
+        asks.push_back(clock.elapsed());
+        if (holdNext) {
+            // Answered later through `held`, as a slow locker's reply is.
+            holdNext = false;
+            message.setDelayedReply(true);
+            held = message;
+            return true;
+        }
+        if (failNext > 0) {
+            --failNext;
+            return connection.send(message.createErrorReply(QStringLiteral("org.freedesktop.DBus.Error.Failed"),
+                                                            QStringLiteral("the stand-in locker failed this call")));
+        }
+        return connection.send(message.createReply(QVariant(active)));
+    }
+};
+
+bool sendActiveChanged(QDBusConnection& from, bool active) {
+    QDBusMessage signal = QDBusMessage::createSignal(QStringLiteral("/ScreenSaver"), QStringLiteral("org.freedesktop.ScreenSaver"),
+                                                     QStringLiteral("ActiveChanged"));
+    signal.setArguments({active});
+    return from.send(signal);
+}
+
+bool holdsHidden(const ReportStub& stub, const QString& out, std::size_t since) {
+    const std::optional<ReportStub::Call> held = heldSince(stub, kVisible, out, since);
+    return held && !held->args.value(1).toBool();
+}
+
 // Sets windowFocused and has the stub refuse it twice as RenderFailed, the second answer handled:
 // the item then holds a retry due in 4 s, and the next refusal of the same run would wait 8 s.
 bool backedOff(ReportStub& stub, const Scene& scene, const QString& out) {
@@ -281,7 +341,22 @@ int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "no-bus") == 0) return noBusRun(argc, argv);
     // X.34: nothing owned or sent off the private bus.
     if (const std::optional<int> refused = wallpaperx::testing::refuseOffPrivateTestBus()) return *refused;
-    qputenv("QT_QPA_PLATFORM", "offscreen");
+    // Two screens, for the shell-focus phase; every other phase stays on the first.
+    QTemporaryDir screensDir;
+    const QString screensFile = screensDir.path() + QStringLiteral("/screens.json");
+    {
+        QFile json(screensFile);
+        const QByteArray text = R"({"screens":[
+            {"name":"WPX-A","x":0,"y":0,"width":1280,"height":720,"logicalDpi":96,"logicalBaseDpi":96},
+            {"name":"WPX-B","x":1280,"y":0,"width":1280,"height":720,"logicalDpi":96,"logicalBaseDpi":96}]})";
+        // Without the file only shell-focus loses its second screen, and its own guard reports that.
+        // CONTROL (test-side, 2026-10-29, reverted): `written` forced false -> this line printed, lock-retry
+        //       still passed, and shell-focus reported NOT VERIFIED (ctest: Skipped), not a FAIL.
+        const bool written = screensDir.isValid() && json.open(QIODevice::WriteOnly) && json.write(text) == text.size();
+        qputenv("QT_QPA_PLATFORM", written ? QByteArray("offscreen:configfile=") + QFile::encodeName(screensFile)
+                                           : QByteArray("offscreen"));
+        if (!written) std::fprintf(stderr, "  the two-screen configuration could not be written; one screen this run\n");
+    }
     QGuiApplication app(argc, argv);
 
     QDBusConnection bus = wallpaperx::testing::stubConnection();
@@ -291,6 +366,16 @@ int main(int argc, char** argv) {
                                                    bus.lastError().message().toStdString());
         return wallpaperx::testing::reportNotVerifiedOrPassed();
     }
+    QDBusConnection lockerBus = QDBusConnection::connectToBus(QDBusConnection::SessionBus, QStringLiteral("wallpaperx-locker-stub"));
+    LockerStub locker;
+    const QString lockerName = QStringLiteral("org.freedesktop.ScreenSaver");
+    const bool lockerUp = lockerBus.isConnected() && lockerBus.registerService(lockerName) &&
+                          lockerBus.registerVirtualObject(QStringLiteral("/ScreenSaver"), &locker);
+    // Whether the locker holds its name now: the lock phase gives it up and takes it back.
+    bool lockerOwned = lockerUp;
+    // Read before any item exists, so the lock watch's first GetActive gets this answer.
+    const bool lockStart = phaseSelected("lock-start");
+    if (lockStart) locker.active = true;
 
     QQmlEngine engine;
     engine.addImportPath(QString::fromUtf8(WALLPAPERX_QML_MODULE_PATH));
@@ -298,6 +383,36 @@ int main(int argc, char** argv) {
     window.setGeometry(0, 0, 400, 300);
     window.show();
     Harness harness(engine, window, stub);
+
+    if (lockStart) {
+        const QString out = QStringLiteral("DP-LOCKSTART");
+        Scene scene = harness.settled(out);
+        if (!lockerUp) {
+            notVerified("the lock-start phase", "the stand-in locker could not take org.freedesktop.ScreenSaver");
+        } else if (ready(scene, "the lock-start phase")) {
+            // GOAL: S15.978 -- an item whose process starts while the session is locked (GetActive answers
+            //       true, no ActiveChanged ever sent) reports its screen hidden, and the locker's
+            //       ActiveChanged(false) then shows it.
+            // WHY-THIS-SHAPE: the phase runs first and the locker's answer is set before any item exists,
+            //       because the watch is process-wide and asks once when the first item makes it. Graded on
+            //       what the stub holds, not on the first report: setOutput reports at once, before the
+            //       asynchronous answer can arrive (printed below).
+            // CONTROL: via control_batch.sh 2026-10-27, `ask();` deleted from ScreenLockWatch's constructor
+            //       (backend/kde/wallpaperx_item.cpp) -> "FAIL: an item started while the session is locked
+            //       reports its screen hidden". Reverted.
+            const bool hidden = pumpUntil([&] { return holdsHidden(stub, out, 0); }, kArrivalLimitMs);
+            check(hidden, "an item started while the session is locked reports its screen hidden");
+            const std::size_t mark = stub.mark();
+            locker.active = false;
+            sendActiveChanged(lockerBus, false);
+            check(pumpUntil([&] { return holdsVisible(stub, out, mark); }, kArrivalLimitMs),
+                  "and the locker's ActiveChanged(false) shows it");
+            std::fprintf(stderr, "  %s: %s\n", qPrintable(out), ReportStub::describe(stub.callsFor(out)).c_str());
+        }
+        locker.active = false;
+        if (lockerUp) sendActiveChanged(lockerBus, false);
+        pumpFor(kTurnMs);
+    }
 
     if (phaseSelected("argument-order")) {
         const QString out = QStringLiteral("DP-ORDER");
@@ -1251,7 +1366,8 @@ int main(int argc, char** argv) {
             //       report shows as a step with no call.
             // CONTROL: via control_batch.sh, --phase '^desktop-focus$', 2026-10-11, each alone, reverted, in
             //       backend/kde/wallpaperx_item.cpp: `m_windowReportTimer.start(0);` deleted from setDesktopFocused
-            //       -> both lines red; sendWindowReport naming the desktop "none" -> the first line red.
+            //       -> both lines red; sendWindowReport naming the desktop "none" -> the first line red (re-run
+            //       2026-10-27 on the expression with shellFocused).
             // COVERAGE-ASSERT: each step must have produced a call to compare.
             struct Step {
                 const char* property;
@@ -1291,7 +1407,8 @@ int main(int argc, char** argv) {
             //       both on any machine.
             // CONTROL: via control_batch.sh, --phase '^window-wins$', 2026-10-11, sendWindowReport testing
             //       desktopFocused before focused (backend/kde/wallpaperx_item.cpp) -> the first line red; naming
-            //       the desktop "none" -> "FAIL: and the window losing the focus leaves "desktop"". Reverted.
+            //       the desktop "none" -> "FAIL: and the window losing the focus leaves "desktop"". Both re-run
+            //       2026-10-27 on the expression with shellFocused. Reverted.
             std::size_t mark = stub.mark();
             scene.renderer->setProperty("desktopFocused", true);
             scene.renderer->setProperty("windowFocused", true);
@@ -1436,6 +1553,547 @@ int main(int argc, char** argv) {
                 QDBusConnection::disconnectFromBus(QStringLiteral("wallpaperx-report-stub-newer"));
             }
         }
+    }
+
+    if (phaseSelected("lock")) {
+        const QString out = QStringLiteral("DP-LOCK");
+        const QString off = QStringLiteral("DP-LOCK-OFF");
+        Scene scene = harness.settled(out);
+        Scene away = harness.settled(off);
+        if (!lockerUp) {
+            notVerified("the lock phase", "the stand-in locker could not take org.freedesktop.ScreenSaver");
+        } else if (ready(scene, "the lock phase") && ready(away, "the lock phase")) {
+            away.renderer->setVisible(false);
+            pumpFor(kTurnMs);
+            const std::size_t start = stub.mark();
+            // GOAL: S15.978 -- ActiveChanged(true) from a connection that does not own
+            //       org.freedesktop.ScreenSaver hides nothing.
+            // WHY-THIS-SHAPE: sent from the daemon stub's own connection while the real locker is on the bus,
+            //       so only the sender differs from the lock the next step sends.
+            // CONTROL: via control_batch.sh 2026-10-27, the service argument of ScreenLockWatch's
+            //       bus.connect (backend/kde/wallpaperx_item.cpp) made QString() -> this line red. Reverted.
+            sendActiveChanged(bus, true);
+            pumpFor(kTurnMs * 2);
+            check(stub.calls(kVisible, out, start).empty(),
+                  "ActiveChanged(true) from a sender that does not own org.freedesktop.ScreenSaver hides nothing");
+
+            // GOAL: S15.978 -- the locker's ActiveChanged(true) hides an on-screen item with nothing being
+            //       drawn, and (false) shows it.
+            // WHY-THIS-SHAPE: the unlock arms the paint watch, which with no pass on this offscreen window
+            //       reports the screen dark about 1.25 s later, so a hide is waited for only within
+            //       kPaintWatchFloorMs of the lock (and of the unlock, for the relock below): a plain
+            //       kArrivalLimitMs wait would take the watch's report for the lock's.
+            // CONTROL: via control_batch.sh 2026-10-27, in backend/kde/wallpaperx_item.cpp, the connect of
+            //       ScreenLockWatch::lockedChanged in the item's constructor deleted -> both lines red;
+            //       `&& !hiddenByState()` dropped from reportVisible -> the first line red. Reverted. Both re-run
+            //       2026-10-28 with the floor-bounded wait: still red.
+            std::size_t mark = stub.mark();
+            sendActiveChanged(lockerBus, true);
+            check(pumpUntil([&] { return holdsHidden(stub, out, mark); }, kPaintWatchFloorMs),
+                  "the locker's ActiveChanged(true) reports an on-screen item's screen hidden");
+            mark = stub.mark();
+            QElapsedTimer sinceUnlock;
+            sinceUnlock.start();
+            sendActiveChanged(lockerBus, false);
+            check(pumpUntil([&] { return holdsVisible(stub, out, mark); }, kArrivalLimitMs),
+                  "and its ActiveChanged(false) shows it again");
+
+            // GOAL: S15.978 -- the locker leaving the bus while locked counts as unlocked.
+            // WHY-THIS-SHAPE: the relock follows the unlock's visible report directly: the unlock armed the
+            //       paint watch, so the relock's hide is read within kPaintWatchFloorMs of it, and anything
+            //       waited for in between would eat that window and make the step ungradable.
+            // CONTROL: control_batch.sh 2026-10-29, --phase lock, reverted: `onActiveChanged(false);` deleted
+            //       from the serviceOwnerChanged handler (backend/kde/wallpaperx_item.cpp) -> this line red.
+            mark = stub.mark();
+            sendActiveChanged(lockerBus, true);
+            const qint64 relockBound = std::max<qint64>(0, kPaintWatchFloorMs - sinceUnlock.elapsed());
+            const bool relocked = pumpUntil([&] { return holdsHidden(stub, out, mark); }, static_cast<int>(relockBound));
+            mark = stub.mark();
+            const bool gone = lockerBus.unregisterService(lockerName);
+            if (gone) lockerOwned = false;
+            if (!relocked || !gone) {
+                notVerified("the lock phase's locker-leaves step", "the screen was not locked again, or the locker could not leave");
+            } else {
+                check(pumpUntil([&] { return holdsVisible(stub, out, mark); }, kArrivalLimitMs),
+                      "the locker leaving the bus while locked counts as unlocked");
+            }
+
+            // GOAL: S15.979 -- an item off the screen sends no visibility report when the lock changes.
+            // WHY-THIS-SHAPE: read after the relock and the locker leaving, over every call since `start`, so
+            //       it covers all four lock changes without a wait between the unlock and the relock.
+            // CONTROL: two guards hold this, so each alone stays green (T6b); both broken together, via
+            //       control_batch.sh 2026-10-29, --phase lock, reverted, in backend/kde/wallpaperx_item.cpp:
+            //       hiddenByStateChanged's `if (!m_onScreen) return;` deleted and reportVisible's `m_onScreen &&`
+            //       dropped -> this line red.
+            pumpFor(kTurnMs);
+            check(stub.calls(kVisible, off, start).empty(), "an item off the screen sends no visibility report on a lock change");
+
+            // Not graded here: that GetActive carries NO_AUTO_START. QtDBus reports every received call as
+            // allowing a start, whatever its header says, so only a bus monitor could read it.
+            lockerOwned = lockerBus.registerService(lockerName);
+            std::fprintf(stderr, "  %s: %s\n", qPrintable(out), ReportStub::describe(stub.callsFor(out, start)).c_str());
+        }
+    }
+
+    if (phaseSelected("lock-retry")) {
+        const QString out = QStringLiteral("DP-LOCK-RETRY");
+        Scene scene = harness.settled(out);
+        if (!lockerOwned) {
+            notVerified("the lock-retry phase", "the stand-in locker does not hold org.freedesktop.ScreenSaver");
+        } else if (ready(scene, "the lock-retry phase")) {
+            // GOAL: S15.1091 -- a GetActive the locker fails (not ServiceUnknown or NameHasNoOwner) is asked
+            //       again, after a wait that doubles: two failures give a second ask no sooner than 2 s after the
+            //       first and a third no sooner than 4 s after the second, and the third's answer is taken. The
+            //       retries are capped at five (graded in the lock-cap phase); two failures are within the cap.
+            // WHY-THIS-SHAPE: graded on the locker's own record of when it was asked, not on a hide report: this
+            //       offscreen window's paint watch reports the screen dark on its own within the same seconds, so
+            //       a hide could not be told from the lock's. The owner change (leave and take the name back) is
+            //       what makes the watch ask, as a locker restarting does. Each wait has a failure branch.
+            // CONTROL: control_batch.sh 2026-10-29, --phase lock-retry, each alone, reverted, in
+            //       backend/kde/wallpaperx_item.cpp ScreenLockWatch::ask(): the retry's QTimer::singleShot deleted ->
+            //       "...asked again after a failure"; `m_failedAsks++` made `0` -> "...the wait doubles".
+            locker.failNext = 2;
+            locker.active = true;
+            const std::size_t asked = locker.asks.size();
+            const bool gone = lockerBus.unregisterService(lockerName);
+            pumpFor(kTurnMs);
+            lockerOwned = lockerBus.registerService(lockerName);
+            if (!gone || !lockerOwned) {
+                notVerified("the lock-retry phase", "the stand-in locker could not leave the bus and take its name back");
+            } else {
+                const bool three = pumpUntil([&] { return locker.asks.size() >= asked + 3; }, kBackoffLimitMs);
+                const std::vector<qint64> times(locker.asks.begin() + static_cast<std::ptrdiff_t>(asked), locker.asks.end());
+                check(times.size() >= 2 && times[1] - times[0] >= 2000 - kTurnMs,
+                      "S15.1091 a failed GetActive is asked again after a failure, no sooner than the base wait");
+                check(three && times.size() >= 3 && times[2] - times[1] >= 4000 - kTurnMs,
+                      "S15.1091 a second failure is asked again after the wait doubles");
+                pumpFor(kTurnMs);
+                check(locker.failNext == 0 && locker.asks.size() == asked + 3,
+                      "S15.1091 the answer after two failures is taken: no fourth GetActive");
+                std::fprintf(stderr, "  GetActive asked at");
+                for (const qint64 t : times) std::fprintf(stderr, " %lld", static_cast<long long>(t - times.front()));
+                std::fprintf(stderr, " ms\n");
+            }
+            locker.failNext = 0;
+            locker.active = false;
+            sendActiveChanged(lockerBus, false);
+            pumpFor(kTurnMs);
+        }
+    }
+
+    if (phaseSelected("lock-cap")) {
+        const QString out = QStringLiteral("DP-LOCK-CAP");
+        Scene scene = harness.settled(out);
+        if (!lockerOwned) {
+            notVerified("the lock-cap phase", "the stand-in locker does not hold org.freedesktop.ScreenSaver");
+        } else if (ready(scene, "the lock-cap phase")) {
+            // GOAL: S15.1151 (D13-g) -- a locker that fails every GetActive is asked at most 6 times after its
+            //       owner changes (one ask and five retries), then not again until the owner changes; and a
+            //       second owner change during a retry wait leaves one retry chain, not two.
+            // WHY-THIS-SHAPE: the second owner change comes 1 s into the first chain's 2 s wait, so a chain left
+            //       running asks between the new chain's asks: a gap under the base wait, and more than six asks.
+            //       Counting after the last retry's 8 s wait has passed again is what makes "no seventh" a
+            //       verdict rather than an early read. Every wait has a failure branch.
+            // CONTROL: backend/kde/wallpaperx_item.cpp ScreenLockWatch::ask(), control_batch.sh 2026-10-29,
+            //       --phase lock-cap, each alone, reverted: (1) `if (m_failedAsks < kLockRetries)` made `if (true)`
+            //       -> "S15.1151 a locker failing every GetActive is asked 6 times after an owner change, no
+            //       more", alone; (2) `m_retry.start(...)` made an unnamed `QTimer::singleShot(..., this,
+            //       &ScreenLockWatch::ask)` -> "S15.1151 ... one retry chain: no two asks closer than the base wait"
+            //       and the count line (asks at 0 1352 1899 5353 10299 13352 18352 ms: the old chain's 1352).
+            constexpr int kAllRetriesMs = 2000 + 4000 + 8000 + 8000 + 8000;
+            locker.failNext = 1000;
+            locker.active = false;
+            const bool firstGone = lockerBus.unregisterService(lockerName);
+            pumpFor(kTurnMs);
+            lockerOwned = lockerBus.registerService(lockerName);
+            const std::size_t firstAsked = locker.asks.size();
+            const bool firstAsk = lockerOwned && pumpUntil([&] { return locker.asks.size() > firstAsked; }, kArrivalLimitMs);
+            pumpFor(1000 - kTurnMs);
+            const bool secondGone = lockerBus.unregisterService(lockerName);
+            const std::size_t asked = locker.asks.size();
+            lockerOwned = lockerBus.registerService(lockerName);
+            if (!firstGone || !secondGone || !lockerOwned || !firstAsk) {
+                notVerified("the lock-cap phase", "the stand-in locker could not change owner twice, or was not asked");
+            } else {
+                const bool six = pumpUntil([&] { return locker.asks.size() >= asked + 6; }, kAllRetriesMs + 3000);
+                // Past the longest retry wait again, so a seventh ask would have come.
+                pumpFor(8000 + 2 * kTurnMs);
+                const std::vector<qint64> times(locker.asks.begin() + static_cast<std::ptrdiff_t>(asked), locker.asks.end());
+                std::fprintf(stderr, "  GetActive asked after the second owner change at");
+                for (const qint64 t : times) std::fprintf(stderr, " %lld", static_cast<long long>(t - times.front()));
+                std::fprintf(stderr, " ms\n");
+                bool spaced = times.size() >= 2;
+                for (std::size_t i = 1; i < times.size(); ++i) spaced = spaced && times[i] - times[i - 1] >= 2000 - kTurnMs;
+                check(spaced, "S15.1151 a second owner change during a retry wait leaves one retry chain: no two asks "
+                              "closer than the base wait");
+                check(six && times.size() == 6, "S15.1151 a locker failing every GetActive is asked 6 times after an owner "
+                                                "change, no more");
+                // Not graded: that an owner change after the cap asks afresh. No break of that ask leaves this
+                // phase's first ask standing, so it could not be shown red here. The owner change puts the
+                // watch back on an answered "unlocked" for later phases.
+                locker.failNext = 0;
+                lockerBus.unregisterService(lockerName);
+                pumpFor(kTurnMs);
+                lockerOwned = lockerBus.registerService(lockerName);
+            }
+            locker.failNext = 0;
+            pumpFor(kTurnMs);
+        }
+    }
+
+    if (phaseSelected("lock-late")) {
+        const QString out = QStringLiteral("DP-LOCK-LATE");
+        Scene scene = harness.settled(out);
+        if (!lockerOwned) {
+            notVerified("the lock-late phase", "the stand-in locker does not hold org.freedesktop.ScreenSaver");
+        } else if (ready(scene, "the lock-late phase")) {
+            // GOAL: S15.1153 (D13-g) -- a GetActive answer that arrives after the locker's owner has changed
+            //       again does not change the lock state: the replaced owner's late "locked" is not taken.
+            // WHY-THIS-SHAPE: the late answer is released right after an unlock that armed the paint watch, so a
+            //       hide within kPaintWatchFloorMs is the lock's, not the paint watch's own dark report; a window
+            //       shorter than kTurnMs is reported as not verified rather than read as "no hide".
+            // CONTROL: backend/kde/wallpaperx_item.cpp ScreenLockWatch::ask(), control_batch.sh 2026-10-29,
+            //       --phase lock-late, reverted: `if (asked != m_lastAsk) return;` deleted -> "S15.1153 a late
+            //       GetActive answer from a replaced locker does not lock the screen".
+            locker.active = false;
+            locker.failNext = 0;
+            locker.holdNext = true;
+            const bool firstGone = lockerBus.unregisterService(lockerName);
+            pumpFor(kTurnMs);
+            lockerOwned = lockerBus.registerService(lockerName);
+            const bool held = lockerOwned && pumpUntil([&] { return locker.held.has_value(); }, kArrivalLimitMs);
+            const std::size_t asked = locker.asks.size();
+            const bool secondGone = lockerBus.unregisterService(lockerName);
+            pumpFor(kTurnMs);
+            lockerOwned = lockerBus.registerService(lockerName);
+            const bool answered = lockerOwned && pumpUntil([&] { return locker.asks.size() > asked; }, kArrivalLimitMs);
+            pumpFor(kTurnMs);
+            // Lock and unlock by signal, so the unlock arms the paint watch just before the late answer.
+            std::size_t mark = stub.mark();
+            sendActiveChanged(lockerBus, true);
+            const bool locked = pumpUntil([&] { return holdsHidden(stub, out, mark); }, kArrivalLimitMs);
+            mark = stub.mark();
+            sendActiveChanged(lockerBus, false);
+            const bool unlocked = pumpUntil([&] { return holdsVisible(stub, out, mark); }, kArrivalLimitMs);
+            QElapsedTimer sinceUnlock;
+            sinceUnlock.start();
+            if (!firstGone || !secondGone || !held || !answered || !locked || !unlocked) {
+                notVerified("the lock-late phase", "the locker could not change owner twice with one answer held, or the "
+                                                   "screen did not lock and unlock by signal");
+            } else {
+                mark = stub.mark();
+                lockerBus.send(locker.held->createReply(QVariant(true)));
+                const qint64 bound = kPaintWatchFloorMs - sinceUnlock.elapsed();
+                if (bound < kTurnMs) {
+                    notVerified("the lock-late phase", "the late answer could not be sent within the paint watch's floor");
+                } else {
+                    const bool hid = pumpUntil([&] { return holdsHidden(stub, out, mark); }, static_cast<int>(bound));
+                    check(!hid, "S15.1153 a late GetActive answer from a replaced locker does not lock the screen");
+                }
+            }
+            locker.held.reset();
+            locker.holdNext = false;
+            sendActiveChanged(lockerBus, false);
+            pumpFor(kTurnMs);
+        }
+    }
+
+    if (phaseSelected("cover")) {
+        const QString out = QStringLiteral("DP-COVER");
+        const QString off = QStringLiteral("DP-COVER-OFF");
+        Scene scene = harness.settled(out);
+        Scene away = harness.settled(off);
+        if (ready(scene, "the cover phase") && ready(away, "the cover phase")) {
+            away.renderer->setVisible(false);
+            pumpFor(kTurnMs);
+            const std::size_t start = stub.mark();
+            // GOAL: S15.977 -- desktopCovered set true hides the screen with nothing being drawn, and false
+            //       shows it again.
+            // WHY-THIS-SHAPE: waited for only within kPaintWatchFloorMs: an item that ignored the cover
+            //       has its paint watch armed, and with no pass on this offscreen window the watch itself
+            //       reports the screen dark about 1.25 s later -- a wait of seconds passed with the cover ignored.
+            // CONTROL: via control_batch.sh 2026-10-28, --phase cover, each alone, reverted, in
+            //       backend/kde/wallpaperx_item.cpp: the covered line deleted from hiddenByState -> "a covered
+            //       screen is reported hidden" and "and uncovering it shows it again" red; setDesktopCovered's
+            //       changeHiddenInput made a bare assignment -> the same two lines red.
+            scene.renderer->setProperty("desktopCovered", true);
+            away.renderer->setProperty("desktopCovered", true);
+            check(pumpUntil([&] { return holdsHidden(stub, out, start); }, kPaintWatchFloorMs), "a covered screen is reported hidden");
+            const std::size_t mark = stub.mark();
+            scene.renderer->setProperty("desktopCovered", false);
+            away.renderer->setProperty("desktopCovered", false);
+            check(pumpUntil([&] { return holdsVisible(stub, out, mark); }, kArrivalLimitMs), "and uncovering it shows it again");
+            // GOAL: S15.979 -- an item off the screen sends no visibility report when its cover changes.
+            // CONTROL: as the lock phase's twin (both guards broken together, --phase cover, 2026-10-29,
+            //       reverted) -> this line red.
+            pumpFor(kTurnMs);
+            check(stub.calls(kVisible, off, start).empty(), "an item off the screen sends no visibility report on a cover change");
+            std::fprintf(stderr, "  %s: %s\n", qPrintable(out), ReportStub::describe(stub.callsFor(out, start)).c_str());
+        }
+    }
+
+    // The pause mode "play" is the user's "Never": a fullscreen window does not hide such a screen.
+    if (phaseSelected("never")) {
+        const QString out = QStringLiteral("DP-NEVER");
+        Scene scene = harness.settled(out);
+        if (ready(scene, "the never phase")) {
+            QQuickItem* item = scene.renderer;
+            // Covers then uncovers under `mode`; true if the cover hid the screen and the uncover showed it,
+            // nullopt if too little of the window was left to grade. Each hide is read only until
+            // kPaintWatchFloorMs after the uncover that armed the watch (`watchArmed`), not after the cover:
+            // the visible report waited for in between would push the window past the watch's own dark report.
+            QElapsedTimer watchArmed;
+            const auto coverHides = [&](const QString& mode) -> std::optional<bool> {
+                item->setProperty("pauseMode", mode);
+                std::size_t mark = stub.mark();
+                const qint64 bound = watchArmed.isValid() ? kPaintWatchFloorMs - watchArmed.elapsed() : kPaintWatchFloorMs;
+                item->setProperty("desktopCovered", true);
+                const bool hid = bound >= kTurnMs && pumpUntil([&] { return holdsHidden(stub, out, mark); }, static_cast<int>(bound));
+                mark = stub.mark();
+                watchArmed.start();
+                item->setProperty("desktopCovered", false);
+                const bool shown = pumpUntil([&] { return holdsVisible(stub, out, mark); }, kArrivalLimitMs);
+                if (bound < kTurnMs) return std::nullopt;
+                return hid && shown;
+            };
+            // Arms the watch afresh with the screen reported visible: an uncovered screen under a hiding mode.
+            const bool fresh = coverHides(QStringLiteral("always_paused")).value_or(false);
+            // GOAL: S15.1030 -- every mode but "play", and an empty mode (a daemon that sends none),
+            //       still hides a covered screen, and uncovering shows it.
+            // WHY-THIS-SHAPE: one loop over the four modes with a count, so a mode list cut short fails;
+            //       each read is bounded by kPaintWatchFloorMs from the watch's last arming (see coverHides),
+            //       and a mode whose window was used up by a slow visible report is reported not verified.
+            // CONTROL: via control_batch.sh 2026-10-28, --phase never, reverted: hiddenByState's covered line
+            //       (backend/kde/wallpaperx_item.cpp) given `!m_pauseMode.isEmpty() &&` -> the mode "" line red.
+            // COVERAGE-ASSERT: modesGraded must be 4 (each graded, or reported not verified).
+            int modesGraded = 0;
+            for (const QString& mode : {QStringLiteral("always_paused"), QStringLiteral("paused_while_focused"),
+                                        QStringLiteral("paused_while_maximized"), QString()}) {
+                const QString line = QStringLiteral("a covered screen under mode \"%1\" is hidden, and shown again").arg(mode);
+                const std::optional<bool> hides = coverHides(mode);
+                if (!hides) {
+                    notVerified(qPrintable(line), "the visible report before it left no window before the paint watch's own");
+                } else {
+                    check(*hides, qPrintable(line));
+                }
+                ++modesGraded;
+            }
+            check(modesGraded == 4, "the never phase graded all four hiding modes");
+
+            // GOAL: S15.1030 -- under "play" a fullscreen window does not hide the screen.
+            // WHY-THIS-SHAPE: the uncover just before re-armed the watch with the screen visible, so no
+            //       hidden report inside kPaintWatchFloorMs can be the watch's; a longer quiet span would
+            //       catch the watch's own dark report on this offscreen window.
+            // CONTROL: via control_batch.sh 2026-10-28, --phase never, reverted: hiddenByState's covered line
+            //       (backend/kde/wallpaperx_item.cpp) made `if (m_covered) return true;` -> this line red, with the
+            //       two mode-change lines below.
+            item->setProperty("pauseMode", QStringLiteral("play"));
+            std::size_t mark = stub.mark();
+            item->setProperty("desktopCovered", true);
+            const qint64 quietBound = kPaintWatchFloorMs - watchArmed.elapsed();
+            if (!fresh || quietBound < kTurnMs) {
+                notVerified("the never phase's play step",
+                            "the screen's visible report came too late to leave a quiet window before the paint watch's own");
+            } else {
+                pumpFor(static_cast<int>(quietBound));
+                check(heldSince(stub, kVisible, out, mark) == std::nullopt, "a covered screen under \"play\" sends no visibility report");
+            }
+
+            // GOAL: S15.1031 -- a mode change while covered takes effect at once: out of "play" hides,
+            //       into "play" shows again (re-arming the paint watch, which is what reports it visible).
+            // WHY-THIS-SHAPE: the hide is waited for only until kPaintWatchFloorMs after a fresh arming (the
+            //       uncover below), timed from before that uncover: read after the quiet wait above, the
+            //       watch's own dark report answered for a mode change the item ignored.
+            // CONTROL: via control_batch.sh 2026-10-28, --phase never, reverted: setPauseMode's
+            //       changeHiddenInput (backend/kde/wallpaperx_item.cpp) made a bare assignment -> both lines red. The
+            //       window must end before the watch's first tick (kPaintDeadlineMs, 1 s), which re-reads hiddenByState
+            //       and so would report the hide the item ignored. A window under kTurnMs is reported not verified.
+            // Set up by cover changes made while uncovered or under a hiding mode, never by a mode change while
+            // covered: a setter that ignored mode changes would otherwise skip this step instead of failing it.
+            item->setProperty("desktopCovered", false);
+            item->setProperty("pauseMode", QStringLiteral("always_paused"));
+            item->setProperty("desktopCovered", true);
+            const bool recovered = pumpUntil([&] { return holdsHidden(stub, out, 0); }, kArrivalLimitMs);
+            QElapsedTimer sinceArm;
+            sinceArm.start();
+            mark = stub.mark();
+            item->setProperty("desktopCovered", false);
+            const bool armed = recovered && pumpUntil([&] { return holdsVisible(stub, out, mark); }, kArrivalLimitMs);
+            item->setProperty("pauseMode", QStringLiteral("play"));
+            item->setProperty("desktopCovered", true);
+            mark = stub.mark();
+            item->setProperty("pauseMode", QStringLiteral("paused_while_focused"));
+            const int leaveBound = static_cast<int>(std::max<qint64>(0, kPaintWatchFloorMs - sinceArm.elapsed()));
+            if (!armed || leaveBound < kTurnMs) {
+                notVerified("the never phase's mode-change steps",
+                            "the screen was not shown with a fresh paint watch in time to read the mode change within the floor");
+            } else {
+                check(pumpUntil([&] { return holdsHidden(stub, out, mark); }, leaveBound),
+                      "a covered screen leaving \"play\" is reported hidden");
+            }
+            mark = stub.mark();
+            QElapsedTimer sincePlayArm;
+            sincePlayArm.start();
+            item->setProperty("pauseMode", QStringLiteral("play"));
+            check(pumpUntil([&] { return holdsVisible(stub, out, mark); }, kArrivalLimitMs),
+                  "a covered screen entering \"play\" is reported visible again");
+
+            // GOAL: S15.1032 -- on a "play" screen a fullscreen window coming or going sends no report
+            //       and does not re-arm the paint watch (which is what asks for a redraw).
+            // WHY-THIS-SHAPE: graded once the watch has reported the screen dark on its own: re-arming then
+            //       marks the screen painting and reports it visible, so a re-arm is visible on the wire. On
+            //       a visible screen a re-arm sends nothing, and the check could not fail.
+            // CONTROL: via control_batch.sh 2026-10-28, --phase never, reverted: changeHiddenInput
+            //       (backend/kde/wallpaperx_item.cpp) made to call hiddenByStateChanged() unconditionally -> this
+            //       line red.
+            const bool dark = pumpUntil([&] { return holdsHidden(stub, out, mark); }, kArrivalLimitMs);
+            // GOAL: every floor-bounded hide in this file assumes the paint watch's own dark report comes later
+            //       than kPaintWatchFloorMs after its arming; false if the item's deadline drops under the floor.
+            // WHY-THIS-SHAPE: measured on the real watch (armed by entering "play" above) rather than copied from
+            //       wallpaperx_item.cpp's kPaintDeadlineMs, which is file-local: a shorter deadline would hollow out
+            //       the lock, cover and never checks silently, and fails here instead.
+            // CONTROL: control_batch.sh 2026-10-29, --phase never, reverted: kPaintDeadlineMs
+            //       (backend/kde/wallpaperx_item.cpp) made 300 -> this line red.
+            const qint64 darkAfter = sincePlayArm.elapsed();
+            if (dark) {
+                check(darkAfter > kPaintWatchFloorMs, "the paint watch's own dark report comes after kPaintWatchFloorMs");
+                if (darkAfter <= kPaintWatchFloorMs) std::fprintf(stderr, "  dark report %lld ms after arming\n", static_cast<long long>(darkAfter));
+            }
+            if (!dark) {
+                notVerified("the never phase's cover toggle", "the paint watch never reported the screen dark");
+            } else {
+                mark = stub.mark();
+                item->setProperty("desktopCovered", false);
+                pumpFor(kTurnMs);
+                item->setProperty("desktopCovered", true);
+                pumpFor(kTurnMs);
+                check(stub.calls(kVisible, out, mark).empty(), "a fullscreen window coming or going on a \"play\" screen sends no report");
+            }
+
+            // GOAL: S15.1033 -- the lock screen still hides a "play" screen, covered or not.
+            // CONTROL: via control_batch.sh 2026-10-28, --phase never, reverted: hiddenByState
+            //       (backend/kde/wallpaperx_item.cpp) given `if (m_pauseMode == "play") return false;` before the
+            //       cover and lock terms -> both lock lines red.
+            if (!lockerOwned) {
+                notVerified("the never phase's lock steps",
+                            "the stand-in locker could not take org.freedesktop.ScreenSaver, or could not take it back after the lock phase");
+            } else {
+                for (const bool covered : {true, false}) {
+                    // Shown with the watch freshly armed: a hiding mode's uncover, then "play" and the cover
+                    // state, neither of which moves the answer, so the lock's hide is read within the floor.
+                    item->setProperty("pauseMode", QStringLiteral("always_paused"));
+                    item->setProperty("desktopCovered", true);
+                    mark = stub.mark();
+                    QElapsedTimer sinceUncover;
+                    sinceUncover.start();
+                    item->setProperty("desktopCovered", false);
+                    const bool shown = pumpUntil([&] { return holdsVisible(stub, out, mark); }, kArrivalLimitMs);
+                    item->setProperty("pauseMode", QStringLiteral("play"));
+                    item->setProperty("desktopCovered", covered);
+                    const qint64 lockBound = kPaintWatchFloorMs - sinceUncover.elapsed();
+                    if (!shown || lockBound < kTurnMs) {
+                        notVerified("the never phase's lock steps",
+                                    "the screen was not reported visible early enough to read the lock within the floor");
+                        continue;
+                    }
+                    mark = stub.mark();
+                    sendActiveChanged(lockerBus, true);
+                    check(pumpUntil([&] { return holdsHidden(stub, out, mark); }, static_cast<int>(lockBound)),
+                          covered ? "the lock hides a covered \"play\" screen" : "the lock hides an uncovered \"play\" screen");
+                    mark = stub.mark();
+                    sendActiveChanged(lockerBus, false);
+                    static_cast<void>(pumpUntil([&] { return holdsVisible(stub, out, mark); }, kArrivalLimitMs));
+                }
+            }
+            std::fprintf(stderr, "  %s: %s\n", qPrintable(out), ReportStub::describe(stub.callsFor(out)).c_str());
+        }
+    }
+
+    // Last: it moves the process's focus away from the window every other phase's item is in.
+    if (phaseSelected("shell-focus")) {
+        const QString out = QStringLiteral("DP-SHELL");
+        Scene scene = harness.settled(out);
+        const QList<QScreen*> screens = QGuiApplication::screens();
+        const auto focusedOn = [](QWindow* w) { return pumpUntil([w] { return QGuiApplication::focusWindow() == w; }, kArrivalLimitMs); };
+        const auto lastFocus = [&](std::size_t since) {
+            const std::vector<ReportStub::Call> calls = stub.calls(kFocus, out, since);
+            return calls.empty() ? QString() : calls.back().args.value(1).toString();
+        };
+        const auto settlesOn = [&](std::size_t since, const QString& focus) {
+            pumpUntil([&] { return lastFocus(since) == focus; }, kArrivalLimitMs);
+            pumpFor(kTurnMs);
+            return lastFocus(since) == focus;
+        };
+        QWindow panel;
+        QWindow popup;
+        panel.setScreen(screens.value(0));
+        panel.setGeometry(20, 400, 200, 40);
+        popup.setScreen(screens.value(1));
+        popup.setGeometry(1300, 400, 200, 40);
+        window.requestActivate();
+        if (screens.size() != 2) {
+            notVerified("the shell-focus phase", "the offscreen platform did not come up with two screens");
+        } else if (!ready(scene, "the shell-focus phase") || !focusedOn(&window) || window.screen() != screens.value(0)) {
+            notVerified("the shell-focus phase", "the item's own window could not be focused on the first screen");
+        } else {
+            // GOAL: S15.981 -- another window of this process focused on the item's screen reports
+            //       "desktop"; an application window (windowFocused) still wins with "window".
+            // CONTROL: via control_batch.sh 2026-10-27, in sendWindowReport (backend/kde/wallpaperx_item.cpp):
+            //       `|| report.windows.shellFocused` dropped -> the first line red; shellFocused tested
+            //       before focused -> "FAIL: and an application window still wins with "window"". Reverted.
+            std::size_t mark = stub.mark();
+            panel.show();
+            panel.requestActivate();
+            if (!focusedOn(&panel)) {
+                notVerified("the shell-focus phase", "the stand-in panel never took the focus");
+            } else {
+                check(settlesOn(mark, QStringLiteral("desktop")),
+                      "a window of this process focused on the item's screen reports \"desktop\"");
+                mark = stub.mark();
+                scene.renderer->setProperty("windowFocused", true);
+                check(settlesOn(mark, QStringLiteral("window")), "and an application window still wins with \"window\"");
+                scene.renderer->setProperty("windowFocused", false);
+                pumpFor(kTurnMs);
+            }
+            panel.hide();
+            window.requestActivate();
+            const bool home = focusedOn(&window) && settlesOn(0, QStringLiteral("none"));
+            // Marked once the last report is "none": calls on one connection arrive in order, so a late
+            // "desktop" from the panel step is already behind it, and the scan below sees only the popup's.
+            mark = stub.mark();
+            // GOAL: S15.981 -- one focused on the other screen leaves this one "none", and one whose screen
+            //       becomes this one only after it has the focus (a popup Wayland places late) reports "desktop".
+            // CONTROL: via control_batch.sh 2026-10-27, in WallpaperXItem::updateShellFocus
+            //       (backend/kde/wallpaperx_item.cpp): `&& focus->screen() == own->screen()` dropped -> the
+            //       first line red; the screenChanged connect deleted -> the second line red. Reverted. The first
+            //       re-run 2026-10-28 with the mark moved after the settle: still red (with the second).
+            popup.show();
+            popup.requestActivate();
+            if (!home || !focusedOn(&popup) || popup.screen() != screens.value(1)) {
+                notVerified("the shell-focus phase's other-screen steps", "the focus did not come home, or the popup "
+                                                                          "was not focused on the second screen");
+            } else {
+                pumpFor(kTurnMs);
+                bool claimed = false;
+                for (const ReportStub::Call& call : stub.calls(kFocus, out, mark)) {
+                    if (call.args.value(1).toString() != QLatin1String("none")) claimed = true;
+                }
+                check(!claimed && settlesOn(0, QStringLiteral("none")), "a window focused on the other screen leaves this one \"none\"");
+                mark = stub.mark();
+                popup.setGeometry(300, 400, 200, 40);
+                const bool moved = pumpUntil([&] { return popup.screen() == screens.value(0); }, kArrivalLimitMs);
+                if (!moved || QGuiApplication::focusWindow() != &popup) {
+                    notVerified("the shell-focus phase's late-screen step", "the offscreen platform did not move the "
+                                                                            "focused popup onto the first screen");
+                } else {
+                    check(settlesOn(mark, QStringLiteral("desktop")),
+                          "a focused window whose screen becomes this one afterwards reports \"desktop\"");
+                }
+            }
+            std::fprintf(stderr, "  %s: %s\n", qPrintable(out), ReportStub::describe(stub.callsFor(out)).c_str());
+        }
+        popup.hide();
+        panel.hide();
     }
 
     if (wallpaperx::testing::reportCheckFailures()) return 1;

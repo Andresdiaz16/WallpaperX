@@ -36,18 +36,24 @@ public:
 
     // The file's time `from` is heard at `at`, and the rest follows on from it at the track's rate. With
     // `loop`, the sound from `from` to its end then plays again and again, with nothing more asked of
-    // the owner.
+    // the owner. With `joins`, `from` starts the file's next pass: should the sound before it run to the
+    // file's last frame within a few tens of milliseconds of `at`, this one follows straight on from that
+    // frame instead, with no fade on either side, and its clock says where that put it. `next` is where
+    // the file's next pass starts, if known: the sound's end is decoded on into it, so a joining play
+    // from exactly there goes on through the same stretch rather than starting one.
     struct Anchor {
         std::chrono::nanoseconds from{};
         std::chrono::steady_clock::time_point at;
         bool loop = false;
+        bool joins = false;
+        std::optional<std::chrono::nanoseconds> next;
         bool operator==(const Anchor&) const = default;
     };
 
-    // Plays from `anchor`, replacing what this track plays at `at`. An `at` already past starts as far
-    // into the file as the sound would have played by now; one still to come keeps the sound before it
-    // until then, however far off, which is how a loop's last picture keeps its sound to its end. A
-    // repeat of the last anchor does nothing.
+    // Plays from `anchor`, replacing what this track plays at `at`, fading the sound before it out and
+    // this one in unless they join. An `at` already past starts as far into the file as the sound would
+    // have played by now; one still to come keeps the sound before it until then, however far off, which
+    // is how a loop's last picture keeps its sound to its end. A repeat of the last anchor does nothing.
     void play(const Anchor& anchor) noexcept;
 
     // Fades out at once; the stream then stops and nothing is decoded until the next play().
@@ -63,6 +69,10 @@ public:
     // is taken up.
     void setRate(double rate) noexcept;
     double rate() const noexcept;
+
+    // Replaces what AudioOutput::track() was given as `name` and `tag`, for the stream playing now and the
+    // file's work from here on; the sound plays on untouched. Throws std::bad_alloc.
+    void rename(std::string name, std::string tag);
 
     // What the last play() asked for; nothing before the first and after stop().
     const std::optional<Anchor>& anchor() const { return m_anchor; }
@@ -85,9 +95,6 @@ public:
 
     // Names the latest play() or stop() that changed anything; each such call gives a new value.
     uint64_t request() const noexcept;
-    // Whether the output's thread has taken up that request. A play() taken up still leaves the
-    // sound before it playing until its `at`.
-    bool taken() const noexcept;
 
     // Whether the file has sound this output can play: Unknown until a play() has had it opened.
     // None and Failed are for good on this track. None is the file's answer: it holds no audio

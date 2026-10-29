@@ -20,7 +20,8 @@ VideoPipeline::VideoPipeline(Device& device, const std::string& file, const std:
       m_hooks(std::move(hooks)),
       m_decoding(std::make_unique<PictureSource>(device, file, playback, startAt)),
       m_deepest(std::get<std::unique_ptr<PictureSource>>(m_decoding)->decoder().deepestSkip()),
-      m_origin(std::get<std::unique_ptr<PictureSource>>(m_decoding)->decoder().timelineStart()) {
+      m_origin(std::get<std::unique_ptr<PictureSource>>(m_decoding)->decoder().timelineStart()),
+      m_declaredEnd(std::get<std::unique_ptr<PictureSource>>(m_decoding)->decoder().declaredEnd()) {
     decodeAheadIfSafe();
 }
 

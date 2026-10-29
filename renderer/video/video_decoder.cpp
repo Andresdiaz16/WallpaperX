@@ -43,6 +43,7 @@ namespace wallpaperx {
 namespace {
 
 using ffmpeg_file::avErrorString;
+using ffmpeg_file::inNanoseconds;
 using ffmpeg_file::throwOutOfMemory;
 
 constexpr const char* kComponent = "VideoDecoder";
@@ -278,12 +279,6 @@ bool nonrefLeavesOutReferenced(const CodecHeader& stream, const AVPacket& packet
 // Nothing references an unreferenced picture, and an intra one references nothing.
 bool lowersOntoSkipped(PictureSkip from, PictureSkip to) {
     return from > PictureSkip::Unreferenced && to <= PictureSkip::Unreferenced;
-}
-
-// `value` in `base` units -- pkt_timebase, which is the stream's -- or nothing for an unset one.
-std::optional<std::chrono::nanoseconds> inNanoseconds(int64_t value, AVRational base) {
-    if (value == AV_NOPTS_VALUE || base.num <= 0 || base.den <= 0) return std::nullopt;
-    return std::chrono::nanoseconds(av_rescale_q(value, base, AVRational{1, 1'000'000'000}));
 }
 
 // One frame at the rate the container declares, else the rate ffmpeg guessed while probing.
@@ -1032,6 +1027,25 @@ int64_t VideoDecoder::streamStart() const {
 
 std::chrono::nanoseconds VideoDecoder::timelineStart() const {
     return inNanoseconds(streamStart(), m_format->streams[m_stream]->time_base).value_or(std::chrono::nanoseconds{});
+}
+
+std::optional<std::chrono::nanoseconds> VideoDecoder::declaredEnd() const {
+    // The file's own numbers: a sum that overflows declares nothing, nor does a length FFmpeg estimated
+    // from the bitrate and wrote into the same fields.
+    if (m_format->duration_estimation_method == AVFMT_DURATION_FROM_BITRATE) return std::nullopt;
+    const AVStream& stream = *m_format->streams[m_stream];
+    int64_t end = 0;
+    if (stream.duration != AV_NOPTS_VALUE && stream.duration > 0) {
+        if (__builtin_add_overflow(streamStart(), stream.duration, &end)) return std::nullopt;
+        return inNanoseconds(end, stream.time_base);
+    }
+    // Matroska declares only the container's. Its Duration runs from the segment's zero, not from the first
+    // timestamp, and FFmpeg passes it on unchanged, so there it is already the end.
+    if (m_format->duration == AV_NOPTS_VALUE || m_format->duration <= 0) return std::nullopt;
+    const bool fromZero = m_format->iformat == av_find_input_format("matroska");
+    const int64_t start = fromZero || m_format->start_time == AV_NOPTS_VALUE ? 0 : m_format->start_time;
+    if (__builtin_add_overflow(start, m_format->duration, &end)) return std::nullopt;
+    return inNanoseconds(end, AVRational{1, AV_TIME_BASE});
 }
 
 VideoDecoder::Verdict VideoDecoder::judgeGrid(const AVPacket& packet) {

@@ -56,8 +56,15 @@ struct DaemonStatus {
     QHash<QString, int> outputs;
     // Ids holding a wallpaper, a pause setting or a sound setting, named or not.
     QSet<int> occupied;
-    // Ids holding a wallpaper.
-    QSet<int> wallpapers;
+    // Ids holding a wallpaper, with what GetStatus says it is: its type, the file it opens (empty when
+    // that is not valid UTF-8), and the properties it was last given.
+    struct Shown {
+        QString type;
+        QString path;
+        QVariantMap properties;
+        bool operator==(const Shown&) const = default;
+    };
+    QHash<int, Shown> wallpapers;
     // How much of a video the daemon decodes on the processor, and the file it holds; for the ids whose video it
     // decodes some of on the processor, by a state this app knows.
     struct OnProcessor {
@@ -176,6 +183,9 @@ public:
 
 signals:
     void statusChanged();
+    // A GetStatus read landed, after statusChanged if it changed anything: also when it changed nothing,
+    // which is how a caller learns a change it sent was refused or undone.
+    void statusRead();
     // The daemon's name has a new owner: a daemon started, holding only what it had saved.
     void serviceStarted();
 

@@ -417,7 +417,7 @@ bool runPhase(Phase phase) {
             //       from updatePaintNode() -> "FAIL: an item whose passes keep arriving never tells
             //       the daemon the screen is dark". Deleting `reportVisible();` from checkPainting()
             //       -> "FAIL: an item whose requested passes stop arriving tells the daemon the
-            //       screen is not being drawn". Both observed 2026-09-20. Reverted.
+            //       screen is not being drawn". Both observed 2026-09-20, re-run 2026-10-27. Reverted.
             // A frame announced every so often, which is what a playing video looks like on this
             // interface -- and it is a precondition, not decoration: the item arms its paint watch
             // when the daemon ANSWERS a hand-over, so an item nobody is announcing frames to never
@@ -490,7 +490,7 @@ bool runPhase(Phase phase) {
                 //       `m_paintWatch.start(m_painting ? kPaintDeadlineMs : m_probeMs);` changed to
                 //       `m_paintWatch.start(50);` and checkPainting()'s unconfirmed arm removed ->
                 //       "FAIL: and it waited for more than one empty window before saying so",
-                //       printing about 100 ms. Observed 2026-09-20. Reverted.
+                //       printing about 100 ms. Observed 2026-09-20, re-run 2026-10-27. Reverted.
                 std::printf("item_offscreen_test: the dark screen was reported %lld ms after the last pass\n",
                             static_cast<long long>(tookMs));
                 std::fflush(stdout);
@@ -505,7 +505,7 @@ bool runPhase(Phase phase) {
             // CONTROL: in backend/kde/wallpaperx_item.cpp, checkPainting()'s `if (drew) { m_painting
             //       = true; m_paintUnconfirmed = false; }` emptied -> "FAIL: and it tells the
             //       daemon the screen is being drawn again once passes come back". Observed
-            //       2026-09-20. Reverted.
+            //       2026-09-20, re-run 2026-10-27. Reverted.
             const size_t beforeBack = stub.visibility().size();
             const bool reportedBack = scene.renderUntil(
                 [&stub, beforeBack] {
@@ -518,6 +518,49 @@ bool runPhase(Phase phase) {
             check(reportedBack, "and it tells the daemon the screen is being drawn again once passes come back");
             if (!reportedBack) {
                 std::fprintf(stderr, "  reports: %s\n", describeVisibility(stub).c_str());
+            }
+
+            // GOAL: S15.980 -- when a cover ends on a screen the paint watch had found dark, the item reports
+            //       visible at once, without waiting for a pass its slowed probe would ask for.
+            // WHY-THIS-SHAPE: no pass runs from the uncover on, so the only way to "visible" is the item's own
+            //       assumption; a plugin that left it to the probe never gets there without a pass, whatever
+            //       the timing. The dark state is reached afresh, so this does not ride on the step above.
+            // CONTROL: via control_batch.sh 2026-10-27, `m_painting = true;` deleted from hiddenByStateChanged
+            //       (backend/kde/wallpaperx_item.cpp) -> this line red. Reverted.
+            if (reportedBack) {
+                const size_t beforeDarkAgain = stub.visibility().size();
+                sinceAnnounce.restart();
+                const bool darkAgain = scene.pumpUntil(
+                    [&] {
+                        if (sinceAnnounce.elapsed() >= 200) {
+                            announce();
+                            sinceAnnounce.restart();
+                        }
+                        for (size_t i = beforeDarkAgain; i < stub.visibility().size(); ++i) {
+                            if (!stub.visibility()[i].visible) return true;
+                        }
+                        return false;
+                    },
+                    15000);
+                if (!darkAgain) {
+                    notVerified(kGoal, "the screen was not reported dark a second time, so the uncover step had no "
+                                       "dark screen to start from");
+                } else {
+                    scene.item->setProperty("desktopCovered", true);
+                    pumpFor(300);
+                    const size_t beforeUncover = stub.visibility().size();
+                    scene.item->setProperty("desktopCovered", false);
+                    const bool shownAtOnce = scene.pumpUntil(
+                        [&] {
+                            for (size_t i = beforeUncover; i < stub.visibility().size(); ++i) {
+                                if (stub.visibility()[i].visible) return true;
+                            }
+                            return false;
+                        },
+                        2000);
+                    check(shownAtOnce, "a cover ending on a dark screen reports it visible with no pass having run");
+                    if (!shownAtOnce) std::fprintf(stderr, "  reports: %s\n", describeVisibility(stub).c_str());
+                }
             }
 
             scene.root.reset();

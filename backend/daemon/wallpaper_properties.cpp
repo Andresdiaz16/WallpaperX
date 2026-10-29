@@ -17,8 +17,9 @@ namespace {
 constexpr const char* kSpeed = "speed";
 constexpr const char* kMute = "mute";
 constexpr const char* kVolume = "volume";
-constexpr std::string_view kAppliedKeys[] = {kSpeed, kMute, kVolume, kPositionKey, kPositionZoomKey, kPositionXKey,
-                                             kPositionYKey};
+constexpr const char* kPaused = "paused";
+constexpr std::string_view kAppliedKeys[] = {kSpeed, kMute, kVolume, kPaused, kPositionKey, kPositionZoomKey,
+                                             kPositionXKey, kPositionYKey};
 
 std::optional<std::uint8_t> hexByte(char high, char low) {
     const auto digit = [](char c) -> int {
@@ -61,6 +62,7 @@ std::string propertyError(const std::string& key, const PropertyValue& value) {
         return "property speed must be " + playbackSpeedsText("or");
     }
     if (key == kMute && !std::holds_alternative<bool>(value)) return "property mute must be a boolean";
+    if (key == kPaused && !std::holds_alternative<bool>(value)) return "property paused must be a boolean";
     if (key == kVolume && (number == nullptr || *number < 0 || *number > 1)) {
         return "property volume must be a number from 0 to 1";
     }
@@ -175,6 +177,12 @@ bool wallpaperMuted(const WallpaperProperties& properties) {
     return mute != nullptr && *mute;
 }
 
+bool wallpaperPaused(const WallpaperProperties& properties) {
+    const auto it = properties.find(kPaused);
+    const bool* paused = it == properties.end() ? nullptr : std::get_if<bool>(&it->second);
+    return paused != nullptr && *paused;
+}
+
 float wallpaperVolume(const WallpaperProperties& properties) {
     const auto it = properties.find(kVolume);
     const double* volume = it == properties.end() ? nullptr : std::get_if<double>(&it->second);
@@ -200,6 +208,25 @@ std::string toJsonText(const WallpaperProperties& properties) {
         text += nlohmann::json(key).dump();
         text += ':';
         text += toJson(value).dump();
+    }
+    text += '}';
+    return text;
+}
+
+std::string changedPropertiesText(const WallpaperProperties& before, const WallpaperProperties& after) {
+    std::string text = "{";
+    const auto add = [&text](const std::string& key, const nlohmann::json& value) {
+        if (text.size() > 1) text += ',';
+        text += nlohmann::json(key).dump();
+        text += ':';
+        text += value.dump();
+    };
+    for (const auto& [key, value] : after) {
+        const auto was = before.find(key);
+        if (was == before.end() || was->second != value) add(key, toJson(value));
+    }
+    for (const auto& [key, value] : before) {
+        if (!after.contains(key)) add(key, nullptr);
     }
     text += '}';
     return text;

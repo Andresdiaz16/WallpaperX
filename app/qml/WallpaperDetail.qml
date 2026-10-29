@@ -118,6 +118,8 @@ Item {
                 }
 
                 ScrollView {
+                    id: settingsView
+
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     contentWidth: availableWidth
@@ -125,6 +127,20 @@ Item {
                     ColumnLayout {
                         width: parent.width
                         spacing: 8
+
+                        // The wheel moves the settings at once, as a desktop list does. Left to the view,
+                        // each notch sets them gliding, and a press while they glide only stops them: the
+                        // first click on a control just scrolled to (Frame as Cover, at the bottom) was lost.
+                        WheelHandler {
+                            onWheel: event => {
+                                const view = settingsView.contentItem;
+                                const step = event.pixelDelta.y !== 0
+                                    ? event.pixelDelta.y
+                                    : event.angleDelta.y / 120 * Qt.styleHints.wheelScrollLines * 20;
+                                view.contentY = Math.max(0, Math.min(view.contentHeight - view.height, view.contentY - step));
+                                event.accepted = true;
+                            }
+                        }
 
                         Label {
                             visible: root.chosen.properties.length === 0
@@ -216,6 +232,26 @@ Item {
                                 Item {
                                     Layout.fillWidth: !row.isSlider && !row.isChoice
                                 }
+                            }
+                        }
+
+                        // Holds the video on its picture on the selected screen, whatever that screen's pause mode.
+                        RowLayout {
+                            Layout.fillWidth: true
+                            visible: root.chosen.type === "video"
+
+                            Label {
+                                Layout.preferredWidth: 120
+                                elide: Text.ElideRight
+                                textFormat: Text.PlainText
+                                text: qsTr("Paused")
+                            }
+                            Switch {
+                                checked: root.library.propertyValues["paused"] === true
+                                onToggled: root.library.setPropertyValue("paused", checked)
+                            }
+                            Item {
+                                Layout.fillWidth: true
                             }
                         }
 

@@ -49,6 +49,11 @@ public:
     virtual void startPacket() = 0;
     // A unit of a packet in decode order; true when the decoder would make up a picture for it.
     virtual bool packetUnit(const uint8_t* unit, size_t size) = 0;
+    // Whether the decoder has decoded a picture from what the stream holds.
+    bool decodedAny() const { return m_decodedAny; }
+
+protected:
+    bool m_decodedAny = false;
 };
 
 // ---------------------------------------------------------------------------------------------- H.264
@@ -130,6 +135,7 @@ public:
         m_prevFrameNum = frameNum;
         const bool second = allocates && m_pictureInPacket != Picture::None;
         m_pictureInPacket = field ? Picture::Field : Picture::Frame;
+        if (!second) m_decodedAny = true;
         return second;
     }
 
@@ -537,7 +543,10 @@ private:
             ended = name(longTerm[i].poc, longTerm[i].used, longTerm[i].fullPoc);
         }
         if (ended && *ended) return true;
-        if (!ended) named.push_back(poc);
+        if (!ended) {
+            named.push_back(poc);
+            m_decodedAny = true;
+        }
         m_held = std::move(named);
         return false;
     }
@@ -630,12 +639,15 @@ std::optional<std::optional<SoftwareStretches>> scanOnce(const std::string& file
     AVPacket& packet = *container.packet;
     bool inLead = readPastLead;
     bool passedLead = false;
+    // The first picture lacked a reference: what is left to learn is whether a reset point hands the stream back.
+    bool seekingReset = false;
     for (;;) {
         if (stop.load(std::memory_order_relaxed)) return std::optional<SoftwareStretches>();
         av_packet_unref(&packet);
         const int err = ffmpeg_file::readPacket(*container.format, &packet);
         if (err == AVERROR_EOF) {
             if (inLead && passedLead) return std::nullopt;
+            found.missingReferenceThroughout = seekingReset;
             return found;
         }
         if (err < 0) ffmpeg_file::throwFileFailure(kComponent, "cannot read the wallpaper", err, file);
@@ -664,7 +676,7 @@ std::optional<std::optional<SoftwareStretches>> scanOnce(const std::string& file
         if (side != nullptr) {
             const CodecHeader held{&codec, current.data(), current.size()};
             const CodecHeader carried{&codec, side, sideSize};
-            if (differInParameterSets(held, carried) && !resetsDecoder(carried, packet)) {
+            if (!seekingReset && differInParameterSets(held, carried) && !resetsDecoder(carried, packet)) {
                 found.parameterSetsChangeOffReset = true;
             }
             current.assign(side, side + sideSize);
@@ -674,6 +686,10 @@ std::optional<std::optional<SoftwareStretches>> scanOnce(const std::string& file
         // FFmpeg refuses the whole of a packet whose units cannot all be split.
         const CodecHeader layout{&codec, current.data(), current.size()};
         if (!eachPacketUnit(layout, packet, [](const uint8_t*, size_t) { return false; })) continue;
+        if (seekingReset) {
+            if (resetsDecoder(layout, packet)) return found;
+            continue;
+        }
         follower->startPacket();
         bool madeUp = false;
         eachPacketUnit(layout, packet, [&](const uint8_t* unit, size_t size) {
@@ -682,7 +698,9 @@ std::optional<std::optional<SoftwareStretches>> scanOnce(const std::string& file
         });
         if (madeUp) {
             found.missingReference = true;
-            return found;
+            // Pictures before it reached the device. Without any, the device gets the stream only at a reset point.
+            if (follower->decodedAny()) return found;
+            seekingReset = true;
         }
     }
 }

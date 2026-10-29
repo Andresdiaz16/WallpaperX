@@ -273,6 +273,11 @@ void HttpServer::registerRoutes() {
                 sendJson(res, out);
                 return;
             }
+            // The mode as applied, so a setting a newer build wrote reads as the play it is here.
+            // The plugin lets a fullscreen window hide only a screen that pauses.
+            const auto pause = snap.pause.find(monitorId);
+            const std::optional<PauseMode> mode = pause != snap.pause.end() ? pause->second.mode : PauseMode::Play;
+            out["pause"] = toString(mode.value_or(PauseMode::Play));
         }
 
         const auto it = snap.monitors.find(monitorId);

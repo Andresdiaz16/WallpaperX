@@ -54,7 +54,9 @@ public:
 
     // The next frame read() returns is the one at `at`, on the timeline DecodedFrame::presentationTime()
     // uses, so audio and pictures of one file line up. Silence stands in for any time before the stream's
-    // first sample. Keeps the rate. Throws as open() does.
+    // first sample. Keeps the rate. Where read() stands at a setNext() pass from `at`, at the rate asked for,
+    // it goes on into that pass through the same stretch, so the end before it joins it as a loop's wrap does.
+    // Throws as open() does.
     void seek(std::chrono::nanoseconds at);
     // As seek(at), at the rate asked for, but joined onto `onward` -- what was to be heard from `at` on, at
     // `onwardRate` -- as a change of rate joins: lined up and crossfaded, so up to 1 ms of `onward` may be read
@@ -77,6 +79,9 @@ public:
     // Holds across seeks; taken up the next time the end is reached. A wrap that finds nothing to play before
     // the end again ends the stream.
     void setLoop(std::optional<std::chrono::nanoseconds> from) { m_loop = from; }
+    // Without a loop, the stream's end is decoded on into the file from `from`, through the same stretch, but
+    // read() stops there as at the end until a seek to `from` lets it go on. Holds across seeks.
+    void setNext(std::optional<std::chrono::nanoseconds> from) { m_next = from; }
 
     // Where a frame lies in the file, and the rate of the frames read with it.
     struct Position {
@@ -103,12 +108,14 @@ private:
     void matchResampler(const AVFrame& frame);
     // Decodes until m_pending or m_silence holds a frame to read, or the stream is exhausted.
     void decodeMore();
+    // seek(at), always from a new stretch.
+    void seekAnew(std::chrono::nanoseconds at);
     // Points the demuxer and decoder at `at`, for the next frame decoded to be the one there.
     void seekStream(std::chrono::nanoseconds at);
     // Appends up to `frames` newly decoded frames to m_history, going back to the loop's start at the stream's
     // end. Returns how many: none only at the end.
     size_t fetch(size_t frames);
-    // Whether the stream's end, reached now, would wrap back to the loop's start.
+    // Whether the stream's end, reached now, would wrap back to the loop's start or on to setNext()'s.
     bool wrapsAtEnd() const;
     uint64_t heldEnd() const { return m_historyFrom + m_history.size() / kChannels; }
     // read() before stretching: frames at the file's own rate, across a loop's wraps, fewer only at the end of
@@ -121,6 +128,8 @@ private:
     bool pulledAll() const;
     // The pass the frame pull() returned `frame` frames after the first lies in.
     size_t passOf(double frame) const;
+    // The pass of the frame read() hands out next, where that is known without decoding more.
+    std::optional<size_t> nextPass() const;
 
     // Makes m_applied the rate frames are produced at from the next frame pulled, after the old stretch
     // is drained.
@@ -187,15 +196,17 @@ private:
     bool m_sentEnd = false;
     bool m_drained = false;
     // Frames are counted along what is decoded since the last seek, whose point is a stretch's lead in. Each pass of a
-    // loop starts at a count, the frame there lying at `at` in the file; the first starts at the seek's point. `wrap`
-    // for a pass begun by going back to the loop's start.
+    // loop starts at a count, the frame there lying at `at` in the file; the first starts at the seek's point. A pass
+    // begun at the stream's end for setNext() Waits, read() handing out none of it, until a seek to it makes it a Wrap.
+    enum class Begun { Seek, Wrap, Waits };
     struct Pass {
         uint64_t from = 0;
         std::chrono::nanoseconds at{};
-        bool wrap = false;
+        Begun begun = Begun::Seek;
     };
     std::vector<Pass> m_passes{Pass{}};
     std::optional<std::chrono::nanoseconds> m_loop;
+    std::optional<std::chrono::nanoseconds> m_next;
     // The count of the next frame pull() returns.
     uint64_t m_pulled = 0;
     // The frames decoded, from count m_historyFrom on: those past m_pulled were handed back by unpull(), and those

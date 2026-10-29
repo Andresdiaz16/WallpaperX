@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <QHash>
 #include <QObject>
 #include <QString>
 #include <QVariant>
@@ -19,8 +20,8 @@ class KScreenClient;
 class LibraryManager;
 class PlasmaController;
 
-// Puts the wallpaper open in the library on the monitor selected in the picker, keeps that
-// monitor's copy of its settings in step while it stays open, and sets the selected monitor's
+// Puts the wallpaper open in the library on the monitor selected in the picker, keeps the selected
+// monitor's copy of its settings in step while that monitor shows it, and sets the selected monitor's
 // pause mode, sound and frame rate, and sound, frame rate and keeping a rate above the screens for
 // every screen.
 //
@@ -37,7 +38,7 @@ class ApplyController : public QObject {
     Q_PROPERTY(QString applyMessage READ applyMessage NOTIFY applyChanged)
     // Why Apply cannot run for what is selected now, or empty when it can.
     Q_PROPERTY(QString blockedReason READ blockedReason NOTIFY blockedReasonChanged)
-    // The screen the open wallpaper's settings are kept in step on, or empty.
+    // The selected screen, while the open wallpaper's settings are kept in step on it; else empty.
     Q_PROPERTY(QString liveOutput READ liveOutput NOTIFY liveChanged)
     // Why the last change sent there was refused, or empty.
     Q_PROPERTY(QString liveError READ liveError NOTIFY liveChanged)
@@ -179,7 +180,8 @@ private:
     void changeScreenSetting(Change& change, ChangeSignal changed, const QVariant& value, const QString& what,
                              std::function<void(int monitorId, std::function<void(std::expected<void, QString>)>)> send);
 
-    // What an Apply put where; the open wallpaper's values follow it there while it stays open.
+    // The selected screen showing the open wallpaper, as an Apply put it there or GetStatus says it is:
+    // the wallpaper's values follow there while both stay selected and each status read still shows it there.
     struct Live {
         quint64 id = 0;
         // The library's path for it, and the type and file the daemon is given.
@@ -188,17 +190,47 @@ private:
         QString assetPath;
         QString connector;
         int monitorId = -1;
-        // What the daemon last accepted for it. Nothing once a restarted daemon may hold another
-        // wallpaper there, and the next send then sets the wallpaper itself with the values.
+        // What the daemon last accepted for it, as the controls hold it. Nothing once a restarted daemon
+        // may hold another wallpaper there, and the next send then sets the wallpaper itself with the values;
+        // until a status read shows it there again, which then stands for it.
         std::optional<QVariantMap> sent;
     };
-    enum class Sending { No, Yes, YesThenAgain };
+    // Values for a screen with the link they were asked on.
+    struct Queued {
+        Live live;
+        QVariantMap values;
+    };
+    // A property send in flight to one screen, and the latest values asked for there meanwhile, which a
+    // link ended since does not lose unless its screen is shown to hold something else, or an Apply there
+    // is about to put something else or has put its values there.
+    struct InFlight {
+        Queued now;
+        std::optional<Queued> next;
+    };
 
+    // Leaving Working follows the selection again, which an Apply to it held back.
     void settleApply(Progress state, QString message);
-    // Gives `live` a new id.
+    // Gives `live` a new id and links it, unless another wallpaper or screen is selected by now.
     void startLive(Live live);
-    void endLiveUnlessOpen();
+    // Ends the link when the status read shows its screen holding another wallpaper, or, while the daemon is
+    // known to hold the link's values, not showing its wallpaper there; then linkSelected().
+    void followStatus();
+    // Ends the link, if any. The controls keep their values until linkSelected() starts a draft.
+    void unlink();
+    // Whether the status read says `link`'s screen no longer holds what the link stands for: another
+    // wallpaper there, or its connector naming another monitor; or, while the daemon is known to hold the
+    // link's values, its wallpaper not there.
+    bool contradicted(const Live& link) const;
+    // Ends the link unless it is the selected screen's and the open wallpaper's; links a selected screen
+    // GetStatus says shows the open wallpaper, and shows that screen's values in the controls. Not while
+    // this app's own Apply there may make GetStatus stale: the controls show what the Apply sets. A send
+    // of ours to that screen for the open wallpaper links it at once, with the values it sets; one for
+    // another link waits for the read after it. Otherwise the controls start a draft for the next Apply
+    // there from the defaults, unless they already hold one for that screen and wallpaper.
+    void linkSelected();
     void sendLive();
+    // Sends `values` to `to`'s screen, by monitor once it is known to hold the wallpaper, else by wallpaper.
+    void sendTo(const Live& to, const QVariantMap& values);
 
     KScreenClient& m_kscreen;
     LibraryManager& m_library;
@@ -207,12 +239,22 @@ private:
 
     Progress m_apply = Progress::Idle;
     QString m_applyMessage;
-    // What the last Apply was for: the wallpaper's path and the connector.
+    // What the last Apply was for: the wallpaper's path, the connector and the values it sent.
     QString m_applyWallpaper;
     QString m_applyOutput;
+    QVariantMap m_applyValues;
     std::optional<Live> m_live;
+    // While nothing is linked, the screen and wallpaper the controls hold a draft for; none once a link
+    // ends, as its screen no longer shows the wallpaper and its values went with it.
+    struct DraftFor {
+        QString connector;
+        QString wallpaperPath;
+        bool operator==(const DraftFor&) const = default;
+    };
+    std::optional<DraftFor> m_draftFor;
     quint64 m_lastLiveId = 0;
-    Sending m_sending = Sending::No;
+    // By monitor id: one send at a time to each screen.
+    QHash<int, InFlight> m_sending;
     QString m_liveError;
     Change m_pause;
     Change m_screenSound;

@@ -18,6 +18,9 @@ struct SoftwareStretches {
     // next reset point after it (Path::SoftwareMissingReference). Not for the pictures before an H.264 stream's first
     // IDR that VideoDecoder reads past undecoded (neverShownBeforeReset()).
     bool missingReference = false;
+    // Only with missingReference: the first picture already lacks one and no reset point follows it, so no picture
+    // of any pass reaches the device.
+    bool missingReferenceThroughout = false;
     // A packet that is not a reset point carries AV_PKT_DATA_NEW_EXTRADATA with other parameter sets than the
     // codec holds, which leaves a device without Device::videoInlineParameters() for the rest of the pass.
     bool parameterSetsChangeOffReset = false;
@@ -32,7 +35,8 @@ struct SoftwareStretches {
 };
 
 // Reads `file`'s video packets once, front to back, as the decoder's first pass would meet them, and stops at
-// the first missing reference: past it the answer is the same on every device. The packets before an H.264
+// the first missing reference: past it the answer is the same on every device. When that is the first picture, it
+// reads on to the first reset point, without parsing, for missingReferenceThroughout. The packets before an H.264
 // stream's first IDR are read twice where the decoder, having read past them, rewinds to send them after all
 // (neverShownBeforeReset()). Nothing when `stop` was seen
 // true, which is read once a packet. Throws WallpaperContentError for a file that cannot be opened or read
@@ -46,6 +50,6 @@ std::optional<SoftwareStretches> scanSoftwareStretches(const std::string& file, 
 
 // Raised whenever scanSoftwareStretches() could answer otherwise for the same bytes, so that an answer saved under
 // another is not reused.
-inline constexpr uint32_t kSoftwareScanRule = 1;
+inline constexpr uint32_t kSoftwareScanRule = 2;
 
 }

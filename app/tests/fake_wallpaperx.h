@@ -105,20 +105,26 @@ public:
     // Replies held back by `hold`, sent in arrival order.
     void release() {
         const QList<QDBusMessage> pending = std::exchange(held, {});
-        for (const QDBusMessage& m : pending) {
-            answer(m);
+        const QList<Refusal> refusals = std::exchange(m_heldRefusals, {});
+        for (qsizetype i = 0; i < pending.size(); ++i) {
+            reply(pending.at(i), refusals.value(i));
         }
     }
     // The held reply at `index` alone, built now; the rest stay held.
     void releaseAt(qsizetype index) {
         if (index >= 0 && index < held.size()) {
-            answer(held.takeAt(index));
+            const Refusal refusal = m_heldRefusals.value(index);
+            m_heldRefusals.removeAt(index);
+            reply(held.takeAt(index), refusal);
         }
     }
     // The held call at `index` answered with an error instead; the rest stay held. `refuse` answers
     // at once, so a failure that must arrive after a later call was sent needs this.
+    // The call's change was applied when it arrived (accept), so this models a reply lost after the
+    // daemon acted, not a refusal that changed nothing: for that, use `refuse`.
     void refuseAt(qsizetype index, const QString& name, const QString& message) {
         if (index >= 0 && index < held.size()) {
+            m_heldRefusals.removeAt(index);
             m_bus.send(held.takeAt(index).createErrorReply(name, message));
         }
     }
@@ -140,12 +146,13 @@ public:
             m_bus.send(m.createErrorReply(r->first, r->second));
             return true;
         }
-        accept(call);
+        const Refusal refusal = accept(call);
         if (hold.contains(m.member())) {
             held.append(m);
+            m_heldRefusals.append(refusal);
             return true;
         }
-        answer(m);
+        reply(m, refusal);
         return true;
     }
 
@@ -157,11 +164,22 @@ public:
     QList<QDBusMessage> held;
 
 protected:
-    // What a call changes, applied when it arrives.
-    virtual void accept(const FakeCall&) {}
+    // (error name, message), decided when the call arrives as the daemon decides it, even for a held reply.
+    using Refusal = std::optional<QPair<QString, QString>>;
+    // What a call changes, applied when it arrives; a refusal changes nothing.
+    virtual Refusal accept(const FakeCall&) { return std::nullopt; }
     // The reply, built when it is sent, so a held GetStatus reports the state at release.
     virtual void answer(const QDBusMessage& m) = 0;
+    void reply(const QDBusMessage& m, const Refusal& refusal) {
+        if (refusal) {
+            m_bus.send(m.createErrorReply(refusal->first, refusal->second));
+        } else {
+            answer(m);
+        }
+    }
 
+    // Beside `held`, index for index.
+    QList<Refusal> m_heldRefusals;
     QString m_service;
     QString m_path;
     QString m_tag;
@@ -197,9 +215,19 @@ public:
     QJsonValue keepHigherFrameRate = false;
     QMap<int, QJsonValue> screenFrameRate;
     QMap<QString, double> refreshRates;
-    // Monitor id -> the file GetStatus names for its video, and the processor_decoding state it reports for it
-    // ("parts" with a reason, any other state with none).
-    QMap<int, QPair<QString, QString>> processorDecoding;
+    // Monitor id -> the processor_decoding state GetStatus reports for its video ("parts" with a reason, any
+    // other state with none). The file it names is the monitor's `screens` entry's.
+    QMap<int, QString> processorDecoding;
+    // Each monitor's wallpaper as the daemon reports it: the type and file the last
+    // SetWallpaperWithProperties gave, and the properties it or a later SetWallpaperProperties set.
+    // A monitor in `wallpapers` with no entry here is listed as a video with a null path and no properties; a
+    // SetWallpaperProperties to it makes one, with no path.
+    struct Shown {
+        QString type;
+        QString path;
+        QVariantMap properties;
+    };
+    QMap<int, Shown> screens;
 
     // The daemon's PersistenceChanged, from the connection owning the stand-in's name.
     bool announcePersistenceChanged() {
@@ -218,12 +246,15 @@ public:
             names.insert(it.key(), it.value());
         }
         for (const int id : wallpapers) {
-            QJsonObject wallpaper{{QStringLiteral("type"), QStringLiteral("video")}};
+            // Every key the daemon always sends; a path it cannot spell is null there, as an unknown one is here.
+            const Shown s = screens.value(id, Shown{QStringLiteral("video"), {}, {}});
+            QJsonObject wallpaper{{QStringLiteral("type"), s.type},
+                                  {QStringLiteral("path_literal"), s.path.isEmpty() ? QJsonValue(QJsonValue::Null) : QJsonValue(s.path)},
+                                  {QStringLiteral("properties"), QJsonObject::fromVariantMap(s.properties)}};
             if (processorDecoding.contains(id)) {
-                const auto& [path, state] = processorDecoding.value(id);
+                const QString state = processorDecoding.value(id);
                 const QJsonArray reasons =
                     state == u"parts" ? QJsonArray{QStringLiteral("missing_reference")} : QJsonArray{};
-                wallpaper.insert(QStringLiteral("path_literal"), path);
                 wallpaper.insert(QStringLiteral("processor_decoding"),
                                  QJsonObject{{QStringLiteral("state"), state}, {QStringLiteral("reasons"), reasons}});
             }
@@ -288,7 +319,7 @@ public:
     }
 
 protected:
-    void accept(const FakeCall& call) override {
+    Refusal accept(const FakeCall& call) override {
         if (call.member == u"SetMonitorOutput") {
             const int id = call.args.value(0).toInt();
             for (auto it = outputs.begin(); it != outputs.end();) {
@@ -297,6 +328,19 @@ protected:
             outputs.insert(call.args.value(1).toString(), id);
         } else if (call.member == u"SetWallpaperWithProperties") {
             wallpapers.insert(call.args.value(2).toInt());
+            screens.insert(call.args.value(2).toInt(),
+                         Shown{call.args.value(0).toString(), call.args.value(1).toString(), call.args.value(3).toMap()});
+        } else if (call.member == u"SetWallpaperProperties") {
+            const int id = call.args.value(0).toInt();
+            if (!wallpapers.contains(id)) {
+                // As the daemon refuses a monitor that shows no wallpaper.
+                return std::pair{QStringLiteral("io.wallpaperx.Daemon.Error.InvalidArgs"), QStringLiteral("monitor %1 has no wallpaper").arg(id)};
+            }
+            if (const auto it = screens.find(id); it != screens.end()) {
+                it->properties = call.args.value(1).toMap();
+            } else {
+                screens.insert(id, Shown{QStringLiteral("video"), {}, call.args.value(1).toMap()});
+            }
         } else if (call.member == u"SetMonitorPause") {
             pause.insert(call.args.value(0).toInt(), call.args.value(1).toString());
         } else if (call.member == u"SetSound") {
@@ -323,7 +367,7 @@ protected:
         } else if (call.member == u"SetOutputRefreshRate") {
             const QString name = call.args.value(0).toString();
             if (!outputs.contains(name)) {
-                return;
+                return std::nullopt;
             }
             if (const double rate = call.args.value(1).toDouble(); rate == 0) {
                 refreshRates.remove(name);
@@ -331,6 +375,7 @@ protected:
                 refreshRates.insert(name, rate);
             }
         }
+        return std::nullopt;
     }
     void answer(const QDBusMessage& m) override {
         if (m.member() == u"GetStatus") {

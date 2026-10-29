@@ -11,6 +11,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/avstring.h>
 #include <libavutil/error.h>
+#include <libavutil/mathematics.h>
 #include <libavutil/mem.h>
 }
 
@@ -41,6 +42,11 @@ constexpr int kIoBufferSize = 32768;
 }
 
 }  // namespace
+
+std::optional<std::chrono::nanoseconds> inNanoseconds(int64_t value, AVRational base) {
+    if (value == AV_NOPTS_VALUE || base.num <= 0 || base.den <= 0) return std::nullopt;
+    return std::chrono::nanoseconds(av_rescale_q(value, base, AVRational{1, 1'000'000'000}));
+}
 
 std::string avErrorString(int err) {
     char text[AV_ERROR_MAX_STRING_SIZE]{};

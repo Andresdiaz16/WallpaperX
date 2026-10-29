@@ -19,6 +19,7 @@ constexpr const char* kKeyInode = "inode";
 constexpr const char* kKeySize = "size";
 constexpr const char* kKeyModified = "modified_ns";
 constexpr const char* kKeyPosition = "position";
+constexpr const char* kKeyPassFirst = "pass_first_ns";
 
 // A point per monitor, each a path and a few numbers: far below this.
 constexpr off_t kMaxRecordBytes = 256 * 1024;
@@ -36,13 +37,15 @@ std::string writeResumeRecord(const std::filesystem::path& stateDir, const std::
 
     nlohmann::json list = nlohmann::json::array();
     for (const ResumePoint& point : points) {
-        list.push_back({{kKeyMonitorId, point.monitorId},
-                        {kKeyPath, point.path},
-                        {kKeyDevice, point.device},
-                        {kKeyInode, point.inode},
-                        {kKeySize, point.size},
-                        {kKeyModified, point.modifiedNs},
-                        {kKeyPosition, point.position}});
+        nlohmann::json entry = {{kKeyMonitorId, point.monitorId},
+                                {kKeyPath, point.path},
+                                {kKeyDevice, point.device},
+                                {kKeyInode, point.inode},
+                                {kKeySize, point.size},
+                                {kKeyModified, point.modifiedNs},
+                                {kKeyPosition, point.position}};
+        if (point.passFirst) entry[kKeyPassFirst] = *point.passFirst;
+        list.push_back(std::move(entry));
     }
     // dump() throws on a path that is not valid UTF-8; replaced rather than lost, and then it names
     // no file the identity check would accept.
@@ -71,6 +74,8 @@ std::vector<ResumePoint> readResumeRecord(const std::filesystem::path& stateDir)
             continue;
         }
         point.path = entry.at(kKeyPath).get<std::string>();
+        // Optional, and a bad one costs only itself: the position still holds without it.
+        if (int64_t passFirst = 0; readNumber(entry, kKeyPassFirst, passFirst)) point.passFirst = passFirst;
         points.push_back(std::move(point));
     }
     return points;

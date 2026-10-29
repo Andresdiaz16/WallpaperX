@@ -4539,6 +4539,49 @@ void runOutputParamChecks(WallpaperManager& manager, httplib::Client& cli, const
               byOutput.json.contains("output_literal"),
           "a /config reply asked by connector name carries the known, output and output_literal fields");
 
+    // GOAL: S15.1035 -- /config?output= carries the screen's pause mode as `pause`: the mode's
+    //       name once set, `play` with no setting; the bare and ?monitor= forms carry no `pause`.
+    // WHY-THIS-SHAPE: two named screens, one set to a mode other than the default and one left unset, so
+    //       a constant "play" and a value read from the wrong monitor both fail; absence by contains(),
+    //       as the connector-name fields above, since value() cannot tell absent from default.
+    // CONTROL: via control_batch.sh 2026-10-28, --phase outputParam, each alone, reverted, in the /config
+    //       handler (backend/daemon/http_server.cpp): `out["pause"]` made the constant "play" -> the set-mode
+    //       line red; `if (!out.contains("pause")) out["pause"] = "play";` added after the output= block ->
+    //       the bare-form and ?monitor= lines red.
+    {
+        const auto pauseOf = [&](const std::string& query) {
+            const HttpReply reply = get(cli, query);
+            return (reply.ok() && reply.json.contains("pause") && reply.json["pause"].is_string())
+                       ? reply.json["pause"].get<std::string>()
+                       : std::string("<absent>");
+        };
+        bool set = false;
+        try {
+            set = manager.setMonitorPause(kMonitorNamedSet, "paused_while_maximized");
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "  SetMonitorPause for the pause fields failed: %s\n", e.what());
+        }
+        if (!set) {
+            notVerified("S15.1035", "the named screen's pause mode could not be set");
+        } else {
+            const std::string setPause = pauseOf(configByOutput("DP-1"));
+            check(setPause == "paused_while_maximized", "/config?output= carries the screen's set pause mode");
+            const std::string unsetPause = pauseOf(configByOutput("DP-2"));
+            check(unsetPause == "play", "/config?output= carries \"play\" for a screen with no pause setting");
+            if (setPause != "paused_while_maximized" || unsetPause != "play") {
+                std::fprintf(stderr, "  pause: set screen '%s', unset screen '%s'\n", setPause.c_str(), unsetPause.c_str());
+            }
+            for (const char* query : {"/config", "/config?t=1", "/config?monitor=0"}) {
+                const HttpReply plain = get(cli, query);
+                check(plain.ok() && !plain.json.contains("pause"), "a /config reply not asked by connector name carries no pause field");
+            }
+            const std::string byMonitor = "/config?monitor=" + std::to_string(kMonitorNamedSet);
+            const HttpReply plain = get(cli, byMonitor);
+            check(plain.ok() && !plain.json.contains("pause"), "a ?monitor= reply for a screen with a pause mode carries no pause field");
+            static_cast<void>(manager.setMonitorPause(kMonitorNamedSet, "play"));
+        }
+    }
+
     // GOAL: S10.8's /config clause -- a connector name is escaped wherever it is displayed.
     //       False if a name holding a newline, a right-to-left override or DEL reaches the
     //       field the plugin renders, or any other part of the reply, raw.

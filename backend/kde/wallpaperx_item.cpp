@@ -14,6 +14,8 @@
 #include <QDBusPendingCallWatcher>
 #include <QDBusReply>
 #include <QDBusUnixFileDescriptor>
+#include <QFileInfo>
+#include <QGuiApplication>
 #include <QOpenGLContext>
 #include <QOpenGLFunctions>
 #include <QPointer>
@@ -24,6 +26,7 @@
 #include <QSocketNotifier>
 #include <QThread>
 #include <QTimer>
+#include <QWindow>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -95,6 +98,9 @@ constexpr int kLookupRetryMs = 2000;
 // message to the bus itself, not to the daemon.
 constexpr int kLookupRetryMaxMs = 8000;
 
+// How many times the screen lock's state is asked again after failed asks, about 30 seconds of them.
+constexpr int kLockRetries = 5;
+
 // libdbus's "no timeout" (DBUS_TIMEOUT_INFINITE), which QtDBus passes through.
 constexpr int kNoReplyTimeout = std::numeric_limits<int>::max();
 
@@ -154,7 +160,119 @@ constexpr int kPaintProbeMs = 250;
 // costs; two seconds is the longest a wallpaper should take to start moving again once it is back.
 constexpr int kPaintProbeMaxMs = 2000;
 
+// The session's screen locker, as KDE's implements the freedesktop interface.
+constexpr const char* kLockService = "org.freedesktop.ScreenSaver";
+constexpr const char* kLockPath = "/ScreenSaver";
+constexpr const char* kLockInterface = "org.freedesktop.ScreenSaver";
+
+// KDE's lock screen draws a Plasma wallpaper in a process of its own. There the lock is what shows the
+// item, and the session's windows are beneath it, so neither hides it.
+bool inScreenLocker() {
+    static const bool locker =
+        QFileInfo(QCoreApplication::applicationFilePath()).fileName() == QLatin1StringView("kscreenlocker_greet");
+    return locker;
+}
+
 }  // namespace
+
+// Whether the session's screen is locked: the locker's ActiveChanged, and GetActive when the watch
+// begins or the locker's name changes owner. Watched once for the process, as DaemonWatch is. An
+// absent locker, or one that refuses the call, counts as unlocked, which leaves the drawing to tell; a
+// lost answer is asked again, one retry pending at a time. GUI thread.
+class ScreenLockWatch : public QObject {
+    Q_OBJECT
+public:
+    // Made on first use, on qApp. Null without a bus.
+    static ScreenLockWatch* instance();
+
+    bool locked() const { return m_locked; }
+
+signals:
+    void lockedChanged();
+
+private slots:
+    void onActiveChanged(bool active);
+
+private:
+    explicit ScreenLockWatch(QObject* parent);
+    void ask();
+
+    bool m_locked = false;
+    int m_failedAsks = 0;
+    QTimer m_retry;
+    // Numbers each ask, so an answer from an owner since replaced is not taken.
+    uint64_t m_lastAsk = 0;
+};
+
+ScreenLockWatch* ScreenLockWatch::instance() {
+    static QPointer<ScreenLockWatch> watch;
+    if (watch) return watch;
+    QCoreApplication* app = QCoreApplication::instance();
+    if (app == nullptr || !QDBusConnection::sessionBus().isConnected()) return nullptr;
+    watch = new ScreenLockWatch(app);
+    return watch;
+}
+
+ScreenLockWatch::ScreenLockWatch(QObject* parent) : QObject(parent) {
+    m_retry.setSingleShot(true);
+    connect(&m_retry, &QTimer::timeout, this, &ScreenLockWatch::ask);
+    QDBusConnection bus = QDBusConnection::sessionBus();
+    auto* watcher = new QDBusServiceWatcher(QString::fromUtf8(kLockService), bus,
+                                            QDBusServiceWatcher::WatchForOwnerChange, this);
+    connect(watcher, &QDBusServiceWatcher::serviceOwnerChanged, this,
+            [this](const QString&, const QString&, const QString& owner) {
+                m_failedAsks = 0;
+                m_retry.stop();
+                if (owner.isEmpty()) {
+                    ++m_lastAsk;
+                    onActiveChanged(false);
+                } else {
+                    ask();
+                }
+            });
+    // Only from the locker's owner: anyone else could otherwise stop every wallpaper.
+    if (!bus.connect(QString::fromUtf8(kLockService), QString::fromUtf8(kLockPath), QString::fromUtf8(kLockInterface),
+                     QStringLiteral("ActiveChanged"), this, SLOT(onActiveChanged(bool)))) {
+        std::fprintf(stderr, "wallpaperx: could not subscribe to the screen locker -- %s\n",
+                     sanitizeForLog(bus.lastError().message().toStdString()).c_str());
+    }
+    // After the subscription, so a change is either in the answer or reported after it.
+    ask();
+}
+
+void ScreenLockWatch::ask() {
+    QDBusMessage request = QDBusMessage::createMethodCall(QString::fromUtf8(kLockService), QString::fromUtf8(kLockPath),
+                                                          QString::fromUtf8(kLockInterface),
+                                                          QStringLiteral("GetActive"));
+    // A bus that can start services would otherwise launch a locker to answer this.
+    request.setAutoStartService(false);
+    auto* call = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(request), this);
+    connect(call, &QDBusPendingCallWatcher::finished, this, [this, asked = ++m_lastAsk](QDBusPendingCallWatcher* done) {
+        done->deleteLater();
+        if (asked != m_lastAsk) return;
+        if (!done->isError()) {
+            m_failedAsks = 0;
+            onActiveChanged(done->reply().arguments().value(0).toBool());
+            return;
+        }
+        const QString error = done->error().name();
+        if (error == QLatin1String("org.freedesktop.DBus.Error.ServiceUnknown") ||
+            error == QLatin1String("org.freedesktop.DBus.Error.NameHasNoOwner")) {
+            return;
+        }
+        // A lost answer is asked again. A bus error does not reliably tell lost from refused, which asking
+        // again cannot change, so the asking ends after a few; a change of owner asks afresh.
+        if (m_failedAsks < kLockRetries) {
+            m_retry.start(doubledWait(kLookupRetryMs, m_failedAsks++, kLookupRetryMaxMs));
+        }
+    });
+}
+
+void ScreenLockWatch::onActiveChanged(bool active) {
+    if (m_locked == active) return;
+    m_locked = active;
+    emit lockedChanged();
+}
 
 namespace {
 
@@ -1072,6 +1190,12 @@ WallpaperXItem::WallpaperXItem(QQuickItem* parent)
     connect(&m_noImageRetryTimer, &QTimer::timeout, this, [this] {
         if (!m_frameShown) fetchFrame(0);
     });
+    if (auto* gui = qobject_cast<QGuiApplication*>(QCoreApplication::instance())) {
+        connect(gui, &QGuiApplication::focusWindowChanged, this, &WallpaperXItem::updateShellFocus);
+    }
+    if (ScreenLockWatch* lock = inScreenLocker() ? nullptr : ScreenLockWatch::instance()) {
+        connect(lock, &ScreenLockWatch::lockedChanged, this, &WallpaperXItem::hiddenByStateChanged);
+    }
     connectToDaemon();
 }
 
@@ -1143,6 +1267,63 @@ void WallpaperXItem::setWindowMaximized(bool maximized) {
     if (m_windows.maximized == maximized) return;
     m_windows.maximized = maximized;
     emit windowMaximizedChanged();
+    m_windowReportTimer.start(0);
+}
+
+template <typename Change>
+void WallpaperXItem::changeHiddenInput(Change&& change) {
+    const bool hidden = hiddenByState();
+    change();
+    if (hiddenByState() != hidden) hiddenByStateChanged();
+}
+
+void WallpaperXItem::setDesktopCovered(bool covered) {
+    if (m_covered == covered) return;
+    changeHiddenInput([&] { m_covered = covered; });
+    emit desktopCoveredChanged();
+}
+
+void WallpaperXItem::setPauseMode(const QString& mode) {
+    if (m_pauseMode == mode) return;
+    changeHiddenInput([&] { m_pauseMode = mode; });
+    emit pauseModeChanged();
+}
+
+bool WallpaperXItem::hiddenByState() const {
+    if (inScreenLocker()) return false;
+    // "play" is the user's "Never": such a screen keeps playing behind a fullscreen window.
+    if (m_covered && m_pauseMode != QLatin1String("play")) return true;
+    const ScreenLockWatch* lock = ScreenLockWatch::instance();
+    return lock != nullptr && lock->locked();
+}
+
+void WallpaperXItem::hiddenByStateChanged() {
+    // Off the screen it does not speak for the screen: another copy may be showing it.
+    if (!m_onScreen) return;
+    if (!hiddenByState()) {
+        // Assumed drawn again until a pass says otherwise, as on coming back on the screen: the
+        // probe a dark screen had slowed down would otherwise hold the wallpaper still for seconds.
+        m_painting = true;
+        m_paintUnconfirmed = false;
+        m_paintWatch.stop();
+        armPaintWatch();
+    }
+    reportVisible();
+}
+
+// A panel's popup is a window of its own, and showing it takes the activation from the desktop's.
+// Only another window: the desktop's own activation is desktopFocused, which QML reads. On the item's
+// screen, since each screen's desktop reports for itself.
+void WallpaperXItem::updateShellFocus() {
+    QObject::disconnect(m_focusScreenWatch);
+    QWindow* focus = QGuiApplication::focusWindow();
+    const QQuickWindow* own = window();
+    if (focus != nullptr && focus != own) {
+        m_focusScreenWatch = connect(focus, &QWindow::screenChanged, this, &WallpaperXItem::updateShellFocus);
+    }
+    const bool here = focus != nullptr && own != nullptr && focus != own && focus->screen() == own->screen();
+    if (m_windows.shellFocused == here) return;
+    m_windows.shellFocused = here;
     m_windowReportTimer.start(0);
 }
 
@@ -1253,7 +1434,8 @@ void WallpaperXItem::checkPainting() {
     }
 
     reportVisible();
-    if (!m_onScreen) return;
+    // A screen known to be hidden is not probed: what ends that state arms the watch afresh.
+    if (!m_onScreen || hiddenByState()) return;
     // Nothing left to watch until the next hand-over arms it again.
     if (m_painting && !m_paintUnconfirmed) return;
 
@@ -1266,7 +1448,7 @@ void WallpaperXItem::checkPainting() {
 }
 
 void WallpaperXItem::reportVisible() {
-    const bool visible = m_onScreen && m_painting;
+    const bool visible = m_onScreen && m_painting && !hiddenByState();
     if (m_output.isEmpty() || m_visibleReported == visible) return;
 
     QDBusConnection bus = QDBusConnection::sessionBus();
@@ -1329,9 +1511,9 @@ void WallpaperXItem::sendWindowReport(const WindowReport& report, WindowCall cal
                                                  QString::fromUtf8(kInterface), QStringLiteral("SetOutputFocusState"));
         // A window keeps precedence: QML reads the two from different sources, which can disagree
         // for the moment between one window losing the focus and the desktop gaining it.
-        const QString focus = report.windows.focused          ? QStringLiteral("window")
-                              : report.windows.desktopFocused ? QStringLiteral("desktop")
-                                                              : QStringLiteral("none");
+        const QString focus = report.windows.focused ? QStringLiteral("window")
+                              : report.windows.desktopFocused || report.windows.shellFocused ? QStringLiteral("desktop")
+                                                                                             : QStringLiteral("none");
         request.setArguments({report.output, focus, report.windows.maximized});
     } else {
         request = QDBusMessage::createMethodCall(QString::fromUtf8(kService), QString::fromUtf8(kPath),
@@ -2569,6 +2751,7 @@ void WallpaperXItem::itemChange(ItemChange change, const ItemChangeData& value) 
     }
     if (change != ItemSceneChange) return;
     updateOnScreen();
+    updateShellFocus();
     if (value.window == nullptr) return;
     ensureFrameRequested();
     scheduleSizeReport();

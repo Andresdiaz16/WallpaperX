@@ -290,17 +290,30 @@ void runLengthSizeChecks() {
 //       "counter_lead_then_i.mp4: no missing reference found".
 // COVERAGE-ASSERT: each row is graded or accounted for: a missing fixture sets g_notVerified (main() then exits
 //       kNotVerifiedExitCode, a ctest skip, not a pass), and a scan that throws or gives no answer calls fail().
+// GOAL: S15.992 -- missingReferenceThroughout is set exactly when the first picture lacks a reference and no reset
+//       point follows: H.264 cut on a non-IDR I with no IDR anywhere (counter_cut_noidr.mp4) and HEVC cut on a CRA with
+//       no IDR after (counter_cra_a_cut.mp4); not when an IDR follows the damaged start (counter_cut_nonidr.mp4,
+//       counter_cut_cra.mp4) nor for damage in the middle (counter_gap.mp4).
+// WHY-THIS-SHAPE: a column on the same real-file rows, both directions: a constant `true` or `false` fails one side.
+// CONTROL: control_batch.sh 2026-10-28, each alone, reverted, renderer/video/software_scan.cpp:
+//       `found.missingReferenceThroughout = seekingReset;` made `= false` -> "counter_cut_noidr.mp4: not throughout,
+//       want throughout"; made `= true` -> "counter_opengop.ts: throughout, want an IDR found after" (every healthy
+//       row); scanOnce()'s `if (resetsDecoder(layout, packet)) return found;` made `if (false && ...)` ->
+//       "counter_cut_nonidr.mp4: throughout, want an IDR found after".
 void runScanChecks() {
     struct Row {
         const char* file;
         bool missingReference;
+        bool throughout = false;
     };
     const Row rows[] = {{"counter_gap.mp4", true},         {"counter_cut_nonidr.mp4", true},
                         {"counter_hevc_gap.mp4", true},
                         {"counter_cut_cra.mp4", true},     {"counter_cut_start.ts", false},
                         {"counter_lead_then_i.mp4", true},
+                        {"counter_cut_noidr.mp4", true, true}, {"counter_cra_a_cut.mp4", true, true},
                         {"counter_opengop.ts", false},     {"counter_two_idr.mp4", false},
                         {"counter_nonidr_src.mp4", false}, {"counter_opengop_hevc.mp4", false}};
+    int throughoutGraded = 0;
     for (const Row& row : rows) {
         const std::string path = asset(row.file);
         if (!std::filesystem::exists(path)) {
@@ -328,11 +341,19 @@ void runScanChecks() {
                          row.missingReference ? "no missing reference found" : "missing reference found, none due");
             fail("the scan finds a missing reference exactly where the decoder makes one up");
         }
+        if (found->missingReferenceThroughout != row.throughout) {
+            std::fprintf(stderr, "FAIL: reset_point_probe: %s: %s\n", row.file,
+                         row.throughout ? "not throughout, want throughout" : "throughout, want an IDR found after");
+            fail("S15.992 the scan says throughout exactly when no reset point follows a damaged start");
+        }
+        if (row.throughout) ++throughoutGraded;
         if (found->parameterSetsChangeOffReset) {
             std::fprintf(stderr, "FAIL: reset_point_probe: %s: a parameter-set change off a reset point found\n", row.file);
             fail("the scan finds no parameter-set change in a file without one");
         }
     }
+    // COVERAGE-ASSERT: both throughout rows were scanned, or the run is not verified rather than green.
+    if (throughoutGraded != 2 && !g_notVerified) fail("S15.992 both throughout rows were graded");
 
     // GOAL: S15.952 -- a parameter-set change off a reset point sends pictures to software only on a device without
     //       inline parameters, and is not known without a device.

@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -21,6 +22,9 @@ struct ResumePoint {
     int64_t modifiedNs = 0;
     // StreamPosition::stored().
     int64_t position = 0;
+    // Where a pass through the file starts, in nanoseconds of its own time; absent when not known,
+    // as in a record written before it was kept.
+    std::optional<int64_t> passFirst;
 };
 
 // <stateDir>/resume.json. Empty when `stateDir` is.

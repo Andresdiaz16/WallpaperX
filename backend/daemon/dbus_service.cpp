@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <exception>
+#include <new>
 #include <optional>
 #include <utility>
 
@@ -161,7 +162,9 @@ void DbusService::forgetClient(const std::string& client) {
 
     // And what it said about its screens' windows: with nobody left to say a window is focused
     // there, a pause that rested on it ends.
-    if (m_manager.forgetOutputFocus(client)) m_worker.wake();
+    // So do its visibility reports, the lock screen's among them once it exits.
+    const bool focusGone = m_manager.forgetOutputFocus(client);
+    if (m_manager.forgetOutputVisibility(client) || focusGone) m_worker.wake();
 
     // Likewise its claim on the images it was reading. A consumer that crashed holding a frame --
     // plasmashell restarts are routine, this daemon does not -- would otherwise keep those images
@@ -314,7 +317,9 @@ void DbusService::registerVTable() {
                 .withInputParamNames("output_name", "width", "height"),
             sdbus::registerMethod("SetOutputVisible")
                 .implementedAs([this](const std::string& outputName, bool visible) {
-                    setOutputVisible(outputName, visible);
+                    // By sender, as SetImportModifiers: the report dies with its reporter.
+                    const char* sender = m_object->getCurrentlyProcessedMessage().getSender();
+                    setOutputVisible(sender ? sender : "", outputName, visible);
                 })
                 .withInputParamNames("output_name", "visible"),
             sdbus::registerMethod("SetMonitorPause")
@@ -376,8 +381,8 @@ void DbusService::registerVTable() {
             // schedule would have to poll. This says "the answer may have changed", once.
             sdbus::registerSignal("ImportModifiersChanged"),
             // No parameters, for the same reason: a consumer reads /config again, and that answer
-            // is the whole of what changed. Sent for a wallpaper set, a screen named and a sound or
-            // frame-rate setting changed.
+            // is the whole of what changed. Sent for a wallpaper set, a screen named and a pause, sound
+            // or frame-rate setting changed.
             sdbus::registerSignal("ConfigChanged"),
             // No parameters: GetStatus's `persistence` may have changed, because a config write
             // returned. Apart from ConfigChanged, which has every consumer read /config again and
@@ -489,11 +494,12 @@ void DbusService::setWallpaper(const char* method, const std::string& type, cons
 }
 
 void DbusService::setWallpaperProperties(int32_t monitorId, const WireProperties& properties) {
-    // Refusals only: a slider sends one of these per step, and a line for each accepted one would
-    // bury everything else in the journal.
     bool redraw = false;
+    WallpaperProperties next;
+    WallpaperProperties replaced;
     try {
-        redraw = m_manager.setWallpaperProperties(monitorId, fromWire(properties));
+        next = fromWire(properties);
+        redraw = m_manager.setWallpaperProperties(monitorId, next, &replaced);
     } catch (const InvalidRequest& e) {
         std::fprintf(stderr, "wallpaperx-daemon: SetWallpaperProperties rejected (monitor=%d): %s\n", monitorId,
                      e.what());
@@ -502,6 +508,18 @@ void DbusService::setWallpaperProperties(int32_t monitorId, const WireProperties
         std::fprintf(stderr, "wallpaperx-daemon: SetWallpaperProperties failed (monitor=%d): %s\n", monitorId,
                      e.what());
         throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
+    }
+    // After the call, unlike setWallpaper(): what changed is only known against what it replaced, and a
+    // repeat that changes nothing is not logged. Keys are checked safe to log unescaped; values are
+    // numbers, booleans, colours and mode names. A line lost for want of memory does not make the
+    // accepted change an error.
+    if (replaced != next) {
+        try {
+            std::printf("wallpaperx-daemon: SetWallpaperProperties(monitor=%d, changed=%s)\n", monitorId,
+                        changedPropertiesText(replaced, next).c_str());
+            std::fflush(stdout);
+        } catch (const std::bad_alloc&) {
+        }
     }
 
     // The round this wakes times the picture waiting after it at the new speed, which the worker's
@@ -586,11 +604,11 @@ void DbusService::setOutputSize(const std::string& outputName, uint32_t width, u
     for (const int id : redraw) m_worker.post(id);
 }
 
-void DbusService::setOutputVisible(const std::string& outputName, bool visible) {
+void DbusService::setOutputVisible(const std::string& client, const std::string& outputName, bool visible) {
     // Changes and refusals only: every wallpaper item reports when it starts and several can share
     // one screen, so most reports change nothing, and logging each would bury the ones that do.
     try {
-        if (m_manager.setOutputVisible(outputName, visible)) {
+        if (m_manager.setOutputVisible(outputName, visible, client)) {
             std::printf("wallpaperx-daemon: SetOutputVisible(output=%s, visible=%s)\n",
                         sanitizeForLog(outputName).c_str(), visible ? "true" : "false");
             std::fflush(stdout);
@@ -616,6 +634,8 @@ void DbusService::setMonitorPause(int32_t monitorId, const std::string& mode) {
             std::printf("wallpaperx-daemon: SetMonitorPause(monitor=%d, mode=%s)\n", monitorId,
                         sanitizeForLog(mode).c_str());
             std::fflush(stdout);
+            // /config carries the mode: whether a fullscreen window hides the screen follows it.
+            announceConfigChanged();
         }
     } catch (const InvalidRequest& e) {
         std::fprintf(stderr, "wallpaperx-daemon: SetMonitorPause rejected (monitor=%d): %s\n", monitorId, e.what());
@@ -1107,7 +1127,8 @@ std::string DbusService::getStatus() {
 
     // Its own object for the reason `outputs` is: a screen can be set to pause before anything is
     // chosen for it. `mode` is null for a setting a newer build wrote, which this one keeps and
-    // does not apply; `paused` is what that setting and the screen's last report come to now.
+    // does not apply; `paused` is what that setting, the screen's last report and its wallpaper's own
+    // "paused" come to now.
     nlohmann::json pause = nlohmann::json::object();
     for (const auto& [monitorId, monitor] : snap.pause) {
         pause[std::to_string(monitorId)] = {

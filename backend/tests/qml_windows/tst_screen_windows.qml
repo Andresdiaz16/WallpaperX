@@ -6,7 +6,7 @@
 // filter by. So these cases grade the file's half of the contract -- what it asks the model for, and
 // how it reads the rows it gets back -- and not Plasma's filtering, which is Plasma's.
 //
-// The renderer is a stand-in too: an object with the two properties the file writes.
+// The renderer is a stand-in too: an object holding each property the file writes.
 
 import QtQuick
 import QtTest
@@ -32,6 +32,7 @@ TestCase {
             property bool windowFocused: false
             property bool desktopFocused: false
             property bool windowMaximized: false
+            property bool desktopCovered: false
         }
     }
 

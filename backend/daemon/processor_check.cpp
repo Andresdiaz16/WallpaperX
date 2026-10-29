@@ -42,13 +42,13 @@ const char* toString(ProcessorDecoding decoding) {
 ProcessorDecodingStatus processorDecoding(const ProcessorUse& use, std::optional<bool> inlineParameters) {
     using FirstPicture = ProcessorUse::FirstPicture;
     ProcessorDecodingStatus status;
-    // Whatever the file holds: no picture of it reaches the device.
-    if (use.firstPicture == FirstPicture::SoftwareThroughout) {
+    const auto* scanned = std::get_if<FileScan>(&use.scan);
+    const SoftwareStretches* found = scanned != nullptr ? &scanned->found : nullptr;
+    // The decoder's choice for the format, or a stream nothing hands back to the device: no picture reaches it.
+    if (use.firstPicture == FirstPicture::SoftwareThroughout || (found != nullptr && found->missingReferenceThroughout)) {
         status.state = ProcessorDecoding::All;
         return status;
     }
-    const auto* scanned = std::get_if<FileScan>(&use.scan);
-    const SoftwareStretches* found = scanned != nullptr ? &scanned->found : nullptr;
     const std::optional<bool> parameterSets =
         found != nullptr ? found->parameterSetsToSoftware(inlineParameters) : std::nullopt;
     if (use.firstPicture == FirstPicture::Software) status.reasons.push_back("first_picture");

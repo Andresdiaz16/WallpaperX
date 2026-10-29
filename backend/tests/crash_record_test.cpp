@@ -1586,6 +1586,89 @@ void runResumeRecordRanges() {
     check(!kept("/size-past-int64"), "resume record: a size above INT64_MAX is dropped");
 }
 
+// GOAL: S15.1150 (D13-b) -- resume.json carries pass_first_ns for a point that knew its pass start and
+//       omits it for one that did not; read back, each has exactly what was written. A record without the
+//       field, or with one that is not an int64, still loads the point with its position.
+// WHY-THIS-SHAPE: the omission is graded on the file's text, since a reader that ignored a written 0 would
+//       make "omitted" and "written as 0" read back alike. The bad values are planted beside a good one
+//       so a reader that drops the whole entry (rather than only the field) shows as a missing position.
+// CONTROL: backend/daemon/resume_record.cpp, control_batch.sh 2026-10-29, each alone, reverted: (1) the
+//       writer's `if (point.passFirst)` line made `entry[kKeyPassFirst] = point.passFirst.value_or(0);` ->
+//       "FAIL: resume record: a point that knew no pass start is written without pass_first_ns" (with the
+//       read-back line); (2) the reader's pass_first_ns line deleted -> "FAIL: resume record: pass_first_ns
+//       reads back as written", alone; (3) the reader's optional read made a requirement (`else continue;`)
+//       -> "FAIL: resume record: a record without pass_first_ns, or with a bad one, still loads each point's
+//       position" (with the read-back line); (4) the writer's `if (point.passFirst)` line deleted -> "FAIL:
+//       resume record: a point that knew its pass start is written with pass_first_ns" (with the read-back line).
+void runResumeRecordPassFirst() {
+    constexpr const char* kGoals = "S15.1150 (resume.json's pass_first_ns)";
+    ScratchDir scratch("resumepassfirst");
+    if (!scratch.ok()) {
+        notVerified(kGoals, "no scratch state directory could be created");
+        return;
+    }
+    wallpaperx::ResumePoint knew;
+    knew.monitorId = 1;
+    knew.path = "/knew";
+    knew.position = 11;
+    knew.passFirst = int64_t{1234567};
+    wallpaperx::ResumePoint unknown = knew;
+    unknown.monitorId = 2;
+    unknown.path = "/unknown";
+    unknown.passFirst.reset();
+    const std::string error = wallpaperx::writeResumeRecord(scratch.path(), {knew, unknown});
+    if (!error.empty()) {
+        notVerified(kGoals, "the record could not be written: " + error);
+        return;
+    }
+    std::ifstream in(wallpaperx::resumeRecordPath(scratch.path()));
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const nlohmann::json written = nlohmann::json::parse(text, nullptr, false);
+    const auto entryFor = [&written](const char* path) -> const nlohmann::json* {
+        if (!written.is_object() || !written.contains("points") || !written["points"].is_array()) return nullptr;
+        for (const nlohmann::json& e : written["points"]) {
+            if (e.is_object() && e.value("path", "") == path) return &e;
+        }
+        return nullptr;
+    };
+    const nlohmann::json* knewEntry = entryFor("/knew");
+    const nlohmann::json* unknownEntry = entryFor("/unknown");
+    check(knewEntry && knewEntry->contains("pass_first_ns"), "resume record: a point that knew its pass start is written with pass_first_ns");
+    check(unknownEntry && !unknownEntry->contains("pass_first_ns"),
+          "resume record: a point that knew no pass start is written without pass_first_ns");
+
+    const std::vector<wallpaperx::ResumePoint> round = wallpaperx::readResumeRecord(scratch.path());
+    const auto find = [](const std::vector<wallpaperx::ResumePoint>& in, const char* path) {
+        const auto it = std::find_if(in.begin(), in.end(), [path](const wallpaperx::ResumePoint& p) { return p.path == path; });
+        return it == in.end() ? std::optional<wallpaperx::ResumePoint>() : std::optional(*it);
+    };
+    const auto knewBack = find(round, "/knew");
+    const auto unknownBack = find(round, "/unknown");
+    check(knewBack && knewBack->passFirst == int64_t{1234567} && unknownBack && !unknownBack->passFirst,
+          "resume record: pass_first_ns reads back as written");
+
+    const auto planted = [](const char* path, std::optional<nlohmann::json> passFirst) {
+        nlohmann::json e{{"monitor_id", 3}, {"path", path}, {"device", 5}, {"inode", 7}, {"size", 13}, {"modified_ns", 9}, {"position", 42}};
+        if (passFirst) e["pass_first_ns"] = std::move(*passFirst);
+        return e;
+    };
+    nlohmann::json points = nlohmann::json::array();
+    points.push_back(planted("/old", std::nullopt));
+    points.push_back(planted("/text", nlohmann::json("soon")));
+    points.push_back(planted("/past-int64", nlohmann::json(uint64_t{18446744073709551615u})));
+    points.push_back(planted("/fraction", nlohmann::json(1.5)));
+    writeText(wallpaperx::resumeRecordPath(scratch.path()), nlohmann::json{{"points", points}}.dump());
+    const std::vector<wallpaperx::ResumePoint> old = wallpaperx::readResumeRecord(scratch.path());
+    int loaded = 0;
+    for (const char* path : {"/old", "/text", "/past-int64", "/fraction"}) {
+        const auto p = find(old, path);
+        if (p && p->position == 42 && !p->passFirst) ++loaded;
+        else std::fprintf(stderr, "  %s: %s\n", path, p ? "loaded, but with a pass start or another position" : "dropped");
+    }
+    // COVERAGE-ASSERT: a literal 4, one per planted entry.
+    check(loaded == 4, "resume record: a record without pass_first_ns, or with a bad one, still loads each point's position");
+}
+
 // GOAL: S15.947's neighbour, INFERRED from S13.19's symlink case -- the resume-record reader does not
 //       follow a symlink planted at resume.json: it reads no entries, even when the target is a valid record.
 // WHY-THIS-SHAPE: the same bytes are read first as a regular file at that path, so an empty read under
@@ -1653,6 +1736,7 @@ int main() {
         if (phaseSelected("playingRecordRules")) runPlayingRecordRules();
         if (phaseSelected("resumeRecordRanges")) runResumeRecordRanges();
         if (phaseSelected("resumeRecordSymlink")) runResumeRecordSymlink();
+        if (phaseSelected("resumeRecordPassFirst")) runResumeRecordPassFirst();
     } catch (const std::exception& e) {
         harnessFailure(std::string("the run ended in an unhandled exception: ") + e.what());
     }

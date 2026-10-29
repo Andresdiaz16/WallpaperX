@@ -25,10 +25,14 @@ Item {
 
     property bool anyActive: false
     property bool anyMaximized: false
+    property bool anyFullScreen: false
 
     // Showing the desktop hides windows without minimizing them.
     readonly property bool focused: root.onScreen && !KWindowSystem.showingDesktop && root.anyActive
     readonly property bool maximized: root.onScreen && !KWindowSystem.showingDesktop && root.anyMaximized
+    // A fullscreen window hides the whole desktop wherever it is stacked, since the desktop is always
+    // below it; KWin goes on drawing the desktop all the same, so nothing else would say so.
+    readonly property bool covered: root.onScreen && !KWindowSystem.showingDesktop && root.anyFullScreen
     // The window this item is in is the screen's desktop window, which the task model never lists.
     // KWin focuses it when it is clicked, when the desktop is shown, and when no window on the screen
     // is left to take the focus.
@@ -37,11 +41,13 @@ Item {
     onFocusedChanged: root.renderer.windowFocused = root.focused
     onDesktopFocusedChanged: root.renderer.desktopFocused = root.desktopFocused
     onMaximizedChanged: root.renderer.windowMaximized = root.maximized
+    onCoveredChanged: root.renderer.desktopCovered = root.covered
     // A value already true when the bindings first ran raised no change.
     Component.onCompleted: {
         root.renderer.windowFocused = root.focused;
         root.renderer.desktopFocused = root.desktopFocused;
         root.renderer.windowMaximized = root.maximized;
+        root.renderer.desktopCovered = root.covered;
     }
 
     // The roles recount() reads; a change to no other can alter its answer. A window title or icon
@@ -56,6 +62,7 @@ Item {
     function recount() {
         let active = false;
         let maximized = false;
+        let fullScreen = false;
         for (let row = 0; row < tasks.count; ++row) {
             const index = tasks.index(row, 0);
             // The model lets a window it cannot place yet through on every screen -- a new one has
@@ -64,12 +71,14 @@ Item {
             if (!placed || placed.width <= 0 || placed.height <= 0) {
                 continue;
             }
+            const full = tasks.data(index, TaskManager.AbstractTasksModel.IsFullScreen) === true;
             active = active || tasks.data(index, TaskManager.AbstractTasksModel.IsActive) === true;
-            maximized = maximized || tasks.data(index, TaskManager.AbstractTasksModel.IsMaximized) === true ||
-                        tasks.data(index, TaskManager.AbstractTasksModel.IsFullScreen) === true;
+            maximized = maximized || full || tasks.data(index, TaskManager.AbstractTasksModel.IsMaximized) === true;
+            fullScreen = fullScreen || full;
         }
         root.anyActive = active;
         root.anyMaximized = maximized;
+        root.anyFullScreen = fullScreen;
     }
 
     TaskManager.VirtualDesktopInfo {

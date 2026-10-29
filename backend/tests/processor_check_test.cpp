@@ -155,10 +155,11 @@ std::string describe(const wallpaperx::ProcessorDecodingStatus& status) {
 
 void runDecodingStateChecks() {
     using First = ProcessorUse::FirstPicture;
-    const auto scanned = [](bool missing, bool change) {
+    const auto scanned = [](bool missing, bool change, bool throughout = false) {
         SoftwareStretches found;
         found.missingReference = missing;
         found.parameterSetsChangeOffReset = change;
+        found.missingReferenceThroughout = throughout;
         return FileScan{found, std::nullopt};
     };
     struct Row {
@@ -184,6 +185,13 @@ void runDecodingStateChecks() {
         {"healthy, drawn on the device", ProcessorUse{1, scanned(false, false), First::Device}, true, "none"},
         {"healthy, no device answer", ProcessorUse{1, scanned(false, false), First::Device}, std::nullopt, "none"},
         {"missing reference", ProcessorUse{1, scanned(true, false), First::Device}, true, "parts missing_reference"},
+        // S15.992: no reset point after a damaged start, so no picture reaches the device.
+        // CONTROL: control_batch.sh 2026-10-28, reverted, backend/daemon/processor_check.cpp processorDecoding():
+        //       `|| (found != nullptr && found->missingReferenceThroughout)` deleted -> "FAIL: S15.952 S15.992 missing
+        //       reference throughout: got 'parts missing_reference', want 'all'".
+        {"S15.992 missing reference throughout", ProcessorUse{1, scanned(true, false, true), First::Device}, true, "all"},
+        {"S15.992 missing reference throughout, first picture in software",
+         ProcessorUse{1, scanned(true, false, true), First::Software}, true, "all"},
         {"first picture in software", ProcessorUse{1, scanned(false, false), First::Software}, true,
          "parts first_picture"},
         {"change, no inline parameters", ProcessorUse{1, scanned(false, true), First::Device}, false,
@@ -345,7 +353,15 @@ void runRecordChecks(const fs::path& dir) {
     }
     SoftwareStretches found;
     found.missingReference = true;
-    const std::string written = wallpaperx::writeScanRecord(state, {wallpaperx::SavedScan{*file, *identity, found}});
+    found.missingReferenceThroughout = true;
+    // A second entry with every flag the other way round, so each flag is read back in both states.
+    SoftwareStretches foundB;
+    foundB.missingReference = true;
+    foundB.missingReferenceThroughout = false;
+    foundB.parameterSetsChangeOffReset = true;
+    const std::string fileB = *file + ".b";
+    const std::string written = wallpaperx::writeScanRecord(
+        state, {wallpaperx::SavedScan{*file, *identity, found}, wallpaperx::SavedScan{fileB, *identity, foundB}});
     if (!written.empty()) {
         harnessFailure("the scan record could not be written: " + written);
         return;
@@ -359,10 +375,29 @@ void runRecordChecks(const fs::path& dir) {
     //       scan.file.device -> "FAIL: S15.954 a saved answer reads back with the identity it was saved against";
     //       the rule comparison deleted -> "FAIL: S15.954 a record from another scan rule is not read".
     const std::vector<wallpaperx::SavedScan> back = wallpaperx::readScanRecord(state);
-    const bool same = back.size() == 1 && back[0].path == *file && back[0].file == *identity &&
-                      back[0].found.missingReference && !back[0].found.parameterSetsChangeOffReset;
+    const auto entry = [&back](const std::string& path) -> const wallpaperx::SavedScan* {
+        for (const wallpaperx::SavedScan& scan : back)
+            if (scan.path == path) return &scan;
+        return nullptr;
+    };
+    const wallpaperx::SavedScan* const a = entry(*file);
+    const wallpaperx::SavedScan* const b = entry(fileB);
+    const bool same = back.size() == 2 && a != nullptr && b != nullptr && a->file == *identity &&
+                      a->found.missingReference && b->found.missingReference;
     if (!same) std::fprintf(stderr, "FAIL: %zu entr(ies) read back\n", back.size());
     check(same, "S15.954 a saved answer reads back with the identity it was saved against");
+    // GOAL: S15.992 -- the record round-trips missingReferenceThroughout and parameterSetsChangeOffReset, each
+    //       as saved, true and false: a reader that fills a flag from another flag or from a constant is red.
+    // WHY-THIS-SHAPE: two entries with opposite flags, looked up by path; one all-true entry cannot tell a
+    //       restored flag from one copied off missingReference.
+    // CONTROL: control_batch.sh 2026-10-29, each alone, reverted, backend/daemon/scan_record.cpp writeScanRecord():
+    //       the kKeyThroughout entry written as `scan.found.missingReference` -> "...false entry reads back false";
+    //       written as `false` -> "...true entry reads back true"; kKeyParameterSets written as `false` -> the
+    //       parameter-sets line.
+    check(a != nullptr && a->found.missingReferenceThroughout, "S15.992 the throughout flag of the true entry reads back true");
+    check(b != nullptr && !b->found.missingReferenceThroughout, "S15.992 the throughout flag of the false entry reads back false");
+    check(a != nullptr && b != nullptr && !a->found.parameterSetsChangeOffReset && b->found.parameterSetsChangeOffReset,
+          "S15.992 the parameter-sets flag reads back as saved, false and true");
 
     const fs::path record = wallpaperx::scanRecordPath(state);
     std::string text = readWhole(record).value_or(std::string());
@@ -388,6 +423,43 @@ void runRecordChecks(const fs::path& dir) {
         }
     }
     check(wallpaperx::readScanRecord(state).empty(), "S15.954 a record from another scan rule is not read");
+
+    // GOAL: S15.992 -- the current scan rule is past rule 1, so a rule-1 answer is never taken as current.
+    // WHY-THIS-SHAPE: a check of its own, not part of the planting guard below: a revert to 1 is a production
+    //       regression and must fail as one, not as a harness fault.
+    // CONTROL: via control_batch.sh 2026-10-28, reverted: kSoftwareScanRule (renderer/video/software_scan.h)
+    //       made 1 -> this line red, alone.
+    check(wallpaperx::kSoftwareScanRule != 1, "S15.992 the current scan rule is not rule 1, so rule-1 records are rescanned");
+    {
+        std::string rule1 = readWhole(record).value_or(std::string());
+        const std::string otherRule = "\"rule\":" + std::to_string(wallpaperx::kSoftwareScanRule + 1);
+        const size_t ruleAt = rule1.find(otherRule);
+        const std::string throughoutTrue = "\"missing_reference_throughout\":true,";
+        const std::string throughoutFalse = "\"missing_reference_throughout\":false,";
+        if (ruleAt == std::string::npos || rule1.find(throughoutTrue) == std::string::npos ||
+            rule1.find(throughoutFalse) == std::string::npos) {
+            harnessFailure("the record does not hold the rule and both throughout keys as expected (" + rule1 +
+                           "), so the rule-1 check cannot be graded");
+            return;
+        }
+        rule1.erase(rule1.find(throughoutTrue), throughoutTrue.size());
+        rule1.erase(rule1.find(throughoutFalse), throughoutFalse.size());
+        rule1.replace(rule1.find(otherRule), otherRule.size(), "\"rule\":1");
+        std::ofstream out(record, std::ios::binary | std::ios::trunc);
+        out << rule1;
+        out.close();
+        if (!out || readWhole(record) != rule1) {
+            harnessFailure("could not plant the rule-1 record, so the rule-1 check cannot be graded");
+            return;
+        }
+    }
+    // GOAL: S15.992 -- a record saved under rule 1, which had no throughout flag, is scanned again, not reused.
+    // WHY-THIS-SHAPE: the rule-1 record is planted as rule 1 wrote it (no throughout key), so it fails both on the
+    //       rule and on the missing key; the rule bump is graded alone by the check above with the key present.
+    // CONTROL: control_batch.sh 2026-10-29, reverted, backend/daemon/scan_record.cpp readScanRecord(): the rule
+    //       comparison made `rule == 0` and a missing throughout key accepted -> "FAIL: S15.992 a rule-1 record is not
+    //       read" (with the S15.954 other-rule line).
+    check(wallpaperx::readScanRecord(state).empty(), "S15.992 a rule-1 record is not read");
 }
 
 }  // namespace

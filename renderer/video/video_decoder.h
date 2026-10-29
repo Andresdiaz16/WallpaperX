@@ -412,6 +412,11 @@ public:
 
     // The stream's start on the timeline presentationTime() uses: where a ShowGrid for it is laid from.
     std::chrono::nanoseconds timelineStart() const;
+    // Where the container says the stream ends on that timeline: its start plus its declared duration.
+    // A stream declaring no duration of its own takes the container's end, which a longer sound track
+    // can put past the last picture. Empty where neither is declared, or FFmpeg estimated it from the
+    // bitrate. A claim, not a measurement.
+    std::optional<std::chrono::nanoseconds> declaredEnd() const;
 
 private:
     std::variant<std::optional<DecodedFrame>, Dropping> decode(std::optional<uint32_t> dropLimit, PictureSkip skip);

@@ -4393,6 +4393,55 @@ void checkPropertiesSavedOnStop(NameWatcher& names, const std::string& validatio
     }
 }
 
+void checkPausedSurvivesRestart(NameWatcher& names, const std::string& validationEnv, const std::string& bluePath,
+                                const Check& check) {
+    constexpr int32_t kMonitor = 6;
+    constexpr const char* kGoals = "S15.999 (a wallpaper's own paused survives a daemon restart)";
+    ScratchDir configHome("pausedrestart");
+    if (!configHome.ok()) {
+        throw ScratchDirectoryLost("a scratch XDG_CONFIG_HOME could not be created under the temp directory");
+    }
+    const auto pausedIn = [&](sdbus::IProxy& proxy) -> std::optional<bool> {
+        const StatusReply status = getStatusOrExplain(proxy);
+        const nlohmann::json* entry = wallpaperx::testing::pauseStatus(status, std::to_string(kMonitor));
+        if (entry == nullptr || !entry->contains("paused") || !(*entry)["paused"].is_boolean()) return std::nullopt;
+        return (*entry)["paused"].get<bool>();
+    };
+    {
+        SpawnedDaemon first({validationEnv, configHome.env()});
+        if (!names.waitFor(true)) {
+            if (!reportedStartupFault(first, kGoals)) notVerified(kGoals, "the first daemon never acquired the bus name");
+            return;
+        }
+        auto proxy = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
+        setWallpaper(*proxy, "static", bluePath, kMonitor);
+        wallpaperx::testing::setWallpaperProperties(*proxy, kMonitor,
+                                                    wallpaperx::testing::WireProperties{{"paused", sdbus::Variant(true)}});
+        const std::optional<bool> before = pausedIn(*proxy);
+        if (before != true) notVerified(kGoals, "GetStatus did not say paused before the restart, so the restart grades nothing");
+        first.shutdown(SIGTERM);
+        awaitNameRelease(names, before == true ? "the second daemon" : "the next phase");
+        if (before != true) return;
+    }
+    // GOAL: S15.999 -- `paused` set on a screen is saved and the restarted daemon reports that screen paused.
+    // WHY-THIS-SHAPE: graded through the second daemon's GetStatus, not the config file, so a value saved but not
+    //       restored into the pause state is red too.
+    // CONTROL: control_batch.sh 2026-10-28, reverted, backend/daemon/config_store.cpp: the saved row's
+    //       properties written with "paused" erased -> "FAIL: S15.999 a wallpaper set paused is still paused after a
+    //       daemon restart".
+    SpawnedDaemon second({validationEnv, configHome.env()});
+    if (!names.waitFor(true)) {
+        if (!reportedStartupFault(second, kGoals)) notVerified(kGoals, "the second daemon never acquired the bus name");
+        return;
+    }
+    auto proxy = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
+    const std::optional<bool> after = pausedIn(*proxy);
+    check(after == true, "S15.999 a wallpaper set paused is still paused after a daemon restart");
+    if (after != true) std::fprintf(stderr, "  GetStatus paused: %s\n", after ? "false" : "absent");
+    second.shutdown(SIGTERM);
+    awaitNameRelease(names, "the next phase");
+}
+
 void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, const Check& check) {
     constexpr int32_t kMonitorRestore = 18;
     constexpr const char* kGoals = "S8.1/S8.3/S8.11 (a wallpaper survives a restart, byte for byte)";
@@ -7297,6 +7346,7 @@ int main(int argc, char** argv) {
         });
         phase("configRestart", [&] { checkConfigRestart(names, validationEnv, check); });
         phase("propertiesSavedOnStop", [&] { checkPropertiesSavedOnStop(names, validationEnv, bluePath, check); });
+        phase("pausedSurvivesRestart", [&] { checkPausedSurvivesRestart(names, validationEnv, bluePath, check); });
         phase("crashRefusal", [&] { checkCrashRefusal(names, validationEnv, bluePath, check); });
         phase("outputRestart", [&] { checkOutputRestart(names, validationEnv, check); });
         phase("startsOnAnyConfig", [&] { checkStartsOnAnyConfig(names, validationEnv, check); });

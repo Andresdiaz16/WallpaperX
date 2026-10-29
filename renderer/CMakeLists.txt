@@ -326,6 +326,13 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         "mpeg4.avi|-f lavfi -i testsrc2=size=320x240:rate=10:duration=1|-c:v mpeg4 -g 5"
         "h264_raw.h264|-f lavfi -i testsrc2=size=320x240:rate=10:duration=2|-c:v libx264 -pix_fmt yuv420p -profile:v baseline -g 5 -bsf:v h264_mp4toannexb -f h264"
         "audio_only.m4a|-f lavfi -i sine=frequency=440:duration=1|-c:a aac"
+        # Declared ends: Matroska carries only the container duration;
+        # the MP4's sound outlasts its video, so the container's duration is not the video's.
+        "declared_container_end.mkv|-f lavfi -i testsrc2=size=320x240:rate=10:duration=2|-c:v libx264 -pix_fmt yuv420p -profile:v baseline -g 5"
+        "declared_stream_wins.mp4|-f lavfi -i testsrc2=size=320x240:rate=10:duration=2 -f lavfi -i sine=frequency=440:duration=3|-c:v libx264 -pix_fmt yuv420p -profile:v baseline -g 5 -c:a aac"
+        # A Matroska file starting at 5 s: FFmpeg writes its container duration as the last end (7 s).
+        "declared_offset_end.mkv|-f lavfi -i testsrc2=size=320x240:rate=10:duration=2|-c:v libx264 -pix_fmt yuv420p -profile:v baseline -g 5 -output_ts_offset 5"
+        "declared_offset_end.webm|-f lavfi -i testsrc2=size=320x240:rate=10:duration=2|-c:v libvpx-vp9 -deadline realtime -g 5 -output_ts_offset 5"
     )
     foreach(RECIPE ${WALLPAPERX_VIDEO_RECIPES})
         string(REPLACE "|" ";" RECIPE_PARTS "${RECIPE}")
@@ -704,7 +711,9 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
             "counter_lead_then_i.mp4||counter_nonidr_src.mp4|-bsf:v noise=drop=not(trunc(n/40)),filter_units=remove_types=6"
             "counter_hevc_gap.mp4||counter_hevc_src.mp4|-bsf:v noise=drop=not(n-97)"
             "counter_cut_nonidr.mp4|-ss 1.6|counter_nonidr_src.mp4|"
-            "counter_cra_a_cut.mp4|-ss 1.6|counter_cra_a.mp4|")
+            "counter_cra_a_cut.mp4|-ss 1.6|counter_cra_a.mp4|"
+            # Open GOP whose only IDR is its first picture, cut at the non-IDR I 48: no IDR anywhere.
+            "counter_cut_noidr.mp4|-ss 1.6|counter_opengop_long.mp4|")
         string(REPLACE "|" ";" DERIVED_PARTS "${DERIVED}")
         list(GET DERIVED_PARTS 0 DERIVED_NAME)
         list(GET DERIVED_PARTS 1 DERIVED_IN)
