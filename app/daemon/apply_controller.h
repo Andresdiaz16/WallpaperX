@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include "remembered_settings.h"
+
 #include <QHash>
 #include <QObject>
 #include <QString>
@@ -28,6 +30,9 @@ class PlasmaController;
 // Apply asks the daemon first, which is what decides the picture, then Plasma, which only switches
 // the desktop to the plugin that draws it. Every failure ends in a state with a sentence saying
 // which half failed and why. All four objects given must outlive this one.
+//
+// What each wallpaper last had on each screen is kept in `rememberedFile`, so a screen not showing the
+// open wallpaper starts from what it last had there, or from its defaults.
 class ApplyController : public QObject {
     Q_OBJECT
     QML_ELEMENT
@@ -84,7 +89,7 @@ public:
     Q_ENUM(Progress)
 
     ApplyController(KScreenClient& kscreen, LibraryManager& library, DaemonClient& daemon, PlasmaController& plasma,
-                    QObject* parent = nullptr);
+                    QString rememberedFile, QObject* parent = nullptr);
 
     Progress applyState() const { return m_apply; }
     QString applyMessage() const;
@@ -223,11 +228,16 @@ private:
     bool contradicted(const Live& link) const;
     // Ends the link unless it is the selected screen's and the open wallpaper's; links a selected screen
     // GetStatus says shows the open wallpaper, and shows that screen's values in the controls. Not while
-    // this app's own Apply there may make GetStatus stale: the controls show what the Apply sets. A send
-    // of ours to that screen for the open wallpaper links it at once, with the values it sets; one for
-    // another link waits for the read after it. Otherwise the controls start a draft for the next Apply
-    // there from the defaults, unless they already hold one for that screen and wallpaper.
+    // this app's own Apply there may make GetStatus stale. A send of ours to that screen for the open
+    // wallpaper links it at once, with the values it sets; one for another link waits for the read after
+    // it. Otherwise the controls start a draft for the next Apply there from what the pair last had,
+    // unless they already hold one for that screen and wallpaper.
     void linkSelected();
+    // Keep: a remembered value the open wallpaper refuses stays, unless the controls hold another for its
+    // key. Forget: dropped too, for a Reset to defaults.
+    enum class Refused { Keep, Forget };
+    // Records the controls' values as the selected pair's, once linkSelected() has made them its.
+    void remember(Refused refused = Refused::Keep);
     void sendLive();
     // Sends `values` to `to`'s screen, by monitor once it is known to hold the wallpaper, else by wallpaper.
     void sendTo(const Live& to, const QVariantMap& values);
@@ -239,19 +249,18 @@ private:
 
     Progress m_apply = Progress::Idle;
     QString m_applyMessage;
-    // What the last Apply was for: the wallpaper's path, the connector and the values it sent.
+    // What the last Apply was for: the wallpaper's path and the connector.
     QString m_applyWallpaper;
     QString m_applyOutput;
-    QVariantMap m_applyValues;
     std::optional<Live> m_live;
-    // While nothing is linked, the screen and wallpaper the controls hold a draft for; none once a link
-    // ends, as its screen no longer shows the wallpaper and its values went with it.
+    // The screen and wallpaper the controls hold values for, linked or not.
     struct DraftFor {
         QString connector;
         QString wallpaperPath;
         bool operator==(const DraftFor&) const = default;
     };
     std::optional<DraftFor> m_draftFor;
+    RememberedSettings m_remembered;
     quint64 m_lastLiveId = 0;
     // By monitor id: one send at a time to each screen.
     QHash<int, InFlight> m_sending;

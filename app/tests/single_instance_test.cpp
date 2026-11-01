@@ -14,12 +14,16 @@
 #include <QDBusConnectionInterface>
 #include <QDir>
 #include <QElapsedTimer>
+#include <QFile>
 #include <QProcess>
 #include <QRandomGenerator>
 #include <QTemporaryDir>
 
+#include <csignal>
+
 #include <algorithm>
 #include <memory>
+#include <optional>
 
 using namespace wallpaperx;
 using namespace wallpaperx::apptest;
@@ -537,6 +541,83 @@ void handOver(const QString& root) {
     stop(app);
 }
 
+// The signals `pid` has a handler for, from /proc's SigCgt mask; nullopt when it cannot be read.
+std::optional<quint64> caughtSignals(qint64 pid) {
+    QFile status(QStringLiteral("/proc/%1/status").arg(pid));
+    if (!status.open(QIODevice::ReadOnly)) {
+        return std::nullopt;
+    }
+    for (const QByteArray& line : status.readAll().split('\n')) {
+        if (line.startsWith("SigCgt:")) {
+            bool ok = false;
+            const quint64 mask = line.mid(7).trimmed().toULongLong(&ok, 16);
+            return ok ? std::optional(mask) : std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+
+// S15.1206: SIGTERM, SIGINT and SIGHUP end the app as a quit would.
+void quitSignals(const QString& root) {
+    struct Row {
+        const char* name;
+        int signal;
+    };
+    int graded = 0;
+    for (const Row& row : {Row{"SIGTERM", SIGTERM}, Row{"SIGINT", SIGINT}, Row{"SIGHUP", SIGHUP}}) {
+        const quint64 bit = quint64(1) << (row.signal - 1);
+        QProcess app;
+        startApp(app, root, root, QStringLiteral("exec \"$0\""));
+        static_cast<void>(app.waitForStarted(kStartMs));
+        // GOAL: S15.1206 (D17) -- once the app holds its bus name it has a handler for each of the three signals, and
+        //       each ends it with exit status 0, as a quit does, instead of death by the signal (143, 130, 129).
+        // WHY-THIS-SHAPE: the signal is sent only once /proc shows it caught, so a signal arriving before main() installs
+        //       the handlers is never graded as the app's fault; waiting only for the bus name would race the install.
+        //       What the app writes on the way out is not graded here: nothing can make an edit in the real binary
+        //       without its window (S15.1194 grades the write on destruction).
+        // CONTROL: app/main.cpp quitOnSignals()'s list without SIGHUP (control_batch 2026-10-31, reverted) -> red,
+        //       "S15.1206: SIGHUP: the app holding its bus name never had a handler for it"; the notifier's
+        //       `QCoreApplication::quit();` deleted -> red, "S15.1206: SIGTERM: the app did not exit within 30 s (exit status 15,
+        //       crashed 1)", and the same for SIGINT and SIGHUP.
+        QElapsedTimer waited;
+        waited.start();
+        std::optional<quint64> caught;
+        bool up = false;
+        while (app.state() == QProcess::Running && waited.elapsed() < kStartMs) {
+            caught = caughtSignals(app.processId());
+            if (nameOwned() && caught && (*caught & bit) != 0) {
+                up = true;
+                break;
+            }
+            app.waitForFinished(50);
+        }
+        if (!up) {
+            const bool started = app.state() == QProcess::Running && nameOwned();
+            const QString said = QString::fromLocal8Bit(app.readAll());
+            stop(app);
+            if (started) {
+                expect(false, QStringLiteral("S15.1206: %1: the app holding its bus name never had a handler for it (caught mask %2)")
+                                  .arg(QLatin1StringView(row.name), QString::number(caught.value_or(0), 16)));
+            } else {
+                harnessFailure(std::string("S15.1206: ") + row.name + ": the app never came up holding its bus name: " +
+                               said.trimmed().left(300).toStdString());
+            }
+            continue;
+        }
+        ::kill(pid_t(app.processId()), row.signal);
+        const bool finished = exitsWithin(app, kStartMs);
+        const QString said = QString::fromLocal8Bit(app.readAll());
+        ++graded;
+        expect(finished && app.exitStatus() == QProcess::NormalExit && app.exitCode() == 0,
+               QStringLiteral("S15.1206: %1: the app %2 (exit status %3, crashed %4) and said: %5")
+                   .arg(QLatin1StringView(row.name), finished ? QStringLiteral("exited") : QStringLiteral("did not exit within 30 s"))
+                   .arg(app.exitCode())
+                   .arg(app.exitStatus() == QProcess::CrashExit)
+                   .arg(said.trimmed().left(300)));
+    }
+    expect(graded == 3, QStringLiteral("S15.1206: %1 of 3 signals graded").arg(graded));
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -567,6 +648,7 @@ int main(int argc, char* argv[]) {
     runPhase("qtOptions", [&] { qtOptions(root); });
     runPhase("unansweredHandOver", [&] { unansweredHandOver(root); });
     runPhase("handOver", [&] { handOver(root); });
+    runPhase("quitSignals", [&] { quitSignals(root); });
 
     const bool failed = wallpaperx::testing::reportCheckFailures();
     const bool faulted = wallpaperx::testing::reportHarnessFaults("in this test file or its fixtures, not in the app");

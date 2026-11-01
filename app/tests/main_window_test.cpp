@@ -812,7 +812,8 @@ int main(int argc, char* argv[]) {
     }
     auto daemon = std::make_unique<DaemonClient>(QDBusConnection::sessionBus(), daemonFake->service(), DaemonTimeouts{2000});
     auto plasma = std::make_unique<PlasmaController>(QDBusConnection::sessionBus(), shellFake->service(), 2000);
-    auto applier = std::make_unique<ApplyController>(*client, *library, *daemon, *plasma);
+    auto applier = std::make_unique<ApplyController>(*client, *library, *daemon, *plasma,
+                                                     scratch.path() + QStringLiteral("/screen-settings.json"));
     daemon->refresh();
 
     QQmlEngine engine;

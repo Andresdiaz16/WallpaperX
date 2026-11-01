@@ -3,6 +3,7 @@
 #include "daemon/apply_controller.h"
 #include "daemon/daemon_client.h"
 #include "daemon/refresh_rate_reporter.h"
+#include "daemon/remembered_settings.h"
 #include "kde/kscreen_client.h"
 #include "kde/kscreen_source.h"
 #include "kde/plasma_controller.h"
@@ -14,16 +15,20 @@
 #include <QDBusConnection>
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
+#include <QSocketNotifier>
 #include <QUrl>
 #include <QWindow>
 
 #include <algorithm>
+#include <cerrno>
 #include <climits>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <optional>
 #include <variant>
 
+#include <sys/socket.h>
 #include <unistd.h>
 
 namespace {
@@ -86,6 +91,43 @@ CommandLine parseCommandLine(const QList<QByteArray>& arguments)
     return files;
 }
 
+int signalWriteFd = -1;
+
+void reportSignal(int)
+{
+    const int saved = errno;
+    const char byte = 0;
+    [[maybe_unused]] const ssize_t written = ::write(signalWriteFd, &byte, 1);
+    errno = saved;
+}
+
+// SIGTERM (as at logout), SIGINT and SIGHUP end the event loop, so main() unwinds and what is built there
+// writes what it holds, settings not yet saved among them. The same signal again ends the process at
+// once; a different one does not.
+void quitOnSignals(QCoreApplication& app)
+{
+    int fds[2];
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, fds) != 0) {
+        qWarning("wallpaperx: socketpair failed (%s), so a logout may lose the last second's setting changes",
+                 std::strerror(errno));
+        return;
+    }
+    signalWriteFd = fds[1];
+    auto* notifier = new QSocketNotifier(fds[0], QSocketNotifier::Read, &app);
+    QObject::connect(notifier, &QSocketNotifier::activated, &app, [notifier] {
+        // The byte stays unread; disabled, the notifier does not report it again.
+        notifier->setEnabled(false);
+        QCoreApplication::quit();
+    });
+    struct sigaction action {};
+    action.sa_handler = reportSignal;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART | SA_RESETHAND;
+    for (const int quitting : {SIGTERM, SIGINT, SIGHUP}) {
+        ::sigaction(quitting, &action, nullptr);
+    }
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -133,6 +175,7 @@ int main(int argc, char* argv[])
         break;
     }
 
+    quitOnSignals(app);
     // Declared before the engine so they outlive every binding that reads them.
     wallpaperx::KScreenClient kscreen(wallpaperx::systemKScreenSource(QDBusConnection::sessionBus()));
     const QString libraryDirectory = wallpaperx::defaultLibraryDirectory();
@@ -141,7 +184,7 @@ int main(int argc, char* argv[])
     QObject::connect(&importer, &wallpaperx::Importer::imported, &library, &wallpaperx::LibraryManager::reveal);
     wallpaperx::DaemonClient daemon(QDBusConnection::sessionBus());
     wallpaperx::PlasmaController plasma(QDBusConnection::sessionBus());
-    wallpaperx::ApplyController applier(kscreen, library, daemon, plasma);
+    wallpaperx::ApplyController applier(kscreen, library, daemon, plasma, wallpaperx::defaultRememberedSettingsFile());
     wallpaperx::RefreshRateReporter refreshRates(kscreen, daemon);
 
     QQmlApplicationEngine engine;

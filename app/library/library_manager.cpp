@@ -270,6 +270,7 @@ bool LibraryManager::setPropertyValues(const QVariantMap& values)
 void LibraryManager::resetPropertyValues()
 {
     changeSelection([&] { m_edits.clear(); });
+    emit propertyValuesReset();
 }
 
 void LibraryManager::adoptPropertyValues(const QVariantMap& values)

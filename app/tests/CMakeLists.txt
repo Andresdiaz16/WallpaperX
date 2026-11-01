@@ -28,6 +28,8 @@ set(WALLPAPERX_APP_APPLY_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../daemon/apply_controller.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../daemon/refresh_rate_reporter.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../daemon/refresh_rate_reporter.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../daemon/remembered_settings.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../daemon/remembered_settings.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../kde/plasma_controller.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../kde/plasma_controller.h
 )

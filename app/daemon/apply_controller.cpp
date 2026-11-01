@@ -7,6 +7,8 @@
 #include "library_manager.h"
 #include "plasma_controller.h"
 
+#include <QScopeGuard>
+
 #include <algorithm>
 #include <memory>
 #include <utility>
@@ -56,12 +58,13 @@ std::optional<int> showing(const DaemonStatus& status, const QString& connector,
 } // namespace
 
 ApplyController::ApplyController(KScreenClient& kscreen, LibraryManager& library, DaemonClient& daemon,
-                                 PlasmaController& plasma, QObject* parent)
+                                 PlasmaController& plasma, QString rememberedFile, QObject* parent)
     : QObject(parent)
     , m_kscreen(kscreen)
     , m_library(library)
     , m_daemon(daemon)
     , m_plasma(plasma)
+    , m_remembered(std::move(rememberedFile))
 {
     connect(&m_library, &LibraryManager::selectionChanged, this, [this] {
         linkSelected();
@@ -69,7 +72,11 @@ ApplyController::ApplyController(KScreenClient& kscreen, LibraryManager& library
         emit applyChanged();
         emit processorNoticeChanged();
     });
-    connect(&m_library, &LibraryManager::propertyValuesChanged, this, &ApplyController::sendLive);
+    connect(&m_library, &LibraryManager::propertyValuesChanged, this, [this] {
+        remember();
+        sendLive();
+    });
+    connect(&m_library, &LibraryManager::propertyValuesReset, this, [this] { remember(Refused::Forget); });
     connect(&m_daemon, &DaemonClient::serviceStarted, this, [this] {
         if (m_live) {
             // A new id, so a reply from the daemon that went away records nothing.
@@ -145,7 +152,6 @@ void ApplyController::apply()
     // shows it there.
     m_applyWallpaper = wallpaper.filePath;
     m_applyOutput = connector;
-    m_applyValues = values;
     settleApply(Progress::Working, tr("Applying %1 to %2…").arg(title, where));
     m_daemon.bindMonitor(this, connector, [=, this](std::expected<int, QString> monitorId) {
         if (!monitorId) {
@@ -421,7 +427,6 @@ void ApplyController::unlink()
 {
     if (m_live) {
         m_live.reset();
-        m_draftFor.reset();
         m_liveError.clear();
         emit liveChanged();
     }
@@ -435,25 +440,26 @@ void ApplyController::linkSelected()
         return;
     }
     unlink();
+    // Whatever the controls end up holding is the pair's from here.
+    const auto recorded = qScopeGuard([this] { remember(); });
     // Unlinked, the controls hold a draft for the selected screen and wallpaper: kept while both stay
-    // selected, else started from `values`, the defaults when empty. Nothing set on another screen carries
-    // over, and the library has already dropped the edits of a wallpaper closed since.
+    // selected, else started from what the pair last had. Nothing set on another screen carries over.
     const DraftFor selected{connector, open.filePath};
     const bool fresh = std::exchange(m_draftFor, selected) != selected;
-    const auto draft = [this, fresh](const QVariantMap& values = {}) {
+    const auto draft = [this, fresh, &selected] {
         if (fresh) {
-            m_library.adoptPropertyValues(values);
+            m_library.adoptPropertyValues(m_remembered.values(selected.connector, selected.wallpaperPath));
         }
     };
     if (!open.usable() || open.assetPath.isEmpty() || m_daemon.state() != DaemonClient::State::Ready) {
         draft();
         return;
     }
-    // An Apply there links as it lands.
+    // An Apply there links as it lands; the pair's values are what it sent and any edit made since.
     const bool applying =
         m_apply == Progress::Working && m_applyOutput == connector && m_applyWallpaper == open.filePath;
     if (applying) {
-        draft(m_applyValues);
+        draft();
         return;
     }
     const DaemonStatus& status = m_daemon.status();
@@ -483,6 +489,32 @@ void ApplyController::linkSelected()
     m_library.adoptPropertyValues(status.wallpapers.value(*id).properties);
     m_live = Live{++m_lastLiveId, open.filePath, open.type, open.assetPath, connector, *id, m_library.propertyValues()};
     emit liveChanged();
+}
+
+void ApplyController::remember(Refused refused)
+{
+    const Wallpaper open = m_library.selectedWallpaper();
+    const DraftFor selected{m_kscreen.selectedOutput(), open.filePath};
+    if (m_draftFor != selected || selected.connector.isEmpty() || !open.usable()) {
+        return;
+    }
+    QVariantMap changed = m_library.propertyValues();
+    QVariantMap defaults = open.defaultValues();
+    // Pause has no default in defaultValues(), which the daemon is sent; unpaused is its default here.
+    if (const QString paused = QString::fromLatin1(kPausedKey); open.accept(paused, false)) {
+        defaults.insert(paused, false);
+    }
+    changed.removeIf([&defaults](const QVariantMap::iterator& it) { return defaults.value(it.key()) == it.value(); });
+    if (refused == Refused::Keep) {
+        // Never in the controls, so they cannot say what it should be now.
+        const QVariantMap held = m_remembered.values(selected.connector, selected.wallpaperPath);
+        for (auto it = held.cbegin(); it != held.cend(); ++it) {
+            if (!changed.contains(it.key()) && !open.accept(it.key(), it.value())) {
+                changed.insert(it.key(), it.value());
+            }
+        }
+    }
+    m_remembered.remember(selected.connector, selected.wallpaperPath, changed);
 }
 
 void ApplyController::sendLive()

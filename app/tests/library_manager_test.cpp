@@ -498,7 +498,7 @@ void selectionAndValues(const QString& root) {
 
     // GOAL: S15.40 -- resetPropertyValues() puts every value back to its default, and says so.
     // CONTROL: app/library/library_manager.cpp, resetPropertyValues()'s `m_edits.clear();` made
-    //       `m_edits.remove(QStringLiteral("speed"));` (control_batch, re-run 2026-10-18) -> red, "S15.40: after a reset the values read {mute=false, position=cover, ..., tint=#ff0000,
+    //       `m_edits.remove(QStringLiteral("speed"));` (control_batch, re-run 2026-10-31) -> red, "S15.40: after a reset the values read {mute=false, position=cover, ..., tint=#ff0000,
     //       volume=1}"; restored.
     c.values = 0;
     m.resetPropertyValues();

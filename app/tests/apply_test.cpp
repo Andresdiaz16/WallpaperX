@@ -21,11 +21,16 @@
 #include "wpx_fixtures.h"
 
 #include <QCoreApplication>
+#include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QScopeGuard>
 #include <QTemporaryDir>
+
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -160,7 +165,7 @@ struct Rig {
         library = std::make_unique<LibraryManager>(lib, 30);
         client = std::make_unique<DaemonClient>(QDBusConnection::sessionBus(), daemonFake->service(), timeouts);
         plasma = std::make_unique<PlasmaController>(QDBusConnection::sessionBus(), shellFake->service(), plasmaTimeoutMs);
-        applier = std::make_unique<ApplyController>(*kscreen, *library, *client, *plasma);
+        startApplier();
         kscreen->refresh();
         library->rescan();
         client->refresh();
@@ -175,6 +180,14 @@ struct Rig {
             return QStringLiteral("DP-1 and ocean could not be selected");
         }
         return {};
+    }
+
+    QString rememberedPath() const { return scratch->path() + QStringLiteral("/screen-settings.json"); }
+    // A controller of its own on this rig's remembered-settings file; the one before it, if any, is
+    // destroyed first, which writes what it had due.
+    void startApplier() {
+        applier.reset();
+        applier = std::make_unique<ApplyController>(*kscreen, *library, *client, *plasma, rememberedPath());
     }
 
     // Applies and waits for it to finish; false if it never did.
@@ -1009,6 +1022,8 @@ void liveEdits() {
         return;
     }
     rig.library->select(rig.ocean);
+    // DP-1 remembers Ocean at speed 2 from S15.239; the edit below must change something.
+    rig.library->resetPropertyValues();
     rig.daemonFake->hold.insert(QStringLiteral("SetWallpaperWithProperties"));
     rig.applier->apply();
     const bool heldSet = waitUntil([&] { return !rig.daemonFake->held.isEmpty(); }, kWaitMs);
@@ -1999,7 +2014,7 @@ void selectedScreenEdits() {
     // WHY-THIS-SHAPE: DP-1 is paused first, so a Reset that kept Paused shows true and sends paused=true;
     //       HDMI-A-1 is paused behind the app, so a send reaching it would turn it off.
     // CONTROL: app/library/library_manager.cpp resetPropertyValues() made to keep `paused` in m_edits (control_batch
-    //       T6a, reverted) -> red, "D12-h: after Reset the switch shows 1 and sent [... paused=true ...]".
+    //       2026-10-31, reverted) -> red, "D12-h: after Reset the switch shows 1 and sent [], HDMI-A-1 paused 1".
     rig.library->setPropertyValue(pausedKey, true);
     quiet = rig.settled();
     d.calls.clear();
@@ -2046,12 +2061,16 @@ void selectedScreenEdits() {
            QStringLiteral("S15.995: Paused on River, shown nowhere, sent [%1] and the Apply sent [%2]; expected [] and paused=true to %3")
                .arg(joined(draftSent), joined(applySent), dp));
 
-    // GOAL: S15.1074 (D12-c) -- a screen that does not show the open wallpaper shows its declared defaults, coming from a
-    //       linked screen with other values and from another unlinked screen with a draft; nothing is sent.
+    // GOAL: S15.1074 (D12-c, D15) -- a screen that does not show the open wallpaper shows its declared defaults when the
+    //       wallpaper was never used there, and what it last had there otherwise, coming from a linked screen with other
+    //       values and from another unlinked screen with a draft; nothing is sent.
     // WHY-THIS-SHAPE: River is linked on DP-1 paused, and HDMI-A-1 then holds a speed-2 draft, so keeping either
-    //       screen's values is red; the defaults are River's own declared ones, compared as a whole map.
-    // CONTROL: app/daemon/apply_controller.cpp linkSelected()'s `fresh` made always false (control_batch T6a, reverted)
-    //       -> red, "D12-c: HDMI-A-1, coming from linked DP-1, showed {... paused=true ...}".
+    //       screen's values is red; the defaults are River's own declared ones, compared as a whole map. DP-1 last had
+    //       River paused, so it comes back paused at speed 1.
+    // CONTROL: app/daemon/apply_controller.cpp, control_batch 2026-10-28, each reverted: linkSelected()'s `fresh` made always false
+    //       -> red, "D12-c: HDMI-A-1, coming from linked DP-1, showed {paused=true(bool), ...}"; the draft adopting
+    //       `QVariantMap()` instead of the pair's remembered values -> red, "D12-c: ... DP-1, ... showed {position=cover(QString),
+    //       ..., speed=1(double), ...}" (no paused).
     const QVariantMap defaults = rig.library->selectedWallpaper().defaultValues();
     const auto shown = [&] { return rig.library->propertyValues(); };
     d.calls.clear();
@@ -2064,15 +2083,23 @@ void selectedScreenEdits() {
     rig.kscreen->select(dpName);
     quiet = rig.settled() && quiet;
     const QVariantMap fromDraft = shown();
-    expect(applied && quiet && read && fromLinked == defaults && fromDraft == defaults && rig.applier->liveOutput().isEmpty() && pausedCalls(d).isEmpty(),
+    QVariantMap dpHad = defaults;
+    dpHad.insert(pausedKey, true);
+    expect(applied && quiet && read && fromLinked == defaults && fromDraft == dpHad && rig.applier->liveOutput().isEmpty() && pausedCalls(d).isEmpty(),
            QStringLiteral("D12-c: HDMI-A-1, coming from linked DP-1, showed %1; DP-1, showing another file, coming from HDMI-A-1's "
-                          "draft, showed %2 (live \"%3\", sent [%4]); expected the defaults %5 both times and nothing sent")
-               .arg(describeMap(fromLinked), describeMap(fromDraft), rig.applier->liveOutput(), joined(pausedCalls(d)), describeMap(defaults)));
+                          "draft, showed %2 (live \"%3\", sent [%4]); expected the defaults %5, then %6, and nothing sent")
+               .arg(describeMap(fromLinked), describeMap(fromDraft), rig.applier->liveOutput(), joined(pausedCalls(d)), describeMap(defaults),
+                    describeMap(dpHad)));
 
     // GOAL: S15.1075 (D12-d; the KScreen-rename case is not graded here) -- a draft on an unlinked selected screen survives status reads and a failed Apply, and the next
-    //       Apply sends it; leaving the screen and coming back shows the defaults.
-    // CONTROL: app/daemon/apply_controller.cpp linkSelected()'s `fresh` made always true (control_batch T6a, reverted)
-    //       -> red, "D12-d: the draft speed 0.5 on DP-1 became 1 ...".
+    //       Apply sends it; leaving the screen and coming back shows the draft it had (D15).
+    // WHY-THIS-SHAPE: the draft survives a read twice over: linkSelected() keeps the controls for the same pair, and the
+    //       memory holds the draft anyway, so only a break of both shows here.
+    // CONTROL: app/daemon/apply_controller.cpp, control_batch 2026-10-28 (first break re-run 2026-10-31, held), each reverted:
+    //       `fresh` made always true AND remember()
+    //       recording an empty map -> red, "D12-d: the draft speed 0.5 on DP-1 became ..." (`fresh` always true alone is no
+    //       longer red); linkSelected()'s draft adopting `QVariantMap()` -> red, "D12-d: leaving DP-1's draft and coming back
+    //       showed {..., speed=1(double), ...} (unlinked 1); expected the draft {..., speed=2(double), ...}".
     rig.library->setPropertyValue(speedKey, 0.5);
     read = rig.reread() && rig.reread();
     d.refuse.insert(QStringLiteral("SetWallpaperWithProperties"), {QStringLiteral("org.freedesktop.DBus.Error.InvalidArgs"), QStringLiteral("no")});
@@ -2091,13 +2118,14 @@ void selectedScreenEdits() {
     d.screens[dp1].path = other;
     read = rig.reread() && rig.applier->liveOutput().isEmpty();
     rig.library->setPropertyValue(speedKey, 2.0);
+    const QVariantMap left = shown();
     rig.kscreen->select(hdmiName);
     quiet = rig.settled();
     rig.kscreen->select(dpName);
     quiet = rig.settled() && quiet;
-    expect(read && quiet && shown() == defaults,
-           QStringLiteral("D12-d: leaving DP-1's draft and coming back showed %1 (unlinked %2); expected the defaults %3")
-               .arg(describeMap(shown())).arg(read).arg(describeMap(defaults)));
+    expect(read && quiet && left != defaults && shown() == left,
+           QStringLiteral("D12-d: leaving DP-1's draft and coming back showed %1 (unlinked %2); expected the draft %3")
+               .arg(describeMap(shown())).arg(read).arg(describeMap(left)));
 }
 
 // Puts Ocean Waves on DP-1 at 2x and HDMI-A-1 at 0.5x, then selects DP-1 and links it; false on a harness fault.
@@ -2208,11 +2236,13 @@ void linkHandOver() {
 
     // GOAL: S15.1015 -- no link forms from a read during this app's own Apply of the open wallpaper to the selected
     //       screen, so the edits made meanwhile are not replaced, and they reach the screen once the Apply lands.
-    //       D12-e -- HDMI-A-1's link ended above, so the Apply carries the defaults (volume 1), not 0.4.
+    //       D15 -- HDMI-A-1's link ended above, so the Apply carries what Ocean last had there (volume 0.4).
     // WHY-THIS-SHAPE: the Apply's SetWallpaperWithProperties is held, and the stand-in shows Ocean on HDMI-A-1 from
     //       its arrival, so the read provably shows the wallpaper there while the Apply runs.
-    // CONTROL: app/daemon/apply_controller.cpp linkSelected()'s `if (applying) {` made `if (false) {` (control_batch T6a,
-    //       reverted) -> red, "S15.1015: a read during this app's Apply of Ocean to HDMI-A-1 (held 1, read 1) linked \"HDMI-A-1\" ...".
+    // CONTROL: app/daemon/apply_controller.cpp, control_batch 2026-10-28, each reverted: linkSelected()'s `if (applying) {` made
+    //       `if (false) {` -> red, "S15.1015: a read during this app's Apply of Ocean to HDMI-A-1 (held 1, read 1) linked
+    //       \"HDMI-A-1\" and showed volume 0.4 ..."; the draft adopting `QVariantMap()` instead of the pair's remembered
+    //       values -> red, "S15.1015: the Apply to HDMI-A-1 ... sent [... SetWallpaperWithProperties 1 volume=1] ...".
     d.calls.clear();
     d.hold.insert(QStringLiteral("SetWallpaperWithProperties"));
     rig.applier->apply();
@@ -2228,7 +2258,7 @@ void linkHandOver() {
            QStringLiteral("S15.1015: a read during this app's Apply of Ocean to HDMI-A-1 (held %1, read %2) linked \"%3\" and showed "
                           "volume %4; expected \"\" and the 0.9 set meanwhile").arg(applyHeld).arg(readDuring).arg(liveApplying).arg(volumeApplying));
     const QStringList applied{QStringLiteral("SetWallpaperProperties %1 volume=0.9").arg(hd),
-                              QStringLiteral("SetWallpaperWithProperties %1 volume=1").arg(hd)};
+                              QStringLiteral("SetWallpaperWithProperties %1 volume=0.4").arg(hd)};
     expect(landed && live() == hdmiName && volumeCalls() == applied,
            QStringLiteral("S15.1015: the Apply to HDMI-A-1 with an edit made meanwhile sent [%1] and left live on \"%2\"; expected [%3]")
                .arg(joined(volumeCalls()), live(), joined(applied)));
@@ -2280,8 +2310,9 @@ void applyReturn() {
     //       DP-1 again shows the values the Apply sent, and an edit made then reaches DP-1 once the Apply lands.
     // WHY-THIS-SHAPE: the Apply's SetWallpaperWithProperties is held, so both selections provably land while it runs;
     //       the Apply sends DP-1's speed 2 and HDMI-A-1 holds 0.5, so carrying HDMI-A-1's values back is red, as is the defaults' speed 1.
-    // CONTROL: app/daemon/apply_controller.cpp linkSelected()'s `draft(m_applyValues);` made `draft();` (control_batch
-    //       T6a, reverted) -> red, "S15.1077: back on DP-1 during its Apply the controls showed speed 1 ...".
+    // CONTROL: app/daemon/apply_controller.cpp linkSelected()'s draft adopting `QVariantMap()` instead of the pair's
+    //       remembered values (control_batch 2026-10-28, reverted) -> red, "S15.1077: back on DP-1 during its Apply the controls
+    //       showed speed 1 ...".
     d.calls.clear();
     d.hold.insert(QStringLiteral("SetWallpaperWithProperties"));
     rig.applier->apply();
@@ -2555,16 +2586,16 @@ void liveFollowsStatus() {
 
     // GOAL: S15.1008 -- with DP-1 linked, a read showing another file, another type or nothing there empties
     //       liveOutput, and the next speed, volume and Paused edits send no SetWallpaper* call.
-    //       S15.1076 (D12-e) -- that read leaves the controls showing the wallpaper's declared defaults.
+    //       S15.1076 (D12-e, D15) -- that read leaves the controls showing what DP-1 last had, not the defaults.
     // WHY-THIS-SHAPE: each row relinks from GetStatus first, so every row starts linked at values other than the
     //       defaults (checked); "nothing sent" is read once every reply has been handled (settled).
     // CONTROL: control_batch 2026-10-28, each reverted, app/daemon/apply_controller.cpp: followStatus()'s unlink
     //       made `if (false && ...)` -> red, "S15.1008: with DP-1 showing another file, speed, volume and Paused edits sent
     //       [SetWallpaperProperties 0,SetWallpaperProperties 0]" (every row); showing() without its path test -> red, "... showing another file, the read
     //       left live on "DP-1""; without its type test -> red, "... showing another type, ..."; returning the id when the
-    //       monitor shows nothing -> red, "... showing nothing, ..."; unlink()'s `m_draftFor.reset();` deleted
-    //       (control_batch T6a; re-run T7a with the draft keyed on screen and wallpaper, reverted) -> red, all three
-    //       rows, "D12-e: with DP-1 showing another file, the read left the controls at {... speed=2 ...}".
+    //       monitor shows nothing -> red, "... showing nothing, ..."; linkSelected()'s draft adopting `QVariantMap()`
+    //       instead of the pair's remembered values (control_batch 2026-10-28, reverted) -> red, all three rows, "D12-e: with DP-1
+    //       showing another file, the read left the controls at {..., speed=1(double), ...} (linked at {..., speed=2(double), ...".
     // COVERAGE-ASSERT: all three rows graded.
     struct Row {
         const char* what;
@@ -2591,8 +2622,8 @@ void liveFollowsStatus() {
         const QVariantMap kept = rig.library->propertyValues();
         expect(read && after.isEmpty(), QStringLiteral("S15.1008: with DP-1 showing %1, the read left live on \"%2\" (read %3); expected \"\"")
                                              .arg(QLatin1StringView(row.what), after).arg(read));
-        expect(read && before != defaults && kept == defaults,
-               QStringLiteral("D12-e: with DP-1 showing %1, the read left the controls at %2 (linked at %3); expected the defaults %4")
+        expect(read && before != defaults && kept == before,
+               QStringLiteral("D12-e: with DP-1 showing %1, the read left the controls at %2 (linked at %3, defaults %4); expected the linked values")
                    .arg(QLatin1StringView(row.what), describeMap(kept), describeMap(before), describeMap(defaults)));
         d.calls.clear();
         const bool edited = rig.library->setPropertyValue(speedKey, 0.5) && rig.library->setPropertyValue(volumeKey, 0.25);
@@ -2606,7 +2637,7 @@ void liveFollowsStatus() {
     expect(graded == 3, QStringLiteral("S15.1008: %1 of 3 rows graded").arg(graded));
 
     // GOAL: S15.1009 -- edits made while unlinked stay through a later read, and the next Apply sends them.
-    // CONTROL: control_batch 2026-10-28, reverted: app/daemon/apply_controller.cpp linkSelected() calling
+    // CONTROL: control_batch 2026-10-31, reverted: app/daemon/apply_controller.cpp linkSelected() calling
     //       m_library.resetPropertyValues() after its unlink() -> red, "S15.1009: after another read while unlinked ..."
     //       and (separate run, same break) "S15.1009: the Apply after the unlinked edits sent ...".
     const bool readAgain = rig.reread();
@@ -2618,7 +2649,7 @@ void liveFollowsStatus() {
     const bool applied = rig.apply() && rig.applier->applyState() == Progress::Done && rig.settled();
     const auto applies = rig.sent("SetWallpaperWithProperties");
     const QVariantMap applySent = applies.isEmpty() ? QVariantMap() : applies.back().args.value(3).toMap();
-    // D12-e: the defaults the link ended at, plus the edits made after.
+    // The values the link ended at, plus the edits made after; they differ from the defaults only in keys the edits set.
     QVariantMap wantSent = rig.library->selectedWallpaper().defaultValues();
     wantSent.insert(speedKey, 0.5);
     wantSent.insert(volumeKey, 0.25);
@@ -3592,6 +3623,554 @@ void frameRateSetters() {
 
 } // namespace
 
+// ---- settings remembered per screen and wallpaper (D15) --------------------------------------
+
+// The remembered-settings file as JSON; empty with `why` set when it is missing or not an object.
+QJsonObject readRemembered(const QString& path, QString& why) {
+    QFile in(path);
+    if (!in.open(QIODevice::ReadOnly)) {
+        why = QStringLiteral("it could not be opened: ") + in.errorString();
+        return {};
+    }
+    QJsonParseError error;
+    const QJsonDocument doc = QJsonDocument::fromJson(in.readAll(), &error);
+    if (!doc.isObject()) {
+        why = QStringLiteral("it is not a JSON object: ") + error.errorString();
+        return {};
+    }
+    why.clear();
+    return doc.object();
+}
+
+QString describeJson(const QJsonObject& json) {
+    return QString::fromUtf8(QJsonDocument(json).toJson(QJsonDocument::Compact));
+}
+
+void rememberedSettings() {
+    constexpr const char* goals = "S15.1192-S15.1200";
+    Rig rig;
+    if (!build(rig, goals, QStringLiteral("remembered"))) {
+        return;
+    }
+    FakeDaemon& d = *rig.daemonFake;
+    const QString dpName = QStringLiteral("DP-1");
+    const QString hdmiName = QStringLiteral("HDMI-A-1");
+    const QString speedKey = QStringLiteral("speed");
+    const QString pausedKey = QStringLiteral("paused");
+    const QString tintKey = QStringLiteral("tint");
+    const auto shown = [&] { return rig.library->propertyValues(); };
+    const auto live = [&] { return rig.applier->liveOutput(); };
+    // Selects HDMI-A-1 and then DP-1, so DP-1's values are read afresh for the open wallpaper.
+    const auto reselectDp = [&] {
+        rig.kscreen->select(hdmiName);
+        bool quiet = rig.settled();
+        rig.kscreen->select(dpName);
+        return rig.settled() && quiet;
+    };
+    const QVariantMap oceanDefaults = rig.library->selectedWallpaper().defaultValues();
+
+    // Ocean on DP-1 paused at 2x, then River applied over it.
+    rig.library->setPropertyValue(speedKey, 2.0);
+    rig.library->setPropertyValue(pausedKey, true);
+    const bool oceanOn = rig.apply() && rig.applier->applyState() == Progress::Done && rig.settled();
+    const bool riverOver = rig.library->select(rig.river) && rig.apply() && rig.applier->applyState() == Progress::Done &&
+                           rig.settled() && live() == dpName;
+    const int dp1 = d.outputs.value(dpName, -1);
+    if (!oceanOn || !riverOver || dp1 < 0 || oceanDefaults.isEmpty() || oceanDefaults.contains(pausedKey) ||
+        oceanDefaults.value(speedKey).toDouble() != 1.0) {
+        harnessFailure(std::string(goals) + ": Ocean Waves, then River, could not be put on DP-1 to start from (Ocean " +
+                       std::to_string(oceanOn) + ", River " + std::to_string(riverOver) + "): " +
+                       rig.applier->applyMessage().toStdString());
+        return;
+    }
+    QVariantMap oceanHad = oceanDefaults;
+    oceanHad.insert(speedKey, 2.0);
+    oceanHad.insert(pausedKey, true);
+
+    // GOAL: S15.1192 (D15-a) -- with DP-1 now showing River, opening Ocean again shows what Ocean last had on DP-1
+    //       (paused, 2x), and the next Apply sends exactly that.
+    // WHY-THIS-SHAPE: opening a wallpaper clears the library's edits, so the paused 2x can only come from the memory;
+    //       the sent map is compared whole, so a default leaking in is red as well as a value missing.
+    // CONTROL: app/daemon/apply_controller.cpp linkSelected()'s draft adopting `QVariantMap()` instead of the pair's
+    //       remembered values (control_batch 2026-10-28, reverted) -> red, "S15.1192: with DP-1 showing River, opening Ocean showed
+    //       {..., speed=1(double), ...}" and "S15.1192: the Apply of Ocean back to DP-1 sent {..., speed=1(double), ...}".
+    bool quiet = rig.library->select(rig.ocean) && rig.settled();
+    const QVariantMap fromOther = shown();
+    d.calls.clear();
+    const bool reapplied = rig.apply() && rig.applier->applyState() == Progress::Done && rig.settled();
+    const auto applies = rig.sent("SetWallpaperWithProperties");
+    const QVariantMap applySent = applies.isEmpty() ? QVariantMap() : applies.back().args.value(3).toMap();
+    expect(quiet && fromOther == oceanHad,
+           QStringLiteral("S15.1192: with DP-1 showing River, opening Ocean showed %1; expected what it last had there, %2")
+               .arg(describeMap(fromOther), describeMap(oceanHad)));
+    expect(reapplied && applies.size() == 1 && describeMap(applySent) == describeMap(oceanHad),
+           QStringLiteral("S15.1192: the Apply of Ocean back to DP-1 sent %1 in %2 call(s) (applied %3); expected %4")
+               .arg(describeMap(applySent)).arg(applies.size()).arg(reapplied).arg(describeMap(oceanHad)));
+
+    // GOAL: S15.1192 (D15-a) -- with DP-1 showing nothing, opening Ocean again shows what it last had there.
+    // CONTROL: the same break, same run -> red, "S15.1192: with DP-1 showing nothing (unlinked 1), opening Ocean again showed
+    //       {..., speed=1(double), ...}".
+    d.screens.remove(dp1);
+    d.wallpapers.remove(dp1);
+    const bool emptied = rig.reread() && live().isEmpty();
+    quiet = rig.library->select(rig.river) && rig.settled() && rig.library->select(rig.ocean) && rig.settled();
+    const QVariantMap fromNothing = shown();
+    expect(emptied && quiet && fromNothing == oceanHad,
+           QStringLiteral("S15.1192: with DP-1 showing nothing (unlinked %1), opening Ocean again showed %2; expected %3")
+               .arg(emptied).arg(describeMap(fromNothing), describeMap(oceanHad)));
+
+    // GOAL: S15.1193 (D15-b) -- on HDMI-A-1, where Ocean was never used, the controls show Ocean's declared defaults;
+    //       DP-1's paused 2x never appears.
+    // WHY-THIS-SHAPE: compared as a whole map against the wallpaper's own defaults, so any carried key is red.
+    // CONTROL: app/daemon/remembered_settings.cpp values() made to fall back to any screen's entry for the wallpaper
+    //       (control_batch 2026-10-28, reverted) -> red, "S15.1193: HDMI-A-1, where Ocean was never used, showed {..., paused=true(bool),
+    //       ..., speed=2(double), ...}".
+    rig.kscreen->select(hdmiName);
+    quiet = rig.settled();
+    const QVariantMap onHdmi = shown();
+    expect(quiet && onHdmi == oceanDefaults,
+           QStringLiteral("S15.1193: HDMI-A-1, where Ocean was never used, showed %1; expected its defaults %2")
+               .arg(describeMap(onHdmi), describeMap(oceanDefaults)));
+
+    // An edit on DP-1, then HDMI-A-1 selected at once (S15.1197, graded in the file below), then a tint set on DP-1
+    // and the controller destroyed straight after, so only its destruction can have written the tint.
+    rig.kscreen->select(dpName);
+    quiet = rig.settled();
+    const bool editDp = rig.library->setPropertyValue(speedKey, 0.5);
+    rig.kscreen->select(hdmiName);
+    const QVariantMap hdmiAfterEdit = shown();
+    quiet = rig.settled() && quiet;
+    rig.kscreen->select(dpName);
+    quiet = rig.settled() && quiet;
+    const bool tinted = rig.library->setPropertyValue(tintKey, QStringLiteral("#102030"));
+    QVariantMap dpHas = oceanDefaults;
+    dpHas.insert(speedKey, 0.5);
+    dpHas.insert(pausedKey, true);
+    dpHas.insert(tintKey, shown().value(tintKey));
+    const QVariantMap dpShown = shown();
+    const bool dpSetUp = editDp && tinted && quiet && live().isEmpty();
+    rig.applier.reset();
+    QString why;
+    const QJsonObject file = readRemembered(rig.rememberedPath(), why);
+    const QJsonObject wantFile{{dpName, QJsonObject{{rig.ocean, QJsonObject{{pausedKey, true}, {speedKey, 0.5},
+                                                                             {tintKey, dpHas.value(tintKey).toString()}}}}}};
+
+    // GOAL: S15.1197 (D15-f) -- an edit on DP-1 followed at once by selecting HDMI-A-1 is written under DP-1 only;
+    //       S15.1198 -- the file holds only values that differ from Ocean's defaults; S15.1194 (D15-c) -- destroying
+    //       the controller writes an edit made less than the save delay before.
+    // WHY-THIS-SHAPE: the file is compared whole, so an HDMI-A-1 entry, a default value, or a missing tint is each red;
+    //       the tint is set with no event loop run before the destruction, so the one-second save cannot have written it.
+    // CONTROL: control_batch 2026-10-28, each reverted, each red with "S15.1197/S15.1198/S15.1194: ...": app/daemon/apply_controller.cpp
+    //       linkSelected()'s `fresh` made always false (HDMI-A-1 shows DP-1's speed 0.5); remember()'s `changed.removeIf(...)`
+    //       deleted (the file holds "mute":true, "position":"cover", ...; re-run control_batch 2026-10-31, held); app/daemon/remembered_settings.cpp's destructor
+    //       save deleted (the file lacks the tint). remember()'s `m_draftFor != selected` test deleted is NOT red here: a
+    //       selection change adopts the new pair's values before anything is recorded (it is red in S15.1194 below).
+    if (!dpSetUp) {
+        harnessFailure(std::string(goals) + ": DP-1 could not be given speed 0.5 and a tint, unlinked, to start the file checks from");
+        return;
+    }
+    expect(why.isEmpty() && file == wantFile && hdmiAfterEdit == oceanDefaults && dpShown == dpHas,
+           QStringLiteral("S15.1197/S15.1198/S15.1194: after an edit on DP-1, HDMI-A-1 selected at once (showing %1), and a tint set "
+                          "just before the controller was destroyed (DP-1 showing %2), the file holds %3 (%4); expected exactly %5")
+               .arg(describeMap(hdmiAfterEdit), describeMap(dpShown), describeJson(file), why, describeJson(wantFile)));
+
+    // GOAL: S15.1194 (D15-c) -- a controller built again on the same file shows what DP-1 last had for Ocean.
+    // WHY-THIS-SHAPE: the controls are reset to the defaults before the new controller reads anything, and DP-1 is reached
+    //       through HDMI-A-1, so the values can only come from the file.
+    // CONTROL: control_batch 2026-10-28 (the remember() break re-run 2026-10-31, held), each reverted -> red, "S15.1194: after
+    //       the controller was built again, DP-1 showed
+    //       {..., speed=1(double), ...}": app/daemon/remembered_settings.cpp's constructor never opening the file; and
+    //       app/daemon/apply_controller.cpp remember()'s `m_draftFor != selected` test deleted (the new controller then
+    //       records the reset under DP-1 before any selection has made the controls DP-1's).
+    rig.startApplier();
+    rig.library->resetPropertyValues();
+    const bool backToDefaults = shown() == oceanDefaults;
+    quiet = reselectDp();
+    expect(backToDefaults && quiet && shown() == dpHas,
+           QStringLiteral("S15.1194: after the controller was built again, DP-1 showed %1 for Ocean (reset first %2); expected %3")
+               .arg(describeMap(shown())).arg(backToDefaults).arg(describeMap(dpHas)));
+
+    // GOAL: S15.1195 (D15-d) -- Reset to defaults on DP-1 forgets the pair: coming back shows the defaults, the file no
+    //       longer holds it, and a controller built again shows the defaults too.
+    // WHY-THIS-SHAPE: DP-1 is left and re-entered after the Reset, so the controls cannot just be still showing it.
+    // CONTROL: app/daemon/remembered_settings.cpp remember()'s `if (changed.isEmpty())` branch made to return
+    //       without forgetting (control_batch 2026-10-28, re-run 2026-10-31, reverted) -> red, "S15.1195: after Reset on DP-1, coming back showed
+    //       {..., paused=true(bool), ..., speed=0.5(double), tint=#102030(QString), ...}".
+    rig.library->resetPropertyValues();
+    quiet = reselectDp();
+    const QVariantMap afterReset = shown();
+    rig.applier.reset();
+    const QJsonObject resetFile = readRemembered(rig.rememberedPath(), why);
+    const QString resetWhy = why;
+    rig.startApplier();
+    const bool restarted = rig.library->setPropertyValue(speedKey, 2.0) && reselectDp();
+    expect(quiet && restarted && afterReset == oceanDefaults && resetWhy.isEmpty() && resetFile.isEmpty() && shown() == oceanDefaults,
+           QStringLiteral("S15.1195: after Reset on DP-1, coming back showed %1; the file then held %2 (%3); built again, DP-1 "
+                          "showed %4; expected the defaults %5, {} and the defaults")
+               .arg(describeMap(afterReset), describeJson(resetFile), resetWhy, describeMap(shown()), describeMap(oceanDefaults)));
+
+    // River on DP-1 at 0.5x, remembered; then Ocean opened, so River's values come back only from the memory.
+    const QString lib = QFileInfo(rig.ocean).path();
+    const bool riverSet = rig.library->select(rig.river) && rig.settled() && rig.library->setPropertyValue(speedKey, 0.5) &&
+                          rig.library->select(rig.ocean) && rig.settled();
+    const auto riverSpeed = [&] {
+        const bool opened = rig.library->select(rig.river) && rig.settled();
+        const double speed = opened ? shown().value(speedKey).toDouble() : -1;
+        return rig.library->select(rig.ocean) && rig.settled() ? speed : -1;
+    };
+    const auto rescanUntil = [&](const std::function<bool()>& done) {
+        rig.library->rescan();
+        return waitUntil(done, kWaitMs);
+    };
+    const auto readyWith = [&](qsizetype n) {
+        return [&rig, n] { return rig.library->state() == LibraryManager::State::Ready && rig.library->wallpapers().size() == n; };
+    };
+    if (!riverSet) {
+        harnessFailure(std::string(goals) + ": River could not be given speed 0.5 on DP-1 to start the library checks from");
+        return;
+    }
+    // Reading it back is the memory's own behaviour (S15.1192), so a miss is the app's, and S15.1196 cannot be graded.
+    if (const double first = riverSpeed(); first != 0.5) {
+        expect(false, QStringLiteral("S15.1192: River set to speed 0.5 on DP-1 came back at %1 after opening Ocean and River again").arg(first));
+        notVerified("S15.1196", "River's speed on DP-1 was not remembered to begin with");
+        return;
+    }
+
+    // GOAL: S15.1196 (D15-e) -- a library scan that could not read the folder forgets nothing: River comes back at 0.5x.
+    // WHY-THIS-SHAPE: the folder is made unreadable, which the library reports as Unavailable with no wallpapers, the list
+    //       a forgetting scan would act on; a run that can still read it (root) cannot grade this and says so.
+    // CONTROL: forgetting reintroduced (control_batch 2026-10-31, reverted): app/daemon/apply_controller.cpp connects
+    //       wallpapersChanged to a new app/daemon/remembered_settings.cpp keepOnly() of the listed paths, with no
+    //       state() check -> red, "S15.1196: after a scan that could not read the library, River on DP-1 showed speed 1;
+    //       expected the 0.5 it had".
+    if (::geteuid() == 0) {
+        notVerified("S15.1196 (an unreadable library forgets nothing)", "running as root, which can list a mode-000 folder");
+    } else if (!QFile::setPermissions(lib, QFileDevice::Permissions())) {
+        harnessFailure(std::string(goals) + ": the library folder could not be made mode 000");
+        return;
+    } else {
+        const auto ownerOnly = QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner;
+        bool restored = false;
+        // Every way out of this block, an exception included, leaves the folder readable, so the scratch dir can be removed.
+        // CONTROL: test side, by hand, 2026-10-31, reverted: the explicit restore aimed at a missing path -> the harness
+        //       failure naming the folder, and no mode-000 folder left; the guard's aimed there too -> also "... is left
+        //       mode 000; remove it by hand", and the folder was found mode 000 after the run.
+        const auto readableAgain = qScopeGuard([&] {
+            if (!restored && !QFile::setPermissions(lib, ownerOnly)) {
+                harnessFailure(std::string(goals) + ": the library folder " + lib.toStdString() +
+                               " is left mode 000; remove it by hand");
+            }
+        });
+        const bool unreadable = rescanUntil([&] { return rig.library->state() == LibraryManager::State::Unavailable; });
+        restored = QFile::setPermissions(lib, ownerOnly);
+        const bool back = restored && rescanUntil(readyWith(3));
+        if (!restored || !back) {
+            harnessFailure(std::string(goals) + ": the library folder " + lib.toStdString() +
+                           " could not be made readable again and listed (made readable " + std::to_string(restored) + ")");
+            return;
+        }
+        if (!unreadable) {
+            notVerified("S15.1196 (an unreadable library forgets nothing)", "a mode-000 library folder was still listed");
+        } else {
+            const double speed = riverSpeed();
+            expect(speed == 0.5, QStringLiteral("S15.1196: after a scan that could not read the library, River on DP-1 showed speed %1; "
+                                                "expected the 0.5 it had").arg(speed));
+        }
+    }
+
+    // GOAL: S15.1196 (D15-e) -- a wallpaper missing from a scan that finished normally is not forgotten: River, taken out
+    //       of the library and put back under the same path, comes back at 0.5x on DP-1.
+    // WHY-THIS-SHAPE: renamed out and back under the same path, so only a forgetting keyed on the scan's list can lose it;
+    //       the unreadable case above cannot stand in, since a forgetting that waits for a Ready scan passes it.
+    // CONTROL: the same reintroduced forgetting, but only on a Ready scan (control_batch 2026-10-31, reverted) -> red, "S15.1196:
+    //       River, taken out of the library and put back, showed speed 1 on DP-1; expected the 0.5 it had", while the
+    //       unreadable check above stayed green.
+    const QString away = rig.scratch->path() + QStringLiteral("/river-away");
+    const bool out = QDir().rename(rig.river, away) && rescanUntil(readyWith(2));
+    const bool in = QDir().rename(away, rig.river) && rescanUntil(readyWith(3));
+    if (!out || !in) {
+        harnessFailure(std::string(goals) + ": River could not be taken out of the library and put back (out " + std::to_string(out) +
+                       ", in " + std::to_string(in) + ")");
+        return;
+    }
+    const double putBack = riverSpeed();
+    expect(putBack == 0.5, QStringLiteral("S15.1196: River, taken out of the library and put back, showed speed %1 on DP-1; "
+                                          "expected the 0.5 it had").arg(putBack));
+
+    // GOAL: S15.1199 -- a corrupt file is survived: a warning names it, the pairs start from the defaults, and the next
+    //       change replaces it with a readable file.
+    // WHY-THIS-SHAPE: the corrupt text is a valid entry for DP-1 cut short by one brace, so a reader that recovered part
+    //       of it would show speed 2.
+    // CONTROL: harness side, by hand, 2026-10-28, reverted: the brace put back -> red, "S15.1199: built on a corrupt file, the
+    //       controller warned [], DP-1 showed {..., speed=2(double), ...}". Production, control_batch 2026-10-28, each reverted, in
+    //       app/daemon/remembered_settings.cpp: the "is not a settings file" qWarning deleted -> red, "S15.1199: ... warned []
+    //       ..."; the destructor's save deleted -> red, the corrupt file never replaced.
+    rig.applier.reset();
+    const QByteArray whole = QJsonDocument(QJsonObject{{dpName, QJsonObject{{rig.ocean, QJsonObject{{speedKey, 2}}}}}})
+                                 .toJson(QJsonDocument::Compact);
+    if (!writeBytes(rig.rememberedPath(), whole.chopped(1))) {
+        harnessFailure(std::string(goals) + ": the corrupt settings file could not be written");
+        return;
+    }
+    QStringList warned;
+    {
+        const WarningLog log;
+        rig.startApplier();
+        warned = log.containing(rig.rememberedPath());
+    }
+    quiet = reselectDp();
+    const QVariantMap fromCorrupt = shown();
+    const bool changed = rig.library->setPropertyValue(speedKey, 0.5);
+    rig.applier.reset();
+    const QJsonObject rewritten = readRemembered(rig.rememberedPath(), why);
+    const QJsonObject wantRewritten{{dpName, QJsonObject{{rig.ocean, QJsonObject{{speedKey, 0.5}}}}}};
+    expect(quiet && warned.size() == 1 && fromCorrupt == oceanDefaults && changed && why.isEmpty() && rewritten == wantRewritten,
+           QStringLiteral("S15.1199: built on a corrupt file, the controller warned [%1], DP-1 showed %2 for Ocean, and after an edit "
+                          "the file held %3 (%4); expected one warning naming it, the defaults %5, then %6")
+               .arg(warned.join(u" | "), describeMap(fromCorrupt), describeJson(rewritten), why, describeMap(oceanDefaults),
+                    describeJson(wantRewritten)));
+
+    // Ocean on HDMI-A-1, never used there and not showing there, paused; leaving and coming back must show it paused,
+    // so the pause provably reached the memory before it is undone.
+    rig.startApplier();
+    const auto reselectHdmi = [&] {
+        rig.kscreen->select(dpName);
+        bool settledDp = rig.settled();
+        rig.kscreen->select(hdmiName);
+        return rig.settled() && settledDp;
+    };
+    QVariantMap hdmiPaused = oceanDefaults;
+    hdmiPaused.insert(pausedKey, true);
+    const bool onHdmiFresh = reselectHdmi() && live().isEmpty() && shown() == oceanDefaults;
+    const bool pausedOnHdmi = onHdmiFresh && rig.library->setPropertyValue(pausedKey, true) && reselectHdmi() &&
+                              shown() == hdmiPaused;
+    if (!pausedOnHdmi) {
+        harnessFailure(std::string(goals) + ": Ocean could not be paused on HDMI-A-1, unlinked, and seen paused on coming back "
+                       "(fresh " + std::to_string(onHdmiFresh) + "), to start the unpause check from; showing " +
+                       describeMap(shown()).toStdString());
+        return;
+    }
+
+    // GOAL: S15.1200 (D16) -- pausing Ocean on HDMI-A-1 and unpausing it, every other control at its default, leaves no
+    //       entry: coming back shows exactly the defaults (no `paused` key), the file holds no HDMI-A-1, and a controller
+    //       built again shows the defaults.
+    // WHY-THIS-SHAPE: Ocean's defaults carry no `paused`, so a stored `paused:false` shows up as an extra key in the whole-map
+    //       compare; checking only `shown().value(paused) == false` would pass with the entry kept. The file is compared
+    //       whole against the DP-1-only content S15.1199 left, so any HDMI-A-1 entry is red.
+    // CONTROL: app/daemon/apply_controller.cpp remember()'s `defaults.insert(paused, false)` removed (control_batch 2026-10-31,
+    //       reverted) -> red, "S15.1200: after pausing and unpausing Ocean on HDMI-A-1, coming back showed {...,
+    //       paused=false(bool), ...}; the file held {..., "HDMI-A-1":{...ocean:{"paused":false}}}".
+    const bool unpaused = rig.library->setPropertyValue(pausedKey, false);
+    quiet = reselectHdmi();
+    const QVariantMap afterUnpause = shown();
+    rig.applier.reset();
+    const QJsonObject unpausedFile = readRemembered(rig.rememberedPath(), why);
+    const QString unpausedWhy = why;
+    rig.startApplier();
+    rig.library->resetPropertyValues();
+    const bool rebuilt = reselectHdmi();
+    const QVariantMap rebuiltShown = shown();
+    expect(unpaused && quiet && rebuilt && afterUnpause == oceanDefaults && unpausedWhy.isEmpty() &&
+               unpausedFile == wantRewritten && rebuiltShown == oceanDefaults,
+           QStringLiteral("S15.1200: after pausing and unpausing Ocean on HDMI-A-1, coming back showed %1; the file held %2 (%3); "
+                          "built again, HDMI-A-1 showed %4; expected the defaults %5, %6 and the defaults")
+               .arg(describeMap(afterUnpause), describeJson(unpausedFile), unpausedWhy, describeMap(rebuiltShown),
+                    describeMap(oceanDefaults), describeJson(wantRewritten)));
+}
+
+// ---- remembered values the open wallpaper refuses (D17) --------------------------------------
+
+void refusedValues() {
+    constexpr const char* goals = "S15.1201-S15.1205";
+    Rig rig;
+    if (!build(rig, goals, QStringLiteral("refused"))) {
+        return;
+    }
+    FakeDaemon& d = *rig.daemonFake;
+    const QString dpName = QStringLiteral("DP-1");
+    const QString hdmiName = QStringLiteral("HDMI-A-1");
+    const QString speedKey = QStringLiteral("speed");
+    const QString tintKey = QStringLiteral("tint");
+    const QString muteKey = QStringLiteral("mute");
+    const QString oldTint = QStringLiteral("#102030");
+    const QString newTint = QStringLiteral("#405060");
+    const auto shown = [&] { return rig.library->propertyValues(); };
+    const auto live = [&] { return rig.applier->liveOutput(); };
+    const auto reselectDp = [&] {
+        rig.kscreen->select(hdmiName);
+        bool quiet = rig.settled();
+        rig.kscreen->select(dpName);
+        return rig.settled() && quiet;
+    };
+    // The file holding `entry` for Ocean on DP-1 alone, or nothing at all for an empty entry.
+    const auto oceanOnDp = [&](const QJsonObject& entry) {
+        return entry.isEmpty() ? QJsonObject() : QJsonObject{{dpName, QJsonObject{{rig.ocean, entry}}}};
+    };
+    // A controller built on a file holding `entry` for Ocean on DP-1; DP-1 is not yet selected through it.
+    const auto seed = [&](const QJsonObject& entry) {
+        rig.applier.reset();
+        const bool written = writeBytes(rig.rememberedPath(), QJsonDocument(oceanOnDp(entry)).toJson(QJsonDocument::Compact));
+        rig.startApplier();
+        return written;
+    };
+    // What the file holds once the controller is destroyed (which writes what it had due); a new one is built after.
+    QString why;
+    const auto fileNow = [&] {
+        rig.applier.reset();
+        const QJsonObject file = readRemembered(rig.rememberedPath(), why);
+        rig.startApplier();
+        return file;
+    };
+    const Wallpaper ocean = rig.library->selectedWallpaper();
+    const QVariantMap oceanDefaults = ocean.defaultValues();
+    if (ocean.filePath != rig.ocean || ocean.accept(speedKey, 3.0) || !ocean.accept(speedKey, 0.5) ||
+        oceanDefaults.value(speedKey).toDouble() != 1.0 || !oceanDefaults.value(muteKey).toBool() || !live().isEmpty()) {
+        harnessFailure(std::string(goals) + ": Ocean, unlinked on DP-1, must take speeds up to 2 only, at 1 and muted by default, "
+                       "to start from; it has " + describeMap(oceanDefaults).toStdString());
+        return;
+    }
+    const QJsonObject refusedAndTint{{speedKey, 3.0}, {tintKey, oldTint}};
+
+    // GOAL: S15.1201 (D17) -- a remembered value Ocean refuses (speed 3, its range being 0.1-2) stays in the file after the
+    //       pair is viewed from a draft, and after an edit to other keys, which are rewritten from the controls.
+    // WHY-THIS-SHAPE: the file is seeded directly, the only way a value outside the manifest's range can be remembered;
+    //       it is compared whole, so a dropped speed, a stale tint or a missing mute are each red. Viewing alone is
+    //       graded first: the scope guard in linkSelected() records on every view, edit or not.
+    // CONTROL: app/daemon/apply_controller.cpp remember()'s `if (refused == Refused::Keep)` made `if (false)` (control_batch
+    //       2026-10-31, reverted) -> red, "S15.1201: viewing Ocean on DP-1 (...) left the file {"DP-1":{".../ocean":
+    //       {"tint":"#102030"}}}" and "... edited ... the file held {"DP-1":{".../ocean":{"mute":false,"tint":"#405060"}}}".
+    const bool seeded = seed(refusedAndTint) && reselectDp();
+    QVariantMap viewed = oceanDefaults;
+    viewed.insert(tintKey, oldTint);
+    const QVariantMap viewedShown = shown();
+    if (!seeded || !live().isEmpty() || viewedShown != viewed) {
+        harnessFailure(std::string(goals) + ": Ocean on DP-1 could not be shown from a file holding speed 3 and a tint; showing " +
+                       describeMap(viewedShown).toStdString());
+        return;
+    }
+    const QJsonObject afterView = fileNow();
+    expect(why.isEmpty() && afterView == oceanOnDp(refusedAndTint),
+           QStringLiteral("S15.1201: viewing Ocean on DP-1 (showing %1) left the file %2 (%3); expected it unchanged, %4")
+               .arg(describeMap(viewedShown), describeJson(afterView), why, describeJson(oceanOnDp(refusedAndTint))));
+    const bool edited = reselectDp() && rig.library->setPropertyValue(tintKey, newTint) && rig.library->setPropertyValue(muteKey, false);
+    const QJsonObject wantEdited = oceanOnDp({{speedKey, 3.0}, {tintKey, newTint}, {muteKey, false}});
+    const QJsonObject afterEdit = fileNow();
+    expect(edited && why.isEmpty() && afterEdit == wantEdited,
+           QStringLiteral("S15.1201: after the tint and mute were edited on DP-1 (edited %1) the file held %2 (%3); expected %4")
+               .arg(edited).arg(describeJson(afterEdit), why, describeJson(wantEdited)));
+
+    // GOAL: S15.1202 (D17) -- setting a non-default value on the refused key replaces the refused value, in the file and
+    //       on coming back.
+    // WHY-THIS-SHAPE: the remembered 3 is still refused when the 0.5 is set, so only the "the controls hold this key"
+    //       test keeps the old value from being copied back over the edit.
+    // CONTROL: app/daemon/apply_controller.cpp remember()'s `!changed.contains(it.key()) &&` deleted (control_batch 2026-10-31,
+    //       reverted) -> red, "S15.1202: after speed 0.5 was set on DP-1 (set 1) the file held {...{"mute":false,"speed":3,...}}
+    //       (), and coming back showed speed 1".
+    const bool sped = reselectDp() && rig.library->setPropertyValue(speedKey, 0.5);
+    const QJsonObject wantSped = oceanOnDp({{speedKey, 0.5}, {tintKey, newTint}, {muteKey, false}});
+    const QJsonObject afterSpeed = fileNow();
+    const bool back = reselectDp();
+    const double speedBack = shown().value(speedKey).toDouble();
+    expect(sped && back && why.isEmpty() && afterSpeed == wantSped && speedBack == 0.5,
+           QStringLiteral("S15.1202: after speed 0.5 was set on DP-1 (set %1) the file held %2 (%3), and coming back showed speed %4; "
+                          "expected %5 and 0.5")
+               .arg(sped).arg(describeJson(afterSpeed), why).arg(speedBack).arg(describeJson(wantSped)));
+
+    // GOAL: S15.1203 (D17) -- Reset to defaults removes the whole entry, the refused value included: with a visible tint
+    //       beside it, and with nothing visible at all, when the controls were at their defaults already.
+    // WHY-THIS-SHAPE: the second row is the one only propertyValuesReset can serve: with the controls at their defaults
+    //       a Reset changes no value, so propertyValuesChanged never fires and nothing else would record it.
+    // CONTROL: control_batch 2026-10-31, each reverted -> red, both rows, "S15.1203: Reset on DP-1 ... left the file
+    //       {"DP-1":{".../ocean":{"speed":3}}}":
+    //       app/daemon/apply_controller.cpp's propertyValuesReset handler calling `remember()` (Keep) instead of
+    //       `remember(Refused::Forget)` (both rows); app/library/library_manager.cpp resetPropertyValues()'s
+    //       `emit propertyValuesReset();` deleted (both rows: with the tint, the change's own Keep record holds speed 3).
+    struct ResetRow {
+        const char* what;
+        QJsonObject entry;
+    };
+    int resetRows = 0;
+    for (const ResetRow& row : {ResetRow{"beside a tint", refusedAndTint}, ResetRow{"with the controls at their defaults", {{speedKey, 3.0}}}}) {
+        const bool ready = seed(row.entry) && reselectDp() && live().isEmpty();
+        if (!ready) {
+            harnessFailure(std::string(goals) + ": S15.1203 " + row.what + ": DP-1 could not be shown from the seeded file");
+            continue;
+        }
+        const QVariantMap before = shown();
+        rig.library->resetPropertyValues();
+        const QJsonObject afterReset = fileNow();
+        const bool returned = reselectDp();
+        ++resetRows;
+        expect(why.isEmpty() && afterReset.isEmpty() && returned && shown() == oceanDefaults,
+               QStringLiteral("S15.1203: Reset on DP-1 %1 (showing %2 before) left the file %3 (%4), and coming back showed %5; "
+                              "expected {} and the defaults")
+                   .arg(QLatin1StringView(row.what), describeMap(before), describeJson(afterReset), why, describeMap(shown())));
+    }
+    // COVERAGE-ASSERT: a row that could not be set up is reported above; this keeps the count visible.
+    expect(resetRows == 2, QStringLiteral("S15.1203: %1 of 2 rows graded").arg(resetRows));
+
+    // Ocean applied to DP-1 with the new tint, so the daemon's status shows it there; River opened, the file seeded with
+    // speed 3 and the old tint, and Ocean opened again, which links DP-1 from that status.
+    const bool applied = rig.library->setPropertyValue(tintKey, newTint) && rig.apply() &&
+                         rig.applier->applyState() == Progress::Done && rig.settled() && live() == dpName;
+    const bool linked = applied && rig.library->select(rig.river) && rig.settled() && seed(refusedAndTint) &&
+                        rig.library->select(rig.ocean) && rig.reread() && live() == dpName;
+    const QVariantMap fromStatus = shown();
+    const int dp1 = d.outputs.value(dpName, -1);
+    if (!linked || dp1 < 0 || fromStatus.value(speedKey).toDouble() != 1.0 || fromStatus.value(tintKey) != newTint) {
+        harnessFailure(std::string(goals) + ": Ocean could not be linked on DP-1 from the daemon's status (applied " +
+                       std::to_string(applied) + ", live \"" + live().toStdString() + "\"), showing " +
+                       describeMap(fromStatus).toStdString());
+        return;
+    }
+
+    // GOAL: S15.1201 (D17) -- when the controls take the daemon's status values, the refused speed 3 still stays in the
+    //       file, and the tint is rewritten from the status (#405060, replacing the remembered #102030).
+    // WHY-THIS-SHAPE: the status shows speed 1, the default, so the controls hold nothing for speed and only the Keep
+    //       copy can put the 3 back; the old tint in the seed makes a file left untouched red as well.
+    // CONTROL: the same `if (false)` break, same run -> red, "S15.1201: linked to Ocean on DP-1 from the daemon's status
+    //       (...), the file held {"DP-1":{".../ocean":{"tint":"#405060"}}}".
+    const QJsonObject wantLinked = oceanOnDp({{speedKey, 3.0}, {tintKey, newTint}});
+    QJsonObject afterLink;
+    {
+        // Destroying the controller writes the file and ends the link; the next one links again from the same status.
+        rig.applier.reset();
+        afterLink = readRemembered(rig.rememberedPath(), why);
+        rig.startApplier();
+    }
+    const bool relinked = rig.library->select(rig.river) && rig.settled() && rig.library->select(rig.ocean) && rig.settled() &&
+                          live() == dpName;
+    expect(why.isEmpty() && afterLink == wantLinked,
+           QStringLiteral("S15.1201: linked to Ocean on DP-1 from the daemon's status (showing %1), the file held %2 (%3); expected %4")
+               .arg(describeMap(fromStatus), describeJson(afterLink), why, describeJson(wantLinked)));
+    if (!relinked) {
+        harnessFailure(std::string(goals) + ": S15.1205: Ocean could not be linked on DP-1 again; live \"" + live().toStdString() + "\"");
+        return;
+    }
+
+    // GOAL: S15.1205 (D17) -- when a link ends with the same screen and wallpaper still selected, the controls keep what
+    //       they showed and the file keeps what it held.
+    // WHY-THIS-SHAPE: a speed edit is made while linked, so the controls hold a value of their own when the status says
+    //       DP-1 shows nothing; DP-1 and Ocean stay selected throughout, so only the link's end can change anything.
+    // CONTROL: app/daemon/apply_controller.cpp unlink() also calling `m_library.adoptPropertyValues({});` (control_batch
+    //       2026-10-31, reverted) -> red, "S15.1205: after DP-1's link ended (ended 1), ... the controls showed {...,
+    //       speed=1(double), tint=#ffffff(QString), ...}". Putting back the removed `m_draftFor.reset();` is NOT red here (control_batch 2026-10-31): the draft it
+    //       forces is adopted from the memory, which already holds exactly what the controls show.
+    const bool spedLinked = rig.library->setPropertyValue(speedKey, 0.5) && rig.settled();
+    const QVariantMap beforeEnd = shown();
+    d.screens.remove(dp1);
+    d.wallpapers.remove(dp1);
+    const bool ended = rig.reread() && live().isEmpty();
+    const QVariantMap afterEnd = shown();
+    const QJsonObject wantEnded = oceanOnDp({{speedKey, 0.5}, {tintKey, newTint}});
+    const QJsonObject endedFile = fileNow();
+    expect(spedLinked && ended && afterEnd == beforeEnd && beforeEnd.value(speedKey).toDouble() == 0.5 && why.isEmpty() &&
+               endedFile == wantEnded,
+           QStringLiteral("S15.1205: after DP-1's link ended (ended %1), Ocean and DP-1 still selected, the controls showed %2 "
+                          "(before %3) and the file held %4 (%5); expected them unchanged and %6")
+               .arg(ended).arg(describeMap(afterEnd), describeMap(beforeEnd), describeJson(endedFile), why, describeJson(wantEnded)));
+}
+
 int main(int argc, char* argv[]) {
     wallpaperx::testing::g_testName = "apply";
     if (const auto refused = refuseUnlessUnderDbusRunSession()) {
@@ -3641,6 +4220,8 @@ int main(int argc, char* argv[]) {
     runPhase("processorNotice", processorNotice);
     runPhase("refreshReporter", refreshReporter);
     runPhase("frameRateSetters", frameRateSetters);
+    runPhase("rememberedSettings", rememberedSettings);
+    runPhase("refusedValues", refusedValues);
 
     const bool failed = wallpaperx::testing::reportCheckFailures();
     const bool faulted = wallpaperx::testing::reportHarnessFaults("in this test file or its stand-ins, not in the app");

@@ -761,7 +761,7 @@ void positionControls(QQmlEngine& engine, QQuickWindow& window, const QString& s
     KScreenClient kscreen(dbusSource(QStringLiteral("io.wallpaperx.test.KScreen.unowned")));
     DaemonClient daemon(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.Daemon.unowned"));
     PlasmaController plasma(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.PlasmaShell.unowned"));
-    ApplyController applier(kscreen, library, daemon, plasma);
+    ApplyController applier(kscreen, library, daemon, plasma, scratchPath + QStringLiteral("/screen-settings.json"));
     library.rescan();
     if (!waitUntil([&] { return library.state() == LibraryManager::State::Ready && library.wallpapers().size() == 2; }, kWaitMs) ||
         !library.select(dir + QStringLiteral("/art"))) {
@@ -1047,7 +1047,8 @@ int main(int argc, char* argv[]) {
     KScreenClient kscreen(dbusSource(QStringLiteral("io.wallpaperx.test.KScreen.unowned")));
     DaemonClient daemon(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.Daemon.unowned"));
     PlasmaController plasma(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.PlasmaShell.unowned"));
-    auto applier = std::make_unique<ApplyController>(kscreen, *library, daemon, plasma);
+    auto applier = std::make_unique<ApplyController>(kscreen, *library, daemon, plasma,
+                                                     scratch.path() + QStringLiteral("/screen-settings.json"));
     library->rescan();
     if (!waitUntil([&] { return library->state() == LibraryManager::State::Ready && library->wallpapers().size() == 2; }, kWaitMs)) {
         expect(false, QStringLiteral("the library never listed its two wallpapers; state %1").arg(int(library->state())));
