@@ -22,6 +22,7 @@
 // still cannot be used, because it forces the software scene graph and the item imports only under
 // OpenGL. A host that has no OpenGL platform skips, with the reason named.
 
+#include "daemon/daemon_bus.h"
 #include "tests/qt_frame_reply.h"
 #include "tests/private_test_bus.h"
 #include "tests/test_report.h"
@@ -61,9 +62,9 @@ using wallpaperx::testing::FramePlane;
 using wallpaperx::testing::frameReplyFields;
 using wallpaperx::testing::notVerified;
 
-constexpr const char* kService = "io.wallpaperx.Daemon";
-constexpr const char* kPath = "/io/wallpaperx/Daemon";
-constexpr const char* kInterface = "io.wallpaperx.Daemon";
+constexpr const char* kService = wallpaperx::kDaemonBusName;
+constexpr const char* kPath = wallpaperx::kDaemonObjectPath;
+constexpr const char* kInterface = wallpaperx::kDaemonInterface;
 
 constexpr int kFrameWidth = 64;
 constexpr int kFrameHeight = 64;

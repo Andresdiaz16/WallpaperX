@@ -13,7 +13,8 @@
 
 namespace wallpaperx::testing {
 
-// main.qml's daemonOrigin. Not a test's choice: a stub anywhere else is never asked.
+// The daemon's port, where the plugin's config read asks. Not a test's choice: a stub anywhere else is
+// never asked. A literal rather than HttpServer::kDefaultPort, so a change to that constant shows here.
 inline constexpr int kDaemonPort = 18462;
 
 // Binds `server` to 127.0.0.1:kDaemonPort with SO_REUSEADDR, as the daemon's own HttpServer sets.

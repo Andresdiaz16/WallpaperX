@@ -32,6 +32,7 @@
 // the plugin sends nothing at all in that case, by design, and a run that graded it would be
 // grading the host.
 
+#include "daemon/daemon_bus.h"
 #include "kde/frame_import.h"
 #include "tests/qt_frame_reply.h"
 #include "tests/private_test_bus.h"
@@ -71,9 +72,9 @@ using wallpaperx::testing::FramePlane;
 using wallpaperx::testing::frameReplyFields;
 using wallpaperx::testing::notVerified;
 
-constexpr const char* kService = "io.wallpaperx.Daemon";
-constexpr const char* kPath = "/io/wallpaperx/Daemon";
-constexpr const char* kInterface = "io.wallpaperx.Daemon";
+constexpr const char* kService = wallpaperx::kDaemonBusName;
+constexpr const char* kPath = wallpaperx::kDaemonObjectPath;
+constexpr const char* kInterface = wallpaperx::kDaemonInterface;
 
 constexpr int kFrameWidth = 64;
 constexpr int kFrameHeight = 64;

@@ -114,8 +114,21 @@ public:
                 if (m_holding) {
                     const int ticket = ++m_held;
                     m_changed.notify_all();
-                    // Bounded, so a phase that never releases cannot wedge the server's stop.
-                    m_changed.wait_for(lock, std::chrono::seconds(20), [&] { return !m_holding || m_released >= ticket; });
+                    // Bounded, so a phase that never releases cannot wedge the server's stop. Running
+                    // out is harness trouble, not a release: answered 503, counted, said on stderr, and
+                    // each holding phase then reports NOT VERIFIED rather than grading the 503.
+                    // CONTROL: test-side, control_batch.sh 2026-11-03, reverted: this wait made 0 s with
+                    //       a predicate that never holds -> config-supersede printed "NOT VERIFIED -- ...
+                    //       a held answer ran out unreleased" and ctest counted the run as passed (the
+                    //       runner reported NOT RED: a withheld verdict is not a failure).
+                    if (!m_changed.wait_for(lock, std::chrono::seconds(20),
+                                            [&] { return !m_holding || m_released >= ticket; })) {
+                        ++m_holdsExpired;
+                        --m_inFlight;
+                        std::fprintf(stderr, "  the /config stub's hold ran out unreleased -- answered 503\n");
+                        res.status = 503;
+                        return;
+                    }
                 }
             }
             res.set_content(R"({"output":"DP-ACTIVITY","known":true,"path":"/w.png","monitor_id":)" + std::to_string(id) + "}",
@@ -192,6 +205,10 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_held;
     }
+    int holdsExpired() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_holdsExpired;
+    }
 
 private:
     httplib::Server m_server;
@@ -205,6 +222,7 @@ private:
     bool m_holding = false;
     int m_held = 0;
     int m_released = 0;
+    int m_holdsExpired = 0;
 };
 
 // Counts a signal of `target`'s, by signature, from the moment it is made.
@@ -335,8 +353,8 @@ void addImportPaths(QQmlEngine& engine) {
 //       reads, the second within 5 s and nothing more over 1.5 s: the first is main.qml's own at
 //       naming, and nothing here announces anything.
 // CONTROL: the `connect(watch, &DaemonWatch::named, ...)` block deleted from ConfigWatch's constructor
-//       (backend/kde/wallpaperx_item.cpp) -> "a daemon already named when the first change watch is
-//       created causes one more /config read" red, with 1 read. Via control_run.sh 2026-10-08. Reverted.
+//       (backend/kde/config_read.cpp) -> "a daemon already named when the first change watch is
+//       created causes one more /config read" red, with 1 read. Re-run via control_batch.sh 2026-11-02. Reverted.
 // COVERAGE-ASSERT: the name is owned before main.qml is created (main() claims it first), and the
 //       change watch must have loaded, or the phase is not verified.
 void configNamedPhase() {
@@ -411,8 +429,13 @@ public:
                 }
                 if (m_holding) {
                     ++m_held;
-                    // Bounded, so a phase that never releases cannot wedge the server's stop.
-                    m_changed.wait_for(lock, std::chrono::seconds(20), [&] { return !m_holding; });
+                    // Bounded, so a phase that never releases cannot wedge the server's stop. Running
+                    // out is harness trouble, not a release: answered 503, counted, said on stderr.
+                    if (!m_changed.wait_for(lock, std::chrono::seconds(20), [&] { return !m_holding; })) {
+                        ++m_holdsExpired;
+                        std::fprintf(stderr, "  the retry stub's hold ran out unreleased -- answered 503\n");
+                        status = 503;
+                    }
                 }
             }
             res.status = status;
@@ -487,6 +510,10 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_held;
     }
+    int holdsExpired() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_holdsExpired;
+    }
 
 private:
     std::unique_ptr<httplib::Server> m_server;
@@ -499,6 +526,7 @@ private:
     int m_peak = 0;
     bool m_holding = false;
     int m_held = 0;
+    int m_holdsExpired = 0;
 };
 
 // The retry's waits are 2, 4, then 8 s. A gap is graded no more than 6 % early -- a QML Timer does not
@@ -605,7 +633,7 @@ void retryUnreachablePhase(QDBusConnection& bus, QQmlEngine& engine, QQuickWindo
     //       after the reopening: the retry, answered 200, and nothing more.
     // CONTROL: `retry.start();` deleted from retryIfFailed (backend/kde/kpackage/contents/ui/main.qml)
     //       -> this line red, no read after the reopening. Via control_batch.sh 2026-10-08, --phase
-    //       '^config-retry-unreachable$'. Reverted.
+    //       '^config-retry-unreachable$'. Reverted. Re-run on the plugin's own read 2026-11-02: same.
     constexpr const char* kPhase = "the config-retry-unreachable phase";
     const QString output = QStringLiteral("DP-RETRY-UNREACHABLE");
     Copy a = settledCopy(engine, window, config, output, kPhase);
@@ -637,9 +665,9 @@ void retryDefinitivePhase(QDBusConnection& bus, QQmlEngine& engine, QQuickWindow
     //       False if either is re-read: every screen would then poll a daemon that has already said no.
     // WHY-THIS-SHAPE: 12 s of quiet after each, past the first two retries (2 s, then 4 s more), so a
     //       retry with any wait up to 6 s shows. The refusal must be on screen, so the answer was applied.
-    // CONTROL: retryIfFailed's definitive test made `if (status === 200)` (backend/kde/kpackage/contents/
-    //       ui/main.qml) -> both lines red, 400 and 404 each re-read. Via control_batch.sh 2026-10-08,
-    //       --phase '^config-retry-definitive$'. Reverted.
+    // CONTROL: control_batch.sh 2026-11-03, --phase '^config-retry-definitive$', reverted: retryIfFailed's
+    //       definitive test made `outcome === "answered" && status === 200` (backend/kde/kpackage/contents/
+    //       ui/main.qml) -> "a 400 is shown as refused and not read again over 12 s" and the 404 line red.
     constexpr const char* kPhase = "the config-retry-definitive phase";
     const QString output = QStringLiteral("DP-RETRY-DEFINITIVE");
     Copy a = settledCopy(engine, window, config, output, kPhase);
@@ -666,8 +694,9 @@ void retryAbsentPhase(QDBusConnection& bus, QQmlEngine& engine, QQuickWindow& wi
     // CONTROL: via control_batch.sh 2026-10-08, --phase '^config-retry-absent$', each reverted. The
     //       owner test in retryIfFailed (backend/kde/kpackage/contents/ui/main.qml) made `if (false)`
     //       -> the first line red, 3 reads while absent; ConfigWatch::daemonAbsent
-    //       (backend/kde/wallpaperx_item.cpp) returning `... && false` -> the same; daemonAbsent
+    //       (backend/kde/config_read.cpp) returning `... && false` -> the same; daemonAbsent
     //       returning `daemon.lifetime != 0` (owner ignored) -> the second line alone red, no retry.
+    //       The two daemonAbsent breaks re-run 2026-11-02 via control_batch.sh, same lines red.
     constexpr const char* kPhase = "the config-retry-absent phase";
     const QString output = QStringLiteral("DP-RETRY-ABSENT");
     Copy a = settledCopy(engine, window, config, output, kPhase);
@@ -805,8 +834,10 @@ void retryBoundPhase(QDBusConnection& bus, QQmlEngine& engine, QQuickWindow& win
     }
     const int peakHeld = config.peak();
     config.unhold();
-    if (!armed || !heldOut) {
-        notVerified(kPhase, !armed ? "no failed read left a retry pending" : "the notice's read never reached the stub");
+    if (!armed || !heldOut || config.holdsExpired() > 0) {
+        notVerified(kPhase, !armed     ? "no failed read left a retry pending"
+                            : !heldOut ? "the notice's read never reached the stub"
+                                       : "a held answer ran out unreleased, so what was answered is not what was held");
         return;
     }
     pumpUntil([&] { return stateOf(a) == QLatin1String("set"); }, kArrivalLimitMs + static_cast<int>(lateLimit(2000)));
@@ -859,9 +890,9 @@ int configRetryRun(QDBusConnection& bus) {
 // WHY-THIS-SHAPE: a process of its own (the entry plasma_surface_retry_no_bus): QtDBus makes its
 //       session connection once per process, and the address set here names a socket that does not
 //       exist. It still runs only under isolated_run.sh's private session.
-// CONTROL: ConfigWatch::daemonAbsent (backend/kde/wallpaperx_item.cpp) made to ignore `lifetime`
+// CONTROL: ConfigWatch::daemonAbsent (backend/kde/config_read.cpp) made to ignore `lifetime`
 //       (`return daemon.owner.empty();`) -> this line red, 1 read and no retry. Via control_batch.sh
-//       2026-10-08, --phase '^config-retry-no-bus$'. Reverted.
+//       2026-10-08, --phase '^config-retry-no-bus$'; re-run 2026-11-02. Reverted.
 // COVERAGE-ASSERT: the change watch must have loaded, or not verified: without it main.qml retries for
 //       want of a watch, and daemonAbsent() is never asked.
 int configRetryNoBusRun(int argc, char** argv) {
@@ -1247,8 +1278,8 @@ int main(int argc, char** argv) {
             //       is taken again, so the two reads are told apart; restartDaemonName's fixed gap would
             //       let one read stand for both.
             // CONTROL: `connect(watch, &DaemonWatch::replaced, this, &ConfigWatch::configChanged);` deleted
-            //       from ConfigWatch's constructor (backend/kde/wallpaperx_item.cpp) -> both lines red, no read
-            //       at all. Re-run 2026-10-08 via control_run.sh, --phase '^config-owner$'. Reverted.
+            //       from ConfigWatch's constructor (backend/kde/config_read.cpp) -> both lines red, no read
+            //       at all. Re-run 2026-11-02 via control_batch.sh, --phase '^config-owner$'. Reverted.
             Copy a = answered("the config-owner phase");
             if (a.holder) {
                 const int before = config.requests();
@@ -1289,9 +1320,10 @@ int main(int argc, char** argv) {
             // CONTROL: in refresh() (backend/kde/kpackage/contents/ui/main.qml), via control_run.sh
             //       2026-10-08, --phase '^config-supersede$', each reverted. `root.askAgain = true;`
             //       deleted -> "notices during a slow read cause exactly one more read after it" and "the
-            //       screen ends on the state from after the notices" red. The askAgain block replaced by
-            //       aborting the pending request and sending a new one -> the exactly-one and "never more
-            //       than one read out at a time" lines red, 21 reads and 6 out at once.
+            //       screen ends on the state from after the notices" red; re-run on the plugin's own read
+            //       2026-11-02, both red again. The `if (root.pending !== null) { ... }` block deleted
+            //       from read(), so every notice reads -> "and never more than one read is out at a time"
+            //       red, with the exactly-one-more line (control_batch.sh 2026-11-02, reverted).
             // COVERAGE-ASSERT: all kBurst notices must have reached main.qml's watch while the first read
             //       was held, or the phase is not verified.
             constexpr int kBurst = 20;
@@ -1316,10 +1348,11 @@ int main(int argc, char** argv) {
                 }
                 const int heldMeanwhile = config.held();
                 config.unhold();
-                if (!slowOut || !heard) {
-                    notVerified("the config-supersede phase", !slowOut ? "the first read never reached the stub"
-                                                                       : "main.qml's watch did not hear every notice while "
-                                                                         "the first read was held");
+                if (!slowOut || !heard || config.holdsExpired() > 0) {
+                    notVerified("the config-supersede phase",
+                                !slowOut ? "the first read never reached the stub"
+                                : !heard ? "main.qml's watch did not hear every notice while the first read was held"
+                                         : "a held answer ran out unreleased, so what was answered is not what was held");
                 } else {
                     const bool settled = pumpUntil(
                         [&] { return config.requests() >= before + 2 && monitorIdOf(a) == 5; }, kArrivalLimitMs);
@@ -1348,7 +1381,8 @@ int main(int argc, char** argv) {
             // CONTROL: `asked === root.connector` made `true` in refresh()'s handler
             //       (backend/kde/kpackage/contents/ui/main.qml) -> "a read about the old name, answered
             //       after a rename, is never applied" red, monitor id 7 then 8. Via control_run.sh
-            //       2026-10-08, --phase '^config-rename$'. Reverted.
+            //       2026-10-08, --phase '^config-rename$'. Reverted. Re-run 2026-11-02 on the plugin's own
+            //       read: same line red.
             // COVERAGE-ASSERT: the held read must have asked about the old name, and the trail must be
             //       connected, or the phase is not verified.
             const QString renamed = QStringLiteral("DP-ACTIVITY-RENAMED-WHILE-READING");
@@ -1364,9 +1398,10 @@ int main(int argc, char** argv) {
                                     config.requestsFor(kOutput) == oldAsked + 1;
                 if (oldOut) a.plugin()->setProperty("connectorOverride", renamed);
                 config.unhold();
-                if (!oldOut) {
-                    notVerified("the config-rename phase", "no read about the old name was held at the stub, or the id "
-                                                           "trail could not be connected");
+                if (!oldOut || config.holdsExpired() > 0) {
+                    notVerified("the config-rename phase", !oldOut ? "no read about the old name was held at the stub, "
+                                                                     "or the id trail could not be connected"
+                                                                   : "a held answer ran out unreleased");
                 } else {
                     const bool took = pumpUntil([&] { return monitorIdOf(a) == 8; }, kArrivalLimitMs);
                     pumpFor(500);
@@ -1390,7 +1425,8 @@ int main(int argc, char** argv) {
             // CONTROL: `&& !root.askAgain` added to refresh()'s `asked === root.connector` test
             //       (backend/kde/kpackage/contents/ui/main.qml) -> "with a notice queued behind every
             //       read, each answer is still applied" red, 0 of 5 applied. Via control_run.sh
-            //       2026-10-08, --phase '^config-stream$'. Reverted.
+            //       2026-10-08, --phase '^config-stream$'. Reverted. Re-run 2026-11-02 on the plugin's own
+            //       read: same line red.
             // COVERAGE-ASSERT: the check requires kStreamReads answers, each with a notice heard during
             //       its read, so a stream that never formed cannot pass.
             constexpr int kStreamReads = 5;
@@ -1416,7 +1452,9 @@ int main(int argc, char** argv) {
                     ++applied;
                 }
                 config.unhold();
-                if (!formed) {
+                if (config.holdsExpired() > 0) {
+                    notVerified("the config-stream phase", "a held answer ran out unreleased");
+                } else if (!formed) {
                     notVerified("the config-stream phase", "read " + std::to_string(applied + 1) +
                                                                " never reached the stub, or no notice was heard while "
                                                                "it was held");

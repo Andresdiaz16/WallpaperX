@@ -39,6 +39,7 @@
 // in the accepted state, with no refusal outstanding" a state this file can reach on purpose
 // instead of waiting for.
 
+#include "daemon/daemon_bus.h"
 #include "kde/frame_import.h"
 #include "tests/qt_frame_reply.h"
 #include "tests/private_test_bus.h"
@@ -80,9 +81,9 @@ using wallpaperx::testing::frameReplyFields;
 using wallpaperx::testing::harnessFailure;
 using wallpaperx::testing::notVerified;
 
-constexpr const char* kService = "io.wallpaperx.Daemon";
-constexpr const char* kPath = "/io/wallpaperx/Daemon";
-constexpr const char* kInterface = "io.wallpaperx.Daemon";
+constexpr const char* kService = wallpaperx::kDaemonBusName;
+constexpr const char* kPath = wallpaperx::kDaemonObjectPath;
+constexpr const char* kInterface = wallpaperx::kDaemonInterface;
 
 constexpr int kFrameWidth = 64;
 constexpr int kFrameHeight = 64;

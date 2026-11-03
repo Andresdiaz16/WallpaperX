@@ -24,9 +24,9 @@ WallpaperItem {
 
     // The request still awaiting a reply, and whether something said the answer may have changed
     // since it was sent: that change may postdate its answer, so one more read follows it. However
-    // many arrive meanwhile, that is one read, so the notices' sender cannot pile requests up. Not
-    // aborted, and nothing times it out (QML's XMLHttpRequest has no timeout): it ends when whatever
-    // holds the port answers or exits, and a replacement would wait on the same server.
+    // many arrive meanwhile, that is one read, so the notices' sender cannot pile requests up. Never
+    // abandoned here: a replacement would wait on the same server. The read gives up on its own after
+    // a few seconds with nothing arriving.
     property var pending: null
     property bool askAgain: false
 
@@ -34,13 +34,10 @@ WallpaperItem {
     // answer needs no reset: only a prompted read follows it.
     property int failedReads: 0
 
-    // What this will parse. The reply comes from whatever holds the port, and nothing else
-    // bounds what the shell acts on. Not what it buffers: see the handler below.
-    readonly property int maxBodyBytes: 65536
-
-    // Checked on the way back as well as set on the way out: a redirect would otherwise make
-    // every screen's plugin fetch from wherever it names, from inside the shell.
-    readonly property string daemonOrigin: "http://127.0.0.1:18462"
+    // The screen the answer shown was read for, while it may outlast one timed-out read; empty once
+    // one has, and while nothing answered. A slow /config says nothing about the frame path, but
+    // only that once, and never for another screen's answer or a daemon whose name has no owner.
+    property string keepableFor: ""
 
     // No headless Qt platform reports a screen name, and an empty one pins every state below to
     // "unnamed", so a test needs a way in. It gets this rather than a writable `connector`: an
@@ -93,6 +90,11 @@ WallpaperItem {
         : root.reply.known !== true ? "unknown"
         : root.wallpaperPath === "" ? "unset"
         : "set"
+
+    // The two loaded items, typed var: their types come from com.wallpaperx, which this file must
+    // never name, so nothing read through them can be checked here.
+    readonly property var watchItem: notice.item
+    readonly property var rendererItem: surface.item
 
     // Why the renderer is not drawing, when it has loaded and still is not. Kept on root rather
     // than read through surface.item, which qmllint can only see as a QtObject.
@@ -155,31 +157,22 @@ WallpaperItem {
         if (root.connector === "") {
             return;
         }
+        // Read through the module, not XMLHttpRequest, which the lock screen's engine refuses. With
+        // the module unloadable, describe() names that before anything an answer could say.
+        if (notice.item === null) {
+            return;
+        }
 
-        // A slow /config is waited for, not reported as "not running": it says nothing about the
-        // frame path, and apply(0, "") would tear the renderer down because the cheap path was slow.
         if (root.pending !== null) {
             root.askAgain = true;
             return;
         }
-        const request = new XMLHttpRequest();
-        root.pending = request;
         const asked = root.connector;
-        // The timestamp defeats any cache between here and the daemon: a wallpaper the user
-        // just chose must not wait on a stale 200.
-        const url = root.daemonOrigin + "/config?output=" +
-                    encodeURIComponent(asked) + "&t=" + Date.now();
-        request.onreadystatechange = function () {
+        const request = root.watchItem.fetch(asked);
+        root.pending = request;
+        request.finished.connect(function () {
             // Only the request this waits on answers it.
             if (root.pending !== request) {
-                return;
-            }
-            // A declared Content-Length is deliberately NOT acted on here. Refusing at
-            // HEADERS_RECEIVED means abort()ing from inside this handler, and on Qt 6.11.2 that
-            // segfaults QQmlXMLHttpRequest on the next network event -- so the defence against
-            // an oversized reply became a way for whatever holds the port to kill plasmashell.
-            // The bound below catches the same reply a moment later, having buffered it.
-            if (request.readyState !== XMLHttpRequest.DONE) {
                 return;
             }
             root.pending = null;
@@ -187,35 +180,34 @@ WallpaperItem {
             // screen unanswered; it is no older than anything applied before. Another screen's
             // answer is not.
             if (asked === root.connector) {
-                // Redirected away from the daemon, or oversized: neither is ours whatever it holds,
-                // so both read as unreadable. An empty responseURL means Qt did not report one.
-                const from = request.responseURL;
-                const elsewhere = typeof from === "string" && from !== "" &&
-                                  from.indexOf(root.daemonOrigin + "/") !== 0;
-                const body = request.responseText;
-                const usable = !elsewhere && body.length <= root.maxBodyBytes;
-                root.apply(request.status, usable ? body : "");
-                root.retryIfFailed(request.status);
+                const outcome = request.outcome;
+                const keep = outcome === "timedOut" && root.keepableFor === asked &&
+                             !(root.watchItem !== null && root.watchItem.daemonAbsent());
+                if (!keep) {
+                    // Unreadable whatever its status: what came of a refusal may not be all of it.
+                    // An oversized 200 arrives answered but empty, and so reads as unreadable too.
+                    root.apply(outcome === "unreadable" ? 200 : request.status, request.responseText);
+                }
+                root.keepableFor = (outcome === "answered" || outcome === "unreadable") ? asked : "";
+                root.retryIfFailed(outcome, request.status);
             }
             if (root.askAgain) {
                 root.askAgain = false;
                 root.refresh();
             }
-        };
-        request.open("GET", url);
-        request.send();
+        });
     }
 
-    // A read the next one may fix: nothing answered, or the server failed or asked for patience. A
-    // 200, or a refusal of the request itself, stands until something changes. Nothing is retried
-    // while the daemon's name has no owner: its arrival is announced, so retrying then only polls a
-    // stopped service.
-    function retryIfFailed(status: int) {
-        if (status !== 0 && status < 500 && status !== 408 && status !== 429) {
+    // A read the next one may fix: nothing whole answered, or the server failed or asked for
+    // patience. A 200, or a refusal of the request itself, stands until something changes. Nothing
+    // is retried while the daemon's name has no owner: its arrival is announced, so retrying then
+    // only polls a stopped service.
+    function retryIfFailed(outcome: string, status: int) {
+        if (outcome === "answered" && status < 500 && status !== 408 && status !== 429) {
             return;
         }
         root.failedReads += 1;
-        if (notice.item !== null && notice.item.daemonAbsent()) {
+        if (root.watchItem !== null && root.watchItem.daemonAbsent()) {
             return;
         }
         retry.interval = Math.min(2000 * Math.pow(2, root.failedReads - 1), 8000);
@@ -280,13 +272,13 @@ WallpaperItem {
         active: root.visible && (root.screenState === "set" || root.screenState === "unset") && root.monitorId >= 0
         source: "WallpaperSurface.qml"
         onLoaded: {
-            item.monitorId = root.monitorId;
-            root.rendererReason = item.unavailableReason;
-            root.rendererDrawing = item.frameShown;
+            root.rendererItem.monitorId = root.monitorId;
+            root.rendererReason = root.rendererItem.unavailableReason;
+            root.rendererDrawing = root.rendererItem.frameShown;
             // The name monitorId was resolved from, so the size the renderer reports is filed
             // under the same screen.
-            item.output = root.connector;
-            item.pauseMode = root.pauseMode;
+            root.rendererItem.output = root.connector;
+            root.rendererItem.pauseMode = root.pauseMode;
         }
         // State from an item that is going away would otherwise outlive it.
         onStatusChanged: {
@@ -302,13 +294,13 @@ WallpaperItem {
         Connections {
             target: root
             function onMonitorIdChanged() {
-                if (surface.item !== null) surface.item.monitorId = root.monitorId;
+                if (root.rendererItem !== null) root.rendererItem.monitorId = root.monitorId;
             }
             function onConnectorChanged() {
-                if (surface.item !== null) surface.item.output = root.connector;
+                if (root.rendererItem !== null) root.rendererItem.output = root.connector;
             }
             function onPauseModeChanged() {
-                if (surface.item !== null) surface.item.pauseMode = root.pauseMode;
+                if (root.rendererItem !== null) root.rendererItem.pauseMode = root.pauseMode;
             }
         }
 
@@ -316,10 +308,10 @@ WallpaperItem {
             target: surface.item
             ignoreUnknownSignals: true
             function onUnavailableReasonChanged() {
-                root.rendererReason = surface.item.unavailableReason;
+                root.rendererReason = root.rendererItem.unavailableReason;
             }
             function onFrameShownChanged() {
-                root.rendererDrawing = surface.item.frameShown;
+                root.rendererDrawing = root.rendererItem.frameShown;
             }
         }
     }
@@ -356,17 +348,19 @@ WallpaperItem {
         }
     }
 
-    // When to ask again, loaded for the reason the renderer is. Never tied to visibility: a hidden
-    // copy keeps its answer current.
+    // When to ask again, and the asking, loaded for the reason the renderer is. Never tied to
+    // visibility: a hidden copy keeps its answer current.
     Loader {
         id: notice
 
         objectName: "wallpaperxConfigWatch"
         source: "ConfigWatch.qml"
+        // The first ask, once there is a watch to read through and to report later changes.
+        onLoaded: root.refresh()
     }
 
     // The fallback for a failed read, since nothing announces that the daemon can answer again. It
-    // runs only after such a failure and never while the last answer stands.
+    // runs only after such a failure.
     Timer {
         id: retry
 
@@ -384,7 +378,4 @@ WallpaperItem {
     // A screen renamed asks about the new name. Also the first ask when the name arrives after
     // the start.
     onConnectorChanged: root.refresh()
-
-    // After the watch above exists, so a change after this ask is reported.
-    Component.onCompleted: root.refresh()
 }

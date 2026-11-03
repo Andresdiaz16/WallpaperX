@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "daemon_bus.h"
 #include "render_worker.h"
 #include "wallpaper_manager.h"
 
@@ -28,9 +29,9 @@ class WallpaperManager;
 // second lock, which is what lets GetStatus and GetFrame disagree.
 class DbusService {
 public:
-    static constexpr const char* kBusName = "io.wallpaperx.Daemon";
-    static constexpr const char* kObjectPath = "/io/wallpaperx/Daemon";
-    static constexpr const char* kInterface = "io.wallpaperx.Daemon";
+    static constexpr const char* kBusName = kDaemonBusName;
+    static constexpr const char* kObjectPath = kDaemonObjectPath;
+    static constexpr const char* kInterface = kDaemonInterface;
 
     // `manager` must outlive this object.
     DbusService(sdbus::IConnection& connection, WallpaperManager& manager);

@@ -31,6 +31,7 @@
 // request but the retry timer this file is about. No OpenGL is needed and the run skips on nothing
 // but a missing bus.
 
+#include "daemon/daemon_bus.h"
 #include "tests/bus_monitor.h"
 #include "tests/qt_frame_reply.h"
 #include "tests/stream_capture.h"
@@ -137,9 +138,9 @@ std::string listed(const std::vector<int>& values) {
 using wallpaperx::testing::check;
 using wallpaperx::testing::notVerified;
 
-constexpr const char* kService = "io.wallpaperx.Daemon";
-constexpr const char* kPath = "/io/wallpaperx/Daemon";
-constexpr const char* kInterface = "io.wallpaperx.Daemon";
+constexpr const char* kService = wallpaperx::kDaemonBusName;
+constexpr const char* kPath = wallpaperx::kDaemonObjectPath;
+constexpr const char* kInterface = wallpaperx::kDaemonInterface;
 
 // The plugin's own constant for how long a refused item with nothing on screen waits. Written out
 // rather than included from the plugin: comparing the plugin against its own number would make
@@ -310,9 +311,9 @@ int runLookupFailed() {
     //       the while, so "is not running" would be a wrong answer and "no reason" the silence the goal
     //       forbids.
     // CONTROL: `m_lookupFailed = true;` deleted from DaemonWatch::askWhoOwns
-    //       (backend/kde/wallpaperx_item.cpp) -> "FAIL: an item whose owner lookup failed says the daemon
+    //       (backend/kde/config_read.cpp) -> "FAIL: an item whose owner lookup failed says the daemon
     //       could not be reached and asks it nothing (published [], 0 request(s))". Re-run via
-    //       control_batch.sh, 2026-10-07.
+    //       control_batch.sh, 2026-11-02, same line.
     const QString kUnreachable = QStringLiteral("WallpaperX could not be reached.");
     const bool said = pumpUntil([&] { return publishedReason() == kUnreachable; }, 5000);
     check(said && stub.requests() == 0,
@@ -328,11 +329,11 @@ int runLookupFailed() {
     //       plugin's first ask, so only gaps over half a second are the plugin's retries. Each gap is
     //       bounded below at 90% of its wait, since Qt's coarse timers fire up to 5% early (1899 ms has
     //       been seen for 2 s); the fourth also above, at 12 s, where the next doubling would be 16 s.
-    // CONTROL: in DaemonWatch::askWhoOwns (backend/kde/wallpaperx_item.cpp), (a) `++m_failedAsks;`
+    // CONTROL: in DaemonWatch::askWhoOwns (backend/kde/config_read.cpp), (a) `++m_failedAsks;`
     //       deleted -> "FAIL: a failed owner lookup is asked again after 2, 4, 8 and 8 s (gaps 1927 1999
     //       2000 2000 ms)"; (b) the cap in the retry's `doubledWait(kLookupRetryMs, m_failedAsks,
-    //       kLookupRetryMaxMs)` made `kWindowRetryMaxMs` -> the same line, "(gaps 1926 4000 7999 16000 ms)".
-    //       Via control_batch.sh, 2026-10-07.
+    //       kLookupRetryMaxMs)` made `60000` -> the same line, "(gaps 2099 4139 7999 16000 ms)".
+    //       Both re-run via control_batch.sh, 2026-11-02.
     // COVERAGE-ASSERT: four retry gaps must be seen within 45 s (22 s are due); fewer is a FAIL, since
     //       the monitor is shown working -- only a monitor that stopped is reported not verified.
     const auto retryGaps = [&monitor] {
@@ -363,11 +364,11 @@ int runLookupFailed() {
     //       name also pass -1 and cannot be told from the plugin's, so "every one is -1" is asserted, not
     //       "the plugin's are": the contract makes them the same. This bus refuses every lookup at once,
     //       so the retries happen and their timeouts are read.
-    // CONTROL: in DaemonWatch::askWhoOwns (backend/kde/wallpaperx_item.cpp), (a) the retries given a growing
+    // CONTROL: in DaemonWatch::askWhoOwns (backend/kde/config_read.cpp), (a) the retries given a growing
     //       timeout again, `asyncCall(request, m_failedAsks == 0 ? -1 : doubledWait(kLookupRetryMs, m_failedAsks,
-    //       kFetchPatienceMs))` -> "FAIL: every owner lookup waits QtDBus's default timeout, -1, at least five of
+    //       25000))` -> "FAIL: every owner lookup waits QtDBus's default timeout, -1, at least five of
     //       them ([-1 -1 4000 8000 16000 25000])"; (b) only the first ask given 2 s, `m_failedAsks == 0 ?
-    //       kLookupRetryMs : -1` -> the same line, "([-1 2000 -1 -1 -1 -1])". Via control_batch.sh, 2026-10-07.
+    //       kLookupRetryMs : -1` -> the same line, "([-1 2000 -1 -1 -1 -1])". Re-run via control_batch.sh, 2026-11-02.
     // COVERAGE-ASSERT: five lookups are required, three of them at least retries (the gaps above need four);
     //       none seen at all means the interposer did not take effect, which is reported not verified.
     const std::vector<int> timeouts = lookupTimeouts();
@@ -1530,12 +1531,13 @@ int runSlowLookup() {
     //       late, as a slow bus at login does. Both halves are needed: a first
     //       ask cut short at 2 s and a longer retry would still fetch, but only after saying the daemon
     //       could not be reached. Every reason published is kept by the QML, so a passing one is seen.
-    // CONTROL: in DaemonWatch::askWhoOwns (backend/kde/wallpaperx_item.cpp), (a) every ask given 2 s,
+    // CONTROL: in DaemonWatch::askWhoOwns (backend/kde/config_read.cpp), (a) every ask given 2 s,
     //       `asyncCall(request, kLookupRetryMs)` -> "FAIL: an owner lookup the bus answers 3 s late is waited for:
     //       no fetch in 20 s, reasons published [WallpaperX could not be reached.], timeouts [-1 2000 2000 2000
     //       2000]"; (b) only the first ask given 2 s, `m_failedAsks == 0 ? kLookupRetryMs : -1` -> the same line,
     //       "fetched 9837 ms after the item was made, reasons published [WallpaperX could not be reached.]" -- a
-    //       run in which "it fetched" alone would have passed. Via control_batch.sh, 2026-10-07.
+    //       run in which "it fetched" alone would have passed. Both re-run via control_batch.sh, 2026-11-02
+    //       ("timeouts [-1 2000 2000 2000]"; "fetched 9997 ms after the item was made").
     // COVERAGE-ASSERT: the fetch must come no sooner than 90% of the stand-in's 3 s, or the plugin's lookup
     //       was answered by the real bus and the redirect did not take; that is a harness fault.
     if (driver.asked() < 1 || (through && fetchedAfter < kDelayMs * 9 / 10)) {
@@ -1590,10 +1592,10 @@ int runSlowRetryLookup() {
     // WHY-THIS-SHAPE: the stand-in refuses at once until the item says the daemon could not be reached, then
     //       answers every lookup 9 s late. A retry cut short at 4, 8 or 16 s is thrown away and the next one
     //       waits longer still, so the item would not reach the daemon until about 35 s; 20 s is the bound.
-    // CONTROL: in DaemonWatch::askWhoOwns (backend/kde/wallpaperx_item.cpp), the retries given a growing
+    // CONTROL: in DaemonWatch::askWhoOwns (backend/kde/config_read.cpp), the retries given a growing
     //       timeout again, `asyncCall(request, m_failedAsks == 0 ? -1 : doubledWait(kLookupRetryMs, m_failedAsks,
-    //       kFetchPatienceMs))` -> "FAIL: a retried owner lookup the bus answers 9 s late is waited for (no fetch
-    //       in 20 s, timeouts [-1 -1 4000 8000])". Via control_batch.sh, 2026-10-07.
+    //       25000))` -> "FAIL: a retried owner lookup the bus answers 9 s late is waited for (no fetch
+    //       in 20 s, timeouts [-1 -1 4000 8000])". Re-run via control_batch.sh, 2026-11-02.
     // COVERAGE-ASSERT: the fetch must come no sooner than 90% of the 9 s, and the stand-in must have answered
     //       at least one lookup late; otherwise the retry was not the stand-in's, a harness fault.
     if (through && (fetchedAfter < kDelayMs * 9 / 10 || driver.answeredLate() < 1)) {

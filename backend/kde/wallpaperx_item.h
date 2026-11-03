@@ -23,27 +23,6 @@ class QDBusMessage;
 
 namespace wallpaperx {
 
-// Says when what the daemon's /config answers may have changed, so main.qml asks then, and otherwise
-// only to retry a failed read: the
-// daemon announced a change, the first lookup of its bus name found an owner, or the name changed
-// owner -- a daemon arriving, leaving or replaced. main.qml asks once at startup on its own; this
-// reports what comes after its creation. GUI thread.
-class ConfigWatch : public QObject {
-    Q_OBJECT
-    QML_NAMED_ELEMENT(WallpaperXConfigWatch)
-
-public:
-    explicit ConfigWatch(QObject* parent = nullptr);
-
-    // Whether the bus has said nobody owns the daemon's name. False while that is not yet known,
-    // and without a bus. A query of the moment, with no change signal: an owner change already
-    // emits configChanged.
-    Q_INVOKABLE bool daemonAbsent() const;
-
-signals:
-    void configChanged();
-};
-
 // The item that puts a daemon-rendered frame on the desktop.
 //
 // Three threads meet here and the split is the whole design:

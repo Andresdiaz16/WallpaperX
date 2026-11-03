@@ -17,9 +17,9 @@
 // three until then. GOALS.md's S9.3 records that as an obligation on Step 15.
 //
 // It grades one Step 10 fact for the same reason, added in the same shape: the address the
-// wallpaper QML asks the daemon at (S10.11). That number is written twice -- as a literal in
-// main.qml's URL and as HttpServer::kDefaultPort in the daemon -- and when the two disagree
-// the plugin reports "WallpaperX is not running" on a machine where it is running.
+// wallpaper QML asks the daemon at (S10.11). The plugin builds that address from
+// HttpServer::kDefaultPort; a second copy written into main.qml could disagree with it, and the
+// plugin would then report "WallpaperX is not running" on a machine where it is running.
 //
 // Its own target rather than a phase of an existing test, and deliberately outside the
 // if(WALLPAPERX_BUILD_KDE_PLUGIN) guard: everything here is text in the source tree, so it
@@ -43,7 +43,7 @@
 // icon theme, and that activation changes a real desktop. Those were checked by hand on
 // Plasma 6.7.4 and are recorded in PLAN.md, not here.
 
-// The daemon's own header, for the loopback host and port the QML has to agree with. Reading
+// The daemon's own header, for the port a stray address in the QML is reported against. Reading
 // a production header is not linking the daemon: it declares those two as constexpr and pulls
 // in nothing heavier than <atomic>, <memory> and <thread>, so this target still links
 // nlohmann_json alone and still builds where the daemon library is not built at all.
@@ -538,18 +538,10 @@ struct LoopbackUrl {
     int line = 0;
 };
 
-// Every request URL in the QML that names the daemon's loopback host, with the port written
-// after it. Comments are blanked first and string bodies deliberately are not: the address
-// lives inside a string literal, and a mention inside a comment is documentation, not a
-// request.
-//
-// The needle is the whole `http://<host>:` prefix, and the digit run has to end at `/` or at
-// the closing quote, rather than matching the bare host anywhere it appears. A text scanner
-// cannot tell a URL the plugin *requests* from one it merely *displays*, and matching the bare
-// host graded a diagnostic string such as "check http://127.0.0.1:8080/health" as a port
-// disagreement -- red on a package that is correct, with deleting a legitimate string as the
-// only remedy. What that narrowing gives up is a wrong port written outside a full URL; the
-// self-test rows below are what keep the narrowing itself from going vacuous.
+// Every full `http://<loopback host>:` URL in the QML, outside comments (string bodies are kept:
+// an address lives in a string literal). It names the line and port for S10.11's diagnostic; the
+// verdict itself also rests on the broader scan in runDaemonPortChecks, since this one sees only
+// that spelling. A bare host:port mention is deliberately not counted.
 std::vector<LoopbackUrl> findLoopbackUrls(std::string_view source) {
     const std::string text = blankComments(source, StringBodies::Keep);
     const std::string needle = std::string("http://") + std::string(wallpaperx::HttpServer::kLoopbackHost) + ":";
@@ -565,19 +557,15 @@ std::vector<LoopbackUrl> findLoopbackUrls(std::string_view source) {
         if (!urlEnds) continue;
         LoopbackUrl url;
         url.line = static_cast<int>(std::count(text.begin(), text.begin() + static_cast<std::ptrdiff_t>(pos), '\n')) + 1;
-        // Ten digits is past any port; parsing it as one would throw out of a helper whose
-        // caller reports "the package disagrees with the daemon", which is the wrong verdict
-        // for a string that is not a port at all.
+        // Parsed only for the diagnostic, and never past five digits, so it cannot throw.
         if (!number.empty() && number.size() <= 5) url.port = std::stoi(number);
         found.push_back(url);
     }
     return found;
 }
 
-// The scanner decides what S10.11 compares, so it is checked against the cases where a naive
-// search is wrong before its answer is believed. A scanner that had stopped seeing the URL
-// would make the check pass over any port at all, silently -- there would simply be nothing
-// left to compare.
+// A scanner that stopped seeing URLs would let the `urls.empty()` check pass over nothing, so it is
+// checked against its own cases first and withholds S10.11's verdict if it fails them.
 bool urlScannerWorks() {
     const std::string host(wallpaperx::HttpServer::kLoopbackHost);
     struct Case {
@@ -1178,66 +1166,39 @@ void runDaemonPortChecks() {
     }
 
     // GOAL: S10.11 -- the address the wallpaper QML asks the daemon at is the address the
-    //       daemon binds. False if main.qml's URL names a port other than
-    //       HttpServer::kDefaultPort. The two are written in different languages in different
-    //       files and nothing makes them agree; when they disagree the plugin's every request
-    //       fails to connect, which it renders as "WallpaperX is not running" on a machine
-    //       where the daemon is running fine.
-    // WHY-THIS-SHAPE: the number is compared against the daemon's own compiled constant, not
-    //       against a literal repeated here. A test that wrote 18462 out again would keep
-    //       passing after someone changed kDefaultPort -- it would then be a third copy of the
-    //       fact and no closer to checking agreement. The QML side has to be read as text
-    //       (nothing here can run a QML engine), so the scanner is the weak link and is
-    //       self-tested first: comments blanked, string bodies kept (including template
-    //       literals, whose `//` would otherwise start a comment that swallows the address),
-    //       every request URL collected rather than the first, and a host with no digits after
-    //       it reported instead of skipped.
-    // COVERAGE-ASSERT: the number of addresses compared is asserted to be non-zero and is
-    //       printed. Without that, a main.qml that built its URL from a variable -- or a
-    //       scanner that stopped matching -- would leave zero comparisons and the phase would
-    //       pass having compared nothing, which is exactly how this check would rot.
-    // CONTROL: four mutations. In a copy of backend/ under /tmp, main.qml's URL changed to
-    //       port 18463 -> `main.qml line 88 asks for port 18463; the daemon binds 18462` and
-    //       `FAIL: main.qml asks the daemon at the port the daemon binds`. In the same copy,
-    //       the URL rewritten to build its address from a property so no literal is left ->
-    //       `FAIL: main.qml names the daemon's loopback address somewhere this check can read
-    //       it`, not a silent pass over zero comparisons. In the repository itself,
-    //       backend/daemon/http_server.h's kDefaultPort changed to 18463 -> the first FAIL
-    //       again with the numbers the other way round, which is what proves the comparison
-    //       reads the daemon's constant rather than a copy of the number; reverted immediately
-    //       and the file checked clean against git. And the scanner itself blanking string
-    //       bodies, the one thing it must not do -> five named scanner errors and `FAIL
-    //       (harness): this file's URL scanner failed its own cases`, with S10.11's verdict
-    //       withheld rather than passed. And two on the scanner's own cases, added before the
-    //       code that satisfies them: a port inside a template literal, and a bare
-    //       `127.0.0.1:1` in a diagnostic string that must not be read as a request -> `the URL
-    //       scanner is wrong about a port inside a template literal: it found 0 mention(s)` and
-    //       `... a bare host:port mention is not a request: it found 1 mention(s)`, with
-    //       S10.11's verdict withheld; green once the backtick delimiter and the `http://`
-    //       needle were in place.
+    //       daemon binds. main.qml names no address: the plugin's read, ConfigRead in
+    //       backend/kde/config_read.cpp, builds its URL from HttpServer's own constants, so the two
+    //       agree as long as main.qml keeps no copy of its own. False if main.qml spells a loopback
+    //       URL: that copy is written in another language in another file, nothing makes it agree,
+    //       and when it disagrees every request fails to connect, which the plugin renders as
+    //       "WallpaperX is not running" on a machine where the daemon is running fine.
+    // WHY-THIS-SHAPE: the QML side has to be read as text (nothing here can run a QML engine), and an
+    //       absence check passes over every spelling its scanner cannot see. So beside the self-tested
+    //       loopback-URL scanner, two broad scans grade what would reach the daemon whatever its
+    //       spelling: no `://` anywhere outside comments (localhost, a concatenated host, another
+    //       port), and no `XMLHttpRequest` token in the code. The cost: any URL main.qml displays,
+    //       such as a help link, is red too; main.qml has none.
+    // CONTROL: control_batch.sh 2026-11-02, reverted: `readonly property string probeAddress:
+    //       "http://127.0.0.1:18462/config"` added to backend/kde/kpackage/contents/ui/main.qml ->
+    //       "FAIL: main.qml names no daemon address of its own" red. Same batch
+    //       (control_batch.sh 2026-11-03, reverted): `"http://localhost:18463/config"` as a property in main.qml -> "FAIL: main.qml spells
+    //       no URL of any form outside comments"; a function returning `new XMLHttpRequest()` ->
+    //       "FAIL: main.qml makes no XMLHttpRequest of its own". The scanner's own
+    //       controls stand: the scanner blanking string bodies -> five named scanner errors and
+    //       `FAIL (harness): this file's URL scanner failed its own cases`, S10.11's verdict
+    //       withheld; and its cases for a port inside a template literal and for a bare
+    //       `127.0.0.1:1` in a diagnostic string, each seen red before the code that satisfies it.
     const std::vector<LoopbackUrl> urls = findLoopbackUrls(*source);
-    check(!urls.empty(), "main.qml names the daemon's loopback address somewhere this check can read it");
-    if (urls.empty()) {
-        std::fprintf(stderr, "  looked for \"%s:<port>\" outside comments in %s; the daemon binds that host and "
-                             "port %d\n",
-                     wallpaperx::HttpServer::kLoopbackHost, mainQml.string().c_str(),
-                     wallpaperx::HttpServer::kDefaultPort);
-        return;
-    }
-    bool agree = true;
     for (const LoopbackUrl& url : urls) {
-        if (url.port == wallpaperx::HttpServer::kDefaultPort) continue;
-        agree = false;
-        std::fprintf(stderr, "  %s line %d asks for port %d; the daemon binds %d (HttpServer::kDefaultPort). Every "
-                             "loopback URL in main.qml is graded, so build any second one from the same literal "
-                             "rather than writing the address again\n",
+        std::fprintf(stderr, "  %s line %d asks for port %d; the address belongs to ConfigRead, which builds it "
+                             "from HttpServer::kLoopbackHost and kDefaultPort (%d)\n",
                      mainQml.string().c_str(), url.line, url.port, wallpaperx::HttpServer::kDefaultPort);
     }
-    check(agree, "main.qml asks the daemon at the port the daemon binds");
-    std::printf("kpackage_metadata_test: compared %zu loopback address(es) in main.qml against "
-                "HttpServer::kDefaultPort (%d).\n",
-                urls.size(), wallpaperx::HttpServer::kDefaultPort);
-    std::fflush(stdout);
+    check(urls.empty(), "main.qml names no daemon address of its own");
+    check(blankComments(*source, StringBodies::Keep).find("://") == std::string::npos,
+          "main.qml spells no URL of any form outside comments");
+    check(blankComments(*source, StringBodies::Blank).find("XMLHttpRequest") == std::string::npos,
+          "main.qml makes no XMLHttpRequest of its own");
 }
 
 }  // namespace
@@ -1273,7 +1234,7 @@ int main() {
         {"the wallpaper's QML entry point (S9.4)", runWallpaperQmlChecks},
         {"the settings page (S9.5)", runConfigQmlChecks},
         {"the settings the pane deliberately does not carry (S11.3, S11.5)", runNoWallpaperSettingsChecks},
-        {"the daemon's address, in the two places it is written (S10.11)", runDaemonPortChecks},
+        {"the daemon's address, written only where the plugin's read builds it (S10.11)", runDaemonPortChecks},
     };
     for (const Phase& phase : kPhases) {
         try {

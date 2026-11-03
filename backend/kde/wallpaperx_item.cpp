@@ -2,6 +2,9 @@
 
 #include "wallpaperx_item.h"
 
+#include "config_read.h"
+
+#include "daemon/daemon_bus.h"
 #include "daemon/log_escape.h"
 #include "daemon/ring_depth.h"
 
@@ -62,23 +65,10 @@ std::vector<uint64_t> g_reportedModifiers;
 void sendImportModifiers(QObject* context, quint32 drmFormat, const std::vector<uint64_t>& modifiers,
                          std::vector<uint64_t> restoreOnFailure);
 
-constexpr const char* kService = "io.wallpaperx.Daemon";
-constexpr const char* kPath = "/io/wallpaperx/Daemon";
-constexpr const char* kInterface = "io.wallpaperx.Daemon";
-
-// The daemon keeps one image per monitor free to render into, and bounds what one consumer may
-// hold; a hand-over past either is refused rather than taken from whoever holds it. Not a failure
-// of either side, and not permanent.
-constexpr const char* kErrorNoFreeImage = "io.wallpaperx.Daemon.Error.NoFreeImage";
-
-// This process has been sent as many descriptors as the daemon lets one caller hold without giving
-// any back. Only this process can end it, so no announcement will follow: it backs off and asks
-// again. The cap is 64 against this plugin's 4 per screen and 1, so reaching it means images not
+// Set when a TooManyDescriptors refusal has been reported, cleared by the next frame served, so a
+// run of them is one line on stderr. Process-wide because the daemon counts per connection, not
+// per item. Its cap is 64 against this plugin's 4 per screen and 1, so reaching it means images not
 // given back, or many re-fetches of one it is still showing that each carried a descriptor.
-constexpr const char* kErrorTooManyDescriptors = "io.wallpaperx.Daemon.Error.TooManyDescriptors";
-
-// Set when a refusal above has been reported, cleared by the next frame served, so a run of them
-// is one line on stderr. Process-wide because the daemon counts per connection, not per item.
 std::atomic<bool> g_descriptorRefusalReported{false};
 
 // How long a refused item first waits before asking again. Long enough that it is not a poll of
@@ -90,14 +80,6 @@ constexpr int kRefusedRetryMs = 2000;
 // coming free.
 constexpr int kRefusedRetryMaxMs = 16000;
 
-// How long the owner lookup first waits to ask again after a lost one. Short, because until one
-// answers no item can fetch at all.
-constexpr int kLookupRetryMs = 2000;
-
-// Where a failed owner lookup's retry stops doubling. Short for the same reason; a lookup is one
-// message to the bus itself, not to the daemon.
-constexpr int kLookupRetryMaxMs = 8000;
-
 // How many times the screen lock's state is asked again after failed asks, about 30 seconds of them.
 constexpr int kLockRetries = 5;
 
@@ -108,13 +90,6 @@ constexpr int kNoReplyTimeout = std::numeric_limits<int>::max();
 // reached: QtDBus's default call timeout, the patience every other call on this bus gets.
 constexpr int kFetchPatienceMs = 25000;
 
-// `baseMs` doubled `times` times, but never past `capMs`.
-int doubledWait(int baseMs, int times, int capMs) {
-    int ms = baseMs;
-    for (int i = 0; i < times && ms < capMs; ++i) ms *= 2;
-    return std::min(ms, capMs);
-}
-
 // Where a window report's retry stops doubling: the longest a pause or resume can lag a daemon that
 // has recovered, if no window changes meanwhile.
 constexpr int kWindowRetryMaxMs = 60000;
@@ -122,10 +97,6 @@ constexpr int kWindowRetryMaxMs = 60000;
 // Where a size report's retry stops doubling: the longest a screen can stay drawn at the wrong size
 // after a daemon that failed to take it has recovered.
 constexpr int kSizeRetryMaxMs = 8000;
-
-// A screen size reported before the daemon knows the screen's name. Ordinary while the app has
-// not named it, and answered by the report the naming's ConfigChanged sends.
-constexpr const char* kErrorUnknownOutput = "io.wallpaperx.Daemon.Error.UnknownOutput";
 
 // What answers a refused size or window report. Absent and Unnamed end with an event: the daemon's
 // arrival, or the ConfigChanged that naming the screen sends. Permanent cannot be cured by sending
@@ -443,8 +414,7 @@ AcquireTimelineRecord g_timeline;  // guarded by g_timelineMutex
 // Errors meaning this daemon will never hand this process a timeline. Anything else is asked about
 // again after kRefusedRetryMs; until then pictures come with sync_fds, as after a lost answer.
 bool timelineRefusalIsPermanent(const QString& name) {
-    return name == QLatin1String("io.wallpaperx.Daemon.Error.Unsupported") ||
-           name == QLatin1String("io.wallpaperx.Daemon.Error.TooManyTimelineCopies") ||
+    return name == QLatin1String(kErrorUnsupported) || name == QLatin1String(kErrorTooManyTimelineCopies) ||
            name == QLatin1String("org.freedesktop.DBus.Error.UnknownMethod") ||
            name == QLatin1String("org.freedesktop.DBus.Error.UnknownInterface");
 }
@@ -477,8 +447,8 @@ void askForAcquireTimeline(const std::string& daemon) {
     }
     if (stale >= 0) ::close(stale);
 
-    QDBusMessage request = QDBusMessage::createMethodCall(QString::fromStdString(daemon), QString::fromUtf8(kPath),
-                                                          QString::fromUtf8(kInterface),
+    QDBusMessage request = QDBusMessage::createMethodCall(QString::fromStdString(daemon), QString::fromUtf8(kDaemonObjectPath),
+                                                          QString::fromUtf8(kDaemonInterface),
                                                           QStringLiteral("GetAcquireTimeline"));
     // Never timed out by QtDBus: the daemon charges this process for every descriptor it sends until
     // the process leaves the bus, so an answer dropped as late and asked for again is charged twice,
@@ -619,8 +589,8 @@ void sendReleaseBuffer(const std::string& owner, int monitorId, quint64 bufferId
     QDBusConnection bus = QDBusConnection::sessionBus();
     if (!bus.isConnected()) return;
 
-    QDBusMessage request = QDBusMessage::createMethodCall(QString::fromStdString(owner), QString::fromUtf8(kPath),
-                                                          QString::fromUtf8(kInterface),
+    QDBusMessage request = QDBusMessage::createMethodCall(QString::fromStdString(owner), QString::fromUtf8(kDaemonObjectPath),
+                                                          QString::fromUtf8(kDaemonInterface),
                                                           QStringLiteral("ReleaseBuffer"));
     request.setArguments({monitorId, bufferId, handover});
     // The pending call is dropped rather than watched: the reply carries nothing, and the only
@@ -1006,131 +976,6 @@ private:
 
 }  // namespace
 
-// Who owns the daemon's bus name, watched once for the process and written to the ledger, which is
-// the one record of it. Not per item: with no item alive a per-item watch sees nothing, so a daemon
-// replaced while the desktop had no wallpaper item would stay recorded, and every request and
-// release would go to a name that has left. GUI thread.
-class DaemonWatch : public QObject {
-    Q_OBJECT
-public:
-    // Made on first use, on qApp, and never destroyed before it. Null without a bus.
-    static DaemonWatch* instance();
-
-    // Whether no owner is known because asking the bus failed, rather than because the answer has
-    // not come yet. Only meaningful in lifetime 0, which the first answer or change ends.
-    static bool lookupFailed();
-
-signals:
-    // A new daemon lifetime has begun, owned by `owner` -- empty for nobody. The ledger records it
-    // before this is emitted.
-    void replaced(const QString& owner);
-    // The bus answered who owned the name when the watch began, which begins the first lifetime.
-    void named(const QString& owner);
-    // Asking the bus who owns the name failed; it is asked again, later each time.
-    void lookupLost();
-
-private:
-    explicit DaemonWatch(QObject* parent);
-    void askWhoOwns();
-
-    bool m_lookupFailed = false;
-    // Asks lost so far, which the wait before the next ask grows with. The retry covers a lookup lost
-    // while the owner stays put, which no change notice would report.
-    int m_failedAsks = 0;
-};
-
-DaemonWatch* DaemonWatch::instance() {
-    static QPointer<DaemonWatch> watch;
-    if (watch) return watch;
-    QCoreApplication* app = QCoreApplication::instance();
-    if (app == nullptr || !QDBusConnection::sessionBus().isConnected()) return nullptr;
-    watch = new DaemonWatch(app);
-    return watch;
-}
-
-bool DaemonWatch::lookupFailed() {
-    const DaemonWatch* watch = instance();
-    return watch != nullptr && watch->m_lookupFailed && BufferClaims::instance().currentDaemon().lifetime == 0;
-}
-
-DaemonWatch::DaemonWatch(QObject* parent) : QObject(parent) {
-    auto* watcher = new QDBusServiceWatcher(QString::fromUtf8(kService), QDBusConnection::sessionBus(),
-                                            QDBusServiceWatcher::WatchForOwnerChange, this);
-    // Every report is a change of owner, departures included, and each arrives here once.
-    connect(watcher, &QDBusServiceWatcher::serviceOwnerChanged, this,
-            [this](const QString&, const QString&, const QString& owner) {
-                BufferClaims::instance().daemonReplaced(owner.toStdString());
-                emit replaced(owner);
-            });
-    // After the watcher: the bus sends its signals and the answer on one connection, in order, so a
-    // change is either already in the answer or reported after it.
-    askWhoOwns();
-}
-
-void DaemonWatch::askWhoOwns() {
-    QDBusMessage request = QDBusMessage::createMethodCall(QStringLiteral("org.freedesktop.DBus"),
-                                                          QStringLiteral("/org/freedesktop/DBus"),
-                                                          QStringLiteral("org.freedesktop.DBus"),
-                                                          QStringLiteral("GetNameOwner"));
-    request.setArguments({QString::fromUtf8(kService)});
-    // QtDBus's default timeout, every time: a bus slow at login is still answering, and timing an
-    // ask out would only throw the answer away and tell every screen the daemon could not be reached.
-    auto* call = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(request), this);
-    connect(call, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher* done) {
-        done->deleteLater();
-        QString owner;
-        if (!done->isError()) {
-            owner = done->reply().arguments().value(0).toString();
-        } else if (done->error().name() != QLatin1String("org.freedesktop.DBus.Error.NameHasNoOwner")) {
-            // Lost rather than answered. Asked again, since until some answer arrives no request
-            // can be addressed; a change reported meanwhile answers it instead.
-            m_lookupFailed = true;
-            emit lookupLost();
-            QTimer::singleShot(doubledWait(kLookupRetryMs, m_failedAsks, kLookupRetryMaxMs), this, [this] {
-                if (BufferClaims::instance().currentDaemon().lifetime == 0) askWhoOwns();
-            });
-            ++m_failedAsks;
-            return;
-        }
-        if (BufferClaims::instance().daemonNamed(owner.toStdString())) emit named(owner);
-    });
-}
-
-namespace {
-
-// From any sender, unlike FrameReady: naming the service makes QtDBus resolve its owner before the
-// rule is in place. A forged one costs a /config read, never more than one at a time, and a size
-// report where one is owed. Not retried: for a new receiver connect() is false only on a disconnected
-// bus, never for a rule the bus refuses.
-void watchConfigChanged(QObject* receiver, const char* slot) {
-    if (!QDBusConnection::sessionBus().connect(QString(), QString::fromUtf8(kPath), QString::fromUtf8(kInterface),
-                                               QStringLiteral("ConfigChanged"), receiver, slot)) {
-        std::fprintf(stderr, "wallpaperx: could not subscribe to WallpaperX config changes -- %s\n",
-                     sanitizeForLog(QDBusConnection::sessionBus().lastError().message().toStdString()).c_str());
-    }
-}
-
-}  // namespace
-
-ConfigWatch::ConfigWatch(QObject* parent) : QObject(parent) {
-    watchConfigChanged(this, SIGNAL(configChanged()));
-    if (DaemonWatch* watch = DaemonWatch::instance()) {
-        // A departure too: the screen then says the daemon is not running.
-        connect(watch, &DaemonWatch::replaced, this, &ConfigWatch::configChanged);
-        // A daemon that took its name before the watch's rule reached the bus is heard of only here,
-        // and main.qml's first read may have gone before its port was open. An empty answer is a
-        // daemon still absent, which that read already reported.
-        connect(watch, &DaemonWatch::named, this, [this](const QString& owner) {
-            if (!owner.isEmpty()) emit configChanged();
-        });
-    }
-}
-
-bool ConfigWatch::daemonAbsent() const {
-    const BufferClaims::Daemon daemon = BufferClaims::instance().currentDaemon();
-    return daemon.lifetime != 0 && daemon.owner.empty();
-}
-
 WallpaperXItem::PendingFrame::~PendingFrame() {
     closeDescriptors(request);
     releaseUnimported(claims, claim);
@@ -1458,8 +1303,8 @@ void WallpaperXItem::reportVisible() {
         armPaintWatch();
         return;
     }
-    QDBusMessage request = QDBusMessage::createMethodCall(QString::fromUtf8(kService), QString::fromUtf8(kPath),
-                                                          QString::fromUtf8(kInterface),
+    QDBusMessage request = QDBusMessage::createMethodCall(QString::fromUtf8(kDaemonBusName), QString::fromUtf8(kDaemonObjectPath),
+                                                          QString::fromUtf8(kDaemonInterface),
                                                           QStringLiteral("SetOutputVisible"));
     request.setArguments({m_output, visible});
     m_visibleReported = visible;
@@ -1507,8 +1352,8 @@ void WallpaperXItem::sendWindowReport(const WindowReport& report, WindowCall cal
     }
     QDBusMessage request;
     if (call == WindowCall::FocusState) {
-        request = QDBusMessage::createMethodCall(QString::fromUtf8(kService), QString::fromUtf8(kPath),
-                                                 QString::fromUtf8(kInterface), QStringLiteral("SetOutputFocusState"));
+        request = QDBusMessage::createMethodCall(QString::fromUtf8(kDaemonBusName), QString::fromUtf8(kDaemonObjectPath),
+                                                 QString::fromUtf8(kDaemonInterface), QStringLiteral("SetOutputFocusState"));
         // A window keeps precedence: QML reads the two from different sources, which can disagree
         // for the moment between one window losing the focus and the desktop gaining it.
         const QString focus = report.windows.focused ? QStringLiteral("window")
@@ -1516,8 +1361,8 @@ void WallpaperXItem::sendWindowReport(const WindowReport& report, WindowCall cal
                                                                                              : QStringLiteral("none");
         request.setArguments({report.output, focus, report.windows.maximized});
     } else {
-        request = QDBusMessage::createMethodCall(QString::fromUtf8(kService), QString::fromUtf8(kPath),
-                                                 QString::fromUtf8(kInterface), QStringLiteral("SetOutputFocus"));
+        request = QDBusMessage::createMethodCall(QString::fromUtf8(kDaemonBusName), QString::fromUtf8(kDaemonObjectPath),
+                                                 QString::fromUtf8(kDaemonInterface), QStringLiteral("SetOutputFocus"));
         request.setArguments({report.output, report.windows.focused, report.windows.maximized});
     }
 
@@ -1591,8 +1436,8 @@ void WallpaperXItem::reportSize() {
 
     QDBusConnection bus = QDBusConnection::sessionBus();
     if (!bus.isConnected()) return;
-    QDBusMessage request = QDBusMessage::createMethodCall(QString::fromUtf8(kService), QString::fromUtf8(kPath),
-                                                          QString::fromUtf8(kInterface),
+    QDBusMessage request = QDBusMessage::createMethodCall(QString::fromUtf8(kDaemonBusName), QString::fromUtf8(kDaemonObjectPath),
+                                                          QString::fromUtf8(kDaemonInterface),
                                                           QStringLiteral("SetOutputSize"));
     request.setArguments({report.output, static_cast<quint32>(report.pixels.width()),
                           static_cast<quint32>(report.pixels.height())});
@@ -1727,14 +1572,14 @@ void WallpaperXItem::publishReason() {
 }
 
 bool WallpaperXItem::subscribeToFrameReady() {
-    return QDBusConnection::sessionBus().connect(QString::fromUtf8(kService), QString::fromUtf8(kPath),
-                                                 QString::fromUtf8(kInterface), QStringLiteral("FrameReady"), this,
+    return QDBusConnection::sessionBus().connect(QString::fromUtf8(kDaemonBusName), QString::fromUtf8(kDaemonObjectPath),
+                                                 QString::fromUtf8(kDaemonInterface), QStringLiteral("FrameReady"), this,
                                                  SLOT(onFrameReady(int, qulonglong)));
 }
 
 bool WallpaperXItem::subscribeToImportModifiersChanged() {
-    return QDBusConnection::sessionBus().connect(QString::fromUtf8(kService), QString::fromUtf8(kPath),
-                                                 QString::fromUtf8(kInterface),
+    return QDBusConnection::sessionBus().connect(QString::fromUtf8(kDaemonBusName), QString::fromUtf8(kDaemonObjectPath),
+                                                 QString::fromUtf8(kDaemonInterface),
                                                  QStringLiteral("ImportModifiersChanged"), this,
                                                  SLOT(onImportModifiersChanged()));
 }
@@ -1929,8 +1774,8 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
     const bool onTimeline = fetchOnTimeline(asked);
     std::vector<quint64> declared = importsToDeclare(asked);
     QDBusMessage request =
-        QDBusMessage::createMethodCall(QString::fromStdString(asked.owner), QString::fromUtf8(kPath),
-                                       QString::fromUtf8(kInterface), QStringLiteral("GetFrame"));
+        QDBusMessage::createMethodCall(QString::fromStdString(asked.owner), QString::fromUtf8(kDaemonObjectPath),
+                                       QString::fromUtf8(kDaemonInterface), QStringLiteral("GetFrame"));
     QList<quint64> wire;
     wire.reserve(static_cast<qsizetype>(declared.size()));
     for (const quint64 id : declared) wire.append(id);
@@ -2114,7 +1959,7 @@ void sendImportModifiers(QObject* context, quint32 drmFormat, const std::vector<
                 return;
             }
             QDBusMessage request = QDBusMessage::createMethodCall(
-                QString::fromUtf8(kService), QString::fromUtf8(kPath), QString::fromUtf8(kInterface),
+                QString::fromUtf8(kDaemonBusName), QString::fromUtf8(kDaemonObjectPath), QString::fromUtf8(kDaemonInterface),
                 QStringLiteral("SetImportModifiers"));
             QList<quint64> wire;
             wire.reserve(static_cast<qsizetype>(modifiers.size()));

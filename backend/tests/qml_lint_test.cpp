@@ -17,14 +17,13 @@
 //     `missing-property` warning; through a target typed `var` it is not;
 //   - in a file where any nested function -- a function expression, an arrow, an inner
 //     function -- declares a `const` or `let`, no read or write anywhere in the file is checked.
-//     main.qml's request handler does, so in main.qml only the first point holds: changing
-//     `root.wallpaperPath` to `root.wallpaperPat` in the screenState binding gives
-//     `{"success":true,"warnings":[]}` and this entry stays green.
+//     main.qml's read handler declares none, so its reads are checked; one nested `const` there
+//     would silently switch that off, and nothing here detects it.
 //
 // main.qml is shaped to put every displayed fact in declarative bindings -- `screenName`,
 // `wallpaperPath` and `screenState`, derived from three properties written from JavaScript --
-// so that a linter checking reads in bindings checks them. While the request handler declares
-// `const` locals, this entry checks none of those reads, and nothing here detects that.
+// so that a linter checking reads in bindings checks them. Reads through the two loaded items go
+// through `var` properties, since their types come from a module main.qml must not import.
 //
 // It grades one half of GOALS.md's S10.9 (and S10.12 for the package's other QML file). The
 // other half -- that the root element is WallpaperItem from org.kde.plasma.plasmoid -- is
@@ -865,11 +864,11 @@ OracleVerdict proveOracleDiscriminates(const PackageQmlFile& entry, const std::f
 //       failure, `Could not find property "nosuchrootprop"`, which is what proves the
 //       linter resolves the Plasma module rather than passing vacuously over it. The same on
 //       config.qml's Text root: `FAIL: backend/kde/kpackage/contents/ui/config.qml passes
-//       qmllint -W0`. And the mutation that does NOT go red, recorded so the limit is on file
-//       rather than rediscovered: `root.answered = true` changed to `root.answerd = true` in
-//       main.qml's apply() -- qmllint answers `success:true, warnings:[]` and this check
-//       passes. qmllint does not type-check an assignment target inside a JavaScript function
-//       body. Every mutation was made in the /tmp copy; the repository was not touched.
+//       qmllint -W0`. Every mutation was made in the /tmp copy; the repository was not touched.
+//       And an assignment target inside a function body: `root.answered = true` made
+//       `root.answerd = true` in main.qml's apply() (control_batch.sh 2026-11-02, reverted) -> this
+//       check red with `[missing-property/warning] Member "answerd" not found on type main`. It
+//       stays checked only while no function in main.qml declares `const` or `let` (see the top).
 void runLintCheck(const PackageQmlFile& entry, const std::filesystem::path& file, bool oracleProven) {
     if (!oracleProven) {
         std::fprintf(stderr, "  the lint verdict for %s is withheld: the linter did not prove it could answer "

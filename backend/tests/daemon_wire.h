@@ -2,13 +2,14 @@
 
 #pragma once
 
+#include "daemon/daemon_bus.h"
+
 namespace wallpaperx::testing {
 
-// The bus name, path and interface the plugin talks to. Literals rather than the daemon's own
-// constants: what is under test is that the item speaks the wire the daemon declares, and taking
-// both sides from one symbol would let a rename pass unnoticed.
-inline constexpr const char* kService = "io.wallpaperx.Daemon";
-inline constexpr const char* kPath = "/io/wallpaperx/Daemon";
-inline constexpr const char* kInterface = "io.wallpaperx.Daemon";
+// The bus name, path and interface the plugin talks to, from the one definition the daemon and the
+// plugin share. dbus_service_test.cpp (S6.1) pins those to their documented strings.
+inline constexpr const char* kService = kDaemonBusName;
+inline constexpr const char* kPath = kDaemonObjectPath;
+inline constexpr const char* kInterface = kDaemonInterface;
 
 }  // namespace wallpaperx::testing

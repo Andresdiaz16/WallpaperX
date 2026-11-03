@@ -6,8 +6,8 @@
 // asserted for each: the state the binding produces and the message describe() hands to the
 // Text that lands on the desktop.
 //
-// The plugin is driven, never polled: apply(status, body) is the same entry point its own
-// XMLHttpRequest handler calls, so no stub HTTP server is needed and no check waits on anything.
+// The plugin is driven, never polled: apply(status, body) is the entry point its own read's
+// handler calls, so the cause cases need no HTTP server and wait on nothing.
 
 import QtQuick
 import QtTest
@@ -148,11 +148,28 @@ TestCase {
     }
 
     // A stand-in for the change watch main.qml loads from the same blocked module: the one signal
-    // main.qml listens to, which a case emits to stand for the daemon's ConfigChanged.
+    // main.qml listens to, which a case emits to stand for the daemon's ConfigChanged, and the
+    // plugin's real read behind fetch() -- made by a real ConfigWatch (compiled into this harness)
+    // owned by this stand-in, so the reads go with the plugin instance as they do in plasmashell.
     Component {
         id: standInWatch
         Item {
             signal configChanged()
+            readonly property QtObject real: readProbe.watchFor(this)
+            function fetch(output) {
+                return readProbe.fetchFrom(real, output);
+            }
+            // main.qml asks this after every failed read before scheduling a retry.
+            function daemonAbsent() {
+                return real.daemonAbsent();
+            }
+        }
+    }
+
+    // Every HTTP case needs the stub; its absence may not read as a pass.
+    function requireRealRead() {
+        if (!stubDaemon.available()) {
+            skip(stubDaemon.unavailableReason());
         }
     }
 
@@ -426,9 +443,8 @@ TestCase {
     }
 
     // ---------------------------------------------------------------------------------- //
-    // The two decisions main.qml makes inside refresh()'s onreadystatechange handler, ahead
-    // of the apply() call every case above drives. Reaching them needs a real HTTP reply, so
-    // these run against the stub daemon tests/qml_states_test.cpp puts on 127.0.0.1:18462 --
+    // What the plugin's read decides before main.qml's apply(), which every case above drives.
+    // Reaching it needs a real HTTP reply, so these run against the stub daemon tests/qml_states_test.cpp puts on 127.0.0.1:18462 --
     // see that file for why it is that port and not one of the harness's choosing.
     // ---------------------------------------------------------------------------------- //
 
@@ -444,28 +460,57 @@ TestCase {
         return item;
     }
 
-    // GOAL (a property of this harness): the stub really does serve a reply the plugin
-    //       accepts over real HTTP. False if the transport is broken -- in which case the two
-    //       cases below would come out "unreadable" or "unreachable" whatever main.qml did,
-    //       and would establish nothing about the origin check or the size bound.
-    // WHY-THIS-SHAPE: the same body the oversized case pads and the same body the foreign
-    //       origin serves, so those two differ from this one in exactly one respect each.
+    // GOAL (a property of this harness): this engine refuses every request QML itself makes, as the
+    //       lock screen's (kscreenlocker_greet) does. False if the refusing network-manager factory
+    //       is not installed -- then every read case below would pass for a read made through QML's
+    //       own XMLHttpRequest too, and none would show the plugin reads past the refusal.
+    // WHY-THIS-SHAPE: the stub's count is the verdict, not the status: a refused request and an
+    //       unanswered one both end at status 0. The factory's own count shows it was asked.
+    // CONTROL: test-side, control_batch.sh 2026-11-02, reverted: setNetworkAccessManagerFactory deleted from
+    //       tests/qml_states_test.cpp -> "a request made through QML's engine never reached the stub" red.
+    function test_this_engine_refuses_qml_requests_like_the_lock_screen() {
+        if (!stubDaemon.available()) {
+            skip(stubDaemon.unavailableReason());
+        }
+        stubDaemon.reset();
+        const refusedBefore = refusingNetwork.refused();
+        const request = new XMLHttpRequest();
+        let done = false;
+        request.onreadystatechange = function () {
+            if (request.readyState === XMLHttpRequest.DONE) {
+                done = true;
+            }
+        };
+        request.open("GET", "http://127.0.0.1:18462/config?output=DP-3");
+        request.send();
+        tryVerify(function () { return done; }, 5000, "QML's own request finished");
+        compare(stubDaemon.requests(), 0, "a request made through QML's engine never reached the stub");
+        compare(request.status, 0, "and it ended as nothing answering");
+        verify(refusingNetwork.refused() > refusedBefore, "the refusing network manager was asked");
+    }
+
+    // GOAL: S15.1207 -- a /config read succeeds in an engine that refuses every request QML makes (the
+    //       lock screen's setup): the stub sees it, and the screen reaches "set". Also, as a property of
+    //       this harness, the stub serves a reply the plugin accepts over real HTTP, so the cases below
+    //       that end "unreadable" or "refused" do so for their own reason.
+    // WHY-THIS-SHAPE: the same body the oversized case pads and the same body the redirect
+    //       target serves, so those differ from this one in exactly one respect each.
     //       The request count is asserted, not just the state: a plugin that never sent
     //       anything and a stub that never answered both leave "unreachable", and only the
     //       counter tells them apart.
     //       The wait is for this request's answer (`pending` cleared), not for "set": the naming
     //       read already left "set", so a state wait returned before the request reached a stub
     //       slowed by load, and counted 0 requests.
-    // CONTROL: control_run.sh 2026-10-16, reverted, tests/qml_states_test.cpp, each only after
-    //       serveGood(): the Good arm answering 500 -> "a reply served over HTTP reaches the set
-    //       state. Actual (): refused. Expected (): set"; the Good arm sleeping 6 s -> "'the
-    //       refresh's request was answered' returned FALSE", where the state wait passed (NOT RED).
-    //       The stub delaying each Good request 300 ms reproduces the load failure on the state
-    //       wait ("exactly one request ... Actual (): 0") and leaves this shape green.
+    // CONTROL: control_batch.sh 2026-11-02, reverted, tests/qml_states_test.cpp, each only after
+    //       serveGood(): serveGood() serving 500 -> "a reply served over HTTP reaches the set state.
+    //       Actual (): refused. Expected (): set"; serveGood() stalling 12 s -> "'the refresh's
+    //       request was answered' returned FALSE" (ConfigRead's 5 s timeout and this 5 s wait race;
+    //       either line is this case going red). The lock-screen half: control_batch.sh 2026-11-02,
+    //       reverted, read() in backend/kde/kpackage/contents/ui/main.qml made to read through
+    //       XMLHttpRequest -> "the naming read was answered with the stub's good reply" red here and in
+    //       every HTTP case.
     function test_the_stub_serves_a_reply_the_plugin_accepts() {
-        if (!stubDaemon.available()) {
-            skip(stubDaemon.unavailableReason());
-        }
+        requireRealRead();
         const item = pluginReadyToFetch();
         stubDaemon.serveGood();
         item.refresh();
@@ -477,81 +522,229 @@ TestCase {
         compare(item.wallpaperPath, "/home/u/Pictures/beach.png", "the served path reached the binding");
     }
 
-    // GOAL: a reply that did not come from root.daemonOrigin is treated as unreadable, whatever
-    //       it holds. False if the plugin parses it: a redirect is enough to make every screen's
-    //       wallpaper plugin fetch from wherever a process on loopback names, once a second,
-    //       from inside plasmashell -- and then act on what it gets back.
-    // WHY-THIS-SHAPE: the foreign origin serves the SAME body the accepted case above serves,
-    //       and a 200 at that. So the two runs differ in the origin and in nothing else, and
-    //       "unreadable" here cannot be caused by the content. The redirect target is a second
-    //       real listener on an ephemeral port rather than the same socket under another host
-    //       name, which would rest on how Qt resolves "localhost". The alt server's own request
-    //       count is asserted, because a redirect Qt declined to follow would leave the plugin
-    //       reading the 302's empty body -- also "unreadable", for a reason this goal is not
-    //       about, and it would pass a state-only check.
-    // CONTROL: `elsewhere` dropped from the `usable` expression in main.qml's
-    //       onreadystatechange -> "FAIL: a reply redirected away from the daemon's origin is
-    //       unreadable. Actual (): set. Expected (): unreadable" -- the plugin having acted on
-    //       a wallpaper served by a foreign origin. That single mutation is also what shows the
-    //       check is not vacuous on this Qt: if responseURL were empty, `elsewhere` would be
-    //       false either way and both builds would read "set". 23 other cases green. Observed
-    //       2026-08-19 on Qt 6.11.2. Reverted.
-    function test_a_reply_from_another_origin_is_unreadable() {
-        if (!stubDaemon.available()) {
-            skip(stubDaemon.unavailableReason());
-        }
+    // GOAL: S15.1209 -- a 3xx from the daemon's port is not followed: the redirect target sees no
+    //       request and the screen shows a refusal naming the status, not the target's answer.
+    // WHY-THIS-SHAPE: the target serves the SAME good body the accepted case above serves, so a
+    //       followed redirect shows "set" and the target's count reads 1. The target is a second
+    //       real listener on an ephemeral port, so "elsewhere" does not rest on name resolution.
+    // CONTROL: control_batch.sh 2026-11-02, reverted: configNetwork()'s ManualRedirectPolicy made
+    //       NoLessSafeRedirectPolicy in backend/kde/config_read.cpp -> "the redirect target was never
+    //       asked" red; re-run on config_read.cpp, control_batch.sh 2026-11-02, same line red.
+    function test_a_redirect_is_not_followed() {
+        requireRealRead();
         const item = pluginReadyToFetch();
         stubDaemon.serveFromAnotherOrigin();
         item.refresh();
 
-        tryCompare(item, "screenState", "unreadable", 5000,
-                   "a reply redirected away from the daemon's origin is unreadable");
-        compare(stubDaemon.requests(), 1, "the plugin asked the daemon's origin first");
-        compare(stubDaemon.altRequests(), 1,
-                "Qt followed the redirect, so what the plugin refused is a served reply and not an empty 302 body");
-        verify(item.describe().indexOf("cannot read") !== -1,
-               "the desktop message names the unreadable cause: [" + item.describe() + "]");
+        verify(item.pending !== null, "the refresh sent a request");
+        tryVerify(function () { return item.pending === null; }, 5000, "the refresh's request was answered");
+        compare(stubDaemon.altRequests(), 0, "the redirect target was never asked");
+        compare(item.screenState, "refused", "a redirect reads as a refusal, not as the target's answer");
+        compare(stubDaemon.requests(), 1, "the plugin asked the daemon's port once");
+        verify(item.describe().indexOf("302") !== -1,
+               "the desktop message names the redirect's status: [" + item.describe() + "]");
     }
 
-    // GOAL: a body larger than maxBodyBytes is treated as unreadable rather than parsed. False
+    // Waits, with events processed, until fewer than `count` reads are alive, or `ms` (default 5 s)
+    // pass. The caller grades the count after: this returns either way, and never decides anything.
+    function waitForLiveReadsBelow(count, ms) {
+        const rounds = (ms === undefined ? 5000 : ms) / 100;
+        for (let t = 0; t < rounds && readProbe.liveReads() >= count; ++t) {
+            wait(100);
+        }
+    }
+
+    // GOAL: S15.1212 -- after N reads, each answered and handled by main.qml's own handler, no read
+    //       object is left alive while the plugin lives. False if a read is kept after it finished.
+    // WHY-THIS-SHAPE: counted from C++ through destroyed(), not by forcing gc(): what is in question is
+    //       whether anything frees the read, and a collector run would grade the collector. The plugin
+    //       is kept alive to the end, so its watch -- the reads' parent -- cannot be what freed them.
+    // CONTROL: control_batch.sh 2026-11-02, reverted: `deleteLater();` deleted from ConfigRead::finish()
+    //       (backend/kde/config_read.cpp) -> "every answered read was freed while its plugin lives.
+    //       Actual (): 11 Expected (): 0". A second break, fetch() making the read with no parent, no C++
+    //       ownership and no deleteLater -> the same line. Both re-run on config_read.cpp,
+    //       control_batch.sh 2026-11-02, both red on that line.
+    // COVERAGE-ASSERT: each refresh is required to have made exactly one read, and all N to be answered
+    //       and applied, so the count is graded over N handled reads and not over none.
+    function test_every_handled_read_is_freed() {
+        requireRealRead();
+        const item = pluginReadyToFetch();
+        const madeBefore = readProbe.madeReads();
+        const rounds = 8;
+        for (let i = 0; i < rounds; ++i) {
+            item.refresh();
+            verify(item.pending !== null, "refresh " + i + " sent a read");
+            tryVerify(function () { return item.pending === null; }, 5000, "read " + i + " was answered");
+            compare(item.screenState, "set", "read " + i + " was applied");
+        }
+        compare(readProbe.madeReads() - madeBefore, rounds, "each refresh made exactly one read");
+        compare(stubDaemon.requests(), rounds, "each read reached the stub");
+        waitForLiveReadsBelow(1);
+        compare(readProbe.liveReads(), 0, "every answered read was freed while its plugin lives");
+        verify(item.pending === null, "the plugin itself still exists");
+    }
+
+    // GOAL: S15.1213 -- every finished handler of a read sees its real status and body, and the read
+    //       is freed only after all of them have run. False if the result is stored after emitting, or
+    //       if the read is freed before or during the emission (later handlers then never run).
+    // WHY-THIS-SHAPE: three handlers, not one: a read freed by the first would still pass a one-handler
+    //       case. The wait is for the read's destruction, not for the handlers, so a read freed without
+    //       its handlers running ends the wait and is graded rather than waited out.
+    // CONTROL: control_batch.sh 2026-11-02, reverted, ConfigRead::finish() in
+    //       backend/kde/config_read.cpp, both re-run there 2026-11-02:
+    //       `m_status`/`m_body` assigned after `emit finished()` ->
+    //       "handler 0 saw the real status. Actual (): 0 Expected (): 200"; `deleteLater(); emit
+    //       finished();` made `delete this; return;` -> "every finished handler ran before the read was
+    //       freed. Actual (): 0 Expected (): 3".
+    function test_every_finished_handler_sees_the_answer_before_the_read_is_freed() {
+        requireRealRead();
+        stubDaemon.reset();
+        const destroyedBefore = readProbe.destroyedReads();
+        const read = readProbe.fetch("DP-3");
+        verify(read !== null, "a read was made");
+        const seen = [];
+        for (let h = 0; h < 3; ++h) {
+            read.finished.connect(function () {
+                seen.push({ handler: h, status: read.status, body: read.responseText });
+            });
+        }
+        for (let t = 0; t < 50 && readProbe.destroyedReads() === destroyedBefore; ++t) {
+            wait(100);
+        }
+        verify(readProbe.destroyedReads() > destroyedBefore, "the read was freed once it finished");
+        compare(seen.length, 3, "every finished handler ran before the read was freed");
+        for (let i = 0; i < seen.length; ++i) {
+            compare(seen[i].status, 200, "handler " + seen[i].handler + " saw the real status");
+            compare(seen[i].body, suite.goodReply, "handler " + seen[i].handler + " saw the real body");
+        }
+    }
+
+    // Loads a plugin, holds the stub's answers, names the screen so main.qml sends its read, and
+    // returns once the stub holds that read. The caller releases the stub (reset or releaseHeld).
+    function pluginWithAHeldRead() {
+        stubDaemon.reset();
+        const host = loadHost();
+        standInTheWatch(host.item);
+        stubDaemon.holdAnswers();
+        const liveBefore = readProbe.liveReads();
+        host.item.connectorOverride = suite.namedScreen;
+        verify(host.item.pending !== null, "naming the screen sent a read");
+        tryVerify(function () { return stubDaemon.requests() === 1; }, 5000, "the stub holds the read");
+        compare(readProbe.liveReads() - liveBefore, 1, "exactly one read is in flight");
+        return { host: host, liveBefore: liveBefore };
+    }
+
+    // GOAL: S15.1214 -- a plugin instance destroyed while its read is held unanswered frees that read
+    //       before the answer comes. False if the read outlives its plugin (it would then finish later,
+    //       and run main.qml's handler against a plugin that no longer exists).
+    // WHY-THIS-SHAPE: the stub holds the answer until released, so "before the answer" is a fact of
+    //       the run, asserted below, rather than a race the fast path usually wins. A separate case
+    //       from the one about the late answer, so each half is graded alone under the same break.
+    //       The wait is bounded well below the read's own timeout and the read must never have
+    //       finished: a read that outlived its plugin is ended by that timeout and frees itself, so a
+    //       5 s wait on the live count alone passes for it.
+    // CONTROL: control_batch.sh 2026-11-03, reverted: ConfigWatch::fetch() in backend/kde/config_read.cpp making the read with no
+    //       parent -> "a read held unanswered is freed with its plugin. Actual (): 1 Expected (): 0" red.
+    //       Test-side, same batch: boundMs made 6000 -> "the wait (6000 ms) ends well before a read's own
+    //       timeout (5000 ms)" red.
+    // COVERAGE-ASSERT: the wait bound is asserted to be below ConfigRead::kTimeoutMs, read off the
+    //       constant, so raising the bound or lowering the timeout fails here instead of going vacuous.
+    function test_a_plugin_destroyed_mid_read_frees_the_read() {
+        requireRealRead();
+        const boundMs = 2000;
+        verify(boundMs < readProbe.timeoutMs() - 1000,
+               "the wait (" + boundMs + " ms) ends well before a read's own timeout (" + readProbe.timeoutMs() + " ms)");
+        try {
+            const held = pluginWithAHeldRead();
+            const finishedBefore = readProbe.finishedReads();
+            held.host.destroy();
+            waitForLiveReadsBelow(held.liveBefore + 1, boundMs);
+            compare(stubDaemon.heldAnswered(), 0, "the answer was still held throughout");
+            compare(readProbe.finishedReads(), finishedBefore, "the held read never finished");
+            compare(readProbe.liveReads(), held.liveBefore, "a read held unanswered is freed with its plugin");
+            // GOAL (a property of this harness): the hold lasted the whole case; one that ran out was
+            //       answered 503, which finishes and frees the read before the plugin goes and leaves
+            //       every check above green for a reason that is not the plugin's.
+            // CONTROL: test-side, control_batch.sh 2026-11-02, reverted: `wait(21000);` before
+            //       `held.host.destroy();` -> "no held answer ran out during the case" red.
+            compare(stubDaemon.holdsExpired(), 0, "no held answer ran out during the case");
+        } finally {
+            stubDaemon.reset();
+        }
+    }
+
+    // GOAL: S15.1215 -- when the answer to a read whose plugin was destroyed arrives, no finished
+    //       handler runs (so nothing is applied anywhere) and the process survives. False if the read
+    //       outlived its plugin and finished.
+    // WHY-THIS-SHAPE: absence needs a window. Its end is a later read's full round trip, made after the
+    //       stub has written the held answer, not a fixed sleep: an answer written first would, in
+    //       practice, be read first. That ordering is across two connections, so this is a strong
+    //       window rather than a proof. The plugin's watch going away is the wait, not the read's
+    //       freeing, so this case does not depend on the one above passing.
+    // CONTROL: control_batch.sh 2026-11-02, reverted: ConfigWatch::fetch() (backend/kde/
+    //       config_read.cpp) making the read with no parent -> "no read finished for the answer that
+    //       reached a destroyed plugin. Actual (): 2 Expected (): 1" red.
+    function test_an_answer_after_the_plugin_is_destroyed_runs_nothing() {
+        requireRealRead();
+        try {
+            const held = pluginWithAHeldRead();
+            const watchesBefore = readProbe.destroyedWatches();
+            held.host.destroy();
+            tryVerify(function () { return readProbe.destroyedWatches() > watchesBefore; }, 5000,
+                      "the plugin's watch went with it");
+            // GOAL (a property of this harness): the answer is still unwritten when the plugin has
+            //       gone -- neither released early nor run out (an expired hold answers 503 and the read
+            //       finishes while its plugin lives) -- so the release below is what sends it.
+            // CONTROL: test-side, control_batch.sh 2026-11-02, each reverted: `wait(21000);` before
+            //       `held.host.destroy();` -> "no held answer ran out before the plugin went" red;
+            //       `stubDaemon.releaseHeld(); wait(300);` before it -> "the held answer was still
+            //       unwritten when the plugin went" red.
+            compare(stubDaemon.holdsExpired(), 0, "no held answer ran out before the plugin went");
+            compare(stubDaemon.heldAnswered(), 0, "the held answer was still unwritten when the plugin went");
+            const finishedBefore = readProbe.finishedReads();
+            stubDaemon.releaseHeld();
+            tryVerify(function () { return stubDaemon.heldAnswered() === 1; }, 5000,
+                      "the stub wrote the held answer");
+            const later = { done: false };
+            const read = readProbe.fetch("DP-3");
+            verify(read !== null, "a later read was made");
+            read.finished.connect(function () { later.done = true; });
+            tryVerify(function () { return later.done; }, 5000, "the later read finished");
+            compare(readProbe.finishedReads() - finishedBefore, 1,
+                    "no read finished for the answer that reached a destroyed plugin");
+        } finally {
+            stubDaemon.reset();
+        }
+    }
+
+    // GOAL: a body larger than the read's bound (ConfigRead::kMaxBodyBytes) is treated as
+    //       unreadable rather than parsed. False
     //       if the plugin buffers and parses whatever arrives: the reply comes from whatever
     //       holds the port, nothing else bounds what the shell takes in, and the parse runs on
     //       plasmashell's GUI thread.
     // WHY-THIS-SHAPE: the oversized body is VALID JSON describing the same wallpaper the
     //       accepted case above serves, so its SIZE is the only thing that can make it
     //       unreadable. A check driven with garbage would be satisfied by the JSON parser and
-    //       would say nothing about the bound.
-    //       Served CHUNKED, deliberately, and that is not a detail: main.qml has two
-    //       independent bounds, and chunked is the only shape that reaches the one graded here.
-    //       With a Content-Length present the plugin refuses at HEADERS_RECEIVED instead, and
-    //       that path CANNOT BE DRIVEN -- it calls request.abort(), which segfaults Qt's
-    //       XMLHttpRequest. See the block below; the coverage that costs is stated there rather
-    //       than papered over with a row that crashes the binary.
-    // CONTROL: `body.length <= root.maxBodyBytes` in main.qml's onreadystatechange replaced by
-    //       `true` -> "FAIL: an oversized reply with no declared length is unreadable. Actual
-    //       (): set. Expected (): unreadable" -- 70 KB parsed and acted on. 23 other cases
-    //       green. Observed 2026-08-19. Reverted.
-    // COVERAGE-ASSERT: the served body is asserted to be larger than the plugin's own
-    //       maxBodyBytes, read off the plugin rather than written as a literal. A fixture that
+    //       would say nothing about the bound. Served chunked, so no declared length is involved;
+    //       the case below serves the same body with one.
+    // CONTROL: control_batch.sh 2026-11-03, reverted, ConfigRead in backend/kde/config_read.cpp:
+    //       takeArrived() always taking the bytes and returning true, and ending()'s
+    //       `received.size() > kMaxBodyBytes` test made `false` -> "an oversized reply with no declared
+    //       length is unreadable" red. Not taken for a timeout (S15.1229): control_batch.sh 2026-11-03,
+    //       reverted, ending()'s first return made `Outcome::TimedOut` (status kept) -> "the plugin
+    //       made exactly one request" red in this, the declared-length and the endless case: the kept
+    //       answer is retried. The state line stays green under that break, since the retry's unkept
+    //       timeout applies status 200 with no body, which also reads "unreadable".
+    // COVERAGE-ASSERT: the served body is asserted to be larger than the read's own bound, read off
+    //       ConfigRead's constant rather than written as a literal. A fixture that
     //       stopped being oversized -- or a ceiling raised past 70000 -- fails here instead of
     //       going green against a body the bound never applied to.
-    //
-    // WAS NOT COVERABLE, and the defect it named is now fixed: driving a reply with an
-    // oversized `Content-Length` reached `request.abort()` inside the HEADERS_RECEIVED handler,
-    // and the process died with SIGSEGV in QIODevice::readAll() under QQmlXMLHttpRequest on the
-    // next network event -- so the defence let anything holding 127.0.0.1:18462 kill
-    // plasmashell. main.qml no longer refuses at HEADERS_RECEIVED; a declared length is left to
-    // the same bound below, which catches it a moment later. A row serving 200 with a valid
-    // body and `Content-Length: 70050` should now pass here, and adding one would cover the
-    // second arm -- it is not shipped because nobody has run it.
     function test_an_oversized_reply_is_unreadable() {
-        if (!stubDaemon.available()) {
-            skip(stubDaemon.unavailableReason());
-        }
+        requireRealRead();
         const item = pluginReadyToFetch();
-        verify(stubDaemon.oversizedBytes() > item.maxBodyBytes,
-               "the stub's oversized body (" + stubDaemon.oversizedBytes() + " bytes) is past the plugin's "
-               + "ceiling of " + item.maxBodyBytes);
+        verify(stubDaemon.oversizedBytes() > readProbe.maxBodyBytes(),
+               "the stub's oversized body (" + stubDaemon.oversizedBytes() + " bytes) is past the read's "
+               + "ceiling of " + readProbe.maxBodyBytes());
 
         stubDaemon.serveOversizedChunked();
         item.refresh();
@@ -564,29 +757,24 @@ TestCase {
     }
 
     // GOAL: the same bound holds for a reply that DECLARES its size, and reaching that verdict
-    //       does not kill the process. Both halves matter: the plugin used to refuse this shape
-    //       at HEADERS_RECEIVED by calling abort() from inside the handler, which segfaults
-    //       Qt's XMLHttpRequest -- so the defence against a hostile reply was itself a way for
+    //       does not kill the process. Both halves matter: the read stops such a transfer with
+    //       abort() from inside its own readyRead handler, and abort() emits finished() from inside
+    //       itself -- a defence against a hostile reply that re-entered the read would be a way for
     //       whatever holds the port to take plasmashell down.
     // WHY-THIS-SHAPE: a separate function from the chunked row above, not a data row beside it.
     //       Under the defect this does not fail, it ABORTS -- and a crash in a shared function
     //       destroys the other row's diagnostics too. Kept apart so a regression prints as one
     //       named case dying rather than as the file going silent.
-    // CONTROL: (a) `body.length <= root.maxBodyBytes` in main.qml's DONE handler replaced by
-    //       `true` -> "FAIL: an oversized reply that declares its length is unreadable. Actual
-    //       (): set. Expected (): unreadable", the chunked row red beside it. (b) the
-    //       HEADERS_RECEIVED arm put back -- `if (!isNaN(declared) && declared >
-    //       root.maxBodyBytes) { ... request.abort(); root.apply(status, ""); }` -> ctest
-    //       reports `qml_states (SEGFAULT)` with a stack trace in place of results, and no
-    //       case in this file reports at all. Both observed 2026-08-20, both reverted.
+    // CONTROL: control_batch.sh 2026-11-03, reverted: the break named on the chunked case above
+    //       (backend/kde/config_read.cpp) -> "an oversized reply that declares its length is
+    //       unreadable" red. The crash half is graded by the endless case below, where the read is
+    //       certain to stop inside readyRead; a 70,000-byte body may have finished before it is read.
     function test_an_oversized_reply_that_declares_its_length_is_unreadable() {
-        if (!stubDaemon.available()) {
-            skip(stubDaemon.unavailableReason());
-        }
+        requireRealRead();
         const item = pluginReadyToFetch();
-        verify(stubDaemon.oversizedBytes() > item.maxBodyBytes,
-               "the stub's oversized body (" + stubDaemon.oversizedBytes() + " bytes) is past the plugin's "
-               + "ceiling of " + item.maxBodyBytes);
+        verify(stubDaemon.oversizedBytes() > readProbe.maxBodyBytes(),
+               "the stub's oversized body (" + stubDaemon.oversizedBytes() + " bytes) is past the read's "
+               + "ceiling of " + readProbe.maxBodyBytes());
 
         stubDaemon.serveOversizedWithLength();
         item.refresh();
@@ -596,6 +784,555 @@ TestCase {
         compare(stubDaemon.requests(), 1, "the plugin made exactly one request");
         verify(item.describe().indexOf("cannot read") !== -1,
                "the desktop message names the unreadable cause: [" + item.describe() + "]");
+    }
+
+    // GOAL: a body that never ends finishes the read promptly as unreadable, and the plugin closes
+    //       the transfer rather than keeps taking it in. False if the bound is checked only once the
+    //       body has ended: that read never finishes and buffers for as long as the server sends.
+    //       Also: ending such a transfer from inside its own readyRead does not crash the process.
+    // WHY-THIS-SHAPE: the 70,000-byte cases above cannot tell the two apart -- a finite body ends,
+    //       so an end-of-body check is satisfied too. The stub's own count of ended transfers is the
+    //       evidence the plugin let go; memory is not measured, but a read that stopped taking bytes
+    //       at the bound cannot hold more than the bound and one chunk.
+    // CONTROL: control_batch.sh 2026-11-03, each reverted, in ConfigRead (backend/kde/config_read.cpp):
+    //       takeArrived() always appending and returning true, with ending()'s size test kept (the
+    //       bound checked only at the end) -> "an endless reply is unreadable" red, the 70,000-byte
+    //       cases above staying green; `reply->disconnect(this);` deleted from complete(), so abort()
+    //       re-enters it -> "Received signal 11 (SIGSEGV)" in this case.
+    function test_an_endless_reply_is_stopped_as_unreadable() {
+        requireRealRead();
+        const item = pluginReadyToFetch();
+        // Reset however this ends: the cases after it that do not reset would be served this shape.
+        try {
+            stubDaemon.serveEndless();
+            item.refresh();
+
+            tryCompare(item, "screenState", "unreadable", 5000, "an endless reply is unreadable");
+            compare(stubDaemon.requests(), 1, "the plugin made exactly one request");
+            tryVerify(function () { return stubDaemon.endlessEnded() === 1; }, 5000,
+                      "the plugin closed the endless transfer");
+            console.log("endless body: " + stubDaemon.endlessBytes() + " bytes sent before the plugin closed it");
+        } finally {
+            stubDaemon.reset();
+        }
+    }
+
+    // A retry is only due while the daemon is not known to be stopped: with its bus name unowned
+    // main.qml rightly retries nothing. qml_states_test.cpp owns the name on the private bus.
+    function requireDaemonNotAbsent(item) {
+        if (item.watchItem.daemonAbsent()) {
+            skip("the daemon's bus name has no owner here, so main.qml rightly schedules no retry");
+        }
+    }
+
+    // GOAL: a 200 whose connection closes before its declared length reads as unreadable, and a retry
+    //       follows. False if it reads as nothing answering ("not running" for a daemon that answered),
+    //       or if the truncated body is applied as a 200, which is never retried.
+    // WHY-THIS-SHAPE: cut short once, then served whole, so the retry is seen arriving and applied;
+    //       waiting for "unreadable" alone would pass for a plugin that never asks again.
+    // CONTROL: control_batch.sh 2026-11-03, each reverted: ConfigRead::ending()'s `status != 0`
+    //       branch made `false` (backend/kde/config_read.cpp) -> "a 200 cut short mid-body reads as
+    //       unreadable" red; in retryIfFailed (backend/kde/kpackage/contents/ui/
+    //       main.qml) `outcome === "answered"` made `true`, and `retry.start();` deleted -> each "'a retry
+    //       follows a read cut short' returned FALSE".
+    function test_a_reply_cut_short_reads_as_unreadable_and_is_retried() {
+        requireRealRead();
+        const item = pluginReadyToFetch();
+        requireDaemonNotAbsent(item);
+        stubDaemon.serveCutShortOnce();
+        item.refresh();
+
+        tryVerify(function () { return item.pending === null; }, 5000, "the cut-short read ended");
+        compare(item.screenState, "unreadable", "a 200 cut short mid-body reads as unreadable");
+        compare(stubDaemon.requests(), 1, "one request so far")
+        tryVerify(function () { return stubDaemon.requests() === 2; }, 5000, "a retry follows a read cut short");
+        tryCompare(item, "screenState", "set", 5000, "the retry's whole answer is applied");
+    }
+
+    // GOAL: a server that accepts and never answers ends the read in about 5 s, `pending` clears, the
+    //       last answer stays on screen, and a later notice reads again. False if the read waits on
+    //       (pending stays set and every notice only queues behind it), if something else ends it
+    //       early, or if the timeout is applied as nothing answering, which tears the renderer down.
+    // WHY-THIS-SHAPE: timed from the refresh and bounded on both sides: an upper bound alone would
+    //       pass a read ended at once by any failure, which is not the timeout. The stub stalls for up
+    //       to 12 s, past the wait, so its own 503 cannot be what ends the read.
+    // CONTROL: control_batch.sh 2026-11-03, reverted, each, backend/kde/config_read.cpp/.h and main.qml:
+    //       `request.setTransferTimeout(kTimeoutMs);` deleted -> "'a read nobody answers ends' returned
+    //       FALSE"; kTimeoutMs made 1000 -> "a read nobody answers ends in about 5 s (took 1006 ms)" red;
+    //       main.qml's `const keep = ...` made `false` -> "and the last answer stays on screen",
+    //       'Actual (): unreachable'. The later-notice half has no control of its own.
+    function test_a_server_that_never_answers_ends_the_read_in_about_5_s() {
+        requireRealRead();
+        const item = pluginReadyToFetch();
+        const watch = childNamed(item, "wallpaperxConfigWatch");
+        stubDaemon.serveStall();
+        const started = Date.now();
+        item.refresh();
+        verify(item.pending !== null, "the refresh sent a read");
+        tryVerify(function () { return stubDaemon.requests() === 1; }, 5000, "the stub holds the read unanswered");
+        tryVerify(function () { return item.pending === null; }, 9000, "a read nobody answers ends");
+        const took = Date.now() - started;
+        verify(took >= 4000 && took < 8000, "a read nobody answers ends in about 5 s (took " + took + " ms)");
+        compare(item.screenState, "set", "and the last answer stays on screen");
+
+        stubDaemon.serveGood();
+        watch.item.configChanged();
+        verify(item.pending !== null, "a later notice reads again");
+        tryVerify(function () { return item.pending === null; }, 5000, "that read is answered");
+        compare(item.screenState, "set", "and applied");
+    }
+
+    // GOAL: an HTTP 400 or 403 keeps its status and the daemon's reason, so the screen says refused,
+    //       with that reason. False if a refusal is reported as nothing answering ("not running"),
+    //       which sends the user to start a service that is up.
+    // WHY-THIS-SHAPE: both codes, since Qt reports them as different errors (ProtocolInvalidOperation
+    //       and ContentAccessDenied, both in isStatusError()), and the reason compared exactly.
+    // CONTROL: control_batch.sh 2026-11-03, each reverted, in ConfigRead::ending()
+    //       (backend/kde/config_read.cpp): `|| wholeRefusal` in the answered branch made `|| false`, and
+    //       `*declaredLength == received.size()` made `false` -> each "an HTTP 400 keeps its status" red.
+    function test_a_refusal_keeps_its_status_and_reason() {
+        requireRealRead();
+        const codes = [400, 403];
+        for (let i = 0; i < codes.length; ++i) {
+            const item = pluginReadyToFetch();
+            const reason = "refused with " + codes[i] + " by the stub";
+            stubDaemon.serveStatus(codes[i], reason, false);
+            item.refresh();
+            tryVerify(function () { return item.pending === null; }, 5000, "the refused read ended");
+            compare(item.screenState, "refused", "an HTTP " + codes[i] + " keeps its status");
+            compare(item.refusalReason, reason, "an HTTP " + codes[i] + " keeps the daemon's reason");
+        }
+    }
+
+    // GOAL: a 503 is retried. False if it is treated as a refusal that stands until something changes.
+    // CONTROL: control_batch.sh 2026-11-03, reverted: retryIfFailed's `status < 500` made `status < 600`
+    //       in backend/kde/kpackage/contents/ui/main.qml -> "'a 503 is retried' returned FALSE".
+    function test_a_503_is_retried() {
+        requireRealRead();
+        const item = pluginReadyToFetch();
+        requireDaemonNotAbsent(item);
+        stubDaemon.serveStatus(503, "busy", true);
+        item.refresh();
+        tryVerify(function () { return item.pending === null; }, 5000, "the 503 read ended");
+        compare(item.screenState, "refused", "a 503 is shown as the daemon's answer meanwhile");
+        tryVerify(function () { return stubDaemon.requests() === 2; }, 5000, "a 503 is retried");
+        tryCompare(item, "screenState", "set", 5000, "the retry's answer is applied");
+    }
+
+    // Waits up to 9 s for `item`'s read to end: past ConfigRead's 5 s timeout, short of the stall's 12 s.
+    function waitOutATimedOutRead(item, what) {
+        tryVerify(function () { return item.pending === null; }, 9000, what);
+    }
+
+    // GOAL: S15.1224 -- a read ended by its timeout changes nothing shown: `answered`, `reply` (the
+    //       same object) and `refusalReason` stay as they were, and a loaded renderer stays loaded. False
+    //       if the timeout is applied as nothing answering, which clears all three and unloads it.
+    // WHY-THIS-SHAPE: two starting answers, a wallpaper with a monitor id (the renderer's Loader is
+    //       active) and a refusal, since apply(0) clears a different field in each. The reply is
+    //       compared by identity: an equal object re-parsed from the same body would be a new apply.
+    // CONTROL: control_batch.sh 2026-11-03, reverted: main.qml's `const keep = ...` made `false`
+    //       (backend/kde/kpackage/contents/ui/main.qml) -> "'a timed-out read keeps the same reply'
+    //       returned FALSE". That ends the case, so the answered, renderer and refusal lines after it
+    //       have no control of their own.
+    function test_a_timed_out_read_keeps_the_last_answer() {
+        requireRealRead();
+        try {
+            const item = pluginReadyToFetch();
+            const surface = childNamed(item, "wallpaperxSurface");
+            item.apply(200, '{"output":"DP-3","known":true,"path":"/home/u/Pictures/beach.png","monitor_id":0}');
+            verify(surface.active, "a wallpaper with a monitor id makes the renderer's Loader active");
+            const reply = item.reply;
+            stubDaemon.serveStall();
+            item.refresh();
+            verify(item.pending !== null, "the refresh sent a read");
+            waitOutATimedOutRead(item, "the stalled read ended");
+            compare(stubDaemon.requests(), 1, "the stub held exactly that read");
+            verify(item.reply === reply, "a timed-out read keeps the same reply");
+            verify(item.answered, "a timed-out read keeps the screen answered");
+            compare(item.screenState, "set", "a timed-out read keeps the wallpaper's state");
+            verify(surface.active, "a timed-out read keeps the renderer loaded");
+
+            stubDaemon.reset();
+            item.refresh();
+            waitOutATimedOutRead(item, "the good read ended");
+            item.apply(400, '{"error":"kept reason"}');
+            compare(item.screenState, "refused", "the refusal is shown");
+            stubDaemon.serveStall();
+            item.refresh();
+            waitOutATimedOutRead(item, "the second stalled read ended");
+            compare(item.refusalReason, "kept reason", "a timed-out read keeps the refusal's reason");
+            compare(item.screenState, "refused", "a timed-out read keeps the refusal shown");
+        } finally {
+            stubDaemon.reset();
+        }
+    }
+
+    // GOAL: S15.1225 -- a read ended by its timeout is retried within the first backoff (2 s). False if
+    //       a timeout leaves the screen waiting for the next notice.
+    // WHY-THIS-SHAPE: the stub keeps stalling, so the second request is the retry and not an answer
+    //       to anything; 4 s is the first backoff doubled, short of the second read's own timeout.
+    // CONTROL: control_batch.sh 2026-11-03, reverted: main.qml's `root.retryIfFailed(outcome,
+    //       request.status)` moved inside the `if (!keep)` block (backend/kde/kpackage/contents/ui/
+    //       main.qml) -> "'a timed-out read is retried' returned FALSE".
+    function test_a_timed_out_read_is_retried() {
+        requireRealRead();
+        try {
+            const item = pluginReadyToFetch();
+            requireDaemonNotAbsent(item);
+            stubDaemon.serveStall();
+            item.refresh();
+            waitOutATimedOutRead(item, "the stalled read ended");
+            compare(stubDaemon.requests(), 1, "one request so far");
+            tryVerify(function () { return stubDaemon.requests() === 2; }, 4000, "a timed-out read is retried");
+        } finally {
+            stubDaemon.reset();
+        }
+    }
+
+    // GOAL: S15.1226 -- while nobody owns the daemon's bus name, a read ended by its timeout is not
+    //       retried. False if a stopped daemon's port is polled every few seconds.
+    // WHY-THIS-SHAPE: absence needs a window; 4.5 s is more than twice the 2 s backoff a retry would
+    //       use. The name is given up by this process (it owns it on the private bus), and
+    //       daemonAbsent() is required to say so before the read, so the case grades the timed-out
+    //       path and not a watch that has not heard yet.
+    // CONTROL: control_batch.sh 2026-11-03, reverted: the daemonAbsent() test in retryIfFailed
+    //       (backend/kde/kpackage/contents/ui/main.qml) made `if (false)` -> "a timed-out read is not
+    //       retried while the daemon's name has no owner. Actual (): 2 Expected (): 1".
+    function test_a_timed_out_read_is_not_retried_while_the_daemon_name_has_no_owner() {
+        requireRealRead();
+        const item = pluginReadyToFetch();
+        if (!daemonName.owned()) {
+            skip("this process does not own the daemon's bus name here, so it cannot make it go");
+        }
+        try {
+            verify(daemonName.release(), "the daemon's bus name was given up");
+            tryVerify(function () { return item.watchItem.daemonAbsent(); }, 5000, "the watch heard the name go");
+            stubDaemon.reset();
+            stubDaemon.serveStall();
+            item.refresh();
+            waitOutATimedOutRead(item, "the stalled read ended");
+            compare(item.failedReads, 1, "the timed-out read counted as failed");
+            wait(4500);
+            compare(stubDaemon.requests(), 1, "a timed-out read is not retried while the daemon's name has no owner");
+        } finally {
+            stubDaemon.reset();
+            daemonName.take();
+        }
+        tryVerify(function () { return !item.watchItem.daemonAbsent(); }, 5000, "the name was taken back");
+    }
+
+    // GOAL: S15.1227 -- with nothing ever answered, a read ended by its timeout leaves the screen
+    //       "unreachable". False if the timeout marks the screen answered.
+    // CONTROL: control_batch.sh 2026-11-03, reverted: main.qml's `outcome === "unreadable" ? 200` made
+    //       `outcome !== "answered" ? 200` (backend/kde/kpackage/contents/ui/main.qml) -> "'nothing
+    //       answered' returned FALSE".
+    function test_a_timeout_before_any_answer_leaves_the_screen_unreachable() {
+        requireRealRead();
+        try {
+            stubDaemon.reset();
+            stubDaemon.serveStall();
+            const item = loadHost().item;
+            standInTheWatch(item);
+            item.connectorOverride = suite.namedScreen;
+            verify(item.pending !== null, "naming the screen sent a read");
+            waitOutATimedOutRead(item, "the stalled first read ended");
+            compare(stubDaemon.requests(), 1, "the stub held the first read");
+            verify(!item.answered, "nothing answered");
+            compare(item.screenState, "unreachable", "a timeout before any answer leaves the screen unreachable");
+        } finally {
+            stubDaemon.reset();
+        }
+    }
+
+    // GOAL: S15.1228 -- a daemon whose bus name goes while its port hangs is shown as "not running".
+    //       False if the read the departure prompts times out, keeps the last answer, and (the name
+    //       being unowned) is never retried, leaving a stopped daemon's wallpaper described as set.
+    // WHY-THIS-SHAPE: the stand-in watch is wired to the real ConfigWatch's configChanged here only,
+    //       so the departure reaches main.qml through the path plasmashell has; other cases keep a
+    //       watch that hears nothing they did not send.
+    // CONTROL: control_batch.sh 2026-11-03, reverted: the `!(... daemonAbsent())` clause dropped from
+    //       `const keep` in backend/kde/kpackage/contents/ui/main.qml (the departure's read is then this
+    //       screen's first timeout, and kept) -> "a daemon whose name went while its port hangs is shown
+    //       as not running", 'Actual (): set'.
+    function test_a_daemon_whose_name_goes_while_its_port_hangs_is_shown_not_running() {
+        requireRealRead();
+        const item = pluginReadyToFetch();
+        if (!daemonName.owned()) {
+            skip("this process does not own the daemon's bus name here, so it cannot make it go");
+        }
+        const watch = item.watchItem;
+        watch.real.configChanged.connect(watch.configChanged);
+        try {
+            stubDaemon.serveStall();
+            verify(daemonName.release(), "the daemon's bus name was given up");
+            tryVerify(function () { return stubDaemon.requests() >= 1; }, 5000, "the name going prompted a read");
+            tryCompare(item, "screenState", "unreachable", 9000,
+                       "a daemon whose name went while its port hangs is shown as not running");
+        } finally {
+            watch.real.configChanged.disconnect(watch.configChanged);
+            stubDaemon.reset();
+            daemonName.take();
+        }
+        tryVerify(function () { return !item.watchItem.daemonAbsent(); }, 5000, "the name was taken back");
+    }
+
+    // GOAL: S15.1230 -- a 200 whose body cannot be decoded (claims gzip, is not) reads as unreadable
+    //       and is retried. False if it reads as nothing answering ("not running" for a daemon that
+    //       answered), or if, read as a 200 answer, it is never retried.
+    // WHY-THIS-SHAPE: once, then the good reply, so the retry is seen arriving and applied.
+    // CONTROL: control_batch.sh 2026-11-03, each reverted, in ConfigRead::ending()
+    //       (backend/kde/config_read.cpp): `wholeRefusal` made `isStatusError(error)` alone, so Qt's
+    //       content error reads as a whole answer -> "'a retry follows an undecodable 200' returned
+    //       FALSE"; the `status != 0` branch made `false` -> "a 200 whose body cannot be decoded reads as
+    //       unreadable" red. Deleting only `status >= 400 &&` stays GREEN here (Qt keeps no length for a
+    //       body it tried to decompress, so the length rule rejects it alone); that clause is graded by
+    //       config_read_ending's "200 undecodable, its declared length all present" row.
+    function test_a_2xx_whose_body_cannot_be_decoded_reads_as_unreadable_and_is_retried() {
+        requireRealRead();
+        const item = pluginReadyToFetch();
+        requireDaemonNotAbsent(item);
+        stubDaemon.serveBadGzipOnce();
+        item.refresh();
+        tryVerify(function () { return item.pending === null; }, 5000, "the undecodable read ended");
+        compare(item.screenState, "unreadable", "a 200 whose body cannot be decoded reads as unreadable");
+        compare(stubDaemon.requests(), 1, "one request so far");
+        tryVerify(function () { return stubDaemon.requests() === 2; }, 5000, "a retry follows an undecodable 200");
+        tryCompare(item, "screenState", "set", 5000, "the retry's whole answer is applied");
+    }
+
+    // GOAL: S15.1231 -- after a rename, a first read for the new name that times out shows
+    //       "unreachable", never the old monitor id or path. False if the old connector's answer is kept.
+    // WHY-THIS-SHAPE: the old answer carries a monitor id, so a kept one would also keep the renderer
+    //       drawing the old monitor; the rename itself sends the read, as plasmashell's would.
+    // CONTROL: control_batch.sh 2026-11-03, reverted: `root.keepableFor === asked` made
+    //       `root.keepableFor !== ""` in backend/kde/kpackage/contents/ui/main.qml -> "after a rename, a
+    //       timed-out first read shows unreachable", 'Actual (): set'.
+    function test_a_timeout_after_a_rename_shows_unreachable() {
+        requireRealRead();
+        try {
+            const item = pluginReadyToFetch();
+            item.apply(200, '{"output":"DP-3","known":true,"path":"/home/u/Pictures/beach.png","monitor_id":4}');
+            compare(item.monitorId, 4, "the old screen's answer names its monitor");
+            stubDaemon.serveStall();
+            item.connectorOverride = "HDMI-A-1";
+            verify(item.pending !== null, "the rename sent a read");
+            waitOutATimedOutRead(item, "the new name's stalled read ended");
+            compare(stubDaemon.requests(), 1, "the stub held exactly that read");
+            compare(stubDaemon.lastOutput(), "HDMI-A-1", "the read asked about the new name");
+            compare(item.screenState, "unreachable", "after a rename, a timed-out first read shows unreachable");
+            verify(item.monitorId !== 4, "the old monitor id is gone");
+            compare(item.wallpaperPath, "", "the old path is gone");
+        } finally {
+            stubDaemon.reset();
+        }
+    }
+
+    // GOAL: S15.1232 -- a second timeout in a row shows "unreachable". False if the keep has no bound.
+    // WHY-THIS-SHAPE: the second timeout is the plugin's own retry of the first, so the case follows
+    //       the path a wedged daemon takes; the first must still be kept, or this would pass for a
+    //       plugin that keeps nothing.
+    // CONTROL: control_batch.sh 2026-11-03, reverted: main.qml's keepableFor line made
+    //       `root.keepableFor = asked;` (backend/kde/kpackage/contents/ui/main.qml) -> "a second timeout
+    //       in a row shows unreachable", 'Actual (): set'.
+    function test_a_second_timeout_in_a_row_shows_unreachable() {
+        requireRealRead();
+        try {
+            const item = pluginReadyToFetch();
+            requireDaemonNotAbsent(item);
+            stubDaemon.serveStall();
+            item.refresh();
+            waitOutATimedOutRead(item, "the first stalled read ended");
+            compare(item.screenState, "set", "the first timeout keeps the answer");
+            tryVerify(function () { return stubDaemon.requests() === 2; }, 4000, "the retry was sent");
+            waitOutATimedOutRead(item, "the retry's stalled read ended");
+            compare(item.screenState, "unreachable", "a second timeout in a row shows unreachable");
+        } finally {
+            stubDaemon.reset();
+        }
+    }
+
+    // GOAL: S15.1233 -- a read that answers between two timeouts lets the next timeout keep the answer
+    //       again. False if the bound counts timeouts since the plugin started, not in a row.
+    // CONTROL: control_batch.sh 2026-11-03, reverted: in backend/kde/kpackage/contents/ui/main.qml a
+    //       `timedOutOnce` property set by any timeout and required clear before keepableFor is set
+    //       again -> "a timeout after an answer between two timeouts keeps the answer",
+    //       'Actual (): unreachable'.
+    function test_an_answer_between_two_timeouts_lets_the_next_one_keep() {
+        requireRealRead();
+        try {
+            const item = pluginReadyToFetch();
+            requireDaemonNotAbsent(item);
+            stubDaemon.serveStall();
+            item.refresh();
+            waitOutATimedOutRead(item, "the first stalled read ended");
+            compare(item.screenState, "set", "the first timeout keeps the answer");
+            stubDaemon.reset();
+            tryVerify(function () { return stubDaemon.requests() === 1; }, 4000, "the retry was sent");
+            tryVerify(function () { return item.pending === null; }, 5000, "the retry was answered");
+            compare(item.screenState, "set", "the retry's answer is applied");
+            stubDaemon.serveStall();
+            item.refresh();
+            waitOutATimedOutRead(item, "the second stalled read ended");
+            compare(stubDaemon.requests(), 2, "the stub held exactly that read");
+            compare(item.screenState, "set", "a timeout after an answer between two timeouts keeps the answer");
+        } finally {
+            stubDaemon.reset();
+        }
+    }
+
+    // GOAL: S15.1234 -- after an unreadable read, the first timeout keeps "unreadable" once. False if a
+    //       timeout after an unreadable read is applied at once as "not running".
+    // WHY-THIS-SHAPE: the timeout is the plugin's own retry of the unreadable read, the stub switched
+    //       to stalling before that retry is due (2 s).
+    // CONTROL: control_batch.sh 2026-11-03, reverted: main.qml's keepableFor line made to set the name
+    //       after an answered read only (backend/kde/kpackage/contents/ui/main.qml) -> "the first timeout
+    //       after an unreadable read keeps unreadable", 'Actual (): unreachable'.
+    function test_the_first_timeout_after_an_unreadable_read_keeps_unreadable() {
+        requireRealRead();
+        try {
+            const item = pluginReadyToFetch();
+            requireDaemonNotAbsent(item);
+            stubDaemon.serveBadGzipOnce();
+            item.refresh();
+            tryVerify(function () { return item.pending === null; }, 5000, "the undecodable read ended");
+            compare(item.screenState, "unreadable", "the read was unreadable");
+            stubDaemon.serveStall();
+            tryVerify(function () { return stubDaemon.requests() === 2; }, 4000, "the retry was sent");
+            waitOutATimedOutRead(item, "the retry's stalled read ended");
+            compare(item.screenState, "unreadable", "the first timeout after an unreadable read keeps unreadable");
+        } finally {
+            stubDaemon.reset();
+        }
+    }
+
+    // GOAL: S15.1235 -- a 407 with a JSON body shows as refused, with that reason, and is not retried.
+    //       False if Qt's proxy-authentication error makes it "not running" or "unreadable", or if it is
+    //       read again with nothing announced.
+    // WHY-THIS-SHAPE: absence needs a window: 3 s is past the first backoff (2 s), and the stub keeps
+    //       answering 407, so a retry would be counted.
+    // CONTROL: control_batch.sh 2026-11-03, each reverted: `error ==
+    //       QNetworkReply::ProxyAuthenticationRequiredError ||` deleted from isStatusError()
+    //       (backend/kde/config_read.cpp) -> "an HTTP 407 is shown as refused", 'Actual (): unreadable';
+    //       retryIfFailed's `status < 500` made `status < 400` (main.qml) -> "a 407 is not retried.
+    //       Actual (): 2 Expected (): 1".
+    function test_a_407_is_a_refusal_and_not_retried() {
+        requireRealRead();
+        try {
+            const item = pluginReadyToFetch();
+            requireDaemonNotAbsent(item);
+            const reason = "refused with 407 by the stub";
+            stubDaemon.serveStatus(407, reason, false);
+            item.refresh();
+            tryVerify(function () { return item.pending === null; }, 5000, "the 407 read ended");
+            compare(item.screenState, "refused", "an HTTP 407 is shown as refused");
+            compare(item.refusalReason, reason, "an HTTP 407 keeps the daemon's reason");
+            wait(3000);
+            compare(stubDaemon.requests(), 1, "a 407 is not retried");
+        } finally {
+            stubDaemon.reset();
+        }
+    }
+
+    // GOAL: S15.1236 -- a 503 cut short reads as unreadable and is retried. False if it is taken as a
+    //       whole refusal, or as nothing answering ("not running" for a daemon that answered).
+    // WHY-THIS-SHAPE: the length rule (a cut 4xx/5xx Qt reports as the status's own error) is NOT
+    //       graded here: Qt picks that report in about one loaded read in four, so a break on it goes red
+    //       only by chance. config_read_ending's "cut short" rows grade it on ending() directly; this case
+    //       grades the network path and the retry.
+    // CONTROL: control_batch.sh 2026-11-03, each reverted: ConfigRead::ending()'s `status != 0` branch
+    //       made `false` (backend/kde/config_read.cpp) -> "a 503 cut short reads as unreadable" red.
+    //       Retry, 2026-11-03 batch, line untouched since: `retry.start();` deleted from retryIfFailed
+    //       (main.qml) -> "'a retry follows a 503 cut short' returned FALSE".
+    function test_a_503_cut_short_reads_as_unreadable_and_is_retried() {
+        requireRealRead();
+        try {
+            const item = pluginReadyToFetch();
+            requireDaemonNotAbsent(item);
+            stubDaemon.serveCutShortWithStatusOnce(503);
+            item.refresh();
+            tryVerify(function () { return item.pending === null; }, 5000, "the cut-short 503 read ended");
+            compare(item.screenState, "unreadable", "a 503 cut short reads as unreadable");
+            compare(stubDaemon.requests(), 1, "one request so far");
+            tryVerify(function () { return stubDaemon.requests() === 2; }, 5000, "a retry follows a 503 cut short");
+            tryCompare(item, "screenState", "set", 5000, "the retry's whole answer is applied");
+        } finally {
+            stubDaemon.reset();
+        }
+    }
+
+    // GOAL: S15.1237 -- a connection closed with no status line reads as "unreachable" and is retried.
+    //       False if it is kept like a timeout, read as an answer, or left waiting for the next notice.
+    // WHY-THIS-SHAPE: counted in reads made, not stub requests: Qt may resend a request whose
+    //       connection closed before any reply, so one read can be several requests. The stub must have
+    //       dropped a connection, or the case would grade some other failure.
+    // CONTROL: control_batch.sh 2026-11-03, each reverted: ConfigRead::ending()'s last return made
+    //       `Outcome::TimedOut` (backend/kde/config_read.cpp) -> "a connection closed with no status line
+    //       reads as unreachable" red; retryIfFailed's `outcome === "answered"` made `true`
+    //       (main.qml) -> "'a retry follows a connection closed with no status line' returned FALSE".
+    //       Test-side: dropConnection() matching ports never present -> "the stub closed the connection
+    //       before any reply" red.
+    function test_a_connection_closed_with_no_status_line_is_unreachable_and_retried() {
+        requireRealRead();
+        try {
+            const item = pluginReadyToFetch();
+            requireDaemonNotAbsent(item);
+            const madeBefore = readProbe.madeReads();
+            stubDaemon.serveNoStatusLine();
+            item.refresh();
+            tryVerify(function () { return item.pending === null; }, 5000, "the dropped read ended");
+            verify(stubDaemon.dropped() >= 1, "the stub closed the connection before any reply");
+            compare(item.screenState, "unreachable", "a connection closed with no status line reads as unreachable");
+            stubDaemon.serveGood();
+            tryVerify(function () { return readProbe.madeReads() - madeBefore === 2; }, 5000,
+                      "a retry follows a connection closed with no status line");
+            tryCompare(item, "screenState", "set", 5000, "the retry's answer is applied");
+        } finally {
+            stubDaemon.reset();
+        }
+    }
+
+    // GOAL: the output name reaches the daemon intact, with `& = + space / %` in it. False if any of
+    //       them is sent raw: `&` and `=` split the query, `+` is read as a space, `%` starts an escape.
+    // WHY-THIS-SHAPE: read off what the stub's HTTP library decoded, the same library the daemon uses,
+    //       rather than off the URL Qt built, which would only grade the encoder against itself.
+    // CONTROL: control_batch.sh 2026-11-02, reverted: in ConfigRead's constructor
+    //       (backend/kde/config_read.cpp) `QUrl::toPercentEncoding(output)` made
+    //       `QUrl::toPercentEncoding(output, "+")` -> "the output name reaches the daemon intact" red.
+    function test_the_output_name_reaches_the_daemon_intact() {
+        requireRealRead();
+        stubDaemon.reset();
+        const name = "A&b=c+d e/%";
+        const read = readProbe.fetch(name);
+        verify(read !== null, "a read was made");
+        const state = { done: false };
+        read.finished.connect(function () { state.done = true; });
+        tryVerify(function () { return state.done; }, 5000, "the read finished");
+        compare(stubDaemon.requests(), 1, "the read reached the stub");
+        compare(stubDaemon.lastOutput(), name, "the output name reaches the daemon intact");
+    }
+
+    // GOAL: a plugin makes exactly one read at startup, sent once its change watch has loaded. False
+    //       if it makes none (the first ask lost while the watch had no item), or two.
+    // WHY-THIS-SHAPE: the screen is named before the watch loads, so the name's own refresh finds no
+    //       watch and the load is the only trigger left. The wait for `pending` to clear also waits out
+    //       a second read queued behind the first, since that is sent from inside the first's handler.
+    // CONTROL: control_batch.sh 2026-11-02, each reverted, in the watch Loader of
+    //       backend/kde/kpackage/contents/ui/main.qml: `onLoaded: root.refresh()` deleted -> "the watch
+    //       loading sent the first read" red; made `{ root.refresh(); root.refresh(); }` -> "startup
+    //       made exactly one read" red, 'Actual (): 2'.
+    function test_startup_makes_exactly_one_read_once_the_watch_has_loaded() {
+        requireRealRead();
+        stubDaemon.reset();
+        const item = loadHost().item;
+        item.connectorOverride = suite.namedScreen;
+        compare(item.pending, null, "no read before the watch has loaded");
+        const watch = childNamed(item, "wallpaperxConfigWatch");
+        compare(watch.status, Loader.Error, "the real change watch cannot load on this harness");
+        watch.sourceComponent = standInWatch;
+        verify(item.pending !== null, "the watch loading sent the first read");
+        tryVerify(function () { return item.pending === null; }, 5000, "the first read was answered");
+        compare(item.screenState, "set", "and applied");
+        compare(stubDaemon.requests(), 1, "startup made exactly one read");
     }
 
     // GOAL: a cause stops being shown once it stops applying. False if a refusal's reason
@@ -983,10 +1720,11 @@ TestCase {
     //       whenever a later reply changes it, and an empty mode when the field is missing or not a string.
     // WHY-THIS-SHAPE: the stand-in starts with a sentinel, so a load that never assigned the mode cannot
     //       pass as an empty one; the change and the bad-type cases are driven on the one loaded item.
-    // CONTROL: via control_batch.sh 2026-10-28, each alone, reverted, in
-    //       backend/kde/kpackage/contents/ui/main.qml: onLoaded's `item.pauseMode = ...` deleted -> "...when it
-    //       loads" red; onPauseModeChanged's assignment deleted -> "a later reply's pause mode..." red; the
-    //       `typeof ... === "string"` test made `!== undefined` -> "...not a string..." red (actual 7).
+    // CONTROL: via control_batch.sh 2026-11-02, each alone, reverted, in
+    //       backend/kde/kpackage/contents/ui/main.qml: onPauseModeChanged's assignment deleted -> "...when it
+    //       loads" red; the `typeof ... === "string"` test made `!== undefined` -> "...not a string..." red
+    //       (actual 7). onLoaded's `rendererItem.pauseMode = ...` deleted goes NOT red: the reply that
+    //       loads the renderer also changes pauseMode, and onPauseModeChanged sets it in the same turn.
     function test_the_renderer_is_told_its_pause_mode() {
         const item = loadPlugin(suite.namedScreen);
         const surface = childNamed(item, "wallpaperxSurface");
@@ -1143,10 +1881,8 @@ TestCase {
     //       by a Loader that is simply switched off.
     //
     //       Whether com.wallpaperx loads is MADE FALSE by this harness rather than assumed absent
-    //       (qml_states_test.cpp rewrites its qmldir URL to one that does not exist). It used to be
-    //       absent by accident, because a test binary's import path does not include the module it
-    //       is built beside -- and the moment the plugin was installed system-wide for a live
-    //       desktop test the import succeeded and this case failed against a correct build. A check
+    //       (qml_states_test.cpp rewrites its qmldir URL to one that does not exist), not left to the
+    //       import path: with the plugin installed system-wide the import would succeed, and a check
     //       that reads differently depending on what is installed grades the machine.
     //       The change watch is stood in (loadPlugin), so the watch's own failure message, which
     //       describe() puts first, does not answer for the renderer's.
@@ -1217,10 +1953,9 @@ TestCase {
     //       anything else would show.
     // CONTROL: `enabled: root.visible` given to the `Connections` on `notice.item` in
     //       backend/kde/kpackage/contents/ui/main.qml -> "a hidden copy reads /config at a notice" red.
+    //       Re-run on the plugin's own read, control_batch.sh 2026-11-02, reverted: same line red.
     function test_a_hidden_copy_reads_at_a_notice() {
-        if (!stubDaemon.available()) {
-            skip(stubDaemon.unavailableReason());
-        }
+        requireRealRead();
         const host = loadHost();
         const item = host.item;
         const watch = standInTheWatch(item);

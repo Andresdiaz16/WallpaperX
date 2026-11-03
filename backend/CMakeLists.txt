@@ -71,7 +71,7 @@ option(WALLPAPERX_BUILD_KDE_PLUGIN "Build the Plasma wallpaper plugin and wpxctl
 
 if(WALLPAPERX_BUILD_KDE_PLUGIN)
     # Qt6 — required for KDE plugin
-    find_package(Qt6 REQUIRED COMPONENTS Core DBus Quick Qml)
+    find_package(Qt6 REQUIRED COMPONENTS Core DBus Network Quick Qml)
     qt_standard_project_setup()
 
     # ECM + KDE — required for KDE plugin
@@ -648,12 +648,16 @@ endif()
 # the reason the lint test is, and QUIET rather than REQUIRED so a host without Qt's test module
 # -- the hosted runner installs no Qt at all -- configures exactly as before and simply does not
 # register the entry.
-find_package(Qt6 QUIET COMPONENTS QuickTest Qml)
-if(Qt6QuickTest_FOUND)
-    add_executable(wallpaperx-qml-states-test tests/qml_states_test.cpp)
-    target_link_libraries(wallpaperx-qml-states-test PRIVATE Qt6::QuickTest Qt6::Qml Threads::Threads)
-    # The stub daemon in that file answers on the port main.qml's daemonOrigin names, which is
-    # the only way to reach the two decisions refresh() makes before apply() is called.
+find_package(Qt6 QUIET COMPONENTS QuickTest Qml Network DBus)
+if(Qt6QuickTest_FOUND AND Qt6Network_FOUND AND Qt6DBus_FOUND)
+    # main.qml's reads go through the plugin's own ConfigRead, compiled in rather than loaded as the
+    # module, because this harness keeps com.wallpaperx unloadable on purpose. It needs no plugin
+    # build, so every tree with this entry drives the shipped read.
+    add_executable(wallpaperx-qml-states-test tests/qml_states_test.cpp kde/config_read.cpp kde/config_read.h
+                   kde/buffer_claims.cpp)
+    target_link_libraries(wallpaperx-qml-states-test PRIVATE
+        Qt6::QuickTest Qt6::Qml Qt6::Network Qt6::DBus wallpaperx-log-escape Threads::Threads)
+    # The stub daemon in that file answers on the daemon's port, where the plugin's read asks.
     target_include_directories(wallpaperx-qml-states-test PRIVATE ${HTTPLIB_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
     # Explicit, not inherited: qt_standard_project_setup() -- which turns AUTOMOC on globally --
     # is inside the KDE-plugin guard, so a -DWALLPAPERX_BUILD_KDE_PLUGIN=OFF tree (the sanitizer
@@ -663,6 +667,14 @@ if(Qt6QuickTest_FOUND)
     # cannot be registered against a directory that moved.
     target_compile_definitions(wallpaperx-qml-states-test PRIVATE
         QUICK_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/qml")
+    # ConfigRead::ending() called directly: inputs a network case reaches only when Qt happens to
+    # report them. No server, no bus, no window.
+    add_executable(wallpaperx-config-read-ending-test tests/config_read_ending_test.cpp kde/config_read.cpp
+                   kde/config_read.h kde/buffer_claims.cpp)
+    target_link_libraries(wallpaperx-config-read-ending-test PRIVATE
+        Qt6::Qml Qt6::Network Qt6::DBus wallpaperx-log-escape Threads::Threads)
+    target_include_directories(wallpaperx-config-read-ending-test PRIVATE ${HTTPLIB_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(wallpaperx-config-read-ending-test PROPERTIES AUTOMOC ON)
 else()
     message(STATUS "  QML state tests: disabled (no Qt6 QuickTest module) -- S10.10 stays uncovered here")
 endif()
@@ -1503,14 +1515,14 @@ set_tests_properties(qml_lint_surface PROPERTIES LABELS "novulkan"
 # Registered only where Qt's test module exists. The offscreen platform is set here rather than
 # left to the environment: with a real display the plugin would open a window on the developer's
 # desktop, and on a host with none the run would fail for a reason unrelated to the checks.
-if(Qt6QuickTest_FOUND)
+if(TARGET wallpaperx-qml-states-test)
     wallpaperx_add_test(NAME qml_states COMMAND $<TARGET_FILE:wallpaperx-qml-states-test>)
-    # No lock although it binds 127.0.0.1:18462, the port main.qml's daemonOrigin names: every
+    # No lock although it binds 127.0.0.1:18462, the daemon's port, which the plugin's read asks: every
     # entry runs in a network namespace of its own, so no other entry's port can collide with it.
     #
     # SKIP_REGULAR_EXPRESSION rather than SKIP_RETURN_CODE: Qt Quick Test exits 0 when cases
     # skip, so a host where something else already holds 18462 would otherwise show green for a
-    # run in which the origin and body-size cases never happened. The trade-off is deliberate
+    # run in which the redirect and body-size cases never happened. The trade-off is deliberate
     # and worth stating: on such a host the whole entry reads Skipped, including the twenty-odd
     # cases that did run and pass. Inconclusive is not green, and the sentinel is printed only
     # when the stub could not be brought up at all.
@@ -1524,6 +1536,10 @@ if(Qt6QuickTest_FOUND)
     set_tests_properties(qml_states PROPERTIES LABELS "novulkan;no-tsan"
                          ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
                          SKIP_REGULAR_EXPRESSION "wallpaperx-qml-states: NO STUB DAEMON --")
+endif()
+if(TARGET wallpaperx-config-read-ending-test)
+    wallpaperx_add_test(NAME config_read_ending COMMAND $<TARGET_FILE:wallpaperx-config-read-ending-test>)
+    set_tests_properties(config_read_ending PROPERTIES LABELS "novulkan")
 endif()
 
 # The entries below need a session bus, which wallpaperx_add_test() gives each run through
@@ -2659,10 +2675,11 @@ if(WALLPAPERX_BUILD_KDE_PLUGIN)
             # load it: the type information alone looks sufficient, so `import com.wallpaperx`
             # resolves but WallpaperXRenderer never gets registered and nothing instantiates.
             NO_PLUGIN_OPTIONAL
-            SOURCES kde/wallpaperx_item.cpp kde/wallpaperx_item.h kde/buffer_claims.h
+            SOURCES kde/wallpaperx_item.cpp kde/wallpaperx_item.h kde/config_read.cpp kde/config_read.h
+                    kde/buffer_claims.h
             OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/qml/com/wallpaperx)
         target_link_libraries(wallpaperxplugin PRIVATE
-            wallpaperx-frame-import wallpaperx-log-escape Qt6::Core Qt6::DBus Qt6::Quick Qt6::Qml)
+            wallpaperx-frame-import wallpaperx-log-escape Qt6::Core Qt6::DBus Qt6::Network Qt6::Quick Qt6::Qml)
 
         # The QML engine looks for lib<plugin>.so, and this target builds as
         # wallpaperxplugin.so without it -- so the module resolves, the type information is read,

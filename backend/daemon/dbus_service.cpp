@@ -2,6 +2,7 @@
 
 #include "dbus_service.h"
 
+#include "daemon_bus.h"
 #include "log_escape.h"
 #include "wallpaper_manager.h"
 
@@ -17,38 +18,8 @@ namespace wallpaperx {
 
 namespace {
 
-// Error names the client can branch on. NoFrame is an ordinary state (nothing has
-// been set on that monitor yet), not a malfunction -- keeping it distinct from
-// ExportFailed is what lets a polling consumer tell "not ready" from "broken".
-constexpr const char* kErrorNoFrame = "io.wallpaperx.Daemon.Error.NoFrame";
-constexpr const char* kErrorExportFailed = "io.wallpaperx.Daemon.Error.ExportFailed";
-constexpr const char* kErrorRenderFailed = "io.wallpaperx.Daemon.Error.RenderFailed";
-// The third answer to "why is there no frame", separate because it calls for a third
-// response: NoFrame means retry, RenderFailed means stop and show the reason, Unsupported
-// means stop asking -- nothing about this build changes while it runs.
-constexpr const char* kErrorUnsupported = "io.wallpaperx.Daemon.Error.Unsupported";
-// The fourth: there is a frame, but handing it over would leave the daemon nowhere to draw the
-// next one. Retryable like NoFrame, and the daemon says when -- a FrameReady follows every
-// release and every commit, so a consumer that waits for one is not polling.
-constexpr const char* kErrorNoFreeImage = "io.wallpaperx.Daemon.Error.NoFreeImage";
-// The fifth, and the only one that is the caller's own doing: it has been sent as many descriptors
-// as it may hold without giving any back. Nothing announces the cure, since only the caller can
-// apply it -- a release, or leaving the bus.
-constexpr const char* kErrorTooManyDescriptors = "io.wallpaperx.Daemon.Error.TooManyDescriptors";
-// The sixth, also the caller's own doing: it already has its share of the worker's queue waiting.
-// Distinct from Busy, which is everyone's queue being full.
-constexpr const char* kErrorTooManyRequests = "io.wallpaperx.Daemon.Error.TooManyRequests";
-// The seventh, also the caller's own doing: it has been sent every copy of its acquire timeline one
-// connection is given. Not retryable on that connection.
-constexpr const char* kErrorTooManyTimelineCopies = "io.wallpaperx.Daemon.Error.TooManyTimelineCopies";
-constexpr const char* kErrorShuttingDown = "io.wallpaperx.Daemon.Error.ShuttingDown";
-constexpr const char* kErrorBusy = "io.wallpaperx.Daemon.Error.Busy";
-
 // Below the whole queue, or one caller's share would still be all of it.
 static_assert(WallpaperManager::kMaxQueuedRequestsPerClient < static_cast<int>(RenderWorker::kMaxQueuedTasks));
-// A size for a screen no monitor answers to. Not InvalidArgs: nothing in the call was wrong, and
-// the same call succeeds once SetMonitorOutput has named the screen.
-constexpr const char* kErrorUnknownOutput = "io.wallpaperx.Daemon.Error.UnknownOutput";
 constexpr const char* kErrorInvalidArgs = "org.freedesktop.DBus.Error.InvalidArgs";
 
 // What a caller refused as TooManyDescriptors is told, and the line logged once per run of refusals.
