@@ -130,7 +130,8 @@ drs_pid=$! launched=1
 # CONTROL: app/CMakeLists.txt `qt_standard_project_setup(REQUIRES 6.8)` -> `qt_standard_project_setup()`
 #   (control_run.sh; cmake --build reconfigures): "FAIL: S15.15: the app exited with status 1
 #   before showing Main.qml's window", stderr `Module "WallpaperX" contains no type named "Main"`.
-#   app/main.cpp without `engine.setInitialProperties(...)`: the same FAIL line.
+#   app/main.cpp's `load` helper without `engine.setInitialProperties(properties)`: the same FAIL
+#   line (2026-11-05).
 #   app/main.cpp with a queued `QCoreApplication::exit(0)` before exec(): see the check below.
 resolved='resolveType: +"Main" +=> +"" +QUrl\("qrc:/qt/qml/WallpaperX/qml/Main\.qml"\)'
 shown='Main_QMLTYPE_[0-9]+\(0x[0-9a-f]+ (active )?exposed, visibility=QWindow::Windowed.*title="WallpaperX"'

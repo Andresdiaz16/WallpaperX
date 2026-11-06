@@ -309,7 +309,7 @@ void checkUnit(const fs::path& unit, const fs::path& expectedExec) {
     // GOAL: S14.7 -- the unit restarts the daemon when it exits nonzero (75 after a lost device)
     //       and not when it is stopped.
     // CONTROL: `Restart=no` in backend/packaging/wallpaperx-daemon.service.in -> this line red,
-    //       alone (systemd accepts the unit). Observed 2026-09-24 via control_run.sh; reverted.
+    //       alone (systemd accepts the unit). Observed 2026-09-24 and 2026-11-05; reverted.
     const std::optional<std::string> restart = onlyValue(keys, "Restart");
     check(restart.value_or("") == "on-failure", "the installed unit keeps Restart=on-failure");
 
@@ -318,7 +318,7 @@ void checkUnit(const fs::path& unit, const fs::path& expectedExec) {
     // WHY-THIS-SHAPE: every RestartPreventExitStatus line, split on whitespace as systemd lists them, so 80
     //       beside other codes or on a line of its own both count.
     // CONTROL: `RestartPreventExitStatus=80` made `=81` in backend/packaging/wallpaperx-daemon.service.in ->
-    //       this line red, alone. control_batch.sh 2026-10-23; reverted, green again.
+    //       this line red, alone. control_batch.sh 2026-10-23 and 2026-11-05; reverted, green again.
     bool prevents80 = false;
     for (auto [it, end] = keys.equal_range("RestartPreventExitStatus"); it != end; ++it) {
         std::istringstream codes(it->second);
@@ -335,7 +335,7 @@ void checkUnit(const fs::path& unit, const fs::path& expectedExec) {
     //       unparseable value is a failure: the unit is ours to keep readable.
     // CONTROL: in backend/packaging/wallpaperx-daemon.service.in, via control_run.sh, reverted:
     //       `StartLimitBurst=100` -> "... start limit is reachable" red, alone; `StartLimitBurst=ten`
-    //       -> "... can be read" red, with every verify line. Observed 2026-09-24.
+    //       -> "... can be read" red, with every verify line. Observed 2026-09-24; the first again 2026-11-05.
     const std::optional<double> restartSec = spanMillis(onlyValue(keys, "RestartSec").value_or("100ms"));
     const std::optional<double> interval = spanMillis(onlyValue(keys, "StartLimitIntervalSec").value_or("10s"));
     std::optional<long> burst;
@@ -363,7 +363,7 @@ void checkVerify(const fs::path& unit, const std::string& label = "") {
     //       Invalid argument" and exits 0, so a status check passes a unit systemd ignores a line of.
     // CONTROL: `Restart=on-failur` in backend/packaging/wallpaperx-daemon.service.in -> this line
     //       red for the plain prefix and all five odd prefixes, with "keeps Restart=on-failure".
-    //       Observed 2026-09-24 via control_run.sh; reverted.
+    //       Observed 2026-09-24 and 2026-11-05; reverted.
     std::string output;
     const int status = runCaptured({WALLPAPERX_SYSTEMD_ANALYZE, "--user", "verify", unit.string()}, {}, output);
     if (status == kCouldNotRun) {

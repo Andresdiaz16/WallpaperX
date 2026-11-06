@@ -117,7 +117,7 @@ protected:
 QString qmlSource() {
     return QStringLiteral(R"(
 import QtQuick
-import com.wallpaperx
+import WallpaperXPlugin
 
 Item {
     width: %1
@@ -205,7 +205,7 @@ void reportingPhase(Harness& harness) {
     const QString sized = QStringLiteral("DP-SIZE");
     Scene scene = harness.scene(sized);
     QQuickItem* renderer = scene.item;
-    check(renderer != nullptr, "the com.wallpaperx module loads and WallpaperXRenderer instantiates");
+    check(renderer != nullptr, "the WallpaperXPlugin module loads and WallpaperXRenderer instantiates");
     if (renderer == nullptr) {
         notVerified(kGoals, "the plugin's QML type could not be instantiated, so nothing was ever reported");
         return;

@@ -174,6 +174,9 @@ foreach(SHADER_SRC fullscreen.vert fullscreen_set.frag fullscreen_heap.frag ycbc
 endforeach()
 
 add_custom_target(wallpaperx-shaders DEPENDS ${SHADER_SPV_FILES})
+# For the backend's daemon bundle, which copies them: a target dependency orders a build but never
+# re-runs a rule when a file changes.
+set(WALLPAPERX_SHADER_SPV_FILES ${SHADER_SPV_FILES} CACHE INTERNAL "The renderer's compiled SPIR-V files")
 
 # Where every probe that writes a PNG fixture puts it. Captured once, and used inside
 # wallpaperx_add_shader_probe() below instead of ${CMAKE_CURRENT_BINARY_DIR}: the function

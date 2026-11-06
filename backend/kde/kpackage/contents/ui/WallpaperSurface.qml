@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // The drawing half of the plugin, kept in its own file so that main.qml never imports
-// com.wallpaperx directly.
+// the renderer module directly.
 //
 // That separation is the point. A failed import at the top of main.qml takes the whole file
 // down, and a wallpaper plugin that fails to load is a black desktop with nothing logged -- the
@@ -11,7 +11,7 @@
 //
 // So this file is allowed to fail. main.qml is not.
 import QtQuick
-import com.wallpaperx
+import "WallpaperXPlugin"
 
 WallpaperXRenderer {
     id: renderer

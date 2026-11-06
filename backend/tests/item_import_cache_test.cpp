@@ -393,7 +393,7 @@ bool runNotOpenGl(ExportingStub& stub, const char* kGoal) {
     auto* rootItem = qobject_cast<QQuickItem*>(root.get());
     if (rootItem == nullptr) {
         for (const QQmlError& error : component.errors()) std::fprintf(stderr, "  qml: %s\n", qPrintable(error.toString()));
-        check(false, "the com.wallpaperx module loads and WallpaperXRenderer instantiates");
+        check(false, "the WallpaperXPlugin module loads and WallpaperXRenderer instantiates");
         return true;
     }
     auto* item = qobject_cast<QQuickItem*>(root->property("rendererItem").value<QObject*>());
@@ -541,7 +541,7 @@ bool runPhase(const PhaseName& which) {
             for (const QQmlError& error : scene.component->errors()) {
                 std::fprintf(stderr, "  qml: %s\n", qPrintable(error.toString()));
             }
-            check(false, "the com.wallpaperx module loads and WallpaperXRenderer instantiates");
+            check(false, "the WallpaperXPlugin module loads and WallpaperXRenderer instantiates");
             scene.control.invalidate();
             return true;
         }

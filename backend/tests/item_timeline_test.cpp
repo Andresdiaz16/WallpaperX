@@ -656,7 +656,7 @@ bool runPhase(const PhaseName& which) {
             for (const QQmlError& error : scene.component->errors()) {
                 std::fprintf(stderr, "  qml: %s\n", qPrintable(error.toString()));
             }
-            check(false, "the com.wallpaperx module loads and WallpaperXRenderer instantiates");
+            check(false, "the WallpaperXPlugin module loads and WallpaperXRenderer instantiates");
             scene.control.invalidate();
             return true;
         }

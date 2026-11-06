@@ -496,7 +496,7 @@ std::string g_qmllint;
 //       passed green over the bogus property; with it restored the run reported `FAIL:
 //       backend/kde/kpackage/contents/ui/main.qml passes qmllint -W0`. The repository itself
 //       was not touched.
-// Where the generated com.wallpaperx module sits in the build tree, or empty when this build did
+// Where the generated WallpaperXPlugin module sits in the build tree, or empty when this build did
 // not produce one. WallpaperSurface.qml imports that module, and qmllint resolves a module's
 // types only from generated type information -- without this it reports WallpaperXRenderer as
 // "not found" and the file cannot be linted at all.
@@ -507,24 +507,17 @@ const std::string g_qmlModulePath;
 #endif
 
 // Qt's own QML directory, where QtQuick and the Plasma modules live -- and where a system-wide
-// install of this project's com.wallpaperx lands. Empty when the build did not know it.
+// install of an older module of this project's lands. Empty when the build did not know it.
 #ifdef WALLPAPERX_QT_QML_IMPORT_DIR
 const std::string g_qtQmlImportDir = WALLPAPERX_QT_QML_IMPORT_DIR;
 #else
 const std::string g_qtQmlImportDir;
 #endif
 
-// GOAL: com.wallpaperx is resolved from this build tree, never from a copy installed on the host.
-//       False if the linter reads the installed module's type information: the files are then
-//       graded against whatever version was last installed, and a type this tree added is "not
-//       found" -- or a type it removed is still found.
-// WHY-THIS-SHAPE: `--bare` and the two directories in order, build tree first. A plain `-I <build>`
-//       is the obvious form and is what failed: qmllint searches its default import directories
-//       ahead of it, so the host's /usr/lib/qt6/qml copy won.
-// CONTROL: test-side, by hand 2026-10-07, `--bare` and the Qt directory dropped (back to the plain
-//       `-I <build>`) on a host whose installed module predates WallpaperXConfigWatch ->
-//       qml_lint_surface Skipped: "cannot resolve a module contents/ui/ConfigWatch.qml imports" and
-//       its verdict withheld. Restored.
+// The package's files import WallpaperXPlugin as a directory beside them, which qmllint resolves
+// from that directory and never from the import path, so no host copy can stand in for it. The
+// probes do the same through a link to the assembled package's folder (proveOracleDiscriminates).
+// `--bare` keeps qmllint's default directories from being searched ahead of the two given here.
 LintReport lintFile(const std::filesystem::path& file, std::string& hostProblem) {
     std::vector<std::string> argv{g_qmllint, "--ignore-settings", "--json", "-"};
     if (!g_qmlModulePath.empty()) {
@@ -608,10 +601,10 @@ constexpr ProbeType kMainProbeTypes[] = {
 };
 constexpr ProbeType kSurfaceProbeTypes[] = {
     {"Item", "QtQuick"},
-    {"WallpaperXRenderer", "com.wallpaperx"},
+    {"WallpaperXRenderer", "WallpaperXPlugin"},
 };
 constexpr ProbeType kWatchProbeTypes[] = {
-    {"WallpaperXConfigWatch", "com.wallpaperx"},
+    {"WallpaperXConfigWatch", "WallpaperXPlugin"},
 };
 constexpr ProbeType kConfigProbeTypes[] = {
     {"Item", "QtQuick"},
@@ -642,13 +635,14 @@ constexpr PackageQmlFile kPackageQml[] = {
      std::size(kMainProbeTypes), "main", false},
     // The one file that imports the project's own QML module, which is why the linter is given
     // the module's build-tree path above.
-    {"contents/ui/WallpaperSurface.qml", "import QtQuick\nimport com.wallpaperx\n", kSurfaceProbeTypes,
+    {"contents/ui/WallpaperSurface.qml", "import QtQuick\nimport \"WallpaperXPlugin\"\n", kSurfaceProbeTypes,
      std::size(kSurfaceProbeTypes), "surface", true},
     // GOAL: the change watch's file is linted like the rest, with the linter proven to read this
     //       tree's WallpaperXConfigWatch first.
     // CONTROL: a bogus root property (`bogusProperty: 1`) added to backend/kde/kpackage/contents/ui/
-    //       ConfigWatch.qml -> "FAIL: ... ConfigWatch.qml passes qmllint -W0" in qml_lint_surface.
-    {"contents/ui/ConfigWatch.qml", "import com.wallpaperx\n", kWatchProbeTypes, std::size(kWatchProbeTypes), "watch",
+    //       ConfigWatch.qml -> "FAIL: ... ConfigWatch.qml passes qmllint -W0" in qml_lint_surface, which lints the assembled package's
+    //       copy; re-observed 2026-11-05 via control_batch.sh.
+    {"contents/ui/ConfigWatch.qml", "import \"WallpaperXPlugin\"\n", kWatchProbeTypes, std::size(kWatchProbeTypes), "watch",
      true},
     {"contents/ui/config.qml",
      "import QtQuick\nimport QtQuick.Controls\nimport QtQuick.Layouts\n"
@@ -656,7 +650,7 @@ constexpr PackageQmlFile kPackageQml[] = {
      kConfigProbeTypes, std::size(kConfigProbeTypes), "config", false},
     // GOAL: the window watcher's QML is linted like the rest of the package, with the linter proven
     //       to read Plasma's task manager and KWindowSystem types first.
-    // CONTROL: observed 2026-10-01. A bogus root property in backend/kde/kpackage/contents/ui/
+    // CONTROL: observed 2026-10-01, re-observed 2026-11-05. A bogus root property in backend/kde/kpackage/contents/ui/
     //       ScreenWindows.qml -> "FAIL: ... ScreenWindows.qml passes qmllint -W0".
     //       A stand-in linter that is real qmllint minus its warnings about KWindowSystem's members
     //       -> ScreenWindows.qml's verdict withheld, exit 77, naming org.kde.kwindowsystem; with the
@@ -746,6 +740,23 @@ enum class OracleVerdict {
 //       check that cannot fail.
 OracleVerdict proveOracleDiscriminates(const PackageQmlFile& entry, const std::filesystem::path& scratch,
                                        std::string& reason) {
+    // GOAL: the probes for a file that imports WallpaperXPlugin resolve it the way that file does,
+    //       from the folder beside it in the assembled package, so their proof covers that copy.
+    // WHY-THIS-SHAPE: a link named WallpaperXPlugin beside the probes, imported as a directory like
+    //       the package's own files; probes importing the module by name went through `-I <build>/qml`,
+    //       a different copy from the one the graded files load.
+    // CONTROL: test-side, by hand 2026-11-05: the link pointed at contents/ui/NoSuchFolder -> qml_lint_surface
+    //       Skipped, "cannot resolve a module contents/ui/WallpaperSurface.qml imports ... trying to import
+    //       does not exist: .../WallpaperXPlugin", and the same for ConfigWatch.qml. Restored, green.
+    if (entry.needsProjectModule) {
+        std::error_code linkEc;
+        std::filesystem::create_directory_symlink(g_packageDir / "contents" / "ui" / "WallpaperXPlugin", scratch / "WallpaperXPlugin", linkEc);
+        if (linkEc) {
+            reason = "the probes for " + std::string(entry.relative) + " could not link the package's WallpaperXPlugin folder under " +
+                     scratch.string() + ": " + linkEc.message();
+            return OracleVerdict::Unusable;
+        }
+    }
     std::size_t modulesProven = 0;
     for (std::size_t t = 0; t < entry.probeTypeCount; ++t) {
         const ProbeType& probe = entry.probeTypes[t];
@@ -1094,6 +1105,11 @@ int main(int argc, char** argv) {
 
     const std::filesystem::path backendDir(WALLPAPERX_BACKEND_SOURCE_DIR);
     g_packageDir = backendDir / "kde" / "kpackage";
+#ifdef WALLPAPERX_PACKAGE_BUILD_DIR
+    // The files that import the renderer module do so by a directory beside them, which only the
+    // package assembled in the build tree has.
+    if (surfaceRun) g_packageDir = WALLPAPERX_PACKAGE_BUILD_DIR;
+#endif
     g_qmllint = WALLPAPERX_QMLLINT_EXECUTABLE;
 
     // The source tree not being where the build recorded it is this run failing to set up, not

@@ -211,7 +211,7 @@ QString qmlSource() {
     // unavailableReasonChanged, so a property that changes silently leaves it stale.
     return QStringLiteral(R"(
 import QtQuick
-import com.wallpaperx
+import WallpaperXPlugin
 
 Item {
     width: 64
@@ -284,9 +284,9 @@ int main(int argc, char** argv) {
     // The module and the type are the plugin's own, so a load failure here is production's, not
     // this harness's -- red, and every check below is gated on it.
     // CONTROL: the import path replaced with a nonexistent directory -> `qml: ... module
-    //       "com.wallpaperx" is not installed` and "FAIL: the com.wallpaperx module loads and
-    //       WallpaperXRenderer instantiates". Observed 2026-08-21. Reverted.
-    check(rootItem != nullptr, "the com.wallpaperx module loads and WallpaperXRenderer instantiates");
+    //       "WallpaperXPlugin" is not installed` and "FAIL: the WallpaperXPlugin module loads and
+    //       WallpaperXRenderer instantiates". Observed 2026-11-05. Reverted.
+    check(rootItem != nullptr, "the WallpaperXPlugin module loads and WallpaperXRenderer instantiates");
 
     if (rootItem != nullptr) {
         rootItem->setParentItem(window.contentItem());

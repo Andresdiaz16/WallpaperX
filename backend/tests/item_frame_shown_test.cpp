@@ -212,7 +212,7 @@ bool runFrameShownChecks() {
                 std::fprintf(stderr, "  qml: %s\n", qPrintable(error.toString()));
             }
             // The module and the type are the plugin's own, so this is production's failure.
-            check(false, "the com.wallpaperx module loads and WallpaperXRenderer instantiates");
+            check(false, "the WallpaperXPlugin module loads and WallpaperXRenderer instantiates");
             control.invalidate();
             return true;
         }

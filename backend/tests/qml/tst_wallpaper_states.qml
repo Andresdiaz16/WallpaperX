@@ -147,7 +147,7 @@ TestCase {
         ];
     }
 
-    // A stand-in for the change watch main.qml loads from the same blocked module: the one signal
+    // A stand-in for the change watch main.qml loads from the same absent module: the one signal
     // main.qml listens to, which a case emits to stand for the daemon's ConfigChanged, and the
     // plugin's real read behind fetch() -- made by a real ConfigWatch (compiled into this harness)
     // owned by this stand-in, so the reads go with the plugin instance as they do in plasmashell.
@@ -178,8 +178,8 @@ TestCase {
     //       real watch left in Loader.Error: describe() then answers "cannot follow changes" for every
     //       named cause, and each cause check would grade that one message.
     // WHY-THIS-SHAPE: found by objectName, not by index, for the reason childNamed() gives; the real
-    //       watch is required to have FAILED first, so the stand-in replaces a load this harness
-    //       blocked rather than one that might have worked.
+    //       watch is required to have FAILED first, so the stand-in replaces a load that could not
+    //       work rather than one that might have.
     // CONTROL: test-side, by hand 2026-10-07, `watch.sourceComponent = standInWatch;` deleted below ->
     //       'the stand-in change watch loaded. Actual (): 3 Expected (): 1' on 34 of 45 cases. Restored.
     function standInTheWatch(item) {
@@ -1880,20 +1880,21 @@ TestCase {
     //       `active` false, the module load never attempted, and every assertion below satisfied
     //       by a Loader that is simply switched off.
     //
-    //       Whether com.wallpaperx loads is MADE FALSE by this harness rather than assumed absent
-    //       (qml_states_test.cpp rewrites its qmldir URL to one that does not exist), not left to the
-    //       import path: with the plugin installed system-wide the import would succeed, and a check
-    //       that reads differently depending on what is installed grades the machine.
+    //       WallpaperXPlugin cannot load here because main.qml is loaded from the source tree's
+    //       package, which holds no WallpaperXPlugin folder, and its directory import never searches
+    //       the import path, so no copy on the host can satisfy it. The harness checks that folder is
+    //       absent (rendererModule) rather than assuming it.
     //       The change watch is stood in (loadPlugin), so the watch's own failure message, which
     //       describe() puts first, does not answer for the renderer's.
     // CONTROL: the `if (surface.status === Loader.Error)` block deleted from describe() in
     //       backend/kde/kpackage/contents/ui/main.qml, so it falls through to the "will draw" line
     //       -> "FAIL!: the plugin does not claim it will draw when the module could not be loaded",
-    //       that case alone.
-    // COVERAGE-ASSERT: the interceptor is asserted to have rewritten at least one candidate qmldir
-    //       URL, so a run in which it silently stopped matching cannot report Loader.Error as
-    //       evidence of anything -- on a machine with no module installed the state would look
-    //       identical.
+    //       that case alone. Re-observed 2026-11-05 via control_batch.sh.
+    // COVERAGE-ASSERT: the absence is asserted, so a source tree that gained a WallpaperXPlugin
+    //       folder beside main.qml stops this case instead of letting it grade a module that loaded.
+    //       CONTROL: test-side, by hand 2026-11-05: absentBesideMainQml() in qml_states_test.cpp pointed at
+    //       contents/ui itself, which exists -> "'main.qml is loaded from the source tree, which holds no
+    //       renderer module' returned FALSE", in both tests. Restored, green.
     function test_a_missing_renderer_module_leaves_the_message_working() {
         const item = drivenPlugin({
             connector: suite.namedScreen,
@@ -1902,8 +1903,8 @@ TestCase {
         const surface = childNamed(item, "wallpaperxSurface");
         verify(surface !== null, "the plugin has a surface");
         verify(surface.active, "the Loader actually tried to load the renderer module");
-        verify(moduleBlock.blocked() > 0,
-               "this harness made com.wallpaperx unloadable, rather than hoping it was absent");
+        verify(rendererModule.absentBesideMainQml(),
+               "main.qml is loaded from the source tree, which holds no renderer module");
         compare(surface.status, Loader.Error,
                 "the module cannot be loaded on this harness, which is the state being graded");
         // Content, not length: every possible string has a length, so the old check could not
@@ -1976,17 +1977,17 @@ TestCase {
     //       changes, any other cause shown could be long out of date.
     // WHY-THIS-SHAPE: driven through two answers that would otherwise each name their own cause (an
     //       unknown screen and a daemon gone), so the message is graded against a cause it must
-    //       outrank, not only for containing the right words. The watch is left unloaded by this
-    //       harness's module block, required to be in Loader.Error, so a host where it loaded cannot
-    //       pass.
+    //       outrank, not only for containing the right words. The watch cannot load because the
+    //       source-tree package has no WallpaperXPlugin folder (asserted), and it is required to be in
+    //       Loader.Error, so a tree where it loaded cannot pass.
     // CONTROL: the `if (notice.status === Loader.Error)` branch deleted from describe() in
     //       backend/kde/kpackage/contents/ui/main.qml -> "an unloadable change watch is named as the
-    //       cause" red, showing "does not know this screen".
+    //       cause" red, showing "does not know this screen". Re-observed 2026-11-05.
     function test_an_unloadable_watch_is_named_as_the_cause() {
         const item = loadHost().item;
         const watch = childNamed(item, "wallpaperxConfigWatch");
         verify(watch !== null, "main.qml has a change watch");
-        verify(moduleBlock.blocked() > 0, "this harness made com.wallpaperx unloadable");
+        verify(rendererModule.absentBesideMainQml(), "main.qml is loaded from the source tree, which holds no renderer module");
         compare(watch.status, Loader.Error, "the change watch could not be loaded, which is the state graded");
         item.connectorOverride = suite.namedScreen;
         tryVerify(function () { return item.pending === null; }, 5000, "the naming read has settled");

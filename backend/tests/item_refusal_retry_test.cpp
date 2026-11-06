@@ -213,7 +213,7 @@ void pumpFor(int ms) {
 QString qmlSource() {
     return QStringLiteral(R"(
 import QtQuick
-import com.wallpaperx
+import WallpaperXPlugin
 
 Item {
     width: 64
@@ -299,7 +299,7 @@ int runLookupFailed() {
     window.setGeometry(0, 0, 64, 64);
     std::unique_ptr<QObject> root = makeItem(engine, window, "item_refusal_retry_lookup.qml");
     if (root == nullptr) {
-        check(false, "the com.wallpaperx module loads and WallpaperXRenderer instantiates");
+        check(false, "the WallpaperXPlugin module loads and WallpaperXRenderer instantiates");
         return wallpaperx::testing::reportNotVerifiedOrPassed();
     }
     const auto publishedReason = [&root] { return root->property("publishedReason").toString(); };
@@ -519,7 +519,7 @@ private:
 QString scriptedQml(int monitor) {
     return QStringLiteral(R"(
 import QtQuick
-import com.wallpaperx
+import WallpaperXPlugin
 
 Item {
     width: 64
@@ -580,7 +580,7 @@ struct ScriptedRun {
             for (const QQmlError& error : component.errors()) {
                 std::fprintf(stderr, "  qml: %s\n", qPrintable(error.toString()));
             }
-            check(false, "the com.wallpaperx module loads and WallpaperXRenderer instantiates");
+            check(false, "the WallpaperXPlugin module loads and WallpaperXRenderer instantiates");
             return {};
         }
         rootItem->setParentItem(window.contentItem());
@@ -1686,9 +1686,9 @@ int main(int argc, char** argv) {
         // The module and the type are the plugin's own, so a load failure here is production's,
         // not this harness's -- and every check below is gated on it.
         // CONTROL: the import path replaced with a nonexistent directory -> `qml: ... module
-        //       "com.wallpaperx" is not installed` and "FAIL: the com.wallpaperx module loads and
-        //       WallpaperXRenderer instantiates". Reverted.
-        check(root != nullptr, "the com.wallpaperx module loads and WallpaperXRenderer instantiates");
+        //       "WallpaperXPlugin" is not installed` and "FAIL: the WallpaperXPlugin module loads and
+        //       WallpaperXRenderer instantiates". Observed 2026-11-05. Reverted.
+        check(root != nullptr, "the WallpaperXPlugin module loads and WallpaperXRenderer instantiates");
         if (root == nullptr) {
             notVerified(kGoals, "the plugin's QML type could not be instantiated, so no item was ever refused");
             return wallpaperx::testing::reportNotVerifiedOrPassed();

@@ -12,7 +12,7 @@ Item {
     id: root
 
     // The renderer these facts are written to. Its type is not named here: that would import
-    // com.wallpaperx, tying this file's loading to the renderer module's. var, not QtObject: qmllint
+    // the renderer module, tying this file's loading to that module's. var, not QtObject: qmllint
     // checks the writes below against a declared type, and QObject has neither property.
     required property var renderer
 

@@ -91,7 +91,8 @@ const QString kFocus = QStringLiteral("SetOutputFocusState");
 const QString kSize = QStringLiteral("SetOutputSize");
 constexpr int kArrivalLimitMs = 5000;
 
-const QString kUiDir = QStringLiteral(WALLPAPERX_BACKEND_SOURCE_DIR "/kde/kpackage/contents/ui");
+// The package as assembled in the build tree: its QML imports the renderer module from beside itself.
+const QString kUiDir = QStringLiteral(WALLPAPERX_PACKAGE_BUILD_DIR "/contents/ui");
 
 // /config, answering every screen as known, set, and on monitorId (0 unless a phase moves it, or
 // names an id for that screen) -- what makes main.qml load its renderer. Records the screen each
@@ -394,7 +395,7 @@ bool spendFirstLookup() {
     QQmlEngine engine;
     addImportPaths(engine);
     QQmlComponent component(&engine);
-    component.setData("import com.wallpaperx\nWallpaperXConfigWatch {}\n",
+    component.setData("import WallpaperXPlugin\nWallpaperXConfigWatch {}\n",
                       QUrl::fromLocalFile(QCoreApplication::applicationDirPath() + QStringLiteral("/first_lookup.qml")));
     std::unique_ptr<QObject> watch(component.create());
     SignalCount heard(watch.get(), "configChanged()");
@@ -1003,7 +1004,8 @@ int main(int argc, char** argv) {
         //       in which the block did nothing cannot pass.
         // CONTROL: `import org.kde.taskmanager as TaskManager` and a `TaskManager.TasksModel {}` added
         //       to WallpaperSurface.qml (backend/kde/kpackage/contents/ui/) -> "FAIL: WallpaperSurface.qml
-        //       loads without the task manager module". This file's controls observed 2026-10-01
+        //       loads without the task manager module"; the import alone, re-observed 2026-11-05 through the
+        //       assembled package's copy. This file's controls observed 2026-10-01
         //       through control_batch.sh, each phase alone, and reverted.
         // COVERAGE-ASSERT: the interceptor must have rewritten a task manager qmldir.
         QQmlEngine engine;

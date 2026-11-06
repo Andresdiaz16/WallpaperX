@@ -208,7 +208,7 @@ bool pumpUntil(const std::function<bool()>& done, int limitMs) {
 QString qmlSource() {
     return QStringLiteral(R"(
 import QtQuick
-import com.wallpaperx
+import WallpaperXPlugin
 
 Item {
     width: 64
@@ -296,7 +296,7 @@ int main(int argc, char** argv) {
     }
     // The module and the type are the plugin's own, so a load failure here is production's, not
     // this harness's -- red, and every check below is gated on it.
-    check(rootItem != nullptr, "the com.wallpaperx module loads and WallpaperXRenderer instantiates");
+    check(rootItem != nullptr, "the WallpaperXPlugin module loads and WallpaperXRenderer instantiates");
 
     if (rootItem != nullptr) {
         rootItem->setParentItem(window.contentItem());

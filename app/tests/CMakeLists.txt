@@ -409,6 +409,29 @@ set(KF6Screen_DIR [==[${KF6Screen_DIR}]==] CACHE PATH \"\")
     set_tests_properties(app_no_kscreen_library_build PROPERTIES LABELS "novulkan" TIMEOUT 900)
 endif()
 
+# First-run setup end to end in a private home, against a stand-in systemd that owns its name on the
+# private bus (which can start nothing). Takes the unit template from the backend, as the app does.
+qt_add_executable(wallpaperx-first-run-setup-test first_run_setup_test.cpp
+                  ${CMAKE_CURRENT_SOURCE_DIR}/../setup/first_run_setup.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../setup/first_run_setup.h
+                  ${WALLPAPERX_APP_LIBRARY_SOURCES})
+wallpaperx_app_test_target(wallpaperx-first-run-setup-test)
+wallpaperx_app_library_test_target(wallpaperx-first-run-setup-test)
+target_include_directories(wallpaperx-first-run-setup-test PRIVATE ${WALLPAPERX_APP_TESTS_DIR}/.. ${WALLPAPERX_APP_TESTS_DIR}/../setup)
+wallpaperx_add_setup_template(wallpaperx-first-run-setup-test)
+wallpaperx_add_test(NAME app_first_run_setup COMMAND wallpaperx-first-run-setup-test)
+# Five phases each wait out setup's 30-second daemon limit on purpose.
+set_tests_properties(app_first_run_setup PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77 TIMEOUT 400)
+
+# S16.11: the bundle's build ids.
+set(build_id_bundle "")
+if(WALLPAPERX_BACKEND_BUILD_DIR)
+    set(build_id_bundle "-DBUNDLE=${CMAKE_BINARY_DIR}")
+endif()
+wallpaperx_add_test(NAME app_build_id
+                    COMMAND ${CMAKE_COMMAND} -DCONTENT_ID=${WALLPAPERX_APP_TESTS_DIR}/../../backend/packaging/content_id.cmake
+                            -DSCRATCH=${CMAKE_CURRENT_BINARY_DIR} ${build_id_bundle} -P ${CMAKE_CURRENT_SOURCE_DIR}/build_id_test.cmake)
+set_tests_properties(app_build_id PROPERTIES LABELS "novulkan" TIMEOUT 120)
+
 # That every entry in this tree runs through isolated_run.sh, read from ctest's own listing, so an
 # entry registered with a bare add_test() -- here or in a subdirectory -- is caught. The floor is
 # what this configure registered, so a host lacking an optional dependency is not failed for the

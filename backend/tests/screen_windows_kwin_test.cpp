@@ -178,7 +178,7 @@ int main(int argc, char** argv) {
     QQmlEngine engine;
     engine.addImportPath(QString::fromUtf8(WALLPAPERX_QML_MODULE_PATH));
     const QString surfaceUrl =
-        QUrl::fromLocalFile(QStringLiteral(WALLPAPERX_BACKEND_SOURCE_DIR "/kde/kpackage/contents/ui/WallpaperSurface.qml"))
+        QUrl::fromLocalFile(QStringLiteral(WALLPAPERX_PACKAGE_BUILD_DIR "/contents/ui/WallpaperSurface.qml"))
             .toString();
     QQmlComponent component(&engine);
     component.setData(QStringLiteral(R"(
@@ -260,7 +260,7 @@ Window {
     //       that ends with no window focused.
     // WHY-THIS-SHAPE: the precondition above accepts any state without a focused window, so a report of
     //       "desktop" is graded here as the plugin's, not skipped as a harness that never settled.
-    // CONTROL: via control_batch.sh, 2026-10-11, `&& root.Window.active` dropped from desktopFocused in
+    // CONTROL: via control_batch.sh, 2026-10-11 and 2026-11-05, `&& root.Window.active` dropped from desktopFocused in
     //       backend/kde/kpackage/contents/ui/ScreenWindows.qml -> this line red, with "showing the desktop
     //       reports no window and no focused desktop", "minimizing a maximized window reports no window" and
     //       "a fullscreen window on the other output does not count here". Reverted.
@@ -321,7 +321,7 @@ Window {
     //       plugin; asked after the placement wait, since a window not yet mapped reports Qt's guess.
     // CONTROL: the IsFullScreen term (`full ||`) dropped from the maximized expression in ScreenWindows.qml's
     //       recount (backend/kde/kpackage/contents/ui/ScreenWindows.qml) -> "making it fullscreen reports a
-    //       maximized window" red; re-run 2026-10-27 via control_batch.sh, reverted. This file's controls observed 2026-10-01 through control_batch.sh,
+    //       maximized window" red; re-run 2026-10-27 and 2026-11-05 via control_batch.sh, reverted. This file's controls observed 2026-10-01 through control_batch.sh,
     //       each under its own nested KWin, and reverted. The placement order observed by hand: the
     //       client made to put its window fullscreen on the second output at "open" -> NOT VERIFIED,
     //       "KWin put the client's window on 'Virtual-1'", Skipped, no FAIL line.
@@ -348,13 +348,13 @@ Window {
     }
     step("max", focusedWindow(true), "maximizing it reports a maximized window");
     // GOAL: S15.977 -- a maximized window does not hide the screen; only a fullscreen one does.
-    // CONTROL: via control_batch.sh 2026-10-27, `root.anyFullScreen = fullScreen;` changed to `= maximized;`
+    // CONTROL: via control_batch.sh 2026-10-27 and 2026-11-05, `root.anyFullScreen = fullScreen;` changed to `= maximized;`
     //       in ScreenWindows.qml's recount (backend/kde/kpackage/contents/ui/ScreenWindows.qml) -> this line red.
     visibleCheck(true, "a maximized window does not hide the screen");
 
     // GOAL: "show desktop" turns both facts off while it is on: windows are hidden, not minimized.
     // CONTROL: `!KWindowSystem.showingDesktop &&` dropped from both bindings in ScreenWindows.qml ->
-    //       "showing the desktop reports no window" red.
+    //       "showing the desktop reports no window" red; from `focused` alone, the same, 2026-11-05.
     QQmlComponent toggle(&engine);
     toggle.setData("import QtQml\nimport org.kde.kwindowsystem\nQtObject { function show(on) { KWindowSystem.showingDesktop = on } }\n",
                    QUrl::fromLocalFile(QCoreApplication::applicationDirPath() + QStringLiteral("/kwin_toggle.qml")));
@@ -372,7 +372,7 @@ Window {
     step("full", focusedWindow(true), "making it fullscreen reports a maximized window");
     // GOAL: S15.977 -- a fullscreen window on this screen reports it hidden, with nothing being drawn;
     //       "show desktop" shows it while on; restoring the window shows it.
-    // CONTROL: via control_batch.sh 2026-10-27, in backend/kde/kpackage/contents/ui/ScreenWindows.qml:
+    // CONTROL: via control_batch.sh 2026-10-27 and 2026-11-05, in backend/kde/kpackage/contents/ui/ScreenWindows.qml:
     //       `fullScreen = fullScreen || full;` made `fullScreen = false;` -> the first line red;
     //       `!KWindowSystem.showingDesktop &&` dropped from `covered` -> the show-desktop line red;
     //       `root.anyFullScreen = fullScreen;` made `= fullScreen || root.anyFullScreen;` -> the restore,
@@ -388,7 +388,7 @@ Window {
     visibleCheck(true, "restoring the fullscreen window shows the screen");
     step("max", focusedWindow(true), "maximizing it again");
     // GOAL: a minimized window counts nowhere, though it is still maximized.
-    // CONTROL: `filterMinimized: false` in ScreenWindows.qml -> this line red, and the other-output
+    // CONTROL: `filterMinimized: false` in ScreenWindows.qml -> this line red (2026-11-05), and the other-output
     //       line below with it (the minimized maximized window still counts here).
     step("min", {}, "minimizing a maximized window reports no window");
     step("full", focusedWindow(true), "making the minimized window fullscreen again");
@@ -426,7 +426,7 @@ Window {
                 check(settled && !claimed && last() == Facts{},
                       "a fullscreen window on the other output does not count here");
                 // GOAL: S15.977 -- a fullscreen window on the other output leaves this screen visible.
-                // CONTROL: via control_batch.sh 2026-10-27, `filterByScreen: false` in ScreenWindows.qml
+                // CONTROL: via control_batch.sh 2026-10-27 and 2026-11-05, `filterByScreen: false` in ScreenWindows.qml
                 //       (backend/kde/kpackage/contents/ui/ScreenWindows.qml) -> this line red. Reverted.
                 bool hid = false;
                 for (const ReportStub::Call& call : stub.calls(kVisible, kOutput, mark)) {

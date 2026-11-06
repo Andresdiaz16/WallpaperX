@@ -39,7 +39,7 @@ namespace wallpaperx::testing {
 inline QString cacheQmlSource() {
     return QStringLiteral(R"(
 import QtQuick
-import com.wallpaperx
+import WallpaperXPlugin
 
 Item {
     id: root

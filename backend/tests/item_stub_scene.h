@@ -941,7 +941,7 @@ inline bool glDeviceUuid(std::array<uint8_t, 16>& out) {
 inline QString qmlSource() {
     return QStringLiteral(R"(
 import QtQuick
-import com.wallpaperx
+import WallpaperXPlugin
 
 Item {
     width: 68

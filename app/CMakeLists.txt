@@ -78,6 +78,8 @@ qt_add_executable(wallpaperx
     library/importer.h
     library/preview_image_provider.cpp
     library/preview_image_provider.h
+    setup/first_run_setup.cpp
+    setup/first_run_setup.h
 )
 
 if(WALLPAPERX_KSCREEN_LIBRARY)
@@ -87,7 +89,7 @@ if(WALLPAPERX_KSCREEN_LIBRARY)
 endif()
 
 # The generated QML type registration includes these headers by bare name.
-target_include_directories(wallpaperx PRIVATE kde library daemon)
+target_include_directories(wallpaperx PRIVATE kde library daemon setup)
 # playback_speed.h, which the daemon includes too.
 target_include_directories(wallpaperx PRIVATE ../shared)
 
@@ -113,7 +115,36 @@ qt_add_qml_module(wallpaperx
         qml/LibraryView.qml
         qml/WallpaperDetail.qml
         qml/ScreenSettings.qml
+        qml/Setup.qml
 )
+
+# First-run setup: compares its stamp with this version, and writes the daemon's unit from the
+# backend's template.
+target_compile_definitions(wallpaperx PRIVATE WALLPAPERX_APP_VERSION="${PROJECT_VERSION}")
+# The daemon's runtime copy is always named <version>+<daemon/build-id>. Off, a source build: the
+# stamp records that name too. A release stamps the plain version.
+option(WALLPAPERX_RELEASE_BUILD "Build as released (Steam): first-run setup stamps the plain version" OFF)
+target_compile_definitions(wallpaperx PRIVATE WALLPAPERX_RELEASE_BUILD=$<BOOL:${WALLPAPERX_RELEASE_BUILD}>)
+# The unit template, at the resource path first_run_setup.cpp reads; also for the setup test.
+function(wallpaperx_add_setup_template target)
+    set(packaging ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../backend/packaging)
+    qt_add_resources(${target} "setup_template" PREFIX "/wallpaperx/setup"
+        BASE ${packaging} FILES ${packaging}/wallpaperx-daemon.service.in)
+endfunction()
+wallpaperx_add_setup_template(wallpaperx)
+
+# The bundle setup installs from, beside the app as a Steam depot carries it: daemon/ and plasma/,
+# taken from a backend build tree. Without one the app finds no bundle and leaves setup to whatever
+# installed the daemon and the plugin.
+set(WALLPAPERX_BACKEND_BUILD_DIR "" CACHE PATH
+    "A backend build tree whose bundle/ is staged beside the app for first-run setup; empty stages none")
+if(WALLPAPERX_BACKEND_BUILD_DIR)
+    add_custom_target(wallpaperx-stage-bundle ALL
+        COMMAND ${CMAKE_COMMAND} -DBUNDLE=${WALLPAPERX_BACKEND_BUILD_DIR}/bundle -DDEST=$<TARGET_FILE_DIR:wallpaperx>
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/setup/stage_bundle.cmake
+        COMMENT "Staging the backend bundle from ${WALLPAPERX_BACKEND_BUILD_DIR}/bundle beside the app"
+        VERBATIM)
+endif()
 
 # Nothing installed this app until now -- it was only ever run out of the build directory. The
 # plugin's settings pane launches it by desktop id, so both halves have to land: the binary

@@ -4,9 +4,9 @@
 // screen should show, identifying itself by connector name -- the one fact both sides derive
 // from the hardware, so nothing has to stay in sync.
 //
-// This file must never import com.wallpaperx: naming a QML type that fails to resolve takes the
-// whole entry file down, which is a black desktop with nothing logged. The renderer is reached
-// through the Loader below -- see WallpaperSurface.qml.
+// This file must never import the renderer module, WallpaperXPlugin: naming a QML type that fails
+// to resolve takes the whole entry file down, which is a black desktop with nothing logged. The
+// renderer is reached through the Loader below -- see WallpaperSurface.qml.
 import QtQuick
 import org.kde.plasma.plasmoid
 
@@ -91,7 +91,7 @@ WallpaperItem {
         : root.wallpaperPath === "" ? "unset"
         : "set"
 
-    // The two loaded items, typed var: their types come from com.wallpaperx, which this file must
+    // The two loaded items, typed var: their types come from the renderer module, which this file must
     // never name, so nothing read through them can be checked here.
     readonly property var watchItem: notice.item
     readonly property var rendererItem: surface.item

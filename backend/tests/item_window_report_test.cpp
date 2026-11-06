@@ -153,7 +153,7 @@ public:
 
     Scene make(const QString& tag) {
         QQmlComponent component(&m_engine);
-        component.setData(QByteArrayLiteral("import QtQuick\nimport com.wallpaperx\n"
+        component.setData(QByteArrayLiteral("import QtQuick\nimport WallpaperXPlugin\n"
                                             "Item { width: 300; height: 170; property Item rendererItem: renderer\n"
                                             "  WallpaperXRenderer { id: renderer; anchors.fill: parent; monitorId: 0 } }\n"),
                           QUrl::fromLocalFile(QCoreApplication::applicationDirPath() +

@@ -30,11 +30,11 @@
 #include <QtQuickTest/quicktest.h>
 
 #include <QCoreApplication>
+#include <QFileInfo>
 #include <QNetworkAccessManager>
 #include <QNetworkRequest>
 #include <QObject>
 #include <QQmlNetworkAccessManagerFactory>
-#include <QQmlAbstractUrlInterceptor>
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QString>
@@ -449,36 +449,17 @@ private:
     bool m_installed = false;
 };
 
-// Makes `com.wallpaperx` unloadable in this process, whatever is installed on the machine.
-//
-// Three of the cases below rest on the renderer module NOT loading -- the one that grades what
-// main.qml does when the Loader reaches Loader.Error, and two that read the backdrop while the
-// Loader is not Ready. That used to be true by accident, because a test binary's import path does
-// not include the module it is built beside. It stopped being true the moment the plugin was
-// installed system-wide for a live desktop test: Qt searches /usr/lib/qt6/qml, the import
-// succeeded, and the Loader.Error case failed with "Actual 1, Expected 3" on a build whose
-// behaviour was correct. A check whose verdict depends on what is installed on the developer's
-// machine grades the machine.
-//
-// Rewriting the qmldir URL is what makes it deterministic in the direction the cases need. The
-// obvious alternative -- trimming /usr/lib/qt6/qml out of the engine's import path -- cannot be
-// used: QtQuick, QtTest and the Plasma modules all live there, so the whole file would stop
-// loading.
-class BlockRendererModule : public QObject, public QQmlAbstractUrlInterceptor {
+// Three cases grade main.qml with the renderer module (WallpaperXPlugin) not loaded. main.qml is
+// loaded from the source tree's package, whose contents/ui holds no WallpaperXPlugin folder (only
+// the build's assembled copy has one), and it imports the module as a directory beside itself, which
+// never searches the import path: a copy installed on the host cannot satisfy it. This reports that
+// precondition, so those cases require it instead of assuming it.
+class RendererModule : public QObject {
     Q_OBJECT
 public:
-    QUrl intercept(const QUrl& path, DataType type) override {
-        if (type != QmldirFile || !path.toString().contains(QLatin1String("com/wallpaperx"))) return path;
-        ++m_blocked;
-        return QUrl::fromLocalFile(QStringLiteral("/nonexistent/wallpaperx-module-blocked-by-this-test/qmldir"));
+    Q_INVOKABLE bool absentBesideMainQml() const {
+        return !QFileInfo::exists(QStringLiteral(QUICK_TEST_SOURCE_DIR "/../../kde/kpackage/contents/ui/WallpaperXPlugin"));
     }
-
-    // Read by the Loader.Error case: a run where no candidate qmldir was ever rewritten is one
-    // where this class did nothing, and its verdict would be about the machine again.
-    Q_INVOKABLE int blocked() const { return m_blocked; }
-
-private:
-    int m_blocked = 0;
 };
 
 // The lock screen's setup: kscreenlocker_greet gives its QML engine a network manager that refuses
@@ -613,7 +594,6 @@ public slots:
     }
 
     void qmlEngineAvailable(QQmlEngine* engine) {
-        engine->addUrlInterceptor(&m_blockRenderer);
         engine->setNetworkAccessManagerFactory(&m_refusing);
         engine->rootContext()->setContextProperty(QStringLiteral("refusingNetwork"), &m_refusing);
         engine->rootContext()->setContextProperty(QStringLiteral("readProbe"), &m_reads);
@@ -621,7 +601,7 @@ public slots:
         engine->rootContext()->setContextProperty(QStringLiteral("daemonName"), &m_name);
         m_translation.setEngine(engine);
         engine->rootContext()->setContextProperty(QStringLiteral("translationProbe"), &m_translation);
-        engine->rootContext()->setContextProperty(QStringLiteral("moduleBlock"), &m_blockRenderer);
+        engine->rootContext()->setContextProperty(QStringLiteral("rendererModule"), &m_rendererModule);
     }
 
     // Belt and braces: a case that failed between installing and removing would otherwise leave
@@ -637,7 +617,7 @@ private:
     RefusingNetwork m_refusing;
     ReadProbe m_reads;
     TranslationProbe m_translation;
-    BlockRendererModule m_blockRenderer;
+    RendererModule m_rendererModule;
 };
 
 }  // namespace

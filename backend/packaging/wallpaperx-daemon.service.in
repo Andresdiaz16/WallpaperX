@@ -2,6 +2,8 @@
 Description=WallpaperX wallpaper daemon
 After=graphical-session.target
 PartOf=graphical-session.target
+# A program that is gone, as after an uninstall, skips the start instead of failing it at every login.
+ConditionFileIsExecutable=@WALLPAPERX_DAEMON_EXECUTABLE@
 # systemd's default, 5 starts in 10 s, is never reached with RestartSec=3, so it would never give up.
 # Ten starts in two minutes leave room for the daemon's own crash-loop breaker -- one death refuses
 # a still wallpaper that killed it, two a video -- to settle with several monitors each holding a

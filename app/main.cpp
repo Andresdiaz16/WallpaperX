@@ -10,10 +10,12 @@
 #include "library/importer.h"
 #include "library/library_manager.h"
 #include "library/preview_image_provider.h"
+#include "setup/first_run_setup.h"
 #include "single_instance.h"
 
 #include <QDBusConnection>
 #include <QGuiApplication>
+#include <QPointer>
 #include <QQmlApplicationEngine>
 #include <QSocketNotifier>
 #include <QUrl>
@@ -187,22 +189,76 @@ int main(int argc, char* argv[])
     wallpaperx::ApplyController applier(kscreen, library, daemon, plasma, wallpaperx::defaultRememberedSettingsFile());
     wallpaperx::RefreshRateReporter refreshRates(kscreen, daemon);
 
+    const wallpaperx::SetupPaths setupPaths = wallpaperx::SetupPaths::forThisApp();
+    constexpr auto buildKind = WALLPAPERX_RELEASE_BUILD ? wallpaperx::BuildKind::Release : wallpaperx::BuildKind::Source;
+    wallpaperx::FirstRunSetup setup(QDBusConnection::sessionBus(), setupPaths,
+                                    wallpaperx::setupVersion(QStringLiteral(WALLPAPERX_APP_VERSION), buildKind, setupPaths.bundle),
+                                    QProcessEnvironment::systemEnvironment());
+
     QQmlApplicationEngine engine;
     engine.addImageProvider(QString::fromLatin1(wallpaperx::kPreviewProviderId), new wallpaperx::PreviewImageProvider);
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreationFailed, &app,
                      [] { QCoreApplication::exit(1); }, Qt::QueuedConnection);
-    engine.setInitialProperties({{QStringLiteral("kscreen"), QVariant::fromValue(&kscreen)},
-                                 {QStringLiteral("library"), QVariant::fromValue(&library)},
-                                 {QStringLiteral("importer"), QVariant::fromValue(&importer)},
-                                 {QStringLiteral("daemon"), QVariant::fromValue(&daemon)},
-                                 {QStringLiteral("applier"), QVariant::fromValue(&applier)}});
-    engine.loadFromModule("WallpaperX", "Main");
+    // The window this load made; nothing when it made none, which objectCreationFailed then ends the app for.
+    const auto load = [&engine](const char* type, const QVariantMap& properties) -> QWindow* {
+        const qsizetype before = engine.rootObjects().size();
+        engine.setInitialProperties(properties);
+        engine.loadFromModule("WallpaperX", type);
+        return engine.rootObjects().size() > before ? qobject_cast<QWindow*>(engine.rootObjects().constLast()) : nullptr;
+    };
+    const QVariantMap mainProperties{{QStringLiteral("kscreen"), QVariant::fromValue(&kscreen)},
+                                     {QStringLiteral("library"), QVariant::fromValue(&library)},
+                                     {QStringLiteral("importer"), QVariant::fromValue(&importer)},
+                                     {QStringLiteral("daemon"), QVariant::fromValue(&daemon)},
+                                     {QStringLiteral("applier"), QVariant::fromValue(&applier)}};
+    const auto setupProperties = [&setup](bool blocking) {
+        return QVariantMap{{QStringLiteral("setup"), QVariant::fromValue(&setup)}, {QStringLiteral("blocking"), blocking}};
+    };
+    // The window a launch handing its files over raises.
+    QPointer<QWindow> front;
+    switch (setup.need()) {
+    case wallpaperx::FirstRunSetup::Need::UpToDate:
+    case wallpaperx::FirstRunSetup::Need::NotBundled:
+        front = load("Main", mainProperties);
+        break;
+    case wallpaperx::FirstRunSetup::Need::FirstRun: {
+        QPointer<QWindow> progress = load("Setup", setupProperties(true));
+        front = progress;
+        QObject::connect(&setup, &wallpaperx::FirstRunSetup::finished, &app, [&, progress] {
+            // A progress window closed during the run was the user quitting.
+            if (setup.state() != wallpaperx::FirstRunSetup::State::Done || front != progress || !progress || !progress->isVisible()) return;
+            QWindow* const main = load("Main", mainProperties);
+            if (main == nullptr) return;
+            front = main;
+            // Hidden, not deleted: the engine owns its root objects.
+            if (progress) progress->close();
+        });
+        setup.start();
+        break;
+    }
+    case wallpaperx::FirstRunSetup::Need::Update: {
+        front = load("Main", mainProperties);
+        // Silent unless it fails; then shown beside the main window, never in its way.
+        QObject::connect(&setup, &wallpaperx::FirstRunSetup::finished, &app, [&, problem = QPointer<QWindow>()]() mutable {
+            if (setup.state() == wallpaperx::FirstRunSetup::State::Done) return;
+            // Every window closed during the run was the user quitting; the next launch runs setup again.
+            if (!(front && front->isVisible()) && !(problem && problem->isVisible())) return;
+            if (problem) {
+                problem->show();
+            } else {
+                problem = load("Setup", setupProperties(false));
+            }
+        });
+        setup.start();
+        break;
+    }
+    }
 
-    service.setHandler([&engine, &importer](const QStringList& paths, const QByteArray& activationToken) {
+    service.setHandler([&front, &importer](const QStringList& paths, const QByteArray& activationToken) {
         for (const QString& path : paths) {
             importer.importPath(path);
         }
-        auto* window = engine.rootObjects().isEmpty() ? nullptr : qobject_cast<QWindow*>(engine.rootObjects().constFirst());
+        QWindow* window = front;
         if (window == nullptr) {
             return;
         }

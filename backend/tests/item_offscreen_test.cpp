@@ -167,7 +167,7 @@ void pumpFor(int ms) {
 QString offscreenQml() {
     return QStringLiteral(R"(
 import QtQuick
-import com.wallpaperx
+import WallpaperXPlugin
 
 Item {
     width: 68
@@ -342,7 +342,7 @@ bool runPhase(Phase phase) {
             for (const QQmlError& error : scene.component->errors()) {
                 std::fprintf(stderr, "  qml: %s\n", qPrintable(error.toString()));
             }
-            check(false, "the com.wallpaperx module loads and WallpaperXRenderer instantiates");
+            check(false, "the WallpaperXPlugin module loads and WallpaperXRenderer instantiates");
             scene.control.invalidate();
             return true;
         }
