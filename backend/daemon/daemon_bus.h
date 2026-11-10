@@ -41,5 +41,9 @@ inline constexpr const char* kErrorBusy = "io.wallpaperx.Daemon.Error.Busy";
 // A call about a screen no monitor answers to. Not InvalidArgs: nothing in the call was wrong, and
 // the same call succeeds once SetMonitorOutput has named the screen.
 inline constexpr const char* kErrorUnknownOutput = "io.wallpaperx.Daemon.Error.UnknownOutput";
+// A change whose success reply would say it is on disk, answered before its save came back: the change
+// stands for this run and the save goes on. Not RenderFailed, since nothing failed and nothing was
+// drawn; the cure is the same call again, which succeeds at once once the save has landed.
+inline constexpr const char* kErrorSavePending = "io.wallpaperx.Daemon.Error.SavePending";
 
 }  // namespace wallpaperx

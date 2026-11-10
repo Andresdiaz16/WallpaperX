@@ -21,26 +21,8 @@ constexpr const char* kPaused = "paused";
 constexpr std::string_view kAppliedKeys[] = {kSpeed, kMute, kVolume, kPaused, kPositionKey, kPositionZoomKey,
                                              kPositionXKey, kPositionYKey};
 
-std::optional<std::uint8_t> hexByte(char high, char low) {
-    const auto digit = [](char c) -> int {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-        return -1;
-    };
-    const int h = digit(high);
-    const int l = digit(low);
-    if (h < 0 || l < 0) return std::nullopt;
-    return static_cast<std::uint8_t>(h * 16 + l);
-}
-
-bool keyCharacter(char c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' ||
-           c == '.';
-}
-
 std::string propertyError(const std::string& key, const PropertyValue& value) {
-    if (key.empty() || key.size() > kMaxPropertyKeyBytes || !std::all_of(key.begin(), key.end(), keyCharacter)) {
+    if (!isPropertyKey(key)) {
         return "property name " + sanitizeForLog(key, 128) + " must be 1 to " + std::to_string(kMaxPropertyKeyBytes) +
                " ASCII letters, digits, '_', '-' or '.'";
     }
@@ -78,25 +60,10 @@ nlohmann::json toJson(const PropertyValue& value) {
 
 }  // namespace
 
-std::optional<Colour> parseColour(std::string_view text) {
-    if (text.size() != 7 || text[0] != '#') return std::nullopt;
-    const auto red = hexByte(text[1], text[2]);
-    const auto green = hexByte(text[3], text[4]);
-    const auto blue = hexByte(text[5], text[6]);
-    if (!red || !green || !blue) return std::nullopt;
-    return Colour{*red, *green, *blue};
-}
-
 std::optional<PropertyValue> propertyFromText(std::string_view text) {
     if (const auto colour = parseColour(text)) return *colour;
     if (const auto mode = positionModeFromName(text)) return *mode;
     return std::nullopt;
-}
-
-std::string toString(Colour colour) {
-    char text[8];
-    std::snprintf(text, sizeof(text), "#%02x%02x%02x", colour.red, colour.green, colour.blue);
-    return text;
 }
 
 std::string propertiesError(const WallpaperProperties& properties) {

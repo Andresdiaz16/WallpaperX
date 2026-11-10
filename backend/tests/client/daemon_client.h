@@ -19,6 +19,7 @@
 // be shared.
 
 #include "daemon/config_store.h"
+#include "daemon/daemon_bus.h"
 #include "daemon/dbus_service.h"
 #include "daemon/log_escape.h"
 #include "support/validation_grade.h"
@@ -42,6 +43,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -393,12 +395,34 @@ inline bool daemonErrorName(const std::string& name) {
 // Shared rather than written out in each tier for the reason this header exists: the two
 // tiers have to agree on the wire. A copy in one file would keep compiling and keep
 // passing if the argument order ever changed under it.
-inline void setMonitorOutput(sdbus::IProxy& proxy, int32_t monitorId, const std::string& outputName,
-                             std::chrono::microseconds timeout = {}) {
+inline void setMonitorOutputOnce(sdbus::IProxy& proxy, int32_t monitorId, const std::string& outputName,
+                                 std::chrono::microseconds timeout = {}) {
     proxy.callMethod("SetMonitorOutput")
         .onInterface(DbusService::kInterface)
         .withTimeout(timeout)
         .withArguments(monitorId, outputName);
+}
+
+inline constexpr int kSavePendingAttempts = 5;
+
+// As setMonitorOutputOnce, sent again on SavePending: the name is bound but its save was not on disk
+// within the daemon's write deadline, which a loaded disk causes and no caller of this is testing.
+// Any other error, or the fifth SavePending, is thrown. A check of SavePending itself uses the Once form.
+inline void setMonitorOutput(sdbus::IProxy& proxy, int32_t monitorId, const std::string& outputName,
+                             std::chrono::microseconds timeout = {}) {
+    for (int attempt = 1;; ++attempt) {
+        try {
+            setMonitorOutputOnce(proxy, monitorId, outputName, timeout);
+            return;
+        } catch (const sdbus::Error& e) {
+            if (e.getName() != wallpaperx::kErrorSavePending || attempt == kSavePendingAttempts) {
+                throw;
+            }
+            std::fprintf(stderr, "  naming %s: its save was not on disk in time, naming it again (%s)\n",
+                         outputName.c_str(), e.getMessage().c_str());
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+    }
 }
 
 // Reports the pixel size the screen named `outputName` is drawn at, as the KDE plugin does. Shared

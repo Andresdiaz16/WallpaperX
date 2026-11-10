@@ -41,6 +41,8 @@ set(WALLPAPERX_APP_LIBRARY_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../library/audio_probe.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../library/wpx_package.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../library/wpx_package.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../shared/wallpaper_manifest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../shared/wallpaper_manifest.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../library/folder_watcher.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../library/folder_watcher.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../library/library_manager.cpp

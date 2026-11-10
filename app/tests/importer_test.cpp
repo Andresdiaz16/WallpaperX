@@ -801,9 +801,9 @@ void refusals(const QString& root) {
         // GOAL: S15.488's archive half -- a .wpx whose video has sound and whose wallpaper.json declares a
         //       volume of 0 to 100 is refused at import with the volume's sentence: an archive is not probed,
         //       so the refusal comes from reading the unpacked folder.
-        // CONTROL: via control_batch.sh, --phase '^refusals$', 2026-10-11, settleSoundProperties' `return
-        //       problem;` made a no-op (app/library/wpx_package.cpp) -> "FAIL: S15.76: loudvolume.wpx gave
-        //       Imported ...; wanted Refused "Property "volume" ... allows 0 to 100 ..."". Reverted.
+        // CONTROL: --phase '^refusals$', control_batch 2026-11-10, each alone, reverted: shared/wallpaper_manifest.cpp
+        //       settleSound's `return problem;` made `(void)problem;` -> "FAIL: S15.76: loudvolume.wpx gave Imported
+        //       ...; wanted Refused ...".
         {"loudvolume.wpx",
          QStringLiteral("Property \"volume\" in wallpaper.json allows 0 to 100, and WallpaperX plays a video's volume from 0 to 1.")},
     };
@@ -2250,11 +2250,10 @@ void swapToFifo(const QString& root) {
     //       hanging the run: it holds the FIFO open so an open does not block, and lets go so a read
     //       ends. The import must still be of the file looked up, and the record still used, so
     //       "refused everything" is not a pass.
-    // CONTROL: in openRegularFile (app/library/wpx_package.cpp) the reopen through /proc/self/fd made
-    //       `::openat(dirfd, name, (flags & ~O_NOFOLLOW) | O_CLOEXEC)` -> one line per site, the helper
-    //       being shared: "FAIL: S15.340 (unpackPackage): ... the FIFO was opened 1 time(s)", "FAIL: S15.340
-    //       (openForWriting): ..." and "FAIL: S15.340 (loadRecordIn): ...". Via control_batch.sh, 2026-10-06.
-    //       Reverted.
+    // CONTROL: in openRegularFile (app/library/wpx_package.cpp) the reopen through /proc/self/fd made `::openat(dirfd,
+    //       name, (flags & ~O_NOFOLLOW) | ...)` -> one line per site, the helper being shared: "FAIL: S15.340
+    //       (unpackPackage): ... the FIFO was opened 1 time(s)", "FAIL: S15.340 (openForWriting): ..." and "FAIL:
+    //       S15.340 (loadRecordIn): ...". --phase '^swapToFifo$', control_batch 2026-11-10, each alone, reverted.
     // COVERAGE-ASSERT: the swap must have run once per site (a harness fault otherwise), and the
     //       guard must count its own open first.
     {
@@ -2652,15 +2651,12 @@ void nulInFileUrl(const QString& root) {
     // WHY-THIS-SHAPE: importFile() is what the Import dialog calls; the importer's drop folder is
     //       never listed here (no rescan()), so any import is this URL's. Every system call would
     //       end the path at the NUL, naming named.wpx.
-    // CONTROL: app/library/wpx_package.cpp, localPathOfFileUrl's `if (!path.startsWith('/') || path.contains('\0')) {`
-    //       made `if (!path.startsWith('/')) {` -> red, "S15.93: file://.../named.wpx%00.jpg gave 1
-    //       import(s), the problems [] and wallpapers/ holding [<name>]", the only line red;
-    //       app/library/importer.cpp, importFile()'s `if (!path) {` made `if (true) {` -> red, "S15.93:
-    //       the same URL without the NUL left wallpapers/ holding [], not one Named", the only line
-    //       red; restored. The second line also grades S15.355's hand import of a file outside the drop
-    //       folder, read by its path: unpackPackage's path form given the file's name alone
-    //       (`encodeFileName(QFileInfo(archivePath).fileName())`) -> red, the same line (control_batch.sh,
-    //       2026-10-14).
+    // CONTROL: app/library/wpx_package.cpp, localPathOfFileUrl's `|| path.contains('\0')` dropped (control_batch
+    //       2026-11-10, each alone, reverted, --phase '^nulInFileUrl$') -> red, "S15.93: file://.../named.wpx%00.jpg
+    //       gave 1 import(s), ..."; app/library/importer.cpp, importFile()'s `if (!path) {` made `if (true) {` -> red,
+    //       "S15.93: the same URL without the NUL left wallpapers/ holding [], not one Named", the only line red. The
+    //       second line also grades S15.355's hand import of a file outside the drop folder: unpackPackage's path form
+    //       given the file's name alone -> red, the same line (control_batch.sh, 2026-10-14).
     const QByteArray folderUrl = "file://" + QFile::encodeName(dir).toPercentEncoding("/");
     Session s(dir + QStringLiteral("/drop"), wallpapers);
     s.importer().importFile(QUrl::fromEncoded(folderUrl + "/named.wpx%00.jpg"));

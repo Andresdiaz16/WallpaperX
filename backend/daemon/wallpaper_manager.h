@@ -83,6 +83,12 @@ struct UnknownOutput : InvalidRequest {
     using InvalidRequest::InvalidRequest;
 };
 
+// A change whose reply promises it is on disk, refused because its save has not come back within the
+// writer's deadline. The change stands for this run and its save goes on; asking again is the retry.
+struct SavePending : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 // One reply handing an image over that has not been given back and carried descriptors -- 1 or 2,
 // depending on whether the consumer already had the memory and which acquire went with it. They
 // count against the consumer until a release covers that reply.
@@ -614,8 +620,12 @@ public:
     // that can only fail on the GPU fails later in renderPending(). The caller must then post
     // the monitor to the render worker, types this build cannot draw included -- those still
     // need their target released. `properties` replace whatever the previous wallpaper had.
-    void requestWallpaper(const std::string& type, const std::string& path, int monitorId,
-                          const WallpaperProperties& properties = {});
+    //
+    // Returns the monitor's generation at the moment the request was recorded. No render of an earlier
+    // request commits after that moment, so every picture numbered above it is this request's or a
+    // later one's.
+    uint64_t requestWallpaper(const std::string& type, const std::string& path, int monitorId,
+                              const WallpaperProperties& properties = {});
 
     // Replaces the properties of the wallpaper this monitor holds, keeping the wallpaper: a video
     // plays on from the picture it is at. Throws InvalidRequest for a bad id, a set
@@ -632,10 +642,10 @@ public:
                                 WallpaperProperties* replaced = nullptr);
 
     // Records the connector name a monitor is known by -- "DP-3". Throws InvalidRequest for a
-    // bad id or a name outputNameError() rejects, and std::runtime_error when the name did not
-    // reach the config file: the binding stands for this run either way, and only the write
-    // makes it outlive a restart. Idempotent; a call that changes nothing already on disk does
-    // not write, since the write parks the calling thread.
+    // bad id or a name outputNameError() rejects, SavePending when its save has not come back in
+    // time, and std::runtime_error when the name did not reach the config file: the binding stands
+    // for this run in each case, and only the write makes it outlive a restart. Idempotent; a call
+    // that changes nothing already on disk does not write, since the write parks the calling thread.
     //
     // A name carries its screen's reported size, so binding one can change what two monitors are
     // drawn at. Those are recorded as owed a render and put in `redraw` before anything can throw;
@@ -1608,11 +1618,12 @@ private:
     // under m_stateMutex and undone there if this throws: nothing is handed over in that case.
     void queuePersist(PersistedConfig config);
 
-    // The writer's bounded wait for what was last queued. Returns whether it is known to be on
-    // disk; on false, `whyNot` receives that write's own reason, sanitized. Parks the calling
-    // thread for up to the writer's deadline, so never under m_stateMutex -- and never at
-    // startup, which is why restoreSaved()'s repair is only queued.
-    bool awaitPersisted(std::string& whyNot);
+    // The writer's bounded wait for what was last queued, throwing unless it is known to be on disk:
+    // SavePending while the write has not come back, std::runtime_error when it failed, with the
+    // write's own reason, sanitized, or `unsaved` when it gives none. Parks the calling thread for
+    // up to the writer's deadline, so never under m_stateMutex -- and never at startup, which is
+    // why restoreSaved()'s repair is only queued.
+    void requirePersisted(const char* unsaved);
     // The same wait with no answer, for a caller that has already committed its change and so
     // must not throw.
     void awaitPersisted() noexcept;

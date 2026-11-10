@@ -13,13 +13,7 @@ class QDBusMessage;
 
 namespace wallpaperx {
 
-// The plugin id Plasma knows the WallpaperX wallpaper by (backend/kde/kpackage/metadata.json).
-inline constexpr const char* kWallpaperPluginId = "com.wallpaperx.wallpaper";
-
-// The script evaluateScript runs to put the WallpaperX wallpaper on `connector`'s desktops. It
-// switches the plugin on and writes nothing else: what to show is the daemon's to say. It throws,
-// failing the call, when Plasma shows no desktop of its own there or the plugin is not installed,
-// and prints how many desktops it switched.
+// plasmaActivationScript() for `connector`: shared/plasma_activation.h.
 QString activationScript(const QString& connector);
 // How many desktops evaluateScript's reply says were switched; the error is a sentence for the user.
 std::expected<int, QString> activationResult(const QDBusMessage& reply);
@@ -32,10 +26,9 @@ class PlasmaController : public QObject {
     Q_OBJECT
 
 public:
-    static constexpr const char* kDefaultService = "org.kde.plasmashell";
-
-    explicit PlasmaController(QDBusConnection bus, QString service = QString::fromLatin1(kDefaultService),
-                              int timeoutMs = 25000, QObject* parent = nullptr);
+    // Without a service or timeout: Plasma's own shell, waited on as plasma_activation.h says.
+    explicit PlasmaController(QDBusConnection bus, QObject* parent = nullptr);
+    PlasmaController(QDBusConnection bus, QString service, int timeoutMs, QObject* parent = nullptr);
 
     // Puts the WallpaperX wallpaper on every desktop Plasma keeps for `connector`, on every activity.
     // `done` gets the number switched, and runs only while `context` is alive.

@@ -5,6 +5,7 @@
 #include "audio_probe.h"
 #include "playback_speed.h"
 #include "unique_fd.h"
+#include "wallpaper_manifest.h"
 #include "wallpaper_position.h"
 
 #include <QByteArray>
@@ -39,7 +40,7 @@ struct WallpaperProperty {
     Q_PROPERTY(QList<double> choices READ choices CONSTANT)
 
 public:
-    enum class Type { Float, Bool, Color };
+    using Type = manifest::Property::Type;
 
     QString key;
     QString label;
@@ -171,29 +172,9 @@ public:
 };
 
 inline constexpr const char* kPreviewProviderId = "wallpaperx-preview";
-inline constexpr qint64 kMaxManifestBytes = 1 << 20;
+inline constexpr qint64 kMaxManifestBytes = qint64(manifest::kMaxManifestBytes);
 inline constexpr qint64 kMaxPreviewBytes = 32 << 20;
-// The daemon's own bounds on what SetWallpaperWithProperties accepts (wallpaper_properties.h), so a
-// wallpaper it would refuse is listed broken instead of failing at Apply. Not `inline`, as in
-// daemon_client.h: internal linkage keeps a copy from merging with a daemon variable of its name.
-constexpr qsizetype kMaxProperties = 65;
-constexpr qsizetype kMaxPropertyKeyBytes = 64;
-constexpr double kMaxVolume = 1.0;
-
-// The keys of a video's own sound: offered for every video with sound, declared or not, and
-// removed from a wallpaper known to have none.
-constexpr const char* kMuteKey = "mute";
-constexpr const char* kVolumeKey = "volume";
-// Holds a video on its picture on the screen it is set for, whatever that screen's pause mode. Taken by
-// every video without being declared, and unset unless the user sets it; refused in wallpaper.json.
-constexpr const char* kPausedKey = "paused";
-
-// The keys every wallpaper takes besides its own; "position" and any "position.*" are refused in
-// wallpaper.json.
-constexpr std::string_view kPositionKeys[] = {kPositionKey, kPositionZoomKey, kPositionXKey, kPositionYKey};
-// A wallpaper's own properties, the sound keys added included: the daemon's cap less room for the
-// position keys and "paused", which are sent with them.
-constexpr qsizetype kMaxWallpaperProperties = kMaxProperties - qsizetype(std::size(kPositionKeys)) - 1;
+constexpr const char* kPausedKey = manifest::kPausedKey;
 
 // The manifest fields of a wallpaper.json; the file fields are left empty. The error is a
 // sentence for the user.

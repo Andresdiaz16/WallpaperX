@@ -3,6 +3,7 @@
 #pragma once
 
 #include "playback_speed.h"
+#include "property_rules.h"
 #include "wallpaper_position.h"
 
 #include <cstddef>
@@ -17,20 +18,6 @@
 
 namespace wallpaperx {
 
-// A wallpaper.json "color": "#rrggbb", no alpha.
-struct Colour {
-    std::uint8_t red = 0;
-    std::uint8_t green = 0;
-    std::uint8_t blue = 0;
-
-    bool operator==(const Colour&) const = default;
-};
-
-// "#rrggbb" in either case, or nothing.
-std::optional<Colour> parseColour(std::string_view text);
-// Lower case, the form the app stores.
-std::string toString(Colour colour);
-
 // wallpaper.json's three property types -- float, bool, color -- and the one string the daemon
 // itself gives a meaning, "position"'s mode.
 using PropertyValue = std::variant<double, bool, Colour, PositionMode>;
@@ -44,14 +31,8 @@ std::optional<PropertyValue> propertyFromText(std::string_view text);
 // declares: that is the app's to enforce, and nothing here depends on it.
 using WallpaperProperties = std::map<std::string, PropertyValue>;
 
-// Bounds on what a client can make the daemon store and write into every save: 32 monitors at
-// these limits stay far under the config file's 1 MiB read cap, past which the whole file is
-// refused at the next start.
-constexpr std::size_t kMaxProperties = 65;
-constexpr std::size_t kMaxPropertyKeyBytes = 64;
-
-// Why `properties` cannot be stored, or empty when it can. Keys are 1 to kMaxPropertyKeyBytes of
-// ASCII letters, digits, '_', '-' and '.', so they are safe to log and publish unescaped; numbers
+// Why `properties` cannot be stored, or empty when it can, within kMaxProperties. Keys are
+// isPropertyKey() (property_rules.h); numbers
 // are finite; "speed" is one of kPlaybackSpeeds, "mute" and "paused" bools, "volume" a number from 0 to 1,
 // "position" a mode, "position.zoom" and "position.x"/"position.y" numbers within Free mode's bounds,
 // the keys the daemon gives a meaning. A mode under any other key is refused.

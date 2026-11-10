@@ -122,11 +122,11 @@ void uriRoundTrip() {
     //       host localhost, an absolute path, and no NUL byte in it: file://otherhost/..., file:name
     //       and file:///...%00... are refused, never read as a local path; file://localhost/...
     //       keeps its bytes.
-    // CONTROL: app/library/wpx_package.cpp, localPathOfFileUrl's host test made `false` -> red,
-    //       "S15.84: file://otherhost/share/x.wpx gave "/share/x.wpx""; its
-    //       `if (!path.startsWith('/') || path.contains('\0')) {` made `if (false) {` -> red, "S15.84:
-    //       file:x.wpx gave "x.wpx"" and the %00 row; `|| path.contains('\0')` removed -> red, the
-    //       %00 row alone, "S15.84: file:///tmp/x.wpx%00.jpg gave "/tmp/x.wpx<NUL>.jpg""; restored.
+    // CONTROL: app/library/wpx_package.cpp, localPathOfFileUrl's host test made `false` (control_batch 2026-11-10,
+    //       each alone, reverted, --phase '^uriRoundTrip$') -> red, "S15.84: file://otherhost/share/x.wpx gave
+    //       "/share/x.wpx""; its `if (!path.startsWith('/') || path.contains('\0')) {` made `if (false) {` -> red,
+    //       "S15.84: file:x.wpx gave "x.wpx"" and the %00 row; `|| path.contains('\0')` removed -> red, the %00 row
+    //       alone (both earlier runs; the function is unchanged).
     for (const char* refused : {"file://otherhost/share/x.wpx", "file:x.wpx", "https://example.org/x.wpx", "file:///tmp/x.wpx%00.jpg"}) {
         const auto got = pathOfFileUri(QString::fromLatin1(refused));
         // A NUL shown as <NUL>: the report is a C string, which would end there.
@@ -166,17 +166,15 @@ void options(const QString& root) {
     //       argument, with the usage on stderr. None starts the app.
     // WHY-THIS-SHAPE: stdout and stderr are read apart, since "exit 0 with the usage" printed to
     //       stderr is the refusal path with its status changed.
-    // CONTROL: app/main.cpp, the Refused branch's `return 2;` made `return 0;` -> red, "S15.83:
-    //       `--bogus` exited 0", the same for both file: URLs, and the S15.94 refusal;
-    //       parseCommandLine's `argument == "--help" || argument == "-h"` made `i == 1 && (...)` (help
-    //       only as the first argument) -> red, "S15.83: `foo.wpx --help` exited 2" and the same for
-    //       `-x -h`; `std::fputs(kUsage, stdout);` made `stderr` -> red, "S15.83: `--help` exited 0 ...
-    //       stdout []" and the other two help rows; app/library/wpx_package.cpp, localPathOfFileUrl's
-    //       host test `!(url.host().isEmpty() || url.host() == u"localhost")` made `false` -> red,
-    //       "S15.83: `file://otherhost/share/x.wpx` exited -1 (finished 0)"; its
-    //       `if (!path.startsWith('/') || path.contains('\0')) {` made `if (false) {` -> red, "S15.83:
-    //       `file:x.wpx` exited -1 (finished 0)" (each such run starts the app on the private bus,
-    //       stopped at the bound); restored.
+    // CONTROL: app/main.cpp, the Refused branch's `return 2;` made `return 0;` -> red, "S15.83: `--bogus` exited 0",
+    //       the same for both file: URLs, and the S15.94 refusal; parseCommandLine's `argument == "--help" || argument
+    //       == "-h"` made `i == 1 && (...)` -> red, "S15.83: `foo.wpx --help` exited 2" and the same for `-x -h`;
+    //       `std::fputs(kUsage, stdout);` made `stderr` -> red, "S15.83: `--help` exited 0 ... stdout []" and the
+    //       other two help rows; app/library/wpx_package.cpp, localPathOfFileUrl's host test made `false`
+    //       (control_batch 2026-11-10, each alone, reverted, --phase '^options$') -> red, "S15.83:
+    //       `file://otherhost/share/x.wpx` exited -1 (finished 0)"; its `if (!path.startsWith('/') ||
+    //       path.contains('\0')) {` made `if (false) {` -> red, "S15.83: `file:x.wpx` exited -1 (finished 0)" (each
+    //       such run starts the app on the private bus, stopped at the bound).
     for (const Case& c : cases) {
         QProcess app;
         startApp(app, root, root, QStringLiteral("exec \"$0\" ") + c.arguments, QProcess::SeparateChannels);
@@ -488,12 +486,13 @@ void handOver(const QString& root) {
     //       the running instance takes the three in that order; imports run one at a time in order,
     //       so once Absolute is listed that import would have finished too. Its absence is graded
     //       only after that barrier, else it proves nothing.
-    // CONTROL: app/library/wpx_package.cpp, localPathOfFileUrl's `|| path.contains('\0')` removed ->
-    //       red, "S15.93: after an Open call for .../nul.wpx%00.jpg the library lists [Absolute, ...,
-    //       Nul, ...]"; app/main.cpp, parseCommandLine()'s `} else if (argument.startsWith('/')) {` made
-    //       `} else if (here && argument.startsWith('/')) {` -> red, "S15.94: an absolute path from a
-    //       removed working folder exited 2 ..."; the `file:` branch's `options && argument.startsWith("file:")`
-    //       made `argument.startsWith("file:")` -> red, "S15.95: `-- file:lit.wpx` exited 2 ..."; restored.
+    // CONTROL: app/library/wpx_package.cpp, localPathOfFileUrl's `|| path.contains('\0')` removed (control_batch
+    //       2026-11-10, each alone, reverted, --phase '^handOver$') -> red, "S15.93: after an Open call for
+    //       .../nul.wpx%00.jpg the library lists [Absolute, ..., Nul, ...]"; app/main.cpp, parseCommandLine()'s `}
+    //       else if (argument.startsWith('/')) {` made `} else if (here && argument.startsWith('/')) {` -> red,
+    //       "S15.94: an absolute path from a removed working folder exited 2 ..."; the `file:` branch's `options &&
+    //       argument.startsWith("file:")` made `argument.startsWith("file:")` -> red, "S15.95: `-- file:lit.wpx`
+    //       exited 2 ...".
     const QString gone = root + QStringLiteral("/gone-later");
     // Titled apart from options()'s nul.wpx, so only the Open call can list it.
     if (!writeZip(second + QStringLiteral("/nul.wpx"), planEntries(titled("Opened with a NUL"))).isEmpty() ||

@@ -197,8 +197,10 @@ private:
     };
 
     QDBusMessage method(const char* name) const;
+    // A call the daemon answers SavePending is sent again, a second apart, a few times before its
+    // refusal is passed on: what it asked for stands, and only its save is late.
     void send(QObject* context, const QDBusMessage& message, int timeoutMs,
-              std::function<void(std::expected<QDBusMessage, QString>)> onReply);
+              std::function<void(std::expected<QDBusMessage, QString>)> onReply, int attempt = 1);
     void sendAndRefresh(QObject* context, const QDBusMessage& message, Done done);
     // Sends a setting change; on success `record` writes it into the status shown, then it is read again.
     void sendSetting(QObject* context, const QDBusMessage& message, std::function<void()> record, Done done);

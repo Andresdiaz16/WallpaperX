@@ -22,6 +22,7 @@
 // quoted include searches this file's directory first, so a backend tests/support/ would shadow it.
 #include "support/exported_frame_map.h"
 #include "support/validation_grade.h"
+#include "tests/client/blocking_config_write.h"
 #include "tests/client/call_gate.h"
 #include "tests/client/daemon_client.h"
 #include "tests/client/scratch_dir.h"
@@ -607,14 +608,19 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
 
     const std::vector<std::tuple<std::string, std::string, ArgList>> expected = {
         {"method", "SetWallpaper",
-         ArgList{{"in", "s:type"}, {"in", "s:path"}, {"in", "i:monitor_id"}}},
+         ArgList{{"in", "s:type"}, {"in", "s:path"}, {"in", "i:monitor_id"}, {"out", "t:frame_generation"}}},
         // GOAL: S15.96 -- properties travel as their own `a{sv}` on two methods of their own, and
-        //       SetWallpaper keeps its three arguments.
+        //       SetWallpaper keeps its three inputs; SetWallpaper and SetWallpaperWithProperties both
+        //       answer `t:frame_generation`.
         // CONTROL: in DbusService::registerVTable (backend/daemon/dbus_service.cpp), the last name of
         //       SetWallpaperWithProperties made "values", and the first of SetWallpaperProperties made
-        //       "monitor" -> each, "FAIL: wire signature of method <that method> is unchanged".
+        //       "monitor" -> each, "FAIL: wire signature of method <that method> is unchanged". The
+        //       `frame_generation` out argument renamed "generation" on SetWallpaper, then on
+        //       SetWallpaperWithProperties (control_batch, --phase '^host$', 2026-11-10) -> red, "FAIL:
+        //       wire signature of method SetWallpaper is unchanged" / "... SetWallpaperWithProperties ...".
         {"method", "SetWallpaperWithProperties",
-         ArgList{{"in", "s:type"}, {"in", "s:path"}, {"in", "i:monitor_id"}, {"in", "a{sv}:properties"}}},
+         ArgList{{"in", "s:type"}, {"in", "s:path"}, {"in", "i:monitor_id"}, {"in", "a{sv}:properties"},
+                 {"out", "t:frame_generation"}}},
         {"method", "SetWallpaperProperties", ArgList{{"in", "i:monitor_id"}, {"in", "a{sv}:properties"}}},
         // GOAL: S15.283 -- the one frame method takes the images the caller can still draw and
         //       whether it asks on its timeline, and answers the memory as 0 or 1 descriptors.
@@ -1743,10 +1749,10 @@ void runPropertiesWireChecksOn(wallpaperx::WallpaperManager& manager, const std:
     //       whose keys are 64 characters are accepted and kept whole, so every refusal below is of its bad entry.
     // WHY-THIS-SHAPE: the counts are literals, not kMaxProperties, so lowering the daemon's constant is red
     //       here instead of moving the test with it.
-    // CONTROL: `key.size() > kMaxPropertyKeyBytes` in propertyError (backend/daemon/
-    //       wallpaper_properties.cpp) made `>=` -> "FAIL: a call with 65 entries whose keys are 64
-    //       characters is accepted and kept whole". kMaxProperties (backend/daemon/wallpaper_properties.h)
-    //       back to 64 -> this line (see the "66 entries" control below).
+    // CONTROL: shared/property_rules.h isPropertyKey(), `key.size() <= kMaxPropertyKeyBytes` made `<`
+    //       (control_batch, --phase '^propertiesWire$', 2026-11-10) -> "FAIL: a call with 65 entries whose
+    //       keys are 64 characters is accepted and kept whole". kMaxProperties (now in
+    //       shared/property_rules.h) back to 64 was not re-run at its new site.
     {
         WireProperties atLimits;
         for (int i = 0; i < 65; ++i) {
@@ -1773,13 +1779,16 @@ void runPropertiesWireChecksOn(wallpaperx::WallpaperManager& manager, const std:
     //       config file" and the held-set line. In fromWire (backend/daemon/dbus_service.cpp), re-run
     //       2026-10-17 via control_batch.sh: the unexpected-type throw made `continue` (types i and as); the
     //       non-colour throw likewise. In
-    //       propertyError (backend/daemon/wallpaper_properties.cpp): keyCharacter() accepting ' ', or any
-    //       byte past 0x7f; the isfinite() test, the speed rule,
-    //       the mute rule, `key.empty() ||`, or the 65-character test deleted. The count bound deleted
+    //       propertyError (backend/daemon/wallpaper_properties.cpp): the isfinite() test, the speed rule,
+    //       the mute rule deleted. The key rule is shared/property_rules.h isPropertyKey() since S17-D,
+    //       re-run there 2026-11-10 (control_batch, --phase '^propertiesWire$'): ' ' accepted -> "FAIL:
+    //       SetWallpaperWithProperties with a key with a space is refused as InvalidArgs"; `!key.empty()
+    //       &&` dropped -> the same for "an empty key"; kMaxProperties made 66 -> "... with 66 entries
+    //       ...". Bytes past 0x7f and the 65-character test were not re-run at the new site. The count bound deleted
     //       from both fromWire and propertiesError -> the "66 entries" lines, with the replace, held-set
     //       and config-file lines (re-run 2026-10-28) (fromWire's alone stays
     //       green: the wire bound has no check of its own). For S15.997, S15.998: kMaxProperties
-    //       (backend/daemon/wallpaper_properties.h) made 66 -> the "66 entries" lines; the paused rule in
+    //       (shared/property_rules.h since S17-D, re-run as above) made 66 -> the "66 entries" lines; the paused rule in
     //       propertyError deleted -> the "paused as a number" and "paused as a colour" lines. propertiesError() deleted from
     //       WallpaperManager::requestWallpaper -> its 16 lines, the error-text check, "creates no monitor",
     //       the file, held-set and replace checks; from WallpaperManager::setWallpaperProperties -> its 16
@@ -3119,6 +3128,7 @@ void runConfigChangedWireChecks(const wallpaperx::WallpaperManager::Config& base
                                 const Check& check) {
     using sdbus::Variant;
     using wallpaperx::testing::setMonitorOutput;
+    using wallpaperx::testing::setMonitorOutputOnce;
     using wallpaperx::testing::setMonitorPause;
     using wallpaperx::testing::setOutputFocus;
     using wallpaperx::testing::setOutputSize;
@@ -3275,8 +3285,8 @@ void runConfigChangedWireChecks(const wallpaperx::WallpaperManager::Config& base
     //       host; the refusal is required to be RenderFailed, the write-failure answer, or the phase
     //       is not verified -- an InvalidArgs would mean the call never reached the write.
     // CONTROL: `announceConfigChanged();` deleted from DbusService::setMonitorOutput's failure branch
-    //       (backend/daemon/dbus_service.cpp) -> "a SetMonitorOutput whose write failed still announces
-    //       ConfigChanged" red.
+    //       (backend/daemon/dbus_service.cpp; re-run on the edited branch, control_batch 2026-11-10) ->
+    //       red, "FAIL: a SetMonitorOutput whose write failed still announces ConfigChanged".
     {
         const wallpaperx::testing::ScratchDir scratch("dbusnoticefail");
         if (!scratch.ok() || !std::ofstream(scratch.path() / "blocker").put('x')) {
@@ -3296,13 +3306,61 @@ void runConfigChangedWireChecks(const wallpaperx::WallpaperManager::Config& base
         listener->uponSignal("ConfigChanged").onInterface(DbusService::kInterface).call([&announced] { announced.record(); });
         auto proxy = sdbus::createProxy(daemonName, objectPath);
 
-        const std::string failed = errorNameFrom([&] { setMonitorOutput(*proxy, kMonitorNoticeFirst, kName); });
+        const std::string failed = errorNameFrom([&] { setMonitorOutputOnce(*proxy, kMonitorNoticeFirst, kName); });
+        // GOAL: S17.28 -- a naming save that failed outright is answered RenderFailed, never SavePending,
+        //       which would tell the client to send it again.
+        // CONTROL: backend/daemon/wallpaper_manager.cpp requirePersisted() throwing SavePending for
+        //       Failed too (control_batch, 2026-11-10) -> red, this line.
+        check(failed != wallpaperx::kErrorSavePending, "a SetMonitorOutput whose write failed is not answered SavePending");
         if (failed != "io.wallpaperx.Daemon.Error.RenderFailed") {
             wallpaperx::testing::notVerified("S15.397", "the staged write failure answered '" + failed +
                                                             "', not RenderFailed, so the failure branch was not reached");
             return;
         }
         check(announced.waitFor(1), "a SetMonitorOutput whose write failed still announces ConfigChanged");
+        });
+    }
+
+    // GOAL: S17.28 -- a SetMonitorOutput whose save does not come back within the write deadline is
+    //       answered io.wallpaperx.Daemon.Error.SavePending, with the name bound; sent again once the
+    //       save has landed, it succeeds.
+    // WHY-THIS-SHAPE: the write is really parked, on a fifo at the store's temporary file, so the
+    //       deadline passes on any host; a 1 ms deadline does not, since a tmpfs write lands inside it.
+    //       The fifo is released on every path, so a writer thread is never left blocked at teardown.
+    // CONTROL: control_batch, 2026-11-10: backend/daemon/dbus_service.cpp setMonitorOutput()'s
+    //       `pending ? kErrorSavePending : kErrorRenderFailed` made `kErrorRenderFailed` -> red, "FAIL: a
+    //       SetMonitorOutput whose save is parked past the deadline is answered SavePending";
+    //       backend/daemon/wallpaper_manager.cpp setMonitorOutput() erasing the name when
+    //       requirePersisted() throws -> red, "FAIL: a SetMonitorOutput answered SavePending still binds the name".
+    {
+        const wallpaperx::testing::ScratchDir scratch("dbussavepending");
+        wallpaperx::WallpaperManager::Config config = base;
+        config.configFile = scratch.path() / "config.json";
+        wallpaperx::testing::BlockingWrite blocked(config.configFile);
+        if (!scratch.ok() || !blocked.arm()) {
+            wallpaperx::testing::notVerified("S17.28", "a fifo could not be made at the config's temporary file");
+            return;
+        }
+        withNoDeviceManager(config, "the SavePending phase", check, [&](wallpaperx::WallpaperManager& manager) {
+        auto serviceConn = sdbus::createSessionBusConnection();
+        DbusService service(*serviceConn, manager);
+        serviceConn->enterEventLoopAsync();
+        auto proxy = sdbus::createProxy(sdbus::ServiceName{serviceConn->getUniqueName()},
+                                        sdbus::ObjectPath{DbusService::kObjectPath});
+        const std::string parked = errorNameFrom([&] { setMonitorOutputOnce(*proxy, kMonitorNoticeFirst, kName); });
+        const wallpaperx::testing::StatusReply status = wallpaperx::testing::getStatus(*proxy);
+        const auto released = blocked.release(std::chrono::seconds(5));
+        check(parked == wallpaperx::kErrorSavePending,
+              "a SetMonitorOutput whose save is parked past the deadline is answered SavePending");
+        if (parked != wallpaperx::kErrorSavePending) std::fprintf(stderr, "  it answered '%s'\n", parked.c_str());
+        check(status.ok() && status.json().value("outputs", nlohmann::json::object()).value(kName, -1) == kMonitorNoticeFirst,
+              "a SetMonitorOutput answered SavePending still binds the name");
+        if (!released.ok) {
+            wallpaperx::testing::harnessFailure("S17.28: the parked write was never released: " + released.why);
+            return;
+        }
+        check(errorNameFrom([&] { setMonitorOutputOnce(*proxy, kMonitorNoticeFirst, kName); }).empty(),
+              "the same SetMonitorOutput sent again once the save has landed succeeds");
         });
     }
 }
@@ -3796,9 +3854,10 @@ void runPauseWireChecks(const wallpaperx::WallpaperManager::Config& base, const 
         setMonitorPause(proxy, kMonitorPauseFocused, "paused_while_focused");
         setMonitorPause(proxy, kMonitorPauseMaximized, "paused_while_maximized");
     });
-    // CONTROL: via control_batch.sh, --phase '^pauseWire$', 2026-10-01, PauseMode::WhileWindowMaximized dropped
-    //       from kPauseModes (backend/daemon/pause_mode.h) -> this line red: SetMonitorPause refuses
-    //       paused_while_maximized. Reverted.
+    // CONTROL: --phase '^pauseWire$', control_batch 2026-11-10, reverted: PauseMode::WhileWindowMaximized
+    //       removed whole -- its enum value, row and isPauseMode() case (backend/daemon/pause_mode.h) and its
+    //       case in backend/daemon/wallpaper_manager.cpp, since a row alone no longer builds -> this line
+    //       red: SetMonitorPause refuses paused_while_maximized.
     check(setupError.empty(), "the two window modes can be set on two named monitors");
     if (!setupError.empty()) {
         std::fprintf(stderr, "  the setup answered '%s'\n", setupError.c_str());

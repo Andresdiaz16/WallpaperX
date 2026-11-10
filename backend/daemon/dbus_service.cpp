@@ -217,17 +217,19 @@ void DbusService::registerVTable() {
         ->addVTable(
             sdbus::registerMethod("SetWallpaper")
                 .implementedAs([this](const std::string& type, const std::string& path, int32_t monitorId) {
-                    setWallpaper("SetWallpaper", type, path, monitorId, {});
+                    return setWallpaper("SetWallpaper", type, path, monitorId, {});
                 })
-                .withInputParamNames("type", "path", "monitor_id"),
+                .withInputParamNames("type", "path", "monitor_id")
+                .withOutputParamNames("frame_generation"),
             // A method of its own rather than a fourth argument on SetWallpaper: a changed signature
             // is refused by the bus for every client still sending three.
             sdbus::registerMethod("SetWallpaperWithProperties")
                 .implementedAs([this](const std::string& type, const std::string& path, int32_t monitorId,
                                       const WireProperties& properties) {
-                    setWallpaper("SetWallpaperWithProperties", type, path, monitorId, properties);
+                    return setWallpaper("SetWallpaperWithProperties", type, path, monitorId, properties);
                 })
-                .withInputParamNames("type", "path", "monitor_id", "properties"),
+                .withInputParamNames("type", "path", "monitor_id", "properties")
+                .withOutputParamNames("frame_generation"),
             sdbus::registerMethod("SetWallpaperProperties")
                 .implementedAs([this](int32_t monitorId, const WireProperties& properties) {
                     setWallpaperProperties(monitorId, properties);
@@ -435,8 +437,8 @@ void DbusService::emitFrameReady(int monitorId, uint64_t generation) {
     }
 }
 
-void DbusService::setWallpaper(const char* method, const std::string& type, const std::string& path,
-                               int32_t monitorId, const WireProperties& properties) {
+uint64_t DbusService::setWallpaper(const char* method, const std::string& type, const std::string& path,
+                                   int32_t monitorId, const WireProperties& properties) {
     // On entry, not on success: most clients drop the error reply, so logging afterwards
     // left failed requests indistinguishable from ones that never arrived. Both strings
     // come off the wire, hence sanitizeForLog -- see log_escape.h.
@@ -447,8 +449,9 @@ void DbusService::setWallpaper(const char* method, const std::string& type, cons
                 sanitizeForLog(path).c_str(), monitorId, counted.c_str());
     std::fflush(stdout);
 
+    uint64_t acceptedAt = 0;
     try {
-        m_manager.requestWallpaper(type, path, monitorId, fromWire(properties));
+        acceptedAt = m_manager.requestWallpaper(type, path, monitorId, fromWire(properties));
     } catch (const InvalidRequest& e) {
         std::fprintf(stderr, "wallpaperx-daemon: %s rejected (monitor=%d): %s\n", method, monitorId, e.what());
         throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
@@ -462,6 +465,7 @@ void DbusService::setWallpaper(const char* method, const std::string& type, cons
     // worker rather than in this handler.
     m_worker.post(monitorId);
     announceConfigChanged();
+    return acceptedAt;
 }
 
 void DbusService::setWallpaperProperties(int32_t monitorId, const WireProperties& properties) {
@@ -542,7 +546,8 @@ void DbusService::setMonitorOutput(int32_t monitorId, const std::string& outputN
         // or memory, and letting that escape the callback tells the client nothing.
         std::fprintf(stderr, "wallpaperx-daemon: SetMonitorOutput failed (monitor=%d): %s\n",
                      monitorId, e.what());
-        throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
+        const bool pending = dynamic_cast<const SavePending*>(&e) != nullptr;
+        throw sdbus::Error(sdbus::Error::Name{pending ? kErrorSavePending : kErrorRenderFailed}, e.what());
     }
 
     // A name carries its screen's size, so moving one can change what a monitor is drawn at.

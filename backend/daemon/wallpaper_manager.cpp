@@ -1323,8 +1323,8 @@ void WallpaperManager::applyImportModifiersLocked() {
     for (int id : monitorIds) releaseTarget(id);
 }
 
-void WallpaperManager::requestWallpaper(const std::string& type, const std::string& path, int monitorId,
-                                        const WallpaperProperties& properties) {
+uint64_t WallpaperManager::requestWallpaper(const std::string& type, const std::string& path, int monitorId,
+                                            const WallpaperProperties& properties) {
     if (!isKnownType(type)) {
         // Sanitized because this message is echoed to the log and returned over the bus,
         // and `type` is whatever the client sent -- a 200 000-character type string was
@@ -1365,6 +1365,7 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
     if (refusal) throw InvalidRequest(describeRejection(kComponent, *refusal, sanitizeForLog(path)));
 
     uint64_t wallpaperSeq = 0;
+    uint64_t acceptedAt = 0;
     const bool video = drawableType(type) == Drawable::Clip;
     const std::optional<FileIdentity> now = video ? fileIdentityOf(path) : std::nullopt;
     std::optional<FileScan> known;
@@ -1397,6 +1398,7 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
         }
 
         ++state.requestSeq;
+        acceptedAt = state.generation;
         // Bumped even when type and path are what this monitor already held: the same path can
         // name different bytes, and a decode session opened on the old ones must not be reused.
         ++state.wallpaperSeq;
@@ -1435,6 +1437,7 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
     // whether or not it turns out to draw. The no-answer wait, which cannot throw: the change is
     // committed, and an error reply now would leave it saved and never drawn.
     awaitPersisted();
+    return acceptedAt;
 }
 
 bool WallpaperManager::setWallpaperProperties(int monitorId, const WallpaperProperties& properties,
@@ -1563,11 +1566,7 @@ bool WallpaperManager::setMonitorOutput(int monitorId, const std::string& output
     // run for weeks. Reported on this call's own write rather than on persistence health, which
     // is an aggregate carrying other monitors' failures: the contract is that an accepted reply
     // means this mapping reached the file.
-    std::string whyNot;
-    if (!awaitPersisted(whyNot)) {
-        throw std::runtime_error(whyNot.empty() ? "the screen name did not reach the config file"
-                                                : whyNot);
-    }
+    requirePersisted("the screen name did not reach the config file");
     return bound != BindResult::Unchanged;
 }
 
@@ -1675,12 +1674,8 @@ bool WallpaperManager::setMonitorPause(int monitorId, const std::string& mode) {
     requireValidMonitorId(monitorId);
     const std::optional<PauseMode> parsed = pauseModeFromName(mode);
     if (!parsed) {
-        std::string expected;
-        for (size_t i = 0; i < std::size(kPauseModes); ++i) {
-            if (i != 0) expected += i + 1 == std::size(kPauseModes) ? " or " : ", ";
-            expected += toString(kPauseModes[i]);
-        }
-        throw InvalidRequest("unknown pause mode " + sanitizeForLog(mode) + " (expected " + expected + ")");
+        throw InvalidRequest("unknown pause mode " + sanitizeForLog(mode) + " (expected " +
+                             pauseModesText(&PauseModeNames::name) + ")");
     }
     // Play is no setting at all, so a config that never paused anything is written as before.
     std::optional<std::string> next;
@@ -1961,14 +1956,16 @@ void WallpaperManager::queuePersist(PersistedConfig config) {
     m_writer.queue(std::move(config));
 }
 
-bool WallpaperManager::awaitPersisted(std::string& whyNot) {
-    std::string why;
-    if (m_writer.awaitQueued(why)) return true;
+void WallpaperManager::requirePersisted(const char* unsaved) {
+    using State = ConfigWriter::Outcome::State;
+    const ConfigWriter::Outcome outcome = m_writer.awaitOutcome();
+    if (outcome.onDisk()) return;
 
     // Sanitized here, once, because this one leaves the process: the store composes its errors
     // around a path, and a path is arbitrary bytes the daemon did not choose.
-    whyNot = sanitizeForLog(why, 1024, LogFraming::Bare);
-    return false;
+    std::string why = outcome.why.empty() ? std::string(unsaved) : sanitizeForLog(outcome.why, 1024, LogFraming::Bare);
+    if (outcome.state == State::Outstanding || outcome.state == State::Stalled) throw SavePending(why);
+    throw std::runtime_error(why);
 }
 
 void WallpaperManager::awaitPersisted() noexcept {

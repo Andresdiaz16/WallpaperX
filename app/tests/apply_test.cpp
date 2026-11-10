@@ -16,6 +16,7 @@
 #include "kscreen_client.h"
 #include "kscreen_fixtures.h"
 #include "library_manager.h"
+#include "plasma_activation.h"
 #include "plasma_controller.h"
 #include "refresh_rate_reporter.h"
 #include "wpx_fixtures.h"
@@ -291,10 +292,9 @@ void activationScriptAlone() {
     // WHY-THIS-SHAPE: the script is run, not searched: a substring test of the literal passes an
     //       escaping that a JavaScript parser reads differently (U+2028 ends a line in old engines,
     //       `\u` needs four digits). The injected name sets a global only if it escapes the string.
-    // CONTROL: app/kde/plasma_controller.cpp, jsString() returning `"\"" + text + "\""` (control_batch,
-    //       2026-10-02) -> red, "S15.229: the connector "DP-1"); this.pwned = 1; ("" reached
-    //       screenForConnector as [] (threw 1, injected 0): Error: SyntaxError: Unexpected token `)'
-    //       at line 2", and the same for the quote, separator and newline names.
+    // CONTROL: shared/plasma_activation.h, plasmaScriptString(u16) appending every code unit unescaped
+    //       (control_batch, 2026-11-07) -> red, "S15.229: the connector "DP-1"); this.pwned = 1; (""
+    //       reached screenForConnector as [] ...", and the same for the other names.
     const QStringList names{QStringLiteral("DP-1\"); this.pwned = 1; (\""), QStringLiteral("a\\\"b\\"),
                             QStringLiteral("x%1y%2z").arg(QChar(0x2028), QChar(0x2029)), QStringLiteral("x\ny\r"),
                             QString(QChar(0x202e)) + QStringLiteral("DP-1"), QString(QChar(0xc9)) + QStringLiteral("cran-1")};
@@ -308,6 +308,18 @@ void activationScriptAlone() {
                    .arg(name, run.asked.join(u'|')).arg(run.threw).arg(run.injected).arg(run.error.section(u'\n', 0, 0)));
     }
 
+    // GOAL: S17.9 -- the app sends byte for byte the script wpxctl sends: activationScript() is
+    //       shared/plasma_activation.h's plasmaActivationScript(), which backend/tests/wpxctl_test.cpp
+    //       compares wpxctl's wire bytes against.
+    // CONTROL: app/kde/plasma_controller.cpp activationScript() with `+ u'\n'` appended (control_batch,
+    //       2026-11-07) -> red, "S17.9: the app's activation script for DP-1 differs from the shared one".
+    for (const char16_t* connector : {u"DP-1", u"HDMI-A-1", u"Écran \"2\""}) {
+        const QString app = activationScript(QString::fromUtf16(connector));
+        expect(app.toStdString() == plasmaActivationScript(connector),
+               QStringLiteral("S17.9: the app's activation script for %1 differs from the shared one")
+                   .arg(QString::fromUtf16(connector)));
+    }
+
     // GOAL: S15.232 -- the plugin the script requires is listed under the display name the plugin's
     //       own metadata.json gives (KPlugin.Name, what knownWallpaperPlugins() lists), and the plugin
     //       it switches to is that file's KPlugin.Id; renaming either side breaks activation here.
@@ -316,11 +328,11 @@ void activationScriptAlone() {
     //       cannot drift along with the controller's.
     // CONTROL: control_batch, 2026-10-02: backend/kde/kpackage/metadata.json `"Name": "WallpaperX"`
     //       made `"WallpaperX Video"` -> red, "S15.232: with only "WallpaperX Video" installed the
-    //       script threw: ...The WallpaperX wallpaper plugin is not installed for Plasma..."; app/kde/
-    //       plasma_controller.cpp kWallpaperPluginName made "Wallpaper X" -> red, "S15.232: with only
-    //       "WallpaperX" installed the script threw: ..."; app/kde/plasma_controller.h
-    //       kWallpaperPluginId made "com.wallpaperx.wp" -> red, "... the script ran and switched to
-    //       com.wallpaperx.wp,com.wallpaperx.wp,com.wallpaperx.wp, not com.wallpaperx.wallpaper".
+    //       script threw: ...The WallpaperX wallpaper plugin is not installed for Plasma...";
+    //       control_batch, 2026-11-07: shared/plasma_activation.h kWallpaperPluginName made
+    //       "Wallpaper X" -> red, "S15.232: with only "WallpaperX" installed the script threw: ...";
+    //       its kWallpaperPluginId made "com.wallpaperx.wp" -> red, "... the script ran and switched
+    //       to com.wallpaperx.wp,com.wallpaperx.wp,com.wallpaperx.wp, not com.wallpaperx.wallpaper".
     QFile metadataFile(QStringLiteral(WALLPAPERX_PLUGIN_METADATA));
     const QJsonObject plugin = metadataFile.open(QIODevice::ReadOnly)
                                    ? QJsonDocument::fromJson(metadataFile.readAll()).object().value(QStringLiteral("KPlugin")).toObject()
@@ -347,9 +359,9 @@ void activationScriptAlone() {
 
     // GOAL: S15.230 -- evaluateScript answering without "wallpaperx-switched=N", N >= 1, is a
     //       failure: a shell that runs nothing is never reported as done.
-    // CONTROL: app/kde/plasma_controller.cpp, activationResult()'s `found.hasMatch() ? ... : 0` made
-    //       `: 1` (control_batch, 2026-10-02) -> red, "S15.230: the reply "" read as switched 1", and
-    //       the same for "done" and "wallpaperx-switched=".
+    // CONTROL: shared/plasma_activation.h, plasmaActivationSwitched()'s final `return 0;` made
+    //       `return 1;` (control_batch, 2026-11-07) -> red, "S15.230: the reply "" read as switched 1",
+    //       and the same for "done" and "wallpaperx-switched=".
     const QDBusMessage call = QDBusMessage::createMethodCall(QStringLiteral("x.y"), QStringLiteral("/"), QStringLiteral("x.y"), QStringLiteral("m"));
     struct Reply {
         QString printed;
@@ -383,7 +395,7 @@ void plasmaShell() {
     //       connectors are switched, so neither a fixed index nor KScreen's position matches both.
     //       The whole after-state is compared, so a desktop switched by mistake is caught as well as
     //       one missed. An empty lastScreen is tested against screen 0, where Number("") would land.
-    // CONTROL: app/kde/plasma_controller.cpp, each through control_batch, 2026-10-02:
+    // CONTROL: shared/plasma_activation.h's script, each through control_batch, 2026-11-07:
     //       `screenForConnector(connector)` made `0` -> red, "S15.226, S15.227: DP-1 (switched 2)
     //       switched [com.wallpaperx.wallpaper,org.kde.image,org.kde.image,com.wallpaperx.wallpaper,...]";
     //       made `1` -> red, "... HDMI-A-1 (switched 3) switched [org.kde.image,com.wallpaperx.wallpaper,...]";
@@ -403,7 +415,7 @@ void plasmaShell() {
     // GOAL: S15.228 -- a connector Plasma shows no desktop of its own on (a mirrored screen), and a
     //       screen Plasma has made no desktop for yet, each fail with their own sentence and switch
     //       nothing.
-    // CONTROL: app/kde/plasma_controller.cpp, control_batch, 2026-10-02: the `|| screen < 0` refusal
+    // CONTROL: shared/plasma_activation.h's script, control_batch, 2026-11-07: the `|| screen < 0` refusal
     //       deleted -> red, "S15.228: DP-2 gave switched 1 and left [...]" (index -1 matched activity
     //       C's desktop, whose missing lastScreen reads as -1); the `switched === 0` refusal made
     //       `if (false)` -> red, "S15.228: DP-3 gave refused: Plasma ran the script that switches the
@@ -429,11 +441,12 @@ void plasmaShell() {
     //       own refusals read as the sentence alone, without Plasma's "Error: ... at line N" wrapping.
     // WHY-THIS-SHAPE: whole sentences are compared, so a refusal shown through the generic
     //       "could not run the script" branch, or with the wrapping left in, goes red.
-    // CONTROL: app/kde/plasma_controller.cpp, control_batch, 2026-10-02: scriptFailure()'s marker
-    //       extraction made `if (false)` -> red, "S15.231: plugin not installed gave refused: Plasma
+    // CONTROL: control_batch, 2026-11-07: shared/plasma_activation.h plasmaActivationFailure()
+    //       returning std::nullopt at once -> red, "S15.231: plugin not installed gave refused: Plasma
     //       could not run the script that switches the desktop: Error: Error: [wallpaperx]The
     //       WallpaperX wallpaper plugin is not installed for Plasma[/wallpaperx] at line 3, ..." and
-    //       the no-screenForConnector row; describe() reduced to `return scriptFailure(error.message());`
+    //       the no-screenForConnector row; app/kde/plasma_controller.cpp describe() reduced to
+    //       `return scriptFailure(error.message());`
     //       -> red, "S15.231: no plasmashell gave refused: Plasma could not run the script that
     //       switches the desktop: The name ... was not provided by any .service files", and the
     //       not-a-Plasma-shell and no-answer rows.
@@ -559,10 +572,9 @@ void applyOrder() {
 
     // GOAL: S15.473's Apply half -- a silent video's declared mute is not sent: River, whose
     //       wallpaper.json declares mute over a video with no sound, is applied with speed and tint alone.
-    // CONTROL: via control_batch.sh, --phase '^applyOrder$', 2026-10-11, settleSoundProperties' `==
-    //       AudioStreams::Absent` strip made `if (false)` (app/library/wpx_package.cpp) -> "FAIL: S15.473: a silent
-    //       video was applied with {mute=true(bool), position=cover(QString), ..., volume=1(double)} (2 call(s))"
-    //       (re-run 2026-10-18). Reverted.
+    // CONTROL: --phase '^applyOrder$', control_batch 2026-11-10, each alone, reverted: shared/wallpaper_manifest.cpp
+    //       settleSound's `== AudioStreams::Absent` strip made `false` -> "FAIL: S15.473: a silent video was applied
+    //       with {mute=true(bool), ..., volume=1(double)} (2 call(s))".
     rig.library->select(rig.river);
     const bool riverFinished = rig.apply();
     const auto riverSet = rig.sent("SetWallpaperWithProperties");
@@ -1139,8 +1151,8 @@ void failureSentences() {
     //       goes red; each row restores the stand-ins first, so one row's state cannot pass another.
     //       The Plasma rows run first, so DP-1 is live when the daemon rows run and "as it was"
     //       means kept: rows before any accepted Apply would pass a controller that drops the link.
-    // CONTROL: control_batch, 2026-10-02: app/daemon/daemon_client.cpp describe() reduced to its
-    //       `default:` sentence -> red, "S15.244: daemon not running gave "Ocean Waves was not applied
+    // CONTROL: control_batch, 2026-10-02, re-run 2026-11-10 with describe() called from inside send():
+    //       app/daemon/daemon_client.cpp describe() reduced to its `default:` sentence -> red, "S15.244: daemon not running gave "Ocean Waves was not applied
     //       to DP-1. The WallpaperX service could not do it: The name ... was not provided by any
     //       .service files"", and the not-answering, older and refusing rows; app/kde/plasma_controller.cpp
     //       describe() reduced to `return scriptFailure(error.message());` -> red, "S15.244: no
@@ -1465,8 +1477,8 @@ void lateReplies() {
     //       delivered by then. The counter makes a breach a FAIL line; the ApplyController case
     //       below relies on AddressSanitizer instead.
     // CONTROL: control_batch, 2026-10-04: app/daemon/daemon_client.cpp send()'s
-    //       `whenAnswered(context, ...)` given `this` -> red, "S15.247: 1 callback(s) ran for a
-    //       destroyed caller (daemon call 1, bind 0, Plasma 0)"; DaemonClient::finishBind()'s
+    //       `whenAnswered(context, ...)` given `this` (re-run on the rewritten send(), 2026-11-10) -> red,
+    //       "S15.247: 1 callback(s) ran for a destroyed caller (daemon call 1, bind 0, Plasma 0)"; DaemonClient::finishBind()'s
     //       `if (finished.context)` made `if (true)` -> red, "(daemon call 0, bind 1, Plasma 0)";
     //       app/kde/plasma_controller.cpp activate()'s `whenAnswered(context, ...)` given `this` ->
     //       red, "(daemon call 0, bind 0, Plasma 1)".
@@ -1506,8 +1518,9 @@ void lateReplies() {
     //       ASan's heap-use-after-free report and a non-zero exit, not a FAIL line. The line below
     //       records that the run got past the delivery.
     // CONTROL: app/daemon/daemon_client.cpp, send()'s `whenAnswered(context, ...)` given `this`
-    //       (control_batch, 2026-10-04) -> red, "AddressSanitizer: heap-use-after-free ... in
-    //       wallpaperx::ApplyController::startLive(...)", after the counter line above.
+    //       (control_batch, re-run 2026-11-10 on the rewritten send()) -> red, "AddressSanitizer:
+    //       heap-use-after-free ... in QHash<int, wallpaperx::ApplyController::InFlight>::begin()",
+    //       after the counter line above.
     rig.library->select(rig.ocean);
     rig.kscreen->select(QStringLiteral("DP-1"));
     rig.daemonFake->hold.insert(QStringLiteral("SetWallpaperWithProperties"));
@@ -1688,6 +1701,107 @@ void bindAndRefresh() {
                .arg(rig.client->persistenceProblem()).arg(bothHeld).arg(answered));
     rig.daemonFake->hold.clear();
     rig.daemonFake->release();
+}
+
+void saveRetry() {
+    constexpr const char* goals = "S17.27";
+    Rig rig;
+    if (!build(rig, goals, QStringLiteral("saveretry"))) {
+        return;
+    }
+    const QString member = QStringLiteral("SetMonitorOutput");
+    const QPair<QString, QString> pending{QStringLiteral("io.wallpaperx.Daemon.Error.SavePending"),
+                                          QStringLiteral("config.json: a write has not come back")};
+    QObject context;
+
+    // GOAL: S17.27 -- a bind answered SavePending is sent again, and succeeds once the daemon accepts.
+    // WHY-THIS-SHAPE: the refusal is lifted when the second call arrives, so the third attempt is the
+    //       first the stand-in accepts; counting the calls tells a retry from a bind that read success
+    //       out of the first refusal.
+    // CONTROL: app/daemon/daemon_client.cpp send(), `attempt < kSaveAttempts` made `false`
+    //       (control_batch, 2026-11-10) -> red, "S17.27: a bind refused SavePending twice ends The
+    //       WallpaperX service could not do it: ... after 1 SetMonitorOutput call(s), want bound after 3".
+    rig.daemonFake->refuse.insert(member, pending);
+    std::optional<std::expected<int, QString>> first;
+    rig.client->bindMonitor(&context, QStringLiteral("DP-4"), [&](std::expected<int, QString> r) { first = std::move(r); });
+    if (waitUntil([&] { return rig.daemonFake->named(member).size() >= 2 || first.has_value(); }, kWaitMs)) {
+        rig.daemonFake->refuse.remove(member);
+    }
+    const bool firstDone = waitUntil([&] { return first.has_value(); }, 3 * kWaitMs);
+    expect(firstDone && first->has_value() && rig.daemonFake->named(member).size() == 3,
+           QStringLiteral("S17.27: a bind refused SavePending twice ends %1 after %2 SetMonitorOutput call(s), want bound after 3")
+               .arg(!firstDone ? QStringLiteral("never") : first->has_value() ? QStringLiteral("bound") : first->error())
+               .arg(rig.daemonFake->named(member).size()));
+
+    // GOAL: S17.27 -- after five SavePending answers the bind reports the error, and sends no sixth.
+    // CONTROL: app/daemon/daemon_client.cpp `kSaveAttempts = 5` made 6 (control_batch, 2026-11-10) ->
+    //       red, "S17.27: a bind refused SavePending every time sent 6 SetMonitorOutput call(s) and
+    //       failed, want 5 and an error".
+    rig.daemonFake->refuse.insert(member, pending);
+    const qsizetype before = rig.daemonFake->named(member).size();
+    std::optional<std::expected<int, QString>> refused;
+    rig.client->bindMonitor(&context, QStringLiteral("DP-5"), [&](std::expected<int, QString> r) { refused = std::move(r); });
+    const bool refusedDone = waitUntil([&] { return refused.has_value(); }, 3 * kWaitMs);
+    expect(refusedDone && !refused->has_value() && rig.daemonFake->named(member).size() - before == 5,
+           QStringLiteral("S17.27: a bind refused SavePending every time sent %1 SetMonitorOutput call(s) and %2, want 5 and an error")
+               .arg(rig.daemonFake->named(member).size() - before)
+               .arg(!refusedDone ? QStringLiteral("never ended") : refused->has_value() ? QStringLiteral("bound") : QStringLiteral("failed")));
+
+    // GOAL: S17.27 -- a caller destroyed while its bind is being retried is never called back, and
+    //       the bind queue still moves on.
+    // WHY-THIS-SHAPE: a later bind, on a live caller, queues behind the abandoned one and finishes only
+    //       after it, so its callback is the barrier: the verdict needs no fixed wait.
+    // CONTROL: app/daemon/daemon_client.cpp finishBind(), `if (finished.context)` made `if (true)`
+    //       (control_batch, 2026-11-10) -> red, "S17.27: 1 callback(s) ran for a caller destroyed ...".
+    int destroyedRan = 0;
+    bool laterBound = false;
+    {
+        auto gone = std::make_unique<QObject>();
+        const qsizetype start = rig.daemonFake->named(member).size();
+        rig.client->bindMonitor(gone.get(), QStringLiteral("DP-6"), [&](std::expected<int, QString>) { ++destroyedRan; });
+        const bool refusedOnce = waitUntil([&] { return rig.daemonFake->named(member).size() > start; }, kWaitMs);
+        gone.reset();
+        rig.client->bindMonitor(&context, QStringLiteral("DP-7"), [&](std::expected<int, QString>) { laterBound = true; });
+        if (refusedOnce) {
+            rig.daemonFake->refuse.remove(member);
+        }
+        if (!refusedOnce || !waitUntil([&] { return laterBound; }, 3 * kWaitMs)) {
+            harnessFailure("S17.27: the bind after a destroyed caller's never finished");
+        } else {
+            expect(destroyedRan == 0, QStringLiteral("S17.27: %1 callback(s) ran for a caller destroyed during its bind's retry").arg(destroyedRan));
+        }
+    }
+
+    // GOAL: S17.27 -- a call whose caller is destroyed while it waits to be sent again is not sent again
+    //       and not answered.
+    // WHY-THIS-SHAPE: the caller is destroyed only once its refusal has been handled -- a later call on
+    //       the same connection has been answered -- so the retry is already scheduled; destroying it
+    //       sooner drops the reply itself and never reaches the timer. The retry being a timer, its
+    //       absence is witnessed by time: 2.5 retry intervals, with the refusal lifted so a resend shows.
+    // CONTROL: app/daemon/daemon_client.cpp send()'s `QTimer::singleShot(kSaveRetryMs, context, ...)`
+    //       given `this` (control_batch, 2026-11-10) -> red, but as "AddressSanitizer: SEGV ... in
+    //       QCoreApplicationPrivate::notify_helper" (the resend touches the freed caller) before this
+    //       line can print; this file is built with AddressSanitizer for S15.247, so that is the verdict.
+    const QString props = QStringLiteral("SetWallpaperProperties");
+    rig.daemonFake->refuse.insert(props, pending);
+    int propsRan = 0;
+    {
+        auto gone = std::make_unique<QObject>();
+        rig.client->setProperties(gone.get(), 0, {{QStringLiteral("speed"), 1.0}}, [&](std::expected<void, QString>) { ++propsRan; });
+        const bool arrived = waitUntil([&] { return rig.daemonFake->named(props).size() == 1; }, kWaitMs);
+        rig.daemonFake->refuse.remove(props);
+        bool laterAnswered = false;
+        rig.client->setProperties(&context, 0, {{QStringLiteral("speed"), 1.0}}, [&](std::expected<void, QString>) { laterAnswered = true; });
+        if (!arrived || !waitUntil([&] { return laterAnswered; }, kWaitMs)) {
+            harnessFailure("S17.27: the refused SetWallpaperProperties, or the call after it, was never answered");
+        } else {
+            gone.reset();
+            waitUntil([&] { return rig.daemonFake->named(props).size() > 2 || propsRan > 0; }, 2500);
+            expect(rig.daemonFake->named(props).size() == 2 && propsRan == 0,
+                   QStringLiteral("S17.27: a SetWallpaperProperties whose caller was destroyed during its retry was sent again (%1 call(s) in all, want 2), its callback ran %2 time(s)")
+                       .arg(rig.daemonFake->named(props).size()).arg(propsRan));
+        }
+    }
 }
 
 void longConnectors() {
@@ -4202,6 +4316,7 @@ int main(int argc, char* argv[]) {
     runPhase("pauseScope", pauseScope);
     runPhase("applyScope", applyScope);
     runPhase("bindAndRefresh", bindAndRefresh);
+    runPhase("saveRetry", saveRetry);
     runPhase("longConnectors", longConnectors);
     runPhase("liveAcrossApplies", liveAcrossApplies);
     runPhase("selectedScreenEdits", selectedScreenEdits);

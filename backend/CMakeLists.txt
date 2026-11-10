@@ -2674,13 +2674,35 @@ endif()
 if(WALLPAPERX_BUILD_KDE_PLUGIN)
     add_executable(wpxctl
         wpxctl/main.cpp
+        ../shared/property_rules.h
+        ../shared/wallpaper_manifest.cpp
+        ../shared/wallpaper_manifest.h
     )
-
+    # The daemon's header-only bus names and setting tables, and shared/: the wallpaper.json rules the app uses.
+    target_include_directories(wpxctl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    # Qt Core for its MIME database only: what a plain file holds, image or video.
     target_link_libraries(wpxctl PRIVATE
         Qt6::Core
-        Qt6::DBus
         SDBusCpp::sdbus-c++
+        nlohmann_json::nlohmann_json
     )
+    set_target_properties(wpxctl PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+
+    # wpxctl run as its own process against the real daemon on the entry's private bus, and against a
+    # stand-in for Plasma's desktop shell the test owns there.
+    if(WALLPAPERX_DBUS_RUN_SESSION)
+        add_executable(wallpaperx-wpxctl-test tests/wpxctl_test.cpp)
+        target_link_libraries(wallpaperx-wpxctl-test PRIVATE wallpaperx-daemon-lib)
+        target_include_directories(wallpaperx-wpxctl-test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+        set_target_properties(wallpaperx-wpxctl-test PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+        target_compile_definitions(wallpaperx-wpxctl-test PRIVATE
+            WALLPAPERX_DAEMON_BINARY="$<TARGET_FILE:wallpaperx-daemon>"
+            WALLPAPERX_WPXCTL_BINARY="$<TARGET_FILE:wpxctl>")
+        add_dependencies(wallpaperx-wpxctl-test wallpaperx-daemon wpxctl)
+        wallpaperx_add_phase_tests(BASE wpxctl TARGET wallpaperx-wpxctl-test
+            SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/tests/wpxctl_test.cpp)
+    endif()
 
     plasma_install_package(kde/kpackage com.wallpaperx.wallpaper wallpapers wallpaper)
 

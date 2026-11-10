@@ -16,6 +16,7 @@
 #include <QColor>
 #include <QCoreApplication>
 #include <QDir>
+#include <QFile>
 #include <QImageReader>
 #include <QRandomGenerator>
 #include <QScopeGuard>
@@ -69,10 +70,9 @@ QByteArray edited(const std::function<void(OrderedJson&)>& change) {
 }
 
 // runBounded (wpx_fixtures.h) catches this file's throws too.
-// CONTROL: app/library/wpx_package.cpp, parseManifest's `Json::parse_error` and `Json::exception`
-//       catch clauses deleted, so badjson's manifest throws out of the scan -> red, "FAIL: S15.34:
-//       scanning a library holding a FIFO threw: [json.exception.parse_error.101] ...", beside
-//       runPhase's "an exception escaped malformedManifests ..."; ctest graded it Failed, not aborted.
+// CONTROL: shared/wallpaper_manifest.cpp, parse()'s `Json::parse_error` and `Json::exception` catch clauses deleted
+//       (control_batch 2026-11-10, each alone, reverted) -> red, "FAIL: S15.34: scanning a library holding a FIFO
+//       threw ..."; graded Failed, not aborted.
 
 bool isBrokenOnly(const Wallpaper& w) {
     return !w.usable() && !w.problem.isEmpty() && w.type.isEmpty() && w.title.isEmpty() && w.author.isEmpty() &&
@@ -129,9 +129,8 @@ void manifestOrderAndFields() {
     // WHY-THIS-SHAPE: PLAN's keys are speed, mute, tint (alphabetical would be mute, speed, tint) and
     //       the second manifest's are zoom, glow, alpha, so a sort in either direction goes red;
     //       a manifest already in alphabetical order would pass a sorting implementation.
-    // CONTROL: app/library/wpx_package.cpp, `using Json = nlohmann::ordered_json;` made
-    //       `nlohmann::json` (a sorted map) -> red, "S15.31: properties came out as mute,speed,tint";
-    //       restored, green.
+    // CONTROL: shared/wallpaper_manifest.cpp, `using Json = nlohmann::ordered_json;` made `nlohmann::json`
+    //       (control_batch 2026-11-10, each alone, reverted) -> red, "S15.31: properties came out as mute,speed,tint".
     expect(keysOf(plan->properties) == QStringLiteral("speed,mute,tint"),
            QStringLiteral("S15.31: properties came out as %1, not speed,mute,tint").arg(keysOf(plan->properties)));
     const auto reversed = parseManifest(edited([](OrderedJson& j) {
@@ -162,15 +161,16 @@ void manifestOrderAndFields() {
         expect(mute.type == WallpaperProperty::Type::Bool && mute.defaultValue == QVariant(true),
                QStringLiteral("S15.31: mute read as %1 default %2").arg(mute.typeName(), mute.defaultValue.toString()));
         // GOAL: S15.31 -- a colour default is stored lower-case, so "#FFFFFF" and "#ffffff" are one value.
-        // CONTROL: app/library/wpx_package.cpp, accept()'s `QVariant(text.toLower())` made
-        //       `QVariant(text)` -> red, "S15.31: tint read as color default #FFFFFF"; restored, green.
+        // CONTROL: shared/property_rules.h toString(Colour)'s `"#%02x%02x%02x"` made `"#%02X%02X%02X"` (control_batch
+        //       2026-11-10, reverted) -> red, "S15.31: tint read as color default #FFFFFF".
         expect(tint.type == WallpaperProperty::Type::Color && tint.defaultValue == QVariant(QStringLiteral("#ffffff")),
                QStringLiteral("S15.31: tint read as %1 default %2").arg(tint.typeName(), tint.defaultValue.toString()));
     }
 
     // GOAL: S15.31 -- schema_version 1 written as a JSON integer is read like "1".
-    // CONTROL: app/library/wpx_package.cpp, the `|| (version->is_number_integer() && ...)` clause
-    //       deleted -> red, "S15.31: schema_version 1 as an integer was refused"; restored, green.
+    // CONTROL: shared/wallpaper_manifest.cpp, parse()'s `|| (version->is_number_integer() && ...)` term deleted
+    //       (control_batch 2026-11-10, each alone, reverted) -> red, "S15.31: schema_version 1 as an integer was
+    //       refused".
     const auto integer = parseManifest(edited([](OrderedJson& j) { j["schema_version"] = 1; }));
     expect(integer.has_value(), QStringLiteral("S15.31: schema_version 1 as an integer was refused: %1")
                                     .arg(integer ? QString() : integer.error()));
@@ -241,22 +241,17 @@ void malformedManifests() {
     // WHY-THIS-SHAPE: each case asserts its own reason substring, so a validator that refuses for
     //       the wrong reason (the file check firing on a missing title, say) goes red; asserting only
     //       "was refused" would pass a parser that rejects everything.
-    // CONTROL: app/library/wpx_package.cpp, one branch per run, each red on its own row and
-    //       restored: `!doc.is_object()` -> "a JSON array was refused with ...has no schema_version";
-    //       `!versionOne` -> "schema_version "2" was accepted"; the type list -> "type gif was
-    //       accepted"; the title test -> "empty title was accepted"; each of isPlainRelativePath's
-    //       four terms -> "absolute file", "file with .", "file with ..", "file with a backslash
-    //       was accepted"; tags' is_array and all_of terms -> "tags as one string", "a tag that is a
-    //       number was accepted"; properties' is_object -> "properties as a list was accepted";
-    //       parseProperty's is_object, type-refusal, no-default, min<max, range and bool tests ->
-    //       their rows; inside isPropertyKey's anchoredPattern, `{1,` made `{0,` -> "a property with
-    //       an empty name was accepted" (control_batch, 2026-10-04); inside colorPattern()'s,
-    //       `{6}` made `{3,8}` -> "a colour default #abc was accepted";
-    //       parseManifest's `catch (const Json::out_of_range&)` clause deleted -> "a number too
-    //       large for a double was refused with "wallpaper.json cannot be read: ..."". Rows with
-    //       no break of their own (invalid JSON or UTF-8, no schema_version, no type, numeric
-    //       author, no preview/file, numeric label, a property with no type or max): removing
-    //       those tests makes nlohmann throw or read past a missing key rather than accept.
+    // CONTROL: shared/wallpaper_manifest.cpp, control_batch 2026-11-10, each alone, reverted: parse()'s
+    //       `!doc.is_object()` made `false` -> red, "a JSON array was refused with ...has no schema_version"; the
+    //       text() lambda's `.empty()` test dropped -> red, "empty title was accepted"; shared/property_rules.h
+    //       isPropertyKey's `!key.empty() &&` dropped -> red, "a property with an empty name was accepted"; parseColour
+    //       taking any 4-character "#..." -> red, "a colour default #abc was accepted" (its size test cannot simply be
+    //       dropped: the reads past a short string would be undefined); the `Json::out_of_range` catch deleted -> red, "a number too
+    //       large for a double was refused with "wallpaper.json cannot be read: ..."". The other rows' branches (type
+    //       list, isPlainRelativePath's terms, tags, properties, parseProperty's tests) were not re-run since the
+    //       rules moved to shared/wallpaper_manifest.cpp. Rows with no break of their own (invalid JSON or UTF-8, no
+    //       schema_version, no type, numeric author, no preview/file, numeric label, a property with no type or max):
+    //       removing those tests makes nlohmann throw or read past a missing key rather than accept.
     // COVERAGE-ASSERT: the case count is checked, so dropping rows fails.
     int checked = 0;
     for (const Case& c : cases) {
@@ -408,11 +403,9 @@ void unquotableValues() {
     // WHY-THIS-SHAPE: parsed in a forked child, so a stack overflow is this case's FAIL, not a binary
     //       killed with no line. The deep cases are now refused by the depth limit before quotable() runs;
     //       the shallow 100000-number array is what still reaches quotable()'s refusal of a non-number.
-    // CONTROL: app/library/wpx_package.cpp quotable(), control_batch: `else if (!value.is_number())`
-    //       refusal deleted (2026-10-17) -> red, "S15.645: a schema_version holding 100000 numbers was refused
-    //       with a 200076-character sentence"; `text.size() > kMaxQuotedBytes ||` deleted -> red, "S15.645: a 1,000,000-character schema_version
-    //       was refused with a 1000077-character sentence" and the type's; the printable-ASCII test deleted
-    //       -> red, "S15.645: a property type holding U+202E was refused with a sentence that quotes it".
+    // CONTROL: shared/wallpaper_manifest.cpp quotable(), `else if (!value.is_number())` refusal deleted (control_batch
+    //       2026-11-10, each alone, reverted) -> red, "S15.645: a schema_version holding 100000 numbers was refused
+    //       with a 200076-character sentence". Its length and printable-ASCII terms were not re-run at the new site.
     // COVERAGE-ASSERT: every case must be graded, so a manifest that failed to build cannot thin this.
     const int graded = gradeUnquotable("S15.645", cases, std::size(cases));
     expect(graded == int(std::size(cases)), QStringLiteral("S15.645: %1 manifests were graded, not %2").arg(graded).arg(std::size(cases)));
@@ -439,9 +432,9 @@ void deepBeforeSiblings() {
     // WHY-THIS-SHAPE: the deep value is followed by more keys at each level, so growing the
     //       ordered_json object (a vector of pairs with a const key, copied rather than moved when it
     //       reallocates) copies the deep value recursively inside Json::parse.
-    // CONTROL: control_batch 2026-10-17, reverted: app/library/wpx_package.cpp parseManifest's
-    //       `if (!nestsWithin(json, kMaxManifestDepth))` made `if (false)` -> red, "S15.659: a schema_version
-    //       nested 100000 deep, with keys after it crashed (signal 11)" and the property type's.
+    // CONTROL: shared/wallpaper_manifest.cpp parse()'s `if (!nestsWithin(json, kMaxManifestDepth))` made `if (false)`
+    //       (control_batch 2026-11-10, each alone, reverted) -> red, "S15.659: a schema_version nested 100000 deep,
+    //       with keys after it crashed (signal 11)".
     const int graded = gradeUnquotable("S15.659", cases, std::size(cases));
     expect(graded == int(std::size(cases)), QStringLiteral("S15.659: %1 manifests were graded, not %2").arg(graded).arg(std::size(cases)));
 }
@@ -485,12 +478,10 @@ void manifestDepthLimit() {
     //       after an escaped quote too, are not levels, and an escaped backslash does not leave a string open.
     // WHY-THIS-SHAPE: the levels alternate arrays and objects, so a scan counting only one kind passes 65 as
     //       ~33; the escaped-backslash case is refused only if the string is seen to close before the deep value.
-    // CONTROL: control_batch 2026-10-17, each alone, reverted, app/library/wpx_package.cpp nestsWithin: kMaxManifestDepth
-    //       65 -> "FAIL: S15.675: a document nested 65 deep was accepted"; `++depth > limit` made `>=` -> "... nested 64
-    //       deep was refused: wallpaper.json is nested more than 64 levels deep."; `|| c == '{'` dropped -> "65 deep was
-    //       accepted"; the `c == '"'` that opens a string made `false` -> "100 brackets inside a string was refused";
-    //       `escaped = true` made `false` -> "100 brackets after an escaped quote inside a string was refused";
-    //       `escaped = false` dropped -> "a string ending in an escaped backslash, then 65 deep was accepted".
+    // CONTROL: shared/wallpaper_manifest.cpp nestsWithin, control_batch 2026-11-10, each alone, reverted:
+    //       kMaxManifestDepth 65 -> "FAIL: S15.675: a document nested 65 deep was accepted"; `escaped = true` made
+    //       `false` -> "100 brackets after an escaped quote inside a string was refused". Its `>=`, `'{'`,
+    //       string-opening and `escaped = false` breaks were not re-run at the new site.
     for (const Case& c : cases) {
         if (!c.json.contains("\"extra\"")) {
             harnessFailure(std::string("S15.675: the manifest for ") + c.what + " could not be made");
@@ -619,29 +610,22 @@ void daemonPropertyRules() {
     //       ones just short of them, 0.4999 and 2.0001), so neither a
     //       validator that refuses too much nor one that refuses too little passes; each refusal's
     //       sentence is matched, so a refusal for some other reason is red.
-    // CONTROL: app/library/wpx_package.cpp, each through control_batch, 2026-10-02 (the first re-run
-    //       2026-10-04, inside anchoredPattern): isPropertyKey's
-    //       `.arg(kMaxPropertyKeyBytes)` made `.arg(kMaxPropertyKeyBytes + 1)` -> red, "S15.221: a
-    //       65-character key was accepted"; `[A-Za-z0-9_.-]` made `[ -~]` -> red, "S15.221: the key
-    //       "my key" was accepted"; the not-a-float test made `if (false)` -> red, "S15.224: a bool
-    //       speed was refused with "...allows 0 to 0, ...", not "...is not a float..."" (the empty
-    //       choices catch it, with the wrong sentence). S15.223, control_batch 2026-10-14: choices()'s
-    //       `speed >= minimum && speed <= maximum` made `speed > minimum && speed < maximum` -> red,
-    //       "S15.223: speed from 0.1 to 0.5 was refused"; the `offered.isEmpty()` refusal made `false` (and
-    //       the snap skipped when nothing is offered), re-run control_batch 2026-10-15 -> red, "S15.223:
-    //       speed from 0.6 to 0.9 was accepted". The refusal's speed list is playbackSpeedsText("or")
-    //       (shared/playback_speed.h): its `std::format(" {} ", last)` made `", {} "` (control_batch
-    //       2026-10-15) -> red, "S15.223: speed from 0.6 to 0.9 was refused with "...0.5, 1, or 2 times
-    //       its speed.", not ...", and the 0.4999 and 2.0001 rows.
+    // CONTROL: control_batch 2026-11-10, each alone, reverted: shared/property_rules.h isPropertyKey's
+    //       `key.size() <= kMaxPropertyKeyBytes` made `+ 1` -> red, "S15.221: a 65-character key was accepted"; `' '`
+    //       added to its characters -> red, "S15.221: the key "my key" was accepted"; shared/wallpaper_manifest.cpp
+    //       parseProperty's not-a-float test
+    //       made `if (false)` -> red, "S15.224: a bool speed was refused with ..." (the empty choices catch it, with
+    //       the wrong sentence); Property::choices()'s `>=`/`<=` made `>`/`<` -> red, "S15.223: speed from 0.1 to 0.5
+    //       was refused". The `offered.empty()` refusal and playbackSpeedsText's separator (shared/playback_speed.h,
+    //       unchanged) were not re-run.
     // GOAL: S15.255 -- a key with a trailing newline, also after 64 allowed characters, and a colour
     //       default with one, are refused, as the daemon refuses them.
     // WHY-THIS-SHAPE: a pattern anchored with `^...$` matches before a final "\n"; graded against
     //       the daemon (S15.225 below) as well as by sentence.
-    // CONTROL: app/library/wpx_package.cpp, isPropertyKey's pattern written
-    //       `QStringLiteral("^[A-Za-z0-9_.-]{1,%1}$")` without anchoredPattern (control_batch,
-    //       2026-10-04) -> red, "S15.255: a key ending in a newline was accepted", the 64-character
-    //       row and their S15.225 lines; colorPattern()'s written `QStringLiteral("^#[0-9a-fA-F]{6}$")`
-    //       -> red, "S15.255: a colour default ending in a newline was accepted" and its S15.225 line.
+    // CONTROL: shared/property_rules.h, control_batch 2026-11-10, each alone, reverted: isPropertyKey taking
+    //       `'\n'` -> red, "S15.255: a key ending in a newline was accepted"; parseColour taking `#rrggbb` followed by
+    //       `'\n'` -> red, "S15.255: a colour default ending in a newline was accepted". The rules are character loops
+    //       now, so a missing regex anchor cannot recur; a newline let through is the same failure.
     std::vector<Row> rows{
         {"S15.221", "a 64-character key", one(std::string(64, 'k'), flag), nullptr},
         {"S15.221", "a 65-character key", one(std::string(65, 'k'), flag), badKey},
@@ -687,21 +671,15 @@ void daemonPropertyRules() {
     //       either side alone is red here even where the table above was changed to match. The usable
     //       side is judged on the parsed values, not the declared ones: a declared speed default
     //       between the choices is one the app moves, so the daemon refusing the declared 0.75 is right.
-    // CONTROL: app/library/wpx_package.cpp isPropertyKey's `.arg(kMaxPropertyKeyBytes + 1)`
-    //       (control_batch, 2026-10-04) -> red, "S15.225: a 65-character key: the app lists it usable,
-    //       the daemon would refuse it (property name "kkk..." must be 1 to 64 ASCII letters, digits,
-    //       '_', '-' or '.')"; each break above gave its own S15.225 line beside its row's. The count
-    //       and the cap (the whole set is sent, position keys and "paused" included, so the daemon's 65
-    //       applies): control_batch: kMaxWallpaperProperties (app/library/wpx_package.h) without
-    //       its `- 1` for "paused" -> red, "S15.720: 61 properties was accepted" and "S15.225: 61 properties:
-    //       the app lists it usable, the daemon would refuse it (at most 65 properties, got 66)"; the daemon's
-    //       kMaxProperties (backend/daemon/wallpaper_properties.h) back to 64 -> red, "S15.225: 60 properties:
-    //       the app lists it usable, the daemon would refuse it". Choices:
-    //       both sides read kPlaybackSpeeds from shared/playback_speed.h, so the list cannot differ; what can
-    //       is choices() (app/library/wpx_package.cpp) offering a value off it. Its `within.append(speed)`
-    //       made `within.append(speed == 2.0 ? 1.5 : speed)` (control_batch 2026-10-15) -> red, "S15.225:
-    //       speed from 0.1 to 2: the app lists it usable, the daemon would refuse it (property speed must be
-    //       0.5, 1 or 2 (the choice 1.500000))".
+    // CONTROL: control_batch 2026-11-10, each alone, reverted. shared/property_rules.h isPropertyKey's `+ 1` no longer
+    //       turns S15.225 red (only S15.221's row above): since S17-D the daemon judges keys by the same function, so a
+    //       key rule changed there changes both sides at once and only the literal rows above can catch it.
+    //       shared/property_rules.h kMaxProperties made 64 -> red, "S15.720: 60 properties was refused".
+    //       shared/wallpaper_manifest.h's kMaxWallpaperProperties without its `- 1` for "paused" -> red, "S15.720: 61
+    //       properties was accepted"; Property::choices()'s `push_back(speed)` made `push_back(speed == 2.0 ? 1.5 :
+    //       speed)` -> red, "S15.225: speed from 0.1 to 2: the app lists it usable, the daemon would refuse it" (these two
+    //       not re-run since S17-D).
+    //       Both sides read kPlaybackSpeeds from shared/playback_speed.h.
     // COVERAGE-ASSERT: the row count, the 30 printable ASCII characters outside the rule among them.
     int checked = 0;
     for (const Row& row : rows) {
@@ -743,14 +721,13 @@ void speedChoices() {
     // WHY-THIS-SHAPE: 0.74 and 1.45 are where nearest-by-difference and nearest-by-ratio disagree, so
     //       a snap by difference is red; 0.8 in a range offering only 0.5 is red for a snap to the
     //       nearest of all three rather than of those offered.
-    // CONTROL: control_batch 2026-10-15, each alone, reverted. In parseProperty (app/library/wpx_package.cpp)
-    //       `nearestPlaybackSpeed(value.toDouble(), among)` made `nearestPlaybackSpeed(value.toDouble(),
-    //       kPlaybackSpeeds)` -> red, "S15.223: speed default 0.8 in 0.1 to 0.9 offers [] and stores Property
-    //       "speed" in wallpaper.json has a default outside its min and max."; the snap's range test deleted
-    //       -> red, "S15.223: speed default 2 in 0.5 to 1 offers [0.5, 1] and stores 1, not refused for its
-    //       default". In nearestPlaybackSpeed (shared/playback_speed.h) `std::fabs(std::log(from / to))` made
-    //       `std::fabs(from - to)` -> red, "S15.223: speed default 0.74 in 0.1 to 2 offers [0.5, 1, 2] and
-    //       stores 0.5", the 0.75 row likewise, and "speed default 1.45 ... stores 1".
+    // CONTROL: shared/wallpaper_manifest.cpp parseProperty, control_batch 2026-11-10, each alone, reverted:
+    //       `nearestPlaybackSpeed(*given, offered)` made `nearestPlaybackSpeed(*given)` (every speed) -> red,
+    //       "S15.223: speed default 0.8 in 0.1 to 0.9 offers [] and stores ..."; the snap's range test deleted -> red,
+    //       "S15.223: speed default 2 in 0.5 to 1 offers [0.5, 1] and stores 1, not refused for its default". In
+    //       nearestPlaybackSpeed (shared/playback_speed.h, unchanged) `std::fabs(std::log(from / to))` made
+    //       `std::fabs(from - to)` (control_batch 2026-10-15) -> red, "S15.223: speed default 0.74 in 0.1 to 2 offers
+    //       [0.5, 1, 2] and stores 0.5".
     // COVERAGE-ASSERT: the row count.
     const Row rows[] = {
         {"speed default 1 in 0.1 to 2", "speed", R"({"type": "float", "default": 1, "min": 0.1, "max": 2})", {0.5, 1.0, 2.0}, 1.0},
@@ -803,12 +780,11 @@ void speedChoices() {
     // WHY-THIS-SHAPE: a nearest-by-ratio search over a non-positive default takes the log of a negative
     //       ratio, every comparison is false and the first offered speed, 0.5, wins; so 1 is asserted
     //       literally, not as "some offered speed", which 0.5 also is.
-    // CONTROL: control_batch 2026-10-15, each alone, reverted. parseProperty's call (app/library/wpx_package.cpp)
-    //       made the earlier `min_element(among, ..., fabs(log(declared / s)))` -> red, "S15.640: speed
-    //       default 0 in -1 to 3 offers [0.5, 1, 2] and stores 0.5, not 1", the -2 and -0.5 rows likewise.
-    //       In nearestPlaybackSpeed (shared/playback_speed.h) the non-positive guard made `from = speed` ->
-    //       the same three; a `return 1.0` for a non-positive speed before the snap -> red, "S15.640: speed
-    //       default -1 in -2 to 0.6 offers [] and stores Property "speed" ... outside its min and max., not 0.5".
+    // CONTROL: shared/wallpaper_manifest.cpp parseProperty's snap made `min_element(offered, ..., fabs(log(*given /
+    //       s)))` (control_batch 2026-11-10, each alone, reverted) -> red, "S15.640: speed default 0 in -1 to 3 offers
+    //       [0.5, 1, 2] and stores 0.5, not 1". In nearestPlaybackSpeed (shared/playback_speed.h, unchanged,
+    //       control_batch 2026-10-15) the non-positive guard made `from = speed` -> the same; a `return 1.0` for a
+    //       non-positive speed -> red, "S15.640: speed default -1 in -2 to 0.6 offers [] ...".
     // COVERAGE-ASSERT: the row count.
     const Row nonPositive[] = {
         {"speed default 0 in -1 to 3", "speed", R"({"type": "float", "default": 0, "min": -1, "max": 3})", {0.5, 1.0, 2.0}, 1.0},
@@ -892,16 +868,13 @@ void acceptValues() {
     // WHY-THIS-SHAPE: the boundaries are probed with nextafter, one ulp outside, so a check using
     //       a tolerance or `<=` on the wrong side goes red; the stored value is compared including its
     //       type, so returning the int unconverted also goes red.
-    // CONTROL: app/library/wpx_package.cpp, `number < minimum || number > maximum` made
-    //       `number <= minimum || number > maximum` -> red, "a float at exactly min"; the
-    //       `!std::isfinite(number) ||` term deleted -> red, "NaN was accepted as nan" (infinity
-    //       is still refused by the range test); `case QMetaType::QString:` added to the float cases -> red,
-    //       "the string "1" for a float"; `return QVariant(number);` made `return value;` -> red,
-    //       "an int gave 2 (int)"; `if (value.typeId() == QMetaType::QColor) {` made `if (false) {`
-    //       -> red, "a QColor gave a refusal"; the QColor path's `color.isValid() ?` made
-    //       `color.isValid() && color.alpha() == 255 ?` -> red, "a QColor with alpha 128 gave a
-    //       refusal"; restored, green each time. The choice rule, control_batch 2026-10-14: accept()'s
-    //       `!offered.contains(number)` made `false` -> red, "S15.35: speed 0.75 was accepted as 0.75".
+    // CONTROL: control_batch 2026-11-10, each alone, reverted. In shared/wallpaper_manifest.cpp Property::accept():
+    //       `*number < minimum` made `<=` -> red, "a float at exactly min"; `!std::isfinite(*number) ||` deleted ->
+    //       red, "NaN was accepted as nan"; the choices test made `false` -> red, "S15.35: speed 0.75 was accepted as
+    //       0.75". In app/library/wpx_package.cpp's converters: numberOf() taking a QString -> red, "the string "1"
+    //       for a float"; WallpaperProperty::accept() returning the given QVariant -> red, "an int gave 2 (int)";
+    //       sharedValue()'s QColor branch made `false &&` -> red, "a QColor gave a refusal"; its `color.isValid()`
+    //       made `&& color.alpha() == 255` -> red, "a QColor with alpha 128 gave a refusal".
     for (const Case& c : cases) {
         const auto got = c.property.accept(c.value);
         if (!c.want) {
@@ -916,9 +889,9 @@ void acceptValues() {
 
     // GOAL: S15.255 -- an edited colour with a trailing newline is refused, and the daemon refuses
     //       it too, so the app never sends what the daemon would turn down at Apply.
-    // CONTROL: app/library/wpx_package.cpp, colorPattern()'s written `QStringLiteral("^#[0-9a-fA-F]{6}$")`
-    //       without anchoredPattern (control_batch, 2026-10-04) -> red, "S15.255: an edited colour
-    //       "#aabbcc\n" was taken as "#aabbcc\n"; the daemon says "property tint is not a colour"".
+    // CONTROL: shared/property_rules.h, parseColour taking `#rrggbb` followed by `'\n'` (control_batch 2026-11-10,
+    //       reverted) -> red, "S15.255: an edited colour "#aabbcc\n" was taken as "#aabbcc"; the daemon says """ --
+    //       the daemon shares parseColour, so both sides accepted it.
     const QString newline = QStringLiteral("#aabbcc\n");
     const auto edited = tint.accept(newline);
     const std::string daemon = daemonPropertiesError({{"tint", newline.toStdString()}});
@@ -993,8 +966,9 @@ void badArchives(const QString& root) {
     // GOAL: S15.33 -- a wallpaper.json of exactly 1 MiB is read; one byte more is refused before it is parsed.
     // WHY-THIS-SHAPE: both manifests are PLAN's example padded with trailing spaces, so they are
     //       valid JSON: without the cap the over-size one would be read as usable, which is what goes red.
-    // CONTROL: app/library/wpx_package.cpp, `st.size > static_cast<zip_uint64_t>(maxBytes)` made
-    //       `false && ...` -> red, "S15.33: huge.wpx read as usable=1 title "Ocean Waves""; restored, green.
+    // CONTROL: app/library/wpx_package.cpp, readEntry's `st.size > static_cast<zip_uint64_t>(maxBytes)` made `false`
+    //       (control_batch 2026-11-10, each alone, reverted) -> red, "S15.33: huge.wpx read as usable=1 title "Ocean
+    //       Waves"".
     const Wallpaper atCapRead = readArchive(at("atcap.wpx"));
     expect(atCapRead.usable(), QStringLiteral("S15.33: a wallpaper.json of exactly 1 MiB was refused: %1").arg(atCapRead.problem));
 
@@ -1011,12 +985,10 @@ void badArchives(const QString& root) {
     //       shown or applied.
     // WHY-THIS-SHAPE: the manifest-field emptiness is checked on every broken result because the
     //       asset check runs after parsing, when those fields are already filled.
-    // CONTROL: app/library/wpx_package.cpp, ArchiveContents::find's `if (!locate(m_zip, name)) {`
-    //       made `if (false) {` -> red, "noasset.wpx read as usable=1"; readFrom's asset
-    //       `return broken(std::move(file), asset.error());` made to return the parsed wallpaper
-    //       with `problem` set -> red, "noasset.wpx read as usable=0 title "Ocean Waves""; the
-    //       ZIP_ER_NOZIP branch's condition made `false` -> red, "notzip.wpx ... It cannot be read
-    //       as a ZIP archive"; restored, green each time.
+    // CONTROL: app/library/wpx_package.cpp, ArchiveContents::find's `if (!locate(m_zip, name)) {` made `if (false) {`
+    //       (control_batch 2026-11-10, each alone, reverted) -> red, "noasset.wpx read as usable=1"; shared/
+    //       wallpaper_manifest.cpp readFrom()'s asset looked up by `previewName` -> red, the same line.
+    //       openArchive's ZIP_ER_NOZIP branch was not re-run at the new site.
     for (const ArchiveCase& c : cases) {
         const Wallpaper w = readArchive(c.file);
         expect(isBrokenOnly(w) && w.problem.contains(QLatin1String(c.reason)) && w.filePath == c.file &&
@@ -1029,18 +1001,19 @@ void badArchives(const QString& root) {
 
     // GOAL: S15.33 -- a preview file over 32 MiB in a wallpaper folder is refused by its size, before
     //       it is read.
-    // CONTROL: app/library/wpx_package.cpp, readToEnd's `if (size > maxBytes) {` made `if (false) {`
-    //       -> red, "S15.33: a 32 MiB + 1 preview was read: 33554433 bytes" (and the two checks below
-    //       it that rely on the same cap, S15.55's and S15.67's); restored.
+    // CONTROL: shared/wallpaper_manifest.cpp, readToEnd's `if (size > maxBytes)` line deleted (control_batch
+    //       2026-11-10, after S17-D's limit clamp, reverted) -> red, "S15.33: a 32 MiB + 1 preview was read: 33554433
+    //       bytes" (and the two checks below that rely on the same cap).
     const auto preview = readWallpaperEntry(at("bigpreview"), QStringLiteral("preview.png"), kMaxPreviewBytes);
     expect(!preview && preview.error() == u"preview.png is larger than 32 MiB.",
            QStringLiteral("S15.33: a 32 MiB + 1 preview was read: %1").arg(preview ? QStringLiteral("%1 bytes").arg(preview->size()) : preview.error()));
 
     // GOAL: S15.55 -- a file name holding "%1" is quoted as it is in a refusal, not taken as a
     //       place for the size to go.
-    // CONTROL: app/library/wpx_package.cpp, FolderContents::read's `.arg(name, QString::number(maxBytes >> 20))`
-    //       made `.arg(name).arg(QString::number(maxBytes >> 20))` -> red, "S15.55: ... "shot1.png
-    //       is larger than %2 MiB.""; restored.
+    // CONTROL: shared/wallpaper_manifest.cpp, FolderContents::read's sentence `"{} is larger than {} MiB."` made `"{}
+    //       is larger than %2 MiB."` (control_batch 2026-11-10, each alone, reverted) -> red, "S15.55: a file named
+    //       shot%1.png over the cap was refused with "shot%1.png is larger than %2 MiB."" (and the S15.33/S15.67 lines
+    //       quoting the same sentence).
     const auto percent = readWallpaperEntry(at("percent"), QStringLiteral("shot%1.png"), 1 << 20);
     expect(!percent && percent.error() == u"shot%1.png is larger than 1 MiB.",
            QStringLiteral("S15.55: a file named %1 over the cap was refused with \"%2\"")
@@ -1050,9 +1023,9 @@ void badArchives(const QString& root) {
     //       refused as "not a regular file", not handed to the ZIP reader.
     // WHY-THIS-SHAPE: opened here with O_NONBLOCK, so the open cannot hang; whether the importer's
     //       own open of such a path blocks is S15.76's (importer_test.cpp).
-    // CONTROL: app/library/wpx_package.cpp, openArchive's `|| !S_ISREG(st.st_mode)` deleted -> red,
-    //       "S15.33: a FIFO read as usable=0 problem "It cannot be read as a ZIP archive: Operation
-    //       not supported.""; restored.
+    // CONTROL: app/library/wpx_package.cpp, openArchive's `|| !S_ISREG(st.st_mode)` deleted (control_batch 2026-11-10,
+    //       each alone, reverted) -> red, "S15.33: a FIFO read as usable=0 problem "It cannot be read as a ZIP
+    //       archive: ..."".
     const Wallpaper fifoRead = readArchive(fifo);
     expect(isBrokenOnly(fifoRead) && fifoRead.problem == u"It is not a regular file.",
            QStringLiteral("S15.33: a FIFO read as usable=%1 problem \"%2\"").arg(fifoRead.usable()).arg(fifoRead.problem));
@@ -1118,9 +1091,9 @@ void scanFolder(const QString& root) {
     // WHY-THIS-SHAPE: bounded as in S15.33. A FIFO directly in the library is not a folder, so a
     //       scan never opens it; one named by wallpaper.json inside a folder is opened, and only
     //       the non-blocking open stands in front of the hang.
-    // CONTROL: app/library/wpx_package.cpp, FolderContents::open's `O_RDONLY | O_NONBLOCK | O_NOCTTY`
-    //       made `O_RDONLY | O_NOCTTY` -> red, "S15.34: scanning a library holding a FIFO blocked for
-    //       3000 ms"; restored.
+    // CONTROL: shared/wallpaper_manifest.cpp, FolderContents::open's `O_RDONLY | O_NONBLOCK | O_NOCTTY` made `O_RDONLY
+    //       | O_NOCTTY` (control_batch 2026-11-10, each alone, reverted) -> red, "S15.34: scanning a library holding a
+    //       FIFO blocked for 3000 ms".
     const QString fifo = at(QStringLiteral("fifojson/wallpaper.json"));
     const auto scanned = runBounded<Scan>([&lib] { return scanLibrary(lib); }, fifo, QStringLiteral("S15.34: scanning a library holding a FIFO"), kFifoTimeoutMs);
     const Wallpaper linkRead = readWallpaperFolder(at(QStringLiteral("linked")));
@@ -1166,9 +1139,8 @@ void scanFolder(const QString& root) {
 
     // GOAL: S15.34 -- each broken folder is broken for its own reason, with nothing read from its
     //       manifest kept.
-    // CONTROL: app/library/wpx_package.cpp, FolderContents::open's `|| !S_ISREG(st.st_mode)` deleted
-    //       -> red, "assetdir is usable" and "fifojson is broken with "wallpaper.json is not valid
-    //       JSON ...""; restored.
+    // CONTROL: shared/wallpaper_manifest.cpp, FolderContents::open's `|| !S_ISREG(st.st_mode)` deleted (control_batch
+    //       2026-11-10, each alone, reverted) -> red, "assetdir is usable".
     // COVERAGE-ASSERT: the number of broken rows whose reason was compared.
     const QMap<QString, QString> reasons{
         {QStringLiteral("assetdir"), QStringLiteral("assets/video.mp4 is not a regular file.")},
@@ -1196,8 +1168,9 @@ void scanFolder(const QString& root) {
 
     // GOAL: S15.34 -- a usable folder's row names the folder, and its assetPath is the folder, a
     //       slash and the manifest's file: the path the daemon is to open.
-    // CONTROL: app/library/wpx_package.cpp, readFolderAt's `read.assetPath = read.filePath + u'/' + read.assetName;`
-    //       deleted -> red, "S15.34: ocean read as path … name ocean asset path """; restored.
+    // CONTROL: app/library/wpx_package.cpp, readFolderAt's `wallpaper.assetPath = wallpaper.filePath + u'/' +
+    //       wallpaper.assetName;` deleted (control_batch 2026-11-10, each alone, reverted) -> red, "S15.34: ocean read
+    //       as path ... asset path """.
     const auto ocean = std::ranges::find(list, QStringLiteral("ocean"), &Wallpaper::fileName);
     expect(ocean != list.end() && ocean->filePath == at(QStringLiteral("ocean")) && ocean->title == u"Ocean Waves" &&
                ocean->assetPath == at(QStringLiteral("ocean/assets/video.mp4")),
@@ -1207,9 +1180,9 @@ void scanFolder(const QString& root) {
 
     // GOAL: S15.34 -- a wallpaper folder that is a link is refused by the folder reader itself,
     //       not only by the scan, so nothing reads through it into another folder.
-    // CONTROL: app/library/wpx_package.cpp, readFolderAt's `O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`
-    //       made `O_RDONLY | O_DIRECTORY | O_CLOEXEC` -> red, "S15.34: the linked folder read
-    //       directly as usable=1 "Linked""; restored.
+    // CONTROL: shared/wallpaper_manifest.cpp, readFolder's `O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` made
+    //       `O_RDONLY | O_DIRECTORY | O_CLOEXEC` (control_batch 2026-11-10, each alone, reverted) -> red, "S15.34: the
+    //       linked folder read directly as usable=1 "Linked"".
     expect(isBrokenOnly(linkRead) && linkRead.problem == u"It is a link, not a folder.",
            QStringLiteral("S15.34: the linked folder read directly as usable=%1 \"%2\" problem \"%3\"")
                .arg(linkRead.usable()).arg(linkRead.title, linkRead.problem));
@@ -1305,11 +1278,10 @@ void folderNamesThatAreNotUtf8(const QString& root) {
     // WHY-THIS-SHAPE: each row is looked up by converting its path back to bytes, so a row whose
     //       text no longer names its folder is not found; comparing texts would pass two names both
     //       decoded to U+FFFD.
-    // CONTROL: app/library/wpx_package.cpp, readFolderAt's `if (!QStringView(path).isValidUtf16()) {`
-    //       made `if (false) {` -> red, "S15.50: the folder of odd names listed [caf%C3%A9, caf%E8,
-    //       caf%E9]", all three usable; decodeFileName's `QChar(char16_t(0xDC00 + value))` made
-    //       `QChar(char16_t(0xFFFD))` (what QFile::decodeName does) -> red, both rows named
-    //       "caf%EF%BF%BD" and read as usable; restored, green each time.
+    // CONTROL: shared/wallpaper_manifest.cpp, readFolder's `if (!isValidUtf8(path))` made `if (false)` (control_batch
+    //       2026-11-10, each alone, reverted) -> red, "S15.50: the folder of odd names listed [...]", all usable;
+    //       app/library/wpx_package.cpp, decodeFileName's `QChar(char16_t(0xDC00 + value))` made
+    //       `QChar(char16_t(0xFFFD))` (unchanged code, earlier run) -> red, both rows named "caf%EF%BF%BD".
     expect(scan->size() == 3 && e8 && e9 && valid && e8 != e9 && e8->filePath != e9->filePath && e8->problem == notUtf8 &&
                e9->problem == notUtf8 && !QStringView(e8->filePath).isValidUtf16() && valid->usable() &&
                valid->fileName == QStringLiteral("café"),
@@ -1382,11 +1354,9 @@ void sharedValidator(const QString& root) {
     // WHY-THIS-SHAPE: the control is made in the one place both readers share (readFrom), so both
     //       rows going red together is what shows the rule is shared rather than written twice;
     //       the whole pair proves the refusal is about the preview and nothing else.
-    // CONTROL: app/library/wpx_package.cpp, readFrom's `contents.find(parsed->previewName)` made
-    //       `contents.find(parsed->assetName)` -> red, "S15.67: the folder missing its preview read
-    //       as usable=1 ..." and "... the archive missing its preview read as usable=1 ..." (control_batch,
-    //       re-run 2026-10-11 with the soundless whole pair); restored. The whole-pair line has no control
-    //       of its own.
+    // CONTROL: shared/wallpaper_manifest.cpp, readFrom's `contents.find(manifest->manifest.previewName)` made
+    //       `...assetName` (control_batch 2026-11-10, reverted) -> red, "S15.67: the folder missing its preview read
+    //       as usable=1 ...". The whole-pair line has no control of its own.
     const Wallpaper folder = readWallpaperFolder(dir + QStringLiteral("/nopreview"));
     const Wallpaper archive = readArchive(dir + QStringLiteral("/nopreview.wpx"));
     const Wallpaper wholeFolder = readWallpaperFolder(dir + QStringLiteral("/whole"));
@@ -1404,9 +1374,10 @@ void sharedValidator(const QString& root) {
     //       read, one byte more is refused before it is parsed.
     // WHY-THIS-SHAPE: both manifests are PLAN's example padded with spaces, so without the cap the
     //       larger one would read as usable.
-    // CONTROL: app/library/wpx_package.cpp, readToEnd's `if (size > maxBytes) {` made `if (false) {`
-    //       -> red, "S15.67: a folder's 1 MiB + 1 wallpaper.json read as usable=1 ..." (its read
-    //       loop alone refuses only a file that grows past the cap while read); restored.
+    // CONTROL: shared/wallpaper_manifest.cpp, each through control_batch 2026-11-10, reverted: readToEnd's `if (size
+    //       > maxBytes)` line deleted -> red, "S15.67: a folder's 1 MiB + 1 wallpaper.json read as usable=1 ..." (its
+    //       read loop alone refuses only a file that grows past the cap while read); readManifest()'s limit made
+    //       `kMaxManifestBytes + 1` -> red, the same line.
     const Wallpaper hugeRead = readWallpaperFolder(dir + QStringLiteral("/huge"));
     const Wallpaper atCapRead = readWallpaperFolder(dir + QStringLiteral("/atcap"));
     expect(isBrokenOnly(hugeRead) && hugeRead.problem == u"wallpaper.json is larger than 1 MiB." && atCapRead.usable(),
@@ -1506,20 +1477,13 @@ void containment(const QString& root) {
         //       that land inside, so those go to the fallback in every pass. Whether the FIFO was
         //       opened is read from inotify's IN_OPEN on it, which a blocked writer would only show
         //       by timing.
-        // CONTROL: app/library/wpx_package.cpp, openBeneath's `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`
-        //       made `RESOLVE_NO_MAGICLINKS` -> red, "S15.68 (with openat2): abs read as usable=1", the
-        //       same for rel, dirlink and abspreview, fifolink read as "not a regular file" and "the
-        //       FIFO outside was opened 1 time(s)", the other passes green; the fallback's
-        //       `if (folder.isEmpty() || !file.startsWith(folder == "/" ? folder : folder + '/')) {`
-        //       made `if (folder.isEmpty()) {` -> red, those same lines in all three passes;
-        //       `errno != EXDEV && ` dropped from `if (fd >= 0 || (errno != EXDEV && ...))` -> red,
-        //       "S15.68 (with openat2): absinside read as usable=0 ... leads outside" and outin only;
-        //       `&& errno != EPERM` dropped -> red, every row of the EPERM pass only, e.g. "S15.68
-        //       (openat2 refused with EPERM): inside read as usable=0 problem "wallpaper.json cannot be
-        //       opened: Operation not permitted.""; the whole condition made `if (true) {` -> red, every
-        //       row of both refused passes, and absinside and outin with openat2; the fallback's
-        //       `O_PATH | O_CLOEXEC` made `O_RDONLY | O_NONBLOCK | O_CLOEXEC` -> red, "S15.68 (...): the
-        //       FIFO outside was opened 1 time(s)" in every pass and nothing else; restored.
+        // CONTROL: shared/wallpaper_manifest.cpp openBeneath, control_batch 2026-11-10, each alone, reverted:
+        //       `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS` made `RESOLVE_NO_MAGICLINKS` -> red, "S15.68 (with openat2):
+        //       abs read as usable=1"; the fallback's `if (folder.empty() || !file.starts_with(...))` made `if
+        //       (folder.empty())` -> red, the same rows in the refused passes; `errno != EPERM` dropped -> red, the
+        //       EPERM pass's "inside read as usable=0 ..."; the fallback's `O_PATH | O_CLOEXEC` made `O_RDONLY |
+        //       O_NONBLOCK | O_CLOEXEC` -> red, "the FIFO outside was opened 1 time(s)". The `errno != EXDEV` and `if
+        //       (true)` breaks were not re-run at the new site.
         // COVERAGE-ASSERT: openat2 was asked for every read of each pass, so the refused passes
         //       went the other way; and an open of the FIFO by this test is seen, so the IN_OPEN
         //       watch is live (test-side control: the watch made on IN_ACCESS -> red, "this test's own
@@ -1918,14 +1882,14 @@ void soundProperties(const QString& root) {
     //       property. With wallpaper.json at the 60-property cap (S15.720) nothing is added.
     // WHY-THIS-SHAPE: the same declared manifest read over a video with sound, a silent video and as a
     //       still, so only the probe and the type decide; the cap case has no sound key of its own.
-    // CONTROL: via control_batch.sh, --phase '^soundProperties$', 2026-10-11, each alone, reverted, in
-    //       app/library/wpx_package.cpp: audioOf() answering Absent in place of the probe -> "FAIL: S15.473: a
-    //       video with sound declaring neither reads speed,tint" and the declaring-both line; settleSoundProperties'
-    //       `== AudioStreams::Absent` strip made `if (false)` -> "... a silent video reads speed,mute,tint,volume
-    //       and a still speed,mute,tint,volume"; audioOf()'s not-a-video answer deleted, so a still is probed ->
-    //       "... a silent video reads speed,tint and a still speed,mute,tint,volume"; the cap test dropped from
-    //       `declared` (re-run 2026-10-18 at the 60 cap) -> "... at the property cap reads 62 properties"; mute added whether declared or not ->
-    //       "... declaring both reads speed,mute,tint,volume,mute" and the cap line.
+    // CONTROL: control_batch 2026-11-10, each alone, reverted:app/library/wpx_package.cpp readFolderAt's audioOf
+    //       answering Absent -> "FAIL: S15.473: a video with sound declaring neither reads speed,tint"; in
+    //       shared/wallpaper_manifest.cpp: settleSound's `audio == AudioStreams::Absent` strip made `false` -> "... a
+    //       silent video reads speed,mute,tint,volume ..."; settleSoundFor()'s `type == "video"` test made `true`, so
+    //       a still is probed (re-run there 2026-11-10) -> "FAIL: S15.473: declaring both, a silent video reads
+    //       speed,tint and a still speed,mute,tint,volume"; the cap term
+    //       dropped from `declared` -> "... at the property cap reads 62 properties". "mute added whether declared or
+    //       not" was not re-run at the new site.
     const Wallpaper added = at("added");
     const WallpaperProperty* mute = find(added, "mute");
     const WallpaperProperty* volume = find(added, "volume");
@@ -2016,11 +1980,9 @@ void soundPropertyRules(const QString& root) {
     // GOAL: S15.225 for these -- the app lists each usable exactly when the daemon would take its properties.
     // WHY-THIS-SHAPE: each row is a whole folder over a video with sound, read as the library reads it,
     //       since the manifest check no longer judges these keys (S15.488's parseManifest line below).
-    // CONTROL: via control_batch.sh, --phase '^soundPropertyRules$', 2026-10-11, settleSoundProperties'
-    //       `return problem;` made a no-op (app/library/wpx_package.cpp) -> every refusal row "was listed
-    //       usable", e.g. "FAIL: S15.474: a video with sound declaring volume from 0 to 100 was listed usable",
-    //       each with its S15.225 line ("the daemon would refuse it (property volume must be a number from 0 to
-    //       1)"), and S15.489's 0-to-100 line. Reverted.
+    // CONTROL: shared/wallpaper_manifest.cpp, settleSound's `return problem;` made `(void)problem;` (control_batch
+    //       2026-11-10, each alone, reverted) -> every refusal row "was listed usable", e.g. "FAIL: S15.474: a video
+    //       with sound declaring volume from 0 to 100 was listed usable".
     // COVERAGE-ASSERT: the row count.
     int checked = 0;
     index = 0;
@@ -2048,10 +2010,9 @@ void soundPropertyRules(const QString& root) {
     //       and keeps neither, its other properties kept in order; parseManifest accepts that manifest.
     // WHY-THIS-SHAPE: both keys broken at once, so a rule applied before the keys are taken away shows on
     //       either; the asset is the video with sound, so only the type decides.
-    // CONTROL: via control_batch.sh, --phase '^soundPropertyRules$', 2026-10-11, settleSoundProperties' rule
-    //       loop copied above the Absent strip (app/library/wpx_package.cpp) -> "FAIL: S15.488: declaring a float
-    //       mute and a volume of 0 to 100, a still reads  (Property "mute" ... is not a bool ...) and a shader
-    //       ...", alone. Reverted.
+    // CONTROL: shared/wallpaper_manifest.cpp, settleSound's rule loop copied above the Absent strip (control_batch
+    //       2026-11-10, each alone, reverted) -> "FAIL: S15.488: declaring a float mute and a volume of 0 to 100, a
+    //       still reads ...".
     const Wallpaper still = at(QStringLiteral("still"));
     const Wallpaper shader = at(QStringLiteral("shader"));
     const auto parsed = parseManifest(manifest("video", broken));
@@ -2066,11 +2027,10 @@ void soundPropertyRules(const QString& root) {
     //       given no `volume` of its own; a declared volume of 0 to 100 there is still refused.
     // WHY-THIS-SHAPE: the asset is the same non-media file in both, so the probe answers Unknown for both
     //       (S15.472's non-media case); `audio` is read as well, so a pass for some other reason shows.
-    // CONTROL: via control_batch.sh, --phase '^soundPropertyRules$', 2026-10-11, each alone, reverted, in
-    //       settleSoundProperties (app/library/wpx_package.cpp): the strip taken for any answer but Present ->
-    //       "FAIL: S15.489: a video the probe cannot read, declaring mute, reads speed,tint (usable 1, audio
-    //       Unknown)" and the 0-to-100 line ("was listed usable"); the `== AudioStreams::Unknown` return
-    //       deleted -> "... declaring mute, reads speed,mute,tint,volume ...", alone.
+    // CONTROL: shared/wallpaper_manifest.cpp settleSound, control_batch 2026-11-10, each alone, reverted: the strip
+    //       taken for any answer but Present -> "FAIL: S15.489: a video the probe cannot read, declaring mute, reads
+    //       speed,tint ..."; the `== AudioStreams::Unknown` return deleted -> "... declaring mute, reads
+    //       speed,mute,tint,volume ...".
     const Wallpaper unknown = at(QStringLiteral("unknown"));
     const Wallpaper unknownLoud = at(QStringLiteral("unknownloud"));
     const auto keptMute = std::ranges::find(unknown.properties, QStringLiteral("mute"), &WallpaperProperty::key);
@@ -2107,9 +2067,9 @@ void probeReuse(const QString& root) {
     //       folder read opened.
     // WHY-THIS-SHAPE: counted by the binary's own open/openat/openat2 replacements (FileOpens), on the
     //       assets folder alone, so the manifest and preview reads are not in the count.
-    // CONTROL: via control_batch.sh, --phase '^probeReuse$', 2026-10-11, readFolderAt
-    //       (app/library/wpx_package.cpp) probing a second descriptor it opens with openat -> "FAIL: S15.490: the
-    //       first scan read audio Present and opened the asset 2 time(s), not Present and once". Reverted.
+    // CONTROL: app/library/wpx_package.cpp, readFolderAt's audioOf probing a second descriptor it opens by path
+    //       (control_batch 2026-11-10, each alone, reverted) -> "FAIL: S15.490: the first scan read audio Present and
+    //       opened the asset 2 time(s), not Present and once".
     std::expected<QList<Wallpaper>, QString> first;
     int opened = -1;
     {
@@ -2150,10 +2110,10 @@ void probeReuse(const QString& root) {
     // WHY-THIS-SHAPE: the asset is no longer media, so a scan with no earlier one answers Unknown; Present
     //       can then only come from the earlier answer. The touched case is read against the same earlier
     //       scan, so only the stamp differs.
-    // CONTROL: via control_batch.sh, --phase '^probeReuse$', 2026-10-11, each alone, reverted, audioOf()'s stamp
-    //       comparison (app/library/wpx_package.cpp) made `false` -> "FAIL: S15.490: with its stamp unchanged, a
-    //       rescan given the first scan read Unknown and one without it Unknown"; made `true` -> "FAIL: S15.490:
-    //       with the modification time moved, a rescan given the first scan read Present, not Unknown".
+    // CONTROL: app/library/wpx_package.cpp readFolderAt's audioOf, control_batch 2026-11-10, each alone, reverted: the
+    //       stamp comparison made `false` -> "FAIL: S15.490: with its stamp unchanged, a rescan given the first scan
+    //       read Unknown ..."; made `true` -> "FAIL: S15.490: with the modification time moved, a rescan given the
+    //       first scan read Present, not Unknown".
     const auto reused = scanLibrary(dir, *first);
     const auto fresh = scanLibrary(dir);
     expect(audioIn(reused) == u"Present" && audioIn(fresh) == u"Unknown",
@@ -2209,9 +2169,9 @@ void positionValues(const QString& root) {
     // WHY-THIS-SHAPE: the literal lists catch a mode left out on both sides; the daemon cross-check catches
     //       the app's type rule drifting from the daemon's, which a check against positionModeShowsVideo()
     //       alone could not, since the app calls that very function.
-    // CONTROL: app/library/wpx_package.cpp positionModes()'s `type == u"static"` made `type != u"video"`
-    //       (control_batch 2026-10-18, reverted) -> red, "S15.721: a still offers [...], a shader
-    //       [cover,fit,center,tile,stretch,free]" and "S15.721: a shader offers tile, the daemon would refuse it".
+    // CONTROL: app/library/wpx_package.cpp positionModes() asking positionModeAllowed about a shader as a still
+    //       (control_batch 2026-11-10, each alone, reverted) -> red, "S15.721: a shader offers tile, the daemon would
+    //       refuse it".
     // COVERAGE-ASSERT: 18 mode-and-type comparisons with the daemon.
     const QStringList all{QStringLiteral("cover"), QStringLiteral("fit"), QStringLiteral("center"), QStringLiteral("tile"), QStringLiteral("stretch"),
                           QStringLiteral("free")};
@@ -2237,7 +2197,7 @@ void positionValues(const QString& root) {
     //       declaring nothing; a broken wallpaper has none.
     // WHY-THIS-SHAPE: compared as text naming each value's type, since QVariant's == takes the int 1 for
     //       the double 1.0, and an int would reach D-Bus as a type the daemon refuses.
-    // CONTROL: app/library/wpx_package.cpp, control_batch 2026-10-18, each reverted: defaultValues()'s zoom
+    // CONTROL: app/library/wpx_package.cpp, control_batch 2026-11-10, each alone, reverted: defaultValues()'s zoom
     //       inserted as `int(standard.zoom)` -> red, "S15.722: a still's defaults read {..., position.zoom=1(int)}";
     //       its `if (!usable())` made `if (false)` -> red, "... a broken one's {mute=true(bool), ...".
     const QString positionDefaults = QStringLiteral("position=cover(QString), position.x=0(double), position.y=0(double), position.zoom=1(double)");
@@ -2258,13 +2218,14 @@ void positionValues(const QString& root) {
     //       their stored type is asserted, not only their value. The daemon cross-check runs on what was
     //       kept; the refused rows are judged against the literal answer, since an int or a bool is not a
     //       value the daemon could be sent and position.foo is refused by the app alone, by decision.
-    // CONTROL: app/library/wpx_package.cpp Wallpaper::accept(), control_batch 2026-10-18, each reverted:
-    //       the number kept as `value` -> red, "a video given position.zoom = 2(int) kept 2(int), not 2(double)"
-    //       and its daemon line; the positionModes() test dropped -> red, "position = tile(QString) kept
-    //       tile(QString), not refused" (centre, Cover, shader tile too); positionOffsetAllowed made
-    //       `!(fabs > max)` -> red, "position.y = nan(double) kept nan(double)"; isPositionKey made a
-    //       "position." prefix test -> red, "position.foo = 1(double) kept 1(double)"; the `!usable()` refusal
-    //       made `false` -> red, "position.zoom = 1(double) kept 1(double), not refused" (the broken rows).
+    // CONTROL: control_batch 2026-11-10, each alone, reverted: app/library/wpx_package.cpp Wallpaper::accept()
+    //       returning the given QVariant -> red, "a video given position.zoom = 2(int) kept 2(int), not 2(double)";
+    //       its `!usable()` refusal made `false` -> red, "position.zoom = 1(double) kept 1(double), not refused";
+    //       shared/wallpaper_manifest.cpp acceptValue's positionModeAllowed test dropped -> red, "position =
+    //       tile(QString) kept tile(QString), not refused"; an unknown mode name taken as cover -> red, "S15.723: a
+    //       video given position = centre(QString) kept centre(QString), not refused"; its isPositionKey made a `starts_with("position")` test ->
+    //       red, "position.foo = 1(double) kept 1(double)". positionOffsetAllowed (unchanged) made `!(fabs > max)` ->
+    //       red, "position.y = nan(double) kept nan(double)" (control_batch 2026-10-18).
     // COVERAGE-ASSERT: the row count, and the kept rows cross-checked with the daemon.
     struct Row {
         const Wallpaper* wallpaper;
@@ -2331,10 +2292,9 @@ void positionValues(const QString& root) {
     //       "Position", "my.position") are usable.
     // WHY-THIS-SHAPE: the near-miss keys are what a prefix test without the dot, or a case-blind one,
     //       would refuse; "position.foo" is a key the daemon itself would take, so only this rule refuses it.
-    // CONTROL: app/library/wpx_package.cpp parseProperty's reserved test, control_batch 2026-10-18, each
-    //       reverted: made `key.startsWith(reserved)` -> red, "S15.724: declaring "positions" was refused: ...";
-    //       made `key == reserved` -> red, "declaring "position.zoom" was accepted" and "a folder declaring
-    //       position.zoom is listed usable".
+    // CONTROL: shared/wallpaper_manifest.cpp parseProperty's reserved test, control_batch 2026-11-10, each alone,
+    //       reverted: made `key.starts_with(kPositionKey)` -> red, "S15.724: declaring "positions" was refused: ...";
+    //       made `key == kPositionKey` -> red, "declaring "position.zoom" was accepted".
     // COVERAGE-ASSERT: the row count.
     const OrderedJson aFloat = OrderedJson::parse(R"({"type": "float", "default": 1, "min": 0.1, "max": 2})");
     const char* reservedKeys[] = {"position", "position.zoom", "position.x", "position.y", "position.foo", "position."};
@@ -2354,8 +2314,8 @@ void positionValues(const QString& root) {
     }
     // GOAL: S15.998 -- a wallpaper.json declaring "paused" is refused with the paused reserved-key sentence;
     //       "Paused" and "pausedx" (above) are usable. False if a package could declare the key the app sets itself.
-    // CONTROL: control_batch: parseProperty's kPausedKey refusal (app/library/wpx_package.cpp) made
-    //       `if (false)` -> red, "S15.998: declaring "paused" was accepted".
+    // CONTROL: shared/wallpaper_manifest.cpp, parseProperty's kPausedKey refusal made `if (false)` (control_batch
+    //       2026-11-10, each alone, reverted) -> red, "S15.998: declaring "paused" was accepted".
     {
         const auto parsed = parseManifest(edited([&](OrderedJson& j) {
             j["properties"]["paused"] = OrderedJson::parse(R"({"type": "bool", "default": false})");
@@ -2378,6 +2338,48 @@ void positionValues(const QString& root) {
 }
 
 } // namespace
+
+// S17.19
+void readToEndUnbounded(const QString& root) {
+    // GOAL: S17.19 -- readToEnd with no limit (SIZE_MAX) reads the whole of a small file, and the whole
+    //       of a pipe, whose size fstat reports as 0.
+    // WHY-THIS-SHAPE: the pipe is the case that reaches the buffer's growth step, where "limit + 1"
+    //       would wrap to 0; a regular file of known size is read without ever growing the buffer.
+    // CONTROL: shared/wallpaper_manifest.cpp readToEnd(), the `maxBytes = std::min(...)` clamp deleted
+    //       (control_batch 2026-11-10, reverted) -> red, "S17.19: readToEnd(pipe, SIZE_MAX) gave error 14"
+    //       (EFAULT: the wrapped limit shrank the buffer to nothing and read() was handed a huge count).
+    const QByteArray text("eleven char");
+    const QString path = root + QStringLiteral("/small.txt");
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly) || file.write(text) != text.size()) {
+        harnessFailure("S17.19: the small file could not be written");
+        return;
+    }
+    file.close();
+    const wallpaperx::UniqueFd fd(::open(QFile::encodeName(path).constData(), O_RDONLY | O_CLOEXEC));
+    int pipeFds[2];
+    if (!fd || ::pipe2(pipeFds, O_CLOEXEC) != 0) {
+        harnessFailure("S17.19: the small file or the pipe could not be opened");
+        return;
+    }
+    const wallpaperx::UniqueFd readEnd(pipeFds[0]);
+    const bool written = ::write(pipeFds[1], text.constData(), text.size()) == text.size();
+    ::close(pipeFds[1]);
+    if (!written) {
+        harnessFailure("S17.19: the pipe could not be filled");
+        return;
+    }
+    const auto quoted = [](const std::expected<std::string, int>& got) {
+        return got ? QStringLiteral("\"%1\"").arg(QString::fromStdString(*got))
+                   : QStringLiteral("error %1").arg(got.error());
+    };
+    const auto fromFile = wallpaperx::manifest::readToEnd(fd.get(), SIZE_MAX);
+    expect(fromFile && *fromFile == text.toStdString(),
+           QStringLiteral("S17.19: readToEnd(small file, SIZE_MAX) gave %1").arg(quoted(fromFile)));
+    const auto fromPipe = wallpaperx::manifest::readToEnd(readEnd.get(), SIZE_MAX);
+    expect(fromPipe && *fromPipe == text.toStdString(),
+           QStringLiteral("S17.19: readToEnd(pipe, SIZE_MAX) gave %1").arg(quoted(fromPipe)));
+}
 
 int main(int argc, char* argv[]) {
     wallpaperx::testing::g_testName = "wpx_package";
@@ -2412,5 +2414,6 @@ int main(int argc, char* argv[]) {
     runPhase("soundPropertyRules", [&] { soundPropertyRules(root); });
     runPhase("probeReuse", [&] { probeReuse(root); });
     runPhase("positionValues", [&] { positionValues(root); });
+    runPhase("readToEndUnbounded", [&] { readToEndUnbounded(root); });
     return verdict();
 }

@@ -9,114 +9,30 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QHash>
-#include <QRegularExpression>
 #include <QStandardPaths>
 #include <QStringDecoder>
 
-#include <nlohmann/json.hpp>
 #include <zip.h>
 
 #include <algorithm>
 #include <cerrno>
-#include <climits>
-#include <cmath>
 #include <memory>
 #include <optional>
-#include <span>
+#include <string>
 #include <string_view>
 
 #include <dirent.h>
 #include <fcntl.h>
-#include <linux/openat2.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 
 namespace wallpaperx {
 
 namespace {
 
-using Json = nlohmann::ordered_json;
-
-constexpr const char* kManifestName = "wallpaper.json";
-
 QString systemError(int error)
 {
     return qt_error_string(error);
-}
-
-QString fromJson(const Json& value)
-{
-    return QString::fromStdString(value.get<std::string>());
-}
-
-// `value` as JSON fit to quote in a sentence: a number, or a short string of printable ASCII. Never
-// anything else: dump() recurses once per level of nesting, and a string may be any length.
-std::optional<QString> quotable(const Json& value)
-{
-    constexpr std::size_t kMaxQuotedBytes = 32;
-    if (value.is_string()) {
-        const auto& text = value.get_ref<const std::string&>();
-        if (text.size() > kMaxQuotedBytes || !std::ranges::all_of(text, [](char c) { return c >= 0x20 && c < 0x7f; })) {
-            return std::nullopt;
-        }
-    } else if (!value.is_number()) {
-        return std::nullopt;
-    }
-    return QString::fromStdString(value.dump());
-}
-
-// Json::parse does not recurse, but an ordered_json object copies its members when it grows, and
-// copying a value recurses once per level. A real manifest nests a handful deep.
-constexpr int kMaxManifestDepth = 64;
-
-// Whether `json` opens at most `limit` arrays and objects inside one another, without recursing.
-// Brackets inside strings are skipped, so up to the first byte the parser refuses, this is the
-// depth it would build.
-bool nestsWithin(const QByteArray& json, int limit)
-{
-    int depth = 0;
-    bool inString = false;
-    bool escaped = false;
-    for (const char c : json) {
-        if (inString) {
-            if (escaped) {
-                escaped = false;
-            } else if (c == '\\') {
-                escaped = true;
-            } else if (c == '"') {
-                inString = false;
-            }
-        } else if (c == '"') {
-            inString = true;
-        } else if (c == '[' || c == '{') {
-            if (++depth > limit) {
-                return false;
-            }
-        } else if ((c == ']' || c == '}') && depth > 0) {
-            --depth;
-        }
-    }
-    return true;
-}
-
-const QRegularExpression& colorPattern()
-{
-    // anchoredPattern, not ^...$: `$` also matches before a final "\n", which the daemon refuses.
-    static const QRegularExpression pattern(QRegularExpression::anchoredPattern(QStringLiteral("#[0-9a-fA-F]{6}")));
-    return pattern;
-}
-
-bool isPropertyKey(const QString& key)
-{
-    static const QRegularExpression pattern(
-        QRegularExpression::anchoredPattern(QStringLiteral("[A-Za-z0-9_.-]{1,%1}").arg(kMaxPropertyKeyBytes)));
-    return pattern.match(key).hasMatch();
-}
-
-QString propertyProblem(const QString& key, const QString& what)
-{
-    return QStringLiteral("Property \"%1\" in wallpaper.json %2").arg(key, what);
 }
 
 // `value` as a double when it holds a number of any width; QML hands an integer literal over as an int.
@@ -135,130 +51,80 @@ std::optional<double> numberOf(const QVariant& value)
     }
 }
 
-bool isPositionKey(QStringView key)
+// What QML hands over, as the shared rules take it: a number of any width, a bool, text, or a QColor,
+// which is a colour once its alpha is dropped. Nothing for anything else, which no rule accepts.
+std::optional<manifest::Value> sharedValue(const QVariant& value)
 {
-    return std::ranges::any_of(kPositionKeys, [key](std::string_view k) { return key == QLatin1StringView(k); });
+    if (const std::optional<double> number = numberOf(value)) {
+        return *number;
+    }
+    switch (value.typeId()) {
+    case QMetaType::Bool:
+        return value.toBool();
+    case QMetaType::QString:
+        return value.toString().toStdString();
+    case QMetaType::QColor:
+        if (const QColor color = value.value<QColor>(); color.isValid()) {
+            return color.name(QColor::HexRgb).toStdString();
+        }
+        return std::nullopt;
+    default:
+        return std::nullopt;
+    }
 }
 
-std::expected<WallpaperProperty, QString> parseProperty(const QString& key, const Json& spec)
+QVariant variantOf(const manifest::Value& value)
 {
-    const auto refuse = [&key](const QString& what) { return std::unexpected(propertyProblem(key, what)); };
-    // Not quoted back: it can hold anything, a bidirectional override included.
-    if (!isPropertyKey(key)) {
-        return std::unexpected(QStringLiteral("wallpaper.json has a property whose name is not 1 to %1 letters, "
-                                              "digits, \"_\", \"-\" or \".\".")
-                                   .arg(kMaxPropertyKeyBytes));
-    }
-    if (!spec.is_object()) {
-        return refuse(QStringLiteral("is not an object."));
-    }
-    // The daemon reads these as the wallpaper's position, which the app sets itself.
-    if (const QString reserved = QString::fromLatin1(kPositionKey); key == reserved || key.startsWith(reserved + u'.')) {
-        return refuse(QStringLiteral("is reserved: WallpaperX sets a wallpaper's position itself."));
-    }
-    if (key == QLatin1StringView(kPausedKey)) {
-        return refuse(QStringLiteral("is reserved: WallpaperX pauses a wallpaper itself."));
-    }
+    return std::visit(
+        [](const auto& v) {
+            if constexpr (std::is_same_v<std::decay_t<decltype(v)>, std::string>) {
+                return QVariant(QString::fromStdString(v));
+            } else {
+                return QVariant(v);
+            }
+        },
+        value);
+}
 
+// The rules are the shared ones; the default is not one of them.
+manifest::Property sharedProperty(const WallpaperProperty& property)
+{
+    manifest::Property shared;
+    shared.key = property.key.toStdString();
+    shared.type = property.type;
+    shared.minimum = property.minimum;
+    shared.maximum = property.maximum;
+    return shared;
+}
+
+WallpaperProperty appProperty(const manifest::Property& shared)
+{
     WallpaperProperty property;
-    property.key = key;
-    property.label = key;
-    if (spec.contains("label")) {
-        if (!spec["label"].is_string()) {
-            return refuse(QStringLiteral("has a label that is not text."));
-        }
-        property.label = fromJson(spec["label"]);
-    }
-
-    const auto type = spec.find("type");
-    if (type == spec.end() || !type->is_string()) {
-        return refuse(QStringLiteral("has no type."));
-    }
-    const std::string typeName = type->get<std::string>();
-    if (typeName == "float") {
-        property.type = WallpaperProperty::Type::Float;
-        if (!spec.contains("min") || !spec["min"].is_number() || !spec.contains("max") || !spec["max"].is_number()) {
-            return refuse(QStringLiteral("needs a numeric min and max."));
-        }
-        property.minimum = spec["min"].get<double>();
-        property.maximum = spec["max"].get<double>();
-        if (!std::isfinite(property.minimum) || !std::isfinite(property.maximum) || !(property.minimum < property.maximum)) {
-            return refuse(QStringLiteral("has a min that is not below its max."));
-        }
-    } else if (typeName == "bool") {
-        property.type = WallpaperProperty::Type::Bool;
-    } else if (typeName == "color") {
-        property.type = WallpaperProperty::Type::Color;
-    } else if (const auto quoted = quotable(*type)) {
-        return refuse(QStringLiteral("has type %1, which is not float, bool or color.").arg(*quoted));
-    } else {
-        return refuse(QStringLiteral("has a type that is not float, bool or color."));
-    }
-
-    const auto fallback = spec.find("default");
-    if (fallback == spec.end()) {
-        return refuse(QStringLiteral("has no default."));
-    }
-    QVariant value;
-    if (fallback->is_number()) {
-        value = fallback->get<double>();
-    } else if (fallback->is_boolean()) {
-        value = fallback->get<bool>();
-    } else if (fallback->is_string()) {
-        value = fromJson(*fallback);
-    }
-
-    // A key the daemon gives a meaning. Its declared range picks which of the playback speeds are
-    // offered, and a default between them is moved to the nearest offered by the daemon's own rule.
-    // The sound keys are checked in settleSoundProperties(), which knows whether they are kept.
-    if (key == u"speed") {
-        if (property.type != WallpaperProperty::Type::Float) {
-            return refuse(QStringLiteral("is not a float, and WallpaperX reads a video's speed as one."));
-        }
-        const QList<double> offered = property.choices();
-        if (offered.isEmpty()) {
-            return refuse(QStringLiteral("allows %1 to %2, and WallpaperX plays video at %3 times its speed.")
-                              .arg(property.minimum)
-                              .arg(property.maximum)
-                              .arg(QString::fromStdString(playbackSpeedsText("or"))));
-        }
-        if (value.typeId() == QMetaType::Double && value.toDouble() >= property.minimum &&
-            value.toDouble() <= property.maximum) {
-            const std::span<const double> among(offered.constData(), static_cast<std::size_t>(offered.size()));
-            value = nearestPlaybackSpeed(value.toDouble(), among);
-        }
-    }
-    const auto accepted = property.accept(value);
-    if (!accepted) {
-        return refuse(property.type == WallpaperProperty::Type::Float
-                          ? QStringLiteral("has a default outside its min and max.")
-                          : QStringLiteral("has a default that is not a %1.").arg(property.typeName()));
-    }
-    property.defaultValue = *accepted;
+    property.key = QString::fromStdString(shared.key);
+    property.label = QString::fromStdString(shared.label);
+    property.type = shared.type;
+    property.defaultValue = variantOf(shared.fallback);
+    property.minimum = shared.minimum;
+    property.maximum = shared.maximum;
     return property;
 }
 
-// Why the daemon would refuse a declared `mute` or `volume`, for the same reason as `speed`.
-std::optional<QString> soundPropertyProblem(const WallpaperProperty& property)
+// The manifest fields of `parsed`; the file fields are left empty.
+Wallpaper appWallpaper(const manifest::Manifest& parsed)
 {
-    if (property.key == QLatin1StringView(kMuteKey) && property.type != WallpaperProperty::Type::Bool) {
-        return propertyProblem(property.key, QStringLiteral("is not a bool, and WallpaperX reads \"mute\" as one."));
+    Wallpaper wallpaper;
+    wallpaper.type = QString::fromStdString(parsed.type);
+    wallpaper.title = QString::fromStdString(parsed.title);
+    wallpaper.author = QString::fromStdString(parsed.author);
+    for (const std::string& tag : parsed.tags) {
+        wallpaper.tags.append(QString::fromStdString(tag));
     }
-    if (property.key != QLatin1StringView(kVolumeKey)) {
-        return std::nullopt;
+    wallpaper.previewName = QString::fromStdString(parsed.previewName);
+    wallpaper.assetName = QString::fromStdString(parsed.assetName);
+    for (const manifest::Property& property : parsed.properties) {
+        wallpaper.properties.append(appProperty(property));
     }
-    if (property.type != WallpaperProperty::Type::Float) {
-        return propertyProblem(property.key,
-                               QStringLiteral("is not a float, and WallpaperX reads a video's volume as one."));
-    }
-    if (property.minimum < 0.0 || property.maximum > kMaxVolume) {
-        return propertyProblem(property.key,
-                               QStringLiteral("allows %1 to %2, and WallpaperX plays a video's volume from 0 to %3.")
-                                   .arg(property.minimum)
-                                   .arg(property.maximum)
-                                   .arg(kMaxVolume));
-    }
-    return std::nullopt;
+    return wallpaper;
 }
 
 struct ZipDiscard {
@@ -268,7 +134,7 @@ using ZipHandle = std::unique_ptr<zip_t, ZipDiscard>;
 
 struct OpenedArchive {
     ZipHandle zip;
-    FileStamp stamp;
+    struct stat st {};
 };
 
 // Takes `fd`, closing it on failure too.
@@ -292,47 +158,46 @@ std::expected<OpenedArchive, QString> openArchive(int fd)
         zip_error_fini(&described);
         return std::unexpected(QStringLiteral("It cannot be read as a ZIP archive: %1.").arg(text));
     }
-    return OpenedArchive{ZipHandle(zip), stampFrom(st)};
+    return OpenedArchive{ZipHandle(zip), st};
 }
 
-std::optional<zip_uint64_t> locate(zip_t* zip, const QString& name)
+std::optional<zip_uint64_t> locate(zip_t* zip, const std::string& name)
 {
-    const zip_int64_t index = zip_name_locate(zip, name.toUtf8().constData(), 0);
+    const zip_int64_t index = zip_name_locate(zip, name.c_str(), 0);
     return index < 0 ? std::nullopt : std::optional<zip_uint64_t>(static_cast<zip_uint64_t>(index));
 }
 
-std::expected<QByteArray, QString> readEntry(zip_t* zip, const QString& name, qint64 maxBytes)
+std::expected<std::string, std::string> readEntry(zip_t* zip, const std::string& name, std::size_t maxBytes)
 {
     const auto index = locate(zip, name);
     if (!index) {
-        return std::unexpected(QStringLiteral("The archive has no %1.").arg(name));
+        return std::unexpected("The archive has no " + name + ".");
     }
     zip_stat_t st;
     zip_stat_init(&st);
     if (zip_stat_index(zip, *index, 0, &st) != 0 || (st.valid & ZIP_STAT_SIZE) == 0) {
-        return std::unexpected(QStringLiteral("The size of %1 in the archive cannot be read.").arg(name));
+        return std::unexpected("The size of " + name + " in the archive cannot be read.");
     }
     if (st.size > static_cast<zip_uint64_t>(maxBytes)) {
-        return std::unexpected(QStringLiteral("%1 is larger than %2 MiB.").arg(name, QString::number(maxBytes >> 20)));
+        return std::unexpected(name + " is larger than " + std::to_string(maxBytes >> 20) + " MiB.");
     }
     zip_file_t* file = zip_fopen_index(zip, *index, 0);
     if (file == nullptr) {
-        return std::unexpected(QStringLiteral("%1 cannot be opened in the archive: %2.")
-                                   .arg(name, QString::fromUtf8(zip_strerror(zip))));
+        return std::unexpected(name + " cannot be opened in the archive: " + zip_strerror(zip) + ".");
     }
-    QByteArray bytes(static_cast<qsizetype>(st.size), Qt::Uninitialized);
-    qsizetype done = 0;
+    std::string bytes(static_cast<std::size_t>(st.size), '\0');
+    std::size_t done = 0;
     while (done < bytes.size()) {
         const zip_int64_t got = zip_fread(file, bytes.data() + done, static_cast<zip_uint64_t>(bytes.size() - done));
         if (got <= 0) {
             break;
         }
-        done += static_cast<qsizetype>(got);
+        done += static_cast<std::size_t>(got);
     }
-    const QString failure = done == bytes.size() ? QString() : QString::fromUtf8(zip_file_strerror(file));
+    const std::string failure = done == bytes.size() ? std::string() : std::string(zip_file_strerror(file));
     zip_fclose(file);
     if (done != bytes.size()) {
-        return std::unexpected(QStringLiteral("%1 cannot be read from the archive: %2.").arg(name, failure));
+        return std::unexpected(name + " cannot be read from the archive: " + failure + ".");
     }
     return bytes;
 }
@@ -347,239 +212,54 @@ Wallpaper broken(Wallpaper wallpaper, QString problem)
     return result;
 }
 
-struct ReadFile {
-    QByteArray bytes;
-    FileStamp stamp;
-};
+Wallpaper broken(Wallpaper file, const manifest::Problem& problem)
+{
+    if (problem.manifestStat) {
+        file.stamp = stampFrom(*problem.manifestStat);
+    }
+    return broken(std::move(file), QString::fromStdString(problem.text));
+}
 
-struct FoundFile {
-    FileStamp stamp;
-    // The file, open, in a folder; none in an archive.
-    UniqueFd fd;
-};
+// `file`'s name, as a usable wallpaper read as `read` says.
+Wallpaper usable(Wallpaper file, const manifest::Read& read)
+{
+    Wallpaper wallpaper = appWallpaper(read.manifest);
+    wallpaper.filePath = std::move(file.filePath);
+    wallpaper.fileName = std::move(file.fileName);
+    wallpaper.stamp = stampFrom(read.manifestStat);
+    wallpaper.previewStamp = stampFrom(read.previewStat);
+    wallpaper.assetStamp = stampFrom(read.asset.st);
+    return wallpaper;
+}
 
-// The files of one wallpaper, wherever they are kept. Messages are sentences for the user.
-class Contents {
+class ArchiveContents final : public manifest::Contents {
 public:
-    virtual ~Contents() = default;
-    virtual std::expected<ReadFile, QString> read(const QString& name, qint64 maxBytes) = 0;
-    // The file wallpaper.json names as `name`.
-    virtual std::expected<FoundFile, QString> find(const QString& name) = 0;
-};
+    ArchiveContents(zip_t* zip, const struct stat& st) : m_zip(zip), m_st(st) {}
 
-class ArchiveContents final : public Contents {
-public:
-    ArchiveContents(zip_t* zip, FileStamp stamp) : m_zip(zip), m_stamp(stamp) {}
-
-    std::expected<ReadFile, QString> read(const QString& name, qint64 maxBytes) override
+    std::expected<manifest::FileRead, std::string> read(const std::string& name, std::size_t maxBytes) override
     {
         auto bytes = readEntry(m_zip, name, maxBytes);
         if (!bytes) {
             return std::unexpected(bytes.error());
         }
-        return ReadFile{std::move(*bytes), m_stamp};
+        return manifest::FileRead{std::move(*bytes), m_st};
     }
 
-    std::expected<FoundFile, QString> find(const QString& name) override
+    std::expected<manifest::FileFound, std::string> find(const std::string& name) override
     {
         if (!locate(m_zip, name)) {
-            return std::unexpected(QStringLiteral("The archive has no %1, which wallpaper.json names.").arg(name));
+            return std::unexpected("The archive has no " + name + ", which wallpaper.json names.");
         }
-        return FoundFile{m_stamp, {}};
+        return manifest::FileFound{m_st, {}};
     }
 
 private:
     zip_t* m_zip;
-    FileStamp m_stamp;
+    struct stat m_st;
 };
-
-// Where /proc says `fd` is open; empty when it cannot tell.
-QByteArray openedPath(int fd)
-{
-    const QByteArray link = "/proc/self/fd/" + QByteArray::number(fd);
-    QByteArray target(PATH_MAX, Qt::Uninitialized);
-    const ssize_t length = ::readlink(link.constData(), target.data(), size_t(target.size()));
-    if (length <= 0 || length >= target.size()) {
-        return {};
-    }
-    target.truncate(length);
-    return target;
-}
-
-// Opens `name` below the folder `dirfd`, refusing with EXDEV a file that, links followed, is not
-// inside it.
-int openBeneath(int dirfd, const QByteArray& name, int flags)
-{
-    open_how how{};
-    how.flags = static_cast<quint64>(flags | O_CLOEXEC);
-    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
-    const int fd = static_cast<int>(::syscall(SYS_openat2, dirfd, name.constData(), &how, sizeof how));
-    // EXDEV also refuses an absolute link, or a ".." out and back in, that lands inside; ENOSYS is
-    // a kernel before 5.6, and a sandbox filtering openat2 answers ENOSYS or EPERM.
-    if (fd >= 0 || (errno != EXDEV && errno != ENOSYS && errno != EPERM)) {
-        return fd;
-    }
-    // Found with O_PATH, which opens nothing, then checked, then opened through its own descriptor:
-    // a device or FIFO outside the folder is never opened, even to be refused.
-    const UniqueFd found(::openat(dirfd, name.constData(), O_PATH | O_CLOEXEC));
-    if (!found) {
-        return -1;
-    }
-    const QByteArray folder = openedPath(dirfd);
-    const QByteArray file = openedPath(found.get());
-    if (folder.isEmpty() || !file.startsWith(folder == "/" ? folder : folder + '/')) {
-        errno = EXDEV;
-        return -1;
-    }
-    return ::open(("/proc/self/fd/" + QByteArray::number(found.get())).constData(), flags | O_CLOEXEC);
-}
-
-class FolderContents final : public Contents {
-public:
-    explicit FolderContents(int dirfd) : m_dir(dirfd) {}
-
-    std::expected<ReadFile, QString> read(const QString& name, qint64 maxBytes) override
-    {
-        struct stat st {};
-        auto fd = open(name, QStringLiteral("The folder has no %1.").arg(name), st);
-        if (!fd) {
-            return std::unexpected(fd.error());
-        }
-        auto bytes = readToEnd(fd->get(), maxBytes);
-        if (!bytes) {
-            return std::unexpected(bytes.error() == EFBIG
-                                       ? QStringLiteral("%1 is larger than %2 MiB.").arg(name, QString::number(maxBytes >> 20))
-                                       : QStringLiteral("%1 cannot be read: %2.").arg(name, systemError(bytes.error())));
-        }
-        return ReadFile{std::move(*bytes), stampFrom(st)};
-    }
-
-    std::expected<FoundFile, QString> find(const QString& name) override
-    {
-        struct stat st {};
-        auto fd = open(name, QStringLiteral("The folder has no %1, which wallpaper.json names.").arg(name), st);
-        if (!fd) {
-            return std::unexpected(fd.error());
-        }
-        return FoundFile{stampFrom(st), std::move(*fd)};
-    }
-
-private:
-    std::expected<UniqueFd, QString> open(const QString& name, QString missing, struct stat& st)
-    {
-        // O_NONBLOCK: a FIFO under the name is refused below instead of blocking the open.
-        UniqueFd fd(openBeneath(m_dir, name.toUtf8(), O_RDONLY | O_NONBLOCK | O_NOCTTY));
-        if (!fd) {
-            switch (const int error = errno) {
-            case ENOENT:
-            case ENOTDIR:
-                return std::unexpected(std::move(missing));
-            case EXDEV:
-                return std::unexpected(QStringLiteral("%1 leads outside the wallpaper's folder.").arg(name));
-            default:
-                return std::unexpected(QStringLiteral("%1 cannot be opened: %2.").arg(name, systemError(error)));
-            }
-        }
-        if (::fstat(fd.get(), &st) != 0 || !S_ISREG(st.st_mode)) {
-            return std::unexpected(QStringLiteral("%1 is not a regular file.").arg(name));
-        }
-        return fd;
-    }
-
-    int m_dir;
-};
-
-struct ReadContents {
-    Wallpaper wallpaper;
-    // The asset, still open, when `wallpaper` is usable and read from a folder.
-    UniqueFd asset;
-};
-
-// The one validator for a folder and an archive: the manifest, then every file it names.
-ReadContents readFrom(Wallpaper file, Contents& contents)
-{
-    const auto manifest = contents.read(QString::fromLatin1(kManifestName), kMaxManifestBytes);
-    if (!manifest) {
-        return {broken(std::move(file), manifest.error())};
-    }
-    file.stamp = manifest->stamp;
-    auto parsed = parseManifest(manifest->bytes);
-    if (!parsed) {
-        return {broken(std::move(file), parsed.error())};
-    }
-    const auto preview = contents.find(parsed->previewName);
-    if (!preview) {
-        return {broken(std::move(file), preview.error())};
-    }
-    auto asset = contents.find(parsed->assetName);
-    if (!asset) {
-        return {broken(std::move(file), asset.error())};
-    }
-    parsed->filePath = std::move(file.filePath);
-    parsed->fileName = std::move(file.fileName);
-    parsed->stamp = file.stamp;
-    parsed->previewStamp = preview->stamp;
-    parsed->assetStamp = asset->stamp;
-    return {std::move(*parsed), std::move(asset->fd)};
-}
-
-// Gives a video with sound its own sound controls, taking the declared ones where there are, and
-// takes them from a wallpaper known to have none: they would set nothing anyone can hear. One the
-// probe could not answer for keeps them as declared. What is kept is what Apply sends, so it is
-// held to the daemon's rule; the error is a sentence for the user.
-std::optional<QString> settleSoundProperties(Wallpaper& wallpaper)
-{
-    if (wallpaper.audio == AudioStreams::Absent) {
-        wallpaper.properties.removeIf([](const WallpaperProperty& property) {
-            return property.key == QLatin1StringView(kMuteKey) || property.key == QLatin1StringView(kVolumeKey);
-        });
-        return std::nullopt;
-    }
-    for (const WallpaperProperty& property : std::as_const(wallpaper.properties)) {
-        if (auto problem = soundPropertyProblem(property)) {
-            return problem;
-        }
-    }
-    if (wallpaper.audio == AudioStreams::Unknown) {
-        return std::nullopt;
-    }
-    // Taken as declared once the cap is reached: one more would cost the wallpaper its Apply.
-    const auto declared = [&wallpaper](const char* key) {
-        return wallpaper.properties.size() >= kMaxWallpaperProperties ||
-               std::ranges::contains(wallpaper.properties, QLatin1StringView(key), &WallpaperProperty::key);
-    };
-    if (!declared(kMuteKey)) {
-        WallpaperProperty mute;
-        mute.key = mute.label = QString::fromLatin1(kMuteKey);
-        mute.type = WallpaperProperty::Type::Bool;
-        mute.defaultValue = false;
-        wallpaper.properties.append(mute);
-    }
-    if (!declared(kVolumeKey)) {
-        WallpaperProperty volume;
-        volume.key = volume.label = QString::fromLatin1(kVolumeKey);
-        volume.type = WallpaperProperty::Type::Float;
-        volume.defaultValue = kMaxVolume;
-        volume.minimum = 0.0;
-        volume.maximum = kMaxVolume;
-        wallpaper.properties.append(volume);
-    }
-    return std::nullopt;
-}
 
 // Probe answers from an earlier scan, by asset path, each with the version of the asset it is for.
 using KnownAudio = QHash<QString, std::pair<FileStamp, AudioStreams>>;
-
-AudioStreams audioOf(const Wallpaper& wallpaper, int assetFd, const KnownAudio& known)
-{
-    if (wallpaper.type != u"video") {
-        return AudioStreams::Absent;
-    }
-    if (const auto it = known.constFind(wallpaper.assetPath); it != known.cend() && it->first == wallpaper.assetStamp) {
-        return it->second;
-    }
-    return probeAudioStreams(assetFd);
-}
 
 Wallpaper namedFile(const QString& path)
 {
@@ -593,110 +273,49 @@ Wallpaper namedFile(const QString& path)
 Wallpaper readFolderAt(int parent, const QByteArray& name, const QString& path, const KnownAudio& known = {})
 {
     Wallpaper folder = namedFile(path);
-    // The daemon and Plasma take a path as a D-Bus string, which must be UTF-8.
-    if (!QStringView(path).isValidUtf16()) {
-        return broken(std::move(folder), QStringLiteral("Its path is not valid UTF-8, so it cannot be set as a wallpaper. "
-                                                        "Rename the folder."));
-    }
-    UniqueFd dir(::openat(parent, name.constData(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
-    if (!dir) {
-        const int error = errno;
-        struct stat link {};
-        if (::fstatat(parent, name.constData(), &link, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(link.st_mode)) {
-            return broken(std::move(folder), QStringLiteral("It is a link, not a folder."));
+    const auto audioOf = [&path, &known](const manifest::Read& video) {
+        const QString assetPath = path + u'/' + QString::fromStdString(video.manifest.assetName);
+        if (const auto it = known.constFind(assetPath); it != known.cend() && it->first == stampFrom(video.asset.st)) {
+            return it->second;
         }
-        return broken(std::move(folder), error == ENOTDIR ? QStringLiteral("It is not a folder.")
-                                                          : QStringLiteral("It cannot be opened: %1.").arg(systemError(error)));
+        return probeAudioStreams(video.asset.fd.get());
+    };
+    auto read = manifest::readFolder(parent, name.toStdString(), encodeFileName(path).toStdString(), audioOf);
+    if (!read) {
+        return broken(std::move(folder), read.error());
     }
-    FolderContents contents(dir.get());
-    ReadContents read = readFrom(std::move(folder), contents);
-    Wallpaper& wallpaper = read.wallpaper;
-    if (wallpaper.usable()) {
-        wallpaper.assetPath = wallpaper.filePath + u'/' + wallpaper.assetName;
-        wallpaper.audio = audioOf(wallpaper, read.asset.get(), known);
-        if (auto problem = settleSoundProperties(wallpaper)) {
-            return broken(std::move(wallpaper), std::move(*problem));
-        }
-    }
-    return std::move(wallpaper);
+    Wallpaper wallpaper = usable(std::move(folder), read->read);
+    wallpaper.assetPath = wallpaper.filePath + u'/' + wallpaper.assetName;
+    wallpaper.audio = read->audio;
+    return wallpaper;
 }
 
 } // namespace
 
 bool isPlainRelativePath(const QString& name)
 {
-    if (name.isEmpty() || name.contains(u'\\') || name.contains(QChar(0))) {
-        return false;
-    }
-    const auto parts = QStringView(name).split(u'/');
-    return std::ranges::none_of(parts, [](QStringView part) { return part.isEmpty() || part == u"." || part == u".."; });
+    return manifest::isPlainRelativePath(name.toStdString());
 }
 
 QString WallpaperProperty::typeName() const
 {
-    switch (type) {
-    case Type::Float:
-        return QStringLiteral("float");
-    case Type::Bool:
-        return QStringLiteral("bool");
-    case Type::Color:
-        return QStringLiteral("color");
-    }
-    return {};
+    return QString::fromLatin1(sharedProperty(*this).typeName());
 }
 
 QList<double> WallpaperProperty::choices() const
 {
-    QList<double> within;
-    if (key != u"speed" || type != Type::Float) {
-        return within;
-    }
-    for (const double speed : kPlaybackSpeeds) {
-        if (speed >= minimum && speed <= maximum) {
-            within.append(speed);
-        }
-    }
-    return within;
+    const std::vector<double> within = sharedProperty(*this).choices();
+    return QList<double>(within.begin(), within.end());
 }
 
 std::optional<QVariant> WallpaperProperty::accept(const QVariant& value) const
 {
-    switch (type) {
-    case Type::Float: {
-        const std::optional<double> given = numberOf(value);
-        if (!given) {
-            return std::nullopt;
-        }
-        const double number = *given;
-        if (!std::isfinite(number) || number < minimum || number > maximum) {
-            return std::nullopt;
-        }
-        if (const QList<double> offered = choices(); !offered.isEmpty() && !offered.contains(number)) {
-            return std::nullopt;
-        }
-        return QVariant(number);
+    const std::optional<manifest::Value> given = sharedValue(value);
+    if (!given) {
+        return std::nullopt;
     }
-    case Type::Bool:
-        if (value.typeId() != QMetaType::Bool) {
-            return std::nullopt;
-        }
-        return value;
-    case Type::Color: {
-        if (value.typeId() == QMetaType::QColor) {
-            const QColor color = value.value<QColor>();
-            return color.isValid() ? std::optional<QVariant>(color.name(QColor::HexRgb)) : std::nullopt;
-        }
-        if (value.typeId() != QMetaType::QString) {
-            return std::nullopt;
-        }
-        const QString text = value.toString();
-        if (!colorPattern().match(text).hasMatch()) {
-            return std::nullopt;
-        }
-        return QVariant(text.toLower());
-    }
-    }
-    return std::nullopt;
+    const std::optional<manifest::Value> kept = sharedProperty(*this).accept(*given);
+    return kept ? std::optional<QVariant>(variantOf(*kept)) : std::nullopt;
 }
 
 QUrl Wallpaper::previewSource() const
@@ -742,131 +361,25 @@ std::optional<QVariant> Wallpaper::accept(const QString& key, const QVariant& va
     if (!usable()) {
         return std::nullopt;
     }
-    if (key == QLatin1StringView(kPausedKey)) {
-        return type == u"video" && value.typeId() == QMetaType::Bool ? std::optional(value) : std::nullopt;
+    const std::optional<manifest::Value> given = sharedValue(value);
+    if (!given) {
+        return std::nullopt;
     }
-    if (!isPositionKey(key)) {
-        const auto it = std::ranges::find(properties, key, &WallpaperProperty::key);
-        return it == properties.end() ? std::nullopt : it->accept(value);
-    }
-    if (key == QLatin1StringView(kPositionKey)) {
-        if (value.typeId() != QMetaType::QString || !positionModes().contains(value.toString())) {
-            return std::nullopt;
-        }
-        return value;
-    }
-    const std::optional<double> number = numberOf(value);
-    const bool allowed = number && (key == QLatin1StringView(kPositionZoomKey) ? positionZoomAllowed(*number)
-                                                                               : positionOffsetAllowed(*number));
-    return allowed ? std::optional<QVariant>(*number) : std::nullopt;
+    const auto it = std::ranges::find(properties, key, &WallpaperProperty::key);
+    const std::optional<manifest::Property> declared =
+        it == properties.end() ? std::nullopt : std::optional(sharedProperty(*it));
+    const std::optional<manifest::Value> kept =
+        manifest::acceptValue(type.toStdString(), declared ? &*declared : nullptr, key.toStdString(), *given);
+    return kept ? std::optional<QVariant>(variantOf(*kept)) : std::nullopt;
 }
 
 std::expected<Wallpaper, QString> parseManifest(const QByteArray& json)
 {
-    if (!nestsWithin(json, kMaxManifestDepth)) {
-        return std::unexpected(
-            QStringLiteral("wallpaper.json is nested more than %1 levels deep.").arg(kMaxManifestDepth));
+    const auto parsed = manifest::parse(std::string_view(json.constData(), size_t(json.size())));
+    if (!parsed) {
+        return std::unexpected(QString::fromStdString(parsed.error()));
     }
-    Json doc;
-    try {
-        doc = Json::parse(json.cbegin(), json.cend());
-    } catch (const Json::parse_error& e) {
-        return std::unexpected(QStringLiteral("wallpaper.json is not valid JSON (at byte %1).").arg(e.byte));
-    } catch (const Json::out_of_range&) {
-        // How the parser reports a number literal too large for a double, such as 1e999.
-        return std::unexpected(QStringLiteral("wallpaper.json holds a number too large to read."));
-    } catch (const Json::exception& e) {
-        return std::unexpected(QStringLiteral("wallpaper.json cannot be read: %1.").arg(QString::fromUtf8(e.what())));
-    }
-    if (!doc.is_object()) {
-        return std::unexpected(QStringLiteral("wallpaper.json is not a JSON object."));
-    }
-
-    const auto version = doc.find("schema_version");
-    if (version == doc.end()) {
-        return std::unexpected(QStringLiteral("wallpaper.json has no schema_version."));
-    }
-    const bool versionOne = (version->is_string() && version->get<std::string>() == "1")
-                            || (version->is_number_integer() && version->get<long long>() == 1);
-    if (!versionOne) {
-        const auto quoted = quotable(*version);
-        return std::unexpected(quoted ? QStringLiteral("wallpaper.json is for schema version %1, which this "
-                                                       "WallpaperX does not read.")
-                                            .arg(*quoted)
-                                      : QStringLiteral("wallpaper.json is for a schema version this WallpaperX "
-                                                       "does not read."));
-    }
-
-    // Each is required, a string, and non-empty.
-    const auto text = [&doc](const char* key) -> std::optional<QString> {
-        const auto it = doc.find(key);
-        if (it == doc.end() || !it->is_string() || it->get_ref<const std::string&>().empty()) {
-            return std::nullopt;
-        }
-        return fromJson(*it);
-    };
-
-    Wallpaper wallpaper;
-    const auto type = text("type");
-    if (!type || (*type != u"static" && *type != u"video" && *type != u"shader")) {
-        return std::unexpected(QStringLiteral("wallpaper.json needs a type of static, video or shader."));
-    }
-    wallpaper.type = *type;
-
-    const auto title = text("title");
-    if (!title) {
-        return std::unexpected(QStringLiteral("wallpaper.json has no title."));
-    }
-    wallpaper.title = *title;
-
-    if (doc.contains("author")) {
-        if (!doc["author"].is_string()) {
-            return std::unexpected(QStringLiteral("wallpaper.json has an author that is not text."));
-        }
-        wallpaper.author = fromJson(doc["author"]);
-    }
-
-    for (const char* key : {"preview", "file"}) {
-        const auto name = text(key);
-        if (!name) {
-            return std::unexpected(QStringLiteral("wallpaper.json has no \"%1\".").arg(QLatin1StringView(key)));
-        }
-        if (!isPlainRelativePath(*name)) {
-            return std::unexpected(QStringLiteral("wallpaper.json's \"%1\" is not a plain path inside the wallpaper.")
-                                       .arg(QLatin1StringView(key)));
-        }
-        (std::string_view(key) == "preview" ? wallpaper.previewName : wallpaper.assetName) = *name;
-    }
-
-    if (doc.contains("tags")) {
-        const Json& tags = doc["tags"];
-        if (!tags.is_array() || !std::ranges::all_of(tags, &Json::is_string)) {
-            return std::unexpected(QStringLiteral("wallpaper.json's tags are not a list of text."));
-        }
-        for (const Json& tag : tags) {
-            wallpaper.tags.append(fromJson(tag));
-        }
-    }
-
-    if (doc.contains("properties")) {
-        const Json& properties = doc["properties"];
-        if (!properties.is_object()) {
-            return std::unexpected(QStringLiteral("wallpaper.json's properties are not an object."));
-        }
-        if (qsizetype(properties.size()) > kMaxWallpaperProperties) {
-            return std::unexpected(QStringLiteral("wallpaper.json has %1 properties; WallpaperX takes at most %2.")
-                                       .arg(properties.size())
-                                       .arg(kMaxWallpaperProperties));
-        }
-        for (const auto& [key, spec] : properties.items()) {
-            auto property = parseProperty(QString::fromStdString(key), spec);
-            if (!property) {
-                return std::unexpected(property.error());
-            }
-            wallpaper.properties.append(std::move(*property));
-        }
-    }
-    return wallpaper;
+    return appWallpaper(*parsed);
 }
 
 Wallpaper readWallpaper(int fd, const QString& path)
@@ -880,9 +393,10 @@ Wallpaper readWallpaper(int fd, const QString& path)
     if (!archive) {
         return broken(std::move(file), archive.error());
     }
-    file.stamp = archive->stamp;
-    ArchiveContents contents(archive->zip.get(), archive->stamp);
-    return readFrom(std::move(file), contents).wallpaper;
+    file.stamp = stampFrom(archive->st);
+    ArchiveContents contents(archive->zip.get(), archive->st);
+    const auto read = manifest::readFrom(contents);
+    return read ? usable(std::move(file), *read) : broken(std::move(file), read.error());
 }
 
 Wallpaper readWallpaperFolder(const QString& path)
@@ -897,12 +411,12 @@ std::expected<QByteArray, QString> readWallpaperEntry(const QString& folderPath,
     if (!dir) {
         return std::unexpected(QStringLiteral("%1 cannot be opened: %2.").arg(folderPath, systemError(errno)));
     }
-    FolderContents contents(dir.get());
-    auto file = contents.read(name, maxBytes);
+    manifest::FolderContents contents(dir.get());
+    auto file = contents.read(name.toStdString(), static_cast<std::size_t>(std::max<qint64>(maxBytes, 0)));
     if (!file) {
-        return std::unexpected(file.error());
+        return std::unexpected(QString::fromStdString(file.error()));
     }
-    return std::move(file->bytes);
+    return QByteArray::fromStdString(file->bytes);
 }
 
 std::expected<QList<Wallpaper>, QString> scanLibrary(const QString& directory, const QList<Wallpaper>& previous)
@@ -1026,35 +540,11 @@ std::expected<UniqueFd, int> openRegularFile(int dirfd, const char* name, int fl
 
 std::expected<QByteArray, int> readToEnd(int fd, qint64 maxBytes)
 {
-    struct stat st {};
-    const qint64 size = ::fstat(fd, &st) == 0 ? qint64(st.st_size) : 0;
-    if (size > maxBytes) {
-        return std::unexpected(EFBIG);
+    auto bytes = manifest::readToEnd(fd, static_cast<std::size_t>(std::max<qint64>(maxBytes, 0)));
+    if (!bytes) {
+        return std::unexpected(bytes.error());
     }
-    // To the end, not to st_size: the file may be growing. One byte over says it is too large.
-    QByteArray bytes(qsizetype(std::max<qint64>(size, 0)) + 1, Qt::Uninitialized);
-    qsizetype done = 0;
-    for (;;) {
-        if (done == bytes.size()) {
-            if (bytes.size() > maxBytes) {
-                return std::unexpected(EFBIG);
-            }
-            bytes.resize(std::min<qsizetype>(bytes.size() * 2, maxBytes + 1));
-        }
-        const ssize_t got = ::read(fd, bytes.data() + done, size_t(bytes.size() - done));
-        if (got < 0 && errno == EINTR) {
-            continue;
-        }
-        if (got < 0) {
-            return std::unexpected(errno);
-        }
-        if (got == 0) {
-            break;
-        }
-        done += got;
-    }
-    bytes.truncate(done);
-    return bytes;
+    return QByteArray::fromStdString(*bytes);
 }
 
 std::optional<FileStamp> stampOf(const QString& path)

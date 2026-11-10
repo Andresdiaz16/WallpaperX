@@ -384,6 +384,9 @@ protected:
             // As the daemon refuses a name no monitor answers to; checked when the reply is built.
             m_bus.send(m.createErrorReply(QStringLiteral("io.wallpaperx.Daemon.Error.UnknownOutput"),
                                           QStringLiteral("no monitor answers to output ") + m.arguments().value(0).toString()));
+        } else if (m.member() == u"SetWallpaperWithProperties") {
+            // As the daemon answers: the frame generation the request was accepted at. Nothing is drawn here.
+            m_bus.send(m.createReply(QVariant::fromValue(qulonglong(0))));
         } else {
             m_bus.send(m.createReply());
         }

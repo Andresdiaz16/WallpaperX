@@ -5856,21 +5856,18 @@ void runIdempotentRenameChecks() {
     //       asserting only the binding admits a daemon that replies success. The error text is
     //       required to carry the write's own reason rather than merely being non-empty -- a bare
     //       "failed" sends the user nowhere.
-    // CONTROL: three, all in WallpaperManager::setMonitorOutput
-    //       (backend/daemon/wallpaper_manager.cpp), via control_batch.sh, --phase 're-asserting a name
-    //       a screen already has', 2026-09-30, all reverted. (a) the `if (!awaitPersisted(whyNot))
-    //       throw ...` made never to throw -> "FAIL: a screen name that never
-    //       reached the config file is reported as an error", printing "the call returned
-    //       normally". (b) an `m_outputs.erase(outputName);` added inside that branch before the
-    //       throw -- the plausible wrong fix, reporting the failure by rolling the binding back ->
-    //       "FAIL: a screen name that could not be written is still bound for this run", printing
-    //       "DP-A resolves to (nothing)", with the first check green. The pair is what separates
-    //       "the daemon reported" from "the daemon gave up". (c) the throw made
-    //       `throw std::runtime_error(m_health.persistence.detail)`, ignoring awaitPersisted()'s
-    //       `whyNot` -> "FAIL: a screen name that never reached the config file is reported as an
-    //       error", printing "it threw: <scratch>/ro/wallpaperx/config.json", the bare path with no
-    //       cause: nothing records a completed write's error into that field, since
-    //       applyPersistOutcomeLocked() composes it into a caller's copy at snapshot time only.
+    // CONTROL: three, in backend/daemon/wallpaper_manager.cpp, via control_batch.sh, --phase
+    //       're-asserting a name a screen already has', re-run 2026-11-10, all reverted. (a)
+    //       setMonitorOutput()'s `requirePersisted(...)` made `(void)m_writer.awaitOutcome();`, the wait
+    //       kept and the throw gone -> "FAIL: a screen name that never reached the config file is
+    //       reported as an error". (Deleting the call outright reddens an earlier check first, "a
+    //       SetMonitorOutput that returned had already finished its write".) (b) the call wrapped so a
+    //       throw first erases `m_outputs[outputName]` -- the plausible wrong fix, rolling the binding
+    //       back -> "FAIL: a screen name that could not be written is still bound for this run". The
+    //       pair is what separates "the daemon reported" from "the daemon gave up". (c)
+    //       requirePersisted()'s `throw std::runtime_error(why)` made `(m_health.persistence.detail)`,
+    //       ignoring the write's own reason -> "FAIL: a screen name that never reached the config file
+    //       is reported as an error": nothing records a completed write's error into that field.
     const std::string blockedThrew = name(3, "DP-A");
     const bool reportedTheLoss = blockedThrew.find("Permission denied") != std::string::npos;
     check(reportedTheLoss, "a screen name that never reached the config file is reported as an error");
@@ -7358,8 +7355,8 @@ void runFailedSaveChecks() {
     //       std::runtime_error(whyNot); }`, via control_batch.sh, --phase 'a save that cannot succeed',
     //       2026-09-30 -> "FAIL: a config write that cannot happen does not fail the request that
     //       triggered it", printing "requestWallpaper threw: .../ro/wallpaperx: could not be created:
-    //       Permission denied". A throw added inside awaitPersisted(std::string&) stays green now:
-    //       requestWallpaper no longer calls that overload.
+    //       Permission denied". Re-run 2026-11-10 with that `awaitPersisted();` made
+    //       `requirePersisted("control");`, the throwing wait setMonitorOutput uses -> red, the same line.
     std::string thrown;
     try {
         manager.requestWallpaper("static", wallpaper.string(), 0);

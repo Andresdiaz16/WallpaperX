@@ -360,16 +360,18 @@ void applyAndPause(Window& w, QQuickItem* root, LibraryManager& library, Service
     // WHY-THIS-SHAPE: a choice is made as the ComboBox makes it -- currentIndex set, then its
     //       `activated` signal -- rather than through the popup, whose offscreen geometry is not
     //       what is graded here; what is graded is the name each entry sends and what is shown.
-    // CONTROL: app/qml/ScreenSettings.qml, the model's `mode: "paused_while_focused"` made
-    //       `mode: "paused_while_focus"` -> red, "S15.245: the selector offers [play,always_paused,
-    //       paused_while_focus,paused_while_maximized], the daemon takes [...]" and "choosing entry 2
-    //       sent "always_paused" ..."; app/daemon/daemon_client.cpp pauseModes()'s `value_or(QString())`
-    //       made `value_or(QStringLiteral("play"))` -> red, "S15.245: with a mode the daemon does not
-    //       name the selector reads "Never"" (both control_batch, 2026-10-02).
-    // COVERAGE-ASSERT: the daemon's table is pinned at four modes, so a table that shrank on both
-    //       sides at once cannot pass "offered == daemon" with fewer choices graded. Controlled with
-    //       backend/daemon/pause_mode.h's toString() and ScreenSettings.qml's model both cut to
-    //       "play" (control_batch, 2026-10-04) -> red, "S15.245: the daemon names 1 mode(s), not 4".
+    // CONTROL: app/qml/ScreenSettings.qml, the model's `mode: "paused_while_focused"` made `mode:
+    //       "paused_while_focus"` (control_batch 2026-11-10, each alone, reverted) -> red, "S15.245: the selector
+    //       offers [play,always_paused,paused_while_focus,paused_while_maximized], the daemon takes [...]";
+    //       app/daemon/daemon_client.cpp pauseModes()'s `value_or(QString())` made `value_or(QStringLiteral("play"))`
+    //       -> red, "S15.245: with a mode the daemon does not name the selector reads "Never"" (control_batch,
+    //       2026-10-02).
+    // COVERAGE-ASSERT: the daemon's table is pinned at four modes, so a table that shrank on both sides at once cannot
+    //       pass "offered == daemon" with fewer choices graded. Controlled with PauseMode::WhileWindowMaximized
+    //       removed whole (enum value, row and isPauseMode() case in backend/daemon/pause_mode.h, its case in
+    //       backend/daemon/wallpaper_manager.cpp -- a shorter table alone no longer builds) and ScreenSettings.qml's
+    //       model cut to the other three (control_batch 2026-11-10, reverted) -> red, "S15.245: the daemon names
+    //       3 mode(s), not 4".
     QQuickItem* combo = pauseSelector(root);
     if (combo == nullptr) {
         expect(false, QStringLiteral("S15.245: Main shows no pause selector with DP-1 selected"));

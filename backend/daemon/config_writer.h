@@ -109,6 +109,8 @@ public:
     bool awaitQueued() noexcept;
     // The same wait; on false, `whyNot` receives the write's own reason, raw.
     bool awaitQueued(std::string& whyNot);
+    // The same wait, answered with outcome() taken after it.
+    Outcome awaitOutcome();
 
     // The single answer to whether the file holds what was handed over. Everything a report
     // needs is in it, so nothing else here answers part of the same question.

@@ -54,13 +54,14 @@ int main() {
     //       still reads play, always_paused, paused_while_focused, paused_while_maximized, and the
     //       app's isPauseMode() takes exactly those four.
     // WHY-THIS-SHAPE: read in a forked child: when the two merge, the side that reads the other's
-    //       array as its own may dereference enum values as string pointers and die, which must be
+    //       array as its own may read its name rows as string pointers and die, which must be
     //       a FAIL line here, not this harness's crash.
-    // CONTROL: app/daemon/daemon_client.h, `inline` put back on the app's kPauseModes
-    //       (control_batch, 2026-10-04) -> red in both entries: app_pause_mode_link_app_first
-    //       "S15.254: the reader exited 0 and read [daemon:play,play,play,play, ...]" (the daemon's
-    //       side read the app's pointers as modes); app_pause_mode_link_daemon_first "S15.254:
-    //       reading the two tables killed the reader with signal 11: ...".
+    // CONTROL: app/daemon/daemon_client.h, `inline` put back on the app's kPauseModes (control_batch
+    //       2026-11-10, reverted; the daemon's backend/daemon/pause_mode.h rows are 32 bytes) -> red in
+    //       both entries: app_pause_mode_link_app_first "S15.254: reading the two tables killed the
+    //       reader with signal 6: the app's and the daemon's kPauseModes are one array in this program";
+    //       app_pause_mode_link_daemon_first "S15.254: the reader exited 0 and read [daemon:play,...,
+    //       app:10000], not [... app:11110]".
     int fds[2];
     if (pipe2(fds, O_CLOEXEC) != 0) {
         wallpaperx::testing::harnessFailure("S15.254: no pipe for the reading child");

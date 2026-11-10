@@ -70,12 +70,13 @@ private:
     // synchronously, since they cost nothing to detect.
     //
     // SetWallpaper and SetWallpaperWithProperties both land here, `method` naming which in the log;
-    // SetWallpaper is the second with no properties.
+    // SetWallpaper is the second with no properties. Both answer the monitor's frame generation when
+    // the request was accepted: a FrameReady above it is a picture of this request or a later one.
     // Every entry as sent, not a map: deserializing into one keeps the first of a repeated key and
     // drops the rest unread.
     using WireProperties = std::vector<sdbus::DictEntry<std::string, sdbus::Variant>>;
-    void setWallpaper(const char* method, const std::string& type, const std::string& path, int32_t monitorId,
-                      const WireProperties& properties);
+    uint64_t setWallpaper(const char* method, const std::string& type, const std::string& path, int32_t monitorId,
+                          const WireProperties& properties);
 
     // Replaces the properties of the wallpaper a monitor holds without setting it again, so a
     // playing video carries on. Wakes the worker, which re-times the picture waiting to be shown.

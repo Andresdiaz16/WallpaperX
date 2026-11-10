@@ -186,10 +186,14 @@ bool ConfigWriter::awaitQueued() noexcept {
 }
 
 bool ConfigWriter::awaitQueued(std::string& whyNot) {
-    waitForQueued();
-    const Outcome result = outcome();
+    const Outcome result = awaitOutcome();
     if (!result.onDisk()) whyNot = result.why;
     return result.onDisk();
+}
+
+ConfigWriter::Outcome ConfigWriter::awaitOutcome() {
+    waitForQueued();
+    return outcome();
 }
 
 void ConfigWriter::onWritten(std::function<void()> written) {

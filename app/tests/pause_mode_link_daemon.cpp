@@ -10,13 +10,13 @@
 #include <vector>
 
 std::vector<std::string> daemonArrayNames() {
-    const wallpaperx::PauseMode* modes = wallpaperx::kPauseModes;
+    const wallpaperx::PauseModeNames* modes = wallpaperx::kPauseModes;
     // Read from memory, through the symbol the linker kept: a compiler that folded the constant
     // array would show this file's own definition whatever the program holds.
     asm volatile("" : "+r"(modes));
     std::vector<std::string> names;
     for (int i = 0; i < 4; ++i) {
-        names.emplace_back(wallpaperx::toString(modes[i]));
+        names.emplace_back(modes[i].name);
     }
     return names;
 }

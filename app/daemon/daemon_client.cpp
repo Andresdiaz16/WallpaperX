@@ -9,6 +9,7 @@
 #include <QDBusServiceWatcher>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QTimer>
 
 #include <algorithm>
 #include <cmath>
@@ -21,6 +22,11 @@ namespace {
 
 constexpr const char* kObjectPath = "/io/wallpaperx/Daemon";
 constexpr const char* kInterface = "io.wallpaperx.Daemon";
+// The daemon's answer to a change whose save has not come back in time: the change stands, and the
+// same call again is the retry.
+constexpr const char* kErrorSavePending = "io.wallpaperx.Daemon.Error.SavePending";
+constexpr int kSaveAttempts = 5;
+constexpr int kSaveRetryMs = 1000;
 
 QString notRunning()
 {
@@ -327,15 +333,22 @@ QDBusMessage DaemonClient::method(const char* name) const
 }
 
 void DaemonClient::send(QObject* context, const QDBusMessage& message, int timeoutMs,
-                        std::function<void(std::expected<QDBusMessage, QString>)> onReply)
+                        std::function<void(std::expected<QDBusMessage, QString>)> onReply, int attempt)
 {
     whenAnswered(context, m_bus.asyncCall(message, timeoutMs),
-                 [onReply = std::move(onReply), member = message.member()](const QDBusMessage& reply) {
-                     if (reply.type() == QDBusMessage::ErrorMessage) {
-                         onReply(std::unexpected(describe(QDBusError(reply), member)));
-                     } else {
+                 [this, context, message, timeoutMs, attempt, onReply = std::move(onReply)](const QDBusMessage& reply) {
+                     if (reply.type() != QDBusMessage::ErrorMessage) {
                          onReply(reply);
+                         return;
                      }
+                     const QDBusError error(reply);
+                     if (error.name() == QLatin1StringView(kErrorSavePending) && attempt < kSaveAttempts) {
+                         QTimer::singleShot(kSaveRetryMs, context, [this, context, message, timeoutMs, attempt, onReply] {
+                             send(context, message, timeoutMs, onReply, attempt + 1);
+                         });
+                         return;
+                     }
+                     onReply(std::unexpected(describe(error, message.member())));
                  });
 }
 

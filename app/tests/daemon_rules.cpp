@@ -49,20 +49,13 @@ std::string daemonShowError(const std::vector<std::pair<std::string, DaemonValue
     return why.empty() ? positionError(converted, type) : why;
 }
 
-// The enum walked through toString() rather than the daemon's kPauseModes, so the names come from
-// the switch the daemon puts on the wire even if the array were ever to read wrong in a binary
-// that also holds the app's copy (pause_mode_link_test checks that it does not). Past the last
-// mode toString() falls back to some name; the walk ends at the first name already seen, whatever
-// that fallback is, and a fallback that is not one of the modes is listed once, so S15.245's
-// comparison reports it instead of the walk running forever.
+// Each mode through toString(), the function the daemon puts on the wire. toString() reads the same
+// kPauseModes rows, so this guards nothing against the table itself reading wrong in this program:
+// pause_mode_link_test is what catches that.
 std::vector<std::string> daemonPauseModeNames() {
     std::vector<std::string> names;
-    for (int i = 0;; ++i) {
-        std::string name = toString(static_cast<PauseMode>(i));
-        if (std::ranges::find(names, name) != names.end()) {
-            break;
-        }
-        names.push_back(std::move(name));
+    for (const PauseModeNames& row : kPauseModes) {
+        names.emplace_back(toString(row.mode));
     }
     return names;
 }

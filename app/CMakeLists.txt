@@ -67,7 +67,11 @@ qt_add_executable(wallpaperx
     library/audio_probe.cpp
     library/audio_probe.h
     library/current_exception.h
-    library/unique_fd.h
+    ../shared/unique_fd.h
+    ../shared/audio_streams.h
+    ../shared/property_rules.h
+    ../shared/wallpaper_manifest.cpp
+    ../shared/wallpaper_manifest.h
     library/wpx_package.cpp
     library/wpx_package.h
     library/folder_watcher.cpp

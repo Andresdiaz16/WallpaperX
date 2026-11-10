@@ -189,9 +189,9 @@ void states(const QString& root) {
            QStringLiteral("S15.36: expected each signal once each way; saw %1 Unavailable and %2 Ready record(s)").arg(unavailableSeen).arg(readySeen));
 
     // GOAL: S15.36 -- a library folder that does not exist is Ready and empty, not Unavailable.
-    // CONTROL: app/library/wpx_package.cpp, scanLibrary's `if (error == ENOENT)` made `if (false)`
-    //       -> red, "S15.36: a missing library folder read as state 2, "…/no/such/folder cannot be
-    //       read: No such file or directory.""; restored, green.
+    // CONTROL: app/library/wpx_package.cpp, scanLibrary's `if (error == ENOENT)` made `if (false)` (control_batch
+    //       2026-11-10, each alone, reverted) -> red, "S15.36: a missing library folder read as state 2,
+    //       "…/no/such/folder cannot be read: No such file or directory."".
     LibraryManager missing(root + QStringLiteral("/no/such/folder"), kSettleMs);
     missing.rescan();
     const bool missingReady = readyWith(missing, 0);
@@ -213,9 +213,9 @@ void states(const QString& root) {
     if (!setMode(closed, 0755)) {
         harnessFailure("S15.36: the mode-000 folder could not be made readable again");
     }
-    // CONTROL: app/library/wpx_package.cpp:795 and :837, scanLibrary's `systemError(error)` made `QString()`,
-    //       control_batch 2026-10-15, app_library_manager '^states$' -> "FAIL: S15.36: a folder that cannot be
-    //       listed read as state 2, "…/closed cannot be read: .""; restored, green.
+    // CONTROL: app/library/wpx_package.cpp, scanLibrary's two `systemError(error)` for the folder made `QString()`
+    //       (control_batch 2026-11-10, each alone, reverted) -> "FAIL: S15.36: a folder that cannot be listed read as
+    //       state 2, "…/closed cannot be read: ."".
     expect(deniedSettled && denied.state() == LibraryManager::State::Unavailable &&
                denied.unavailableReason() == closed + QStringLiteral(" cannot be read: Permission denied."),
            QStringLiteral("S15.36: a folder that cannot be listed read as state %1, \"%2\"").arg(int(denied.state())).arg(denied.unavailableReason()));
@@ -237,13 +237,13 @@ void overflowingManifest(const QString& root) {
     // WHY-THIS-SHAPE: the wait is for any settled state, then the state and reason are printed, so
     //       a scan that threw is told apart from one stuck in Loading. The scan-failure handler it
     //       would reach is not reachable by any input today (see CONTROL).
-    // CONTROL: app/library/wpx_package.cpp, parseManifest's `catch (const Json::out_of_range&)`
-    //       clause deleted (the generic `Json::exception` catch takes it) -> red, "S15.48: ... reason
-    //       ... wallpaper.json cannot be read: [json.exception.out_of_range.406] ..."; both that and
-    //       the `Json::exception` clause deleted, so the throw leaves the scan -> red, "state 2
-    //       ... Reading …/overflow failed: [json.exception.out_of_range.406] number overflow ...",
-    //       which is library_manager.cpp's onFailed handler settling Unavailable; those two plus
-    //       rescan()'s `.onFailed(...)` block deleted -> red, "state 0" (stuck Loading); restored.
+    // CONTROL: shared/wallpaper_manifest.cpp, control_batch 2026-11-10, each alone, reverted: parse()'s `catch (const
+    //       Json::out_of_range&)` clause deleted (the generic `Json::exception` catch takes it) -> red, "S15.48: ...
+    //       wallpaper.json cannot be read: [json.exception.out_of_range.406] ..."; that and the `Json::exception`
+    //       clause deleted, so the throw leaves the scan -> red, "... Reading …/overflow failed:
+    //       [json.exception.out_of_range.406] number overflow ...", library_manager.cpp's onFailed settling
+    //       Unavailable. Those two plus rescan()'s `.onFailed(...)` deleted -> red, "state 0" (earlier run;
+    //       library_manager.cpp unchanged).
     LibraryManager m(dir, kSettleMs);
     m.rescan();
     const bool settled = waitUntil([&] { return m.state() != LibraryManager::State::Loading; }, kWaitMs);
@@ -456,9 +456,9 @@ void selectionAndValues(const QString& root) {
     expect(m.propertyValues() == defaults, QStringLiteral("S15.40: the defaults read %1").arg(describe(m.propertyValues())));
 
     c.values = 0;
-    // CONTROL: app/library/wpx_package.cpp, control_batch 2026-10-15: the speed choices' `>=`/`<=` range
-    //       test made `>`/`<` (2, the range's max, no longer offered) -> red, "S15.40: an accepted edit of
-    //       speed to 2 read {mute=true, ..., speed=1, ...} with 0 signal(s)"; restored.
+    // CONTROL: shared/wallpaper_manifest.cpp, Property::choices()'s `>=`/`<=` made `>`/`<` (control_batch 2026-11-10,
+    //       each alone, reverted; 2, the range's max, no longer offered) -> red, "S15.40: an accepted edit of speed to
+    //       2 read {...} with 0 signal(s)".
     // CONTROL: app/library/library_manager.cpp:262, setPropertyValue emitting propertyValuesChanged a second time,
     //       control_batch 2026-10-15, app_library_manager '^selectionAndValues$' -> "FAIL: S15.40: an accepted edit
     //       of speed to 2 read {mute=true, ..., speed=2, ...} with 2 signal(s)"; restored, green.
@@ -469,11 +469,11 @@ void selectionAndValues(const QString& root) {
     // GOAL: S15.40 -- an edit the property cannot hold is refused: false, no value changed, no
     //       propertyValuesChanged. Speed 0.75 is inside the declared range but is not a playback speed.
     // CONTROL: app/library/library_manager.cpp, setPropertyValue()'s `if (!accepted) { return false; }`
-    //       made `if (!accepted) { changeSelection([&] { m_edits.insert(key, value); }); return true; }`
-    //       -> red, "S15.40: the refused edit speed = 9 returned 1", and each row after it, the two volume
-    //       rows included (control_batch, re-run 2026-10-11); restored. The 0.75 row alone, control_batch
-    //       2026-10-14: accept()'s `!offered.contains(number)` (app/library/wpx_package.cpp) made `false` ->
-    //       red, "S15.40: the refused edit speed = 0.75 returned 1".
+    //       made `if (!accepted) { changeSelection([&] { m_edits.insert(key, value); }); return true; }` -> red,
+    //       "S15.40: the refused edit speed = 9 returned 1", and each row after it, the two volume rows included
+    //       (control_batch, re-run 2026-10-11). The 0.75 row alone, control_batch 2026-11-10, each alone, reverted:
+    //       shared/wallpaper_manifest.cpp Property::accept()'s choices test made `false` -> red, "S15.40: the refused
+    //       edit speed = 0.75 returned 1".
     const QVariantMap before = m.propertyValues();
     const std::pair<const char*, QVariant> refused[] = {
         {"speed", 9.0}, {"speed", 0.75}, {"speed", QStringLiteral("1")}, {"speed", std::numeric_limits<double>::quiet_NaN()},
@@ -487,9 +487,9 @@ void selectionAndValues(const QString& root) {
                QStringLiteral("S15.40: the refused edit %1 = %2 returned %3; values now %4, %5 signal(s)")
                    .arg(QLatin1String(key), value.toString()).arg(took).arg(describe(m.propertyValues())).arg(c.values));
     }
-    // CONTROL: app/library/wpx_package.cpp, accept()'s `if (value.typeId() == QMetaType::QColor) {`
-    //       made `if (false) {` -> red, "S15.40: a QColor tint and mute=false read {mute=false, ...,
-    //       tint=#ffffff, volume=1}" (control_batch, re-run 2026-10-11); restored.
+    // CONTROL: app/library/wpx_package.cpp, sharedValue()'s QColor branch made `false &&` (control_batch 2026-11-10,
+    //       each alone, reverted) -> red, "S15.40: a QColor tint and mute=false read {mute=false, ..., tint=#ffffff,
+    //       volume=1}".
     const bool tookColour = m.setPropertyValue(QStringLiteral("tint"), QColor(255, 0, 0));
     const bool tookMute = m.setPropertyValue(QStringLiteral("mute"), false);
     expect(tookColour && tookMute && m.propertyValues().value(QStringLiteral("tint")) == QVariant(QStringLiteral("#ff0000")) &&
@@ -1322,10 +1322,11 @@ void positionEdits(const QString& root) {
     //       offset, NaN or an unknown "position.*" key is refused, changing nothing and emitting nothing.
     // WHY-THIS-SHAPE: read back as text naming each type: QVariant's == takes the int 2 for 2.0, so a
     //       map comparison would pass an int that the daemon then refuses on the wire.
-    // CONTROL: app/library/wpx_package.cpp, control_batch 2026-10-18, each reverted: Wallpaper::accept()
-    //       keeping `value` for a number -> red, "S15.726: the edits were taken 1 and read {..., position.x=1(int),
-    //       ..., position.zoom=2(int)}"; its positionModes() test dropped -> red, "S15.726: the refused edit
-    //       position = centre returned 1".
+    // CONTROL: control_batch 2026-11-10, each alone, reverted: app/library/wpx_package.cpp Wallpaper::accept()
+    //       returning the given QVariant -> red, "S15.726: the edits were taken 1 and read {..., position.x=1(int),
+    //       ...}"; shared/wallpaper_manifest.cpp acceptValue taking an unknown mode name as cover -> red, "S15.726:
+    //       the refused edit position = centre returned 1". ("centre" is no mode name, so dropping the
+    //       positionModeAllowed test leaves this row green; S15.725 went red instead.)
     const bool took = m.setPropertyValue(QStringLiteral("position"), QStringLiteral("tile")) && m.setPropertyValue(QStringLiteral("position.zoom"), 2) &&
                       m.setPropertyValue(QStringLiteral("position.x"), 1) && m.setPropertyValue(QStringLiteral("position.y"), -0.5);
     const QString edited = QStringLiteral("{position=tile(QString), position.x=1(double), position.y=-0.5(double), position.zoom=2(double)}");

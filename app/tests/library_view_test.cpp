@@ -210,8 +210,9 @@ void grid(QQmlEngine& engine, QQuickWindow& window, LibraryManager& library, Imp
     //       folder whose path holds a space, '#', '?', '%' and a non-ASCII letter.
     // WHY-THIS-SHAPE: this is the only check that runs the real URL-to-provider path; the package
     //       test's round trip imitates how Qt splits the URL, this one does not have to.
-    // CONTROL: app/library/wpx_package.cpp, previewImageId's folder part made the raw `folderPath`
-    //       instead of its base64 -> red, "S15.45: the usable tile's preview ended with status 3"; restored.
+    // CONTROL: app/library/wpx_package.cpp, previewImageId's folder part made the raw `folderPath` instead of its
+    //       base64 (control_batch 2026-11-10, each alone, reverted) -> red, "S15.45: the usable tile's preview ended
+    //       with status 3".
     QQuickItem* image = firstInheriting(usable, "QQuickImage");
     // Image.Ready is 1 and Image.Error 3; Null (0) and Loading (2) are not an outcome yet.
     const bool loaded = image && waitUntil([&] { const int s = image->property("status").toInt(); return s == 1 || s == 3; }, kWaitMs);
@@ -550,12 +551,11 @@ void busyGrid(QQmlEngine& engine, QQuickWindow& window, const QString& root) {
     //       for the fixture's "hello", so a wrong or empty reason in the row cannot pass by being
     //       compared with itself.
     // CONTROL: app/qml/LibraryView.qml, the one-pass `.replace(/%[12]/g, ...)` made
-    //       `.arg(tile.modelData.fileName).arg(tile.modelData.problem)` -> red, "S15.55: the
-    //       broken tile's accessible name is "bad %2 wallpaper.json is not valid JSON ..."; restored.
-    //       app/library/wpx_package.cpp, the invalid-JSON reason "wallpaper.json is not valid JSON
-    //       (at byte %1)." made "... is not valid (at byte %1)." -> red, "S15.55: ... the row's
-    //       reason is "wallpaper.json is not valid (at byte 1)."" (and S15.46's shown reason), though
-    //       the name equals the row's reason exactly; restored.
+    //       `.arg(tile.modelData.fileName).arg(tile.modelData.problem)` -> red, "S15.55: the broken tile's accessible
+    //       name is "bad %2 wallpaper.json is not valid JSON ...". shared/wallpaper_manifest.cpp, parse()'s
+    //       invalid-JSON reason "wallpaper.json is not valid JSON (at byte {})." made "... is not valid (at byte {})."
+    //       (control_batch 2026-11-10, each alone, reverted) -> red, "S15.55: ... the row's reason is "wallpaper.json
+    //       is not valid (at byte 1)."", though the name equals the row's reason exactly.
     if (!broken) {
         expect(false, QStringLiteral("S15.55: the broken tile is not among the delegates at the grid's end: [%1]").arg(keptPaths.join(u", ")));
     } else {
@@ -760,7 +760,7 @@ void positionControls(QQmlEngine& engine, QQuickWindow& window, const QString& s
     LibraryManager library(dir, 30);
     KScreenClient kscreen(dbusSource(QStringLiteral("io.wallpaperx.test.KScreen.unowned")));
     DaemonClient daemon(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.Daemon.unowned"));
-    PlasmaController plasma(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.PlasmaShell.unowned"));
+    PlasmaController plasma(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.PlasmaShell.unowned"), 2000);
     ApplyController applier(kscreen, library, daemon, plasma, scratchPath + QStringLiteral("/screen-settings.json"));
     library.rescan();
     if (!waitUntil([&] { return library.state() == LibraryManager::State::Ready && library.wallpapers().size() == 2; }, kWaitMs) ||
@@ -1046,7 +1046,7 @@ int main(int argc, char* argv[]) {
     // bus and are never asked, so no monitor is selected and Apply stays blocked.
     KScreenClient kscreen(dbusSource(QStringLiteral("io.wallpaperx.test.KScreen.unowned")));
     DaemonClient daemon(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.Daemon.unowned"));
-    PlasmaController plasma(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.PlasmaShell.unowned"));
+    PlasmaController plasma(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.PlasmaShell.unowned"), 2000);
     auto applier = std::make_unique<ApplyController>(kscreen, *library, daemon, plasma,
                                                      scratch.path() + QStringLiteral("/screen-settings.json"));
     library->rescan();

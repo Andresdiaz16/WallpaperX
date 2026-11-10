@@ -4,8 +4,8 @@
 
 // Test-only: the daemon's own rules, compiled from backend/daemon, so an app check can be graded
 // against what the daemon will actually accept rather than against a copy of it. Standard types
-// only: the daemon's headers and the app's declare the same names inside namespace wallpaperx
-// (kMaxProperties, kPauseModes), which cannot both be declared in one translation unit.
+// only: the daemon's headers and the app's declare the same name inside namespace wallpaperx
+// (kPauseModes), which cannot both be declared in one translation unit.
 
 #include <string>
 #include <utility>
