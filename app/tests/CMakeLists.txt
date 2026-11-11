@@ -41,8 +41,16 @@ set(WALLPAPERX_APP_LIBRARY_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../library/audio_probe.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../library/wpx_package.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../library/wpx_package.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../shared/json_document.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../shared/json_document.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../../shared/wallpaper_manifest.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../shared/wallpaper_manifest.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../shared/steam_libraries.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../shared/steam_libraries.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../shared/we_project.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../shared/we_project.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../library/wallpaper_engine.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../library/wallpaper_engine.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../library/folder_watcher.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../library/folder_watcher.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../library/library_manager.cpp
@@ -166,6 +174,14 @@ if(Qt6Test_FOUND)
 else()
     wallpaperx_tests_not_registered("Qt6 Test not found -- app_library_changes (S15.52, S15.56, S15.59-S15.66, S15.70-S15.74, S15.86-S15.88) is not registered")
 endif()
+
+# Wallpaper Engine's Workshop items: Steam's library list, project.json, and LibraryManager listing
+# and watching a fake Steam folder in the test's scratch folder. No bus.
+qt_add_executable(wallpaperx-wallpaper-engine-test wallpaper_engine_test.cpp ${WALLPAPERX_APP_LIBRARY_SOURCES})
+wallpaperx_app_test_target(wallpaperx-wallpaper-engine-test)
+wallpaperx_app_library_test_target(wallpaperx-wallpaper-engine-test)
+wallpaperx_add_test(NAME app_wallpaper_engine COMMAND wallpaperx-wallpaper-engine-test)
+set_tests_properties(app_wallpaper_engine PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77 TIMEOUT 90)
 
 # S15.58, S15.75-S15.81, S15.89-S15.93: unpacking a .wpx into a wallpaper folder, and the Importer's
 # drop folder (links in it included) and explicit imports. The free-space case runs in a user and

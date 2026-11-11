@@ -181,7 +181,10 @@ int main(int argc, char* argv[])
     // Declared before the engine so they outlive every binding that reads them.
     wallpaperx::KScreenClient kscreen(wallpaperx::systemKScreenSource(QDBusConnection::sessionBus()));
     const QString libraryDirectory = wallpaperx::defaultLibraryDirectory();
-    wallpaperx::LibraryManager library(wallpaperx::wallpapersDirectory(libraryDirectory));
+    using wallpaperx::LibraryManager;
+    LibraryManager library(wallpaperx::wallpapersDirectory(libraryDirectory), LibraryManager::kSettleMs,
+                           LibraryManager::kPollMs, LibraryManager::Watching::Inotify, LibraryManager::kHoldMs,
+                           wallpaperx::defaultSteamRoots());
     wallpaperx::Importer importer(libraryDirectory, wallpaperx::wallpapersDirectory(libraryDirectory));
     QObject::connect(&importer, &wallpaperx::Importer::imported, &library, &wallpaperx::LibraryManager::reveal);
     wallpaperx::DaemonClient daemon(QDBusConnection::sessionBus());

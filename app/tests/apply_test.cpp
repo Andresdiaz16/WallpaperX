@@ -19,6 +19,7 @@
 #include "plasma_activation.h"
 #include "plasma_controller.h"
 #include "refresh_rate_reporter.h"
+#include "we_fixtures.h"
 #include "wpx_fixtures.h"
 
 #include <QCoreApplication>
@@ -119,6 +120,9 @@ struct Rig {
     std::unique_ptr<PlasmaController> plasma;
     std::unique_ptr<ApplyController> applier;
     QString ocean, river, glow;
+    // Set before build(): a fake Steam folder beside the library, with one Wallpaper Engine video item.
+    bool workshop = false;
+    QString workshopItem;
 
     ~Rig() {
         applier.reset();
@@ -163,7 +167,19 @@ struct Rig {
             }
         }
         kscreen = std::make_unique<KScreenClient>(dbusSource(kscreenFake->service()));
-        library = std::make_unique<LibraryManager>(lib, 30);
+        QStringList steamRoots;
+        if (workshop) {
+            const QString steam = scratch->path() + QStringLiteral("/steam");
+            workshopItem = steamItemFolder(steam) + QStringLiteral("/1001");
+            for (const QString& why : {writeSteamRoot(steam, {steam}), writeItem(steam, QStringLiteral("1001"), videoItem(QStringLiteral("Rain")))}) {
+                if (!why.isEmpty()) {
+                    return QStringLiteral("the fake Steam folder could not be written: ") + why;
+                }
+            }
+            steamRoots.append(steam);
+        }
+        library = std::make_unique<LibraryManager>(lib, 30, LibraryManager::kPollMs, LibraryManager::Watching::Inotify,
+                                                   LibraryManager::kHoldMs, steamRoots);
         client = std::make_unique<DaemonClient>(QDBusConnection::sessionBus(), daemonFake->service(), timeouts);
         plasma = std::make_unique<PlasmaController>(QDBusConnection::sessionBus(), shellFake->service(), plasmaTimeoutMs);
         startApplier();
@@ -172,7 +188,7 @@ struct Rig {
         client->refresh();
         if (!waitUntil([&] {
                 return kscreen->state() == KScreenClient::State::Ready && library->state() == LibraryManager::State::Ready &&
-                       library->wallpapers().size() == 3 && client->state() == DaemonClient::State::Ready;
+                       library->wallpapers().size() == (workshop ? 4 : 3) && client->state() == DaemonClient::State::Ready;
             }, kWaitMs)) {
             return QStringLiteral("KScreen, the library (%1 listed) and the daemon client never all became ready")
                 .arg(library->wallpapers().size());
@@ -491,6 +507,37 @@ void plasmaShell() {
 }
 
 // ---- Apply ---------------------------------------------------------------------------------
+
+// A Wallpaper Engine video item applies as a WallpaperX video: its own file, read where Steam keeps
+// it, with the sound and position values every video with sound takes and none of its own settings.
+void wallpaperEngineVideo() {
+    Rig rig;
+    rig.workshop = true;
+    if (!build(rig, "Wallpaper Engine video", QStringLiteral("workshop"))) {
+        return;
+    }
+    if (!rig.library->select(rig.workshopItem)) {
+        expect(false, QStringLiteral("the Wallpaper Engine video could not be opened"));
+        return;
+    }
+    // GOAL: P4.11 -- applying a Workshop video sends ("video", <item>/<file>) with its sound and position
+    //       values, and ends Done.
+    // CONTROL: app/library/wallpaper_engine.cpp, 2026-11-11, control_batch, reverted: readWorkshopItem()'s usable
+    //       row given `item.assetPath = path` after usableFolder() -> red, "the Wallpaper Engine video applied as
+    //       video <item> ...". (Its local `assetPath` now feeds only the sound probe.)
+    const bool finished = rig.apply();
+    const auto set = rig.sent("SetWallpaperWithProperties");
+    const QVariantMap values = set.isEmpty() ? QVariantMap() : set[0].args.value(3).toMap();
+    const QVariantMap wantValues = withPosition({{QStringLiteral("mute"), false}, {QStringLiteral("volume"), 1.0}});
+    expect(finished && rig.applier->applyState() == Progress::Done && set.size() == 1 &&
+               set[0].args.value(0).toString() == u"video" &&
+               set[0].args.value(1) == QString(rig.workshopItem + QStringLiteral("/clip [1] it's.flv")) &&
+               describeMap(values) == describeMap(wantValues),
+           QStringLiteral("the Wallpaper Engine video applied as %1 %2 %3, ending %4: %5")
+               .arg(set.isEmpty() ? QStringLiteral("(nothing)") : set[0].args.value(0).toString(),
+                    set.isEmpty() ? QString() : set[0].args.value(1).toString(), describeMap(values))
+               .arg(int(rig.applier->applyState())).arg(rig.applier->applyMessage()));
+}
 
 void applyOrder() {
     constexpr const char* goals = "S15.233, S15.234, S15.243";
@@ -4303,6 +4350,7 @@ int main(int argc, char* argv[]) {
     runPhase("activationScriptAlone", activationScriptAlone);
     runPhase("plasmaShell", plasmaShell);
     runPhase("applyOrder", applyOrder);
+    runPhase("wallpaperEngineVideo", wallpaperEngineVideo);
     runPhase("freeIds", freeIds);
     runPhase("bindQueue", bindQueue);
     runPhase("liveEdits", liveEdits);

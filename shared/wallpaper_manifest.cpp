@@ -2,6 +2,7 @@
 
 #include "wallpaper_manifest.h"
 
+#include "json_document.h"
 #include "playback_speed.h"
 
 #include <nlohmann/json.hpp>
@@ -25,37 +26,6 @@ namespace wallpaperx::manifest {
 namespace {
 
 using Json = nlohmann::ordered_json;
-
-// Json::parse does not recurse, but an ordered_json object copies its members when it grows, and
-// copying a value recurses once per level. A real manifest nests a handful deep.
-constexpr int kMaxManifestDepth = 64;
-
-// Whether `json` opens at most `limit` arrays and objects inside one another, without recursing.
-// Brackets inside strings are skipped, so up to the first byte the parser refuses, this is the depth
-// it would build.
-bool nestsWithin(std::string_view json, int limit) {
-    int depth = 0;
-    bool inString = false;
-    bool escaped = false;
-    for (const char c : json) {
-        if (inString) {
-            if (escaped) {
-                escaped = false;
-            } else if (c == '\\') {
-                escaped = true;
-            } else if (c == '"') {
-                inString = false;
-            }
-        } else if (c == '"') {
-            inString = true;
-        } else if (c == '[' || c == '{') {
-            if (++depth > limit) return false;
-        } else if ((c == ']' || c == '}') && depth > 0) {
-            --depth;
-        }
-    }
-    return true;
-}
 
 // `value` as JSON fit to quote in a sentence: a number, or a short string of printable ASCII. Never
 // anything else: dump() recurses once per level of nesting, and a string may be any length.
@@ -249,20 +219,9 @@ const Property* Manifest::find(std::string_view key) const {
 }
 
 std::expected<Manifest, std::string> parse(std::string_view json) {
-    if (!nestsWithin(json, kMaxManifestDepth)) {
-        return std::unexpected(std::format("wallpaper.json is nested more than {} levels deep.", kMaxManifestDepth));
-    }
-    Json doc;
-    try {
-        doc = Json::parse(json.begin(), json.end());
-    } catch (const Json::parse_error& e) {
-        return std::unexpected(std::format("wallpaper.json is not valid JSON (at byte {}).", e.byte));
-    } catch (const Json::out_of_range&) {
-        // How the parser reports a number literal too large for a double, such as 1e999.
-        return std::unexpected("wallpaper.json holds a number too large to read.");
-    } catch (const Json::exception& e) {
-        return std::unexpected(std::format("wallpaper.json cannot be read: {}.", e.what()));
-    }
+    auto parsed = parseJsonDocument(json, kManifestName);
+    if (!parsed) return std::unexpected(std::move(parsed.error()));
+    const Json& doc = *parsed;
     if (!doc.is_object()) return std::unexpected("wallpaper.json is not a JSON object.");
 
     const auto version = doc.find("schema_version");
@@ -331,15 +290,10 @@ std::expected<Manifest, std::string> parse(std::string_view json) {
 }
 
 std::optional<std::string> assetNameIn(std::string_view json) {
-    if (!nestsWithin(json, kMaxManifestDepth)) return std::nullopt;
-    Json doc;
-    try {
-        doc = Json::parse(json.begin(), json.end());
-    } catch (const Json::exception&) {
-        return std::nullopt;
-    }
-    const auto file = doc.find("file");
-    if (file == doc.end() || !file->is_string() || !isPlainRelativePath(file->get_ref<const std::string&>())) {
+    const auto doc = parseJsonDocument(json, kManifestName);
+    if (!doc) return std::nullopt;
+    const auto file = doc->find("file");
+    if (file == doc->end() || !file->is_string() || !isPlainRelativePath(file->get_ref<const std::string&>())) {
         return std::nullopt;
     }
     return file->get<std::string>();
@@ -527,7 +481,7 @@ std::expected<FileRead, std::string> FolderContents::read(const std::string& nam
 
 std::expected<FileFound, std::string> FolderContents::find(const std::string& name) {
     FileFound file;
-    auto fd = open(name, "The folder has no " + name + ", which wallpaper.json names.", file.st);
+    auto fd = open(name, "The folder has no " + name + ", which " + m_manifestName + " names.", file.st);
     if (!fd) return std::unexpected(fd.error());
     file.fd = std::move(*fd);
     return file;

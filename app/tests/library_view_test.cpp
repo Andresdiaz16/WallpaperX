@@ -14,6 +14,7 @@
 #include "plasma_controller.h"
 #include "preview_image_provider.h"
 #include "qml_load.h"
+#include "we_fixtures.h"
 #include "wpx_fixtures.h"
 #include "wpx_package.h"
 
@@ -496,14 +497,19 @@ void busyGrid(QQmlEngine& engine, QQuickWindow& window, const QString& root) {
                               {QStringLiteral("assets/video.mp4"), QByteArrayLiteral("not really a video")}};
         built = writeFolder(dir + QStringLiteral("/tile%1").arg(i, 2, 10, QLatin1Char('0')), entries).isEmpty();
     }
+    // A broken row that has a title: a Wallpaper Engine scene, which WallpaperX lists but cannot show.
+    const QString steam = root + QStringLiteral("/busy-steam");
+    const QString sceneTitle = QStringLiteral("Scene %2 %1");
+    const QString scenePath = steamItemFolder(steam) + QStringLiteral("/2002");
+    built = built && writeSteamRoot(steam, {steam}).isEmpty() && writeItem(steam, QStringLiteral("2002"), sceneItem(sceneTitle)).isEmpty();
     if (!built) {
         harnessFailure("S15.52: the library of forty wallpapers could not be built");
         return;
     }
-    LibraryManager library(dir, 30);
+    LibraryManager library(dir, 30, 200, LibraryManager::Watching::Inotify, 2000, {steam});
     Importer importer(root + QStringLiteral("/busy-drop"), dir, 30);
     library.rescan();
-    if (!waitUntil([&] { return library.state() == LibraryManager::State::Ready && library.wallpapers().size() == kPackages + 1; }, kWaitMs)) {
+    if (!waitUntil([&] { return library.state() == LibraryManager::State::Ready && library.wallpapers().size() == kPackages + 2; }, kWaitMs)) {
         expect(false, QStringLiteral("S15.52: the library of forty wallpapers never settled; state %1").arg(int(library.state())));
         return;
     }
@@ -525,11 +531,15 @@ void busyGrid(QQmlEngine& engine, QQuickWindow& window, const QString& root) {
     QList<QPointer<QQuickItem>> kept;
     QStringList keptPaths;
     QQuickItem* broken = nullptr;
+    QQuickItem* titled = nullptr;
     for (QQuickItem* tile : delegates()) {
         kept.append(tile);
         keptPaths.append(pathOf(tile));
         if (tile->property("modelData").value<Wallpaper>().fileName == badName) {
             broken = tile;
+        }
+        if (pathOf(tile) == scenePath) {
+            titled = tile;
         }
     }
     const double scrolled = gridView->property("contentY").toDouble();
@@ -541,21 +551,34 @@ void busyGrid(QQmlEngine& engine, QQuickWindow& window, const QString& root) {
         }
     }
 
-    // GOAL: S15.55 -- a broken tile's accessible name quotes its folder name as it is, "%1" and
-    //       "%2" included, and then the reason.
+    // GOAL: S15.55 -- a broken tile's accessible name quotes the wallpaper's display title (its title, or
+    //       its folder name when it has none) as it is, "%1" and "%2" included, and then the reason.
     // WHY-THIS-SHAPE: read through a QML expression on the tile, since the attached Accessible
-    //       object has no public C++ accessor; the folder name holds both markers, so a chained
-    //       substitution changes it whichever order it runs in.
+    //       object has no public C++ accessor; the folder name and the title hold both markers, so a
+    //       chained substitution changes them whichever order it runs in. An untitled and a titled broken
+    //       row are both checked, since for the untitled one the folder name and display title agree.
     //       The whole name is compared with the reason the tile's row carries, since the reason
     //       holds a byte offset; that reason is then matched on its own against the literal text
     //       for the fixture's "hello", so a wrong or empty reason in the row cannot pass by being
     //       compared with itself.
-    // CONTROL: app/qml/LibraryView.qml, the one-pass `.replace(/%[12]/g, ...)` made
-    //       `.arg(tile.modelData.fileName).arg(tile.modelData.problem)` -> red, "S15.55: the broken tile's accessible
-    //       name is "bad %2 wallpaper.json is not valid JSON ...". shared/wallpaper_manifest.cpp, parse()'s
-    //       invalid-JSON reason "wallpaper.json is not valid JSON (at byte {})." made "... is not valid (at byte {})."
-    //       (control_batch 2026-11-10, each alone, reverted) -> red, "S15.55: ... the row's reason is "wallpaper.json
-    //       is not valid (at byte 1)."", though the name equals the row's reason exactly.
+    // CONTROL: app/qml/LibraryView.qml, 2026-11-11, control_batch, each alone, reverted: the one-pass
+    //       `.replace(/%[12]/g, ...)` made `.arg(tile.modelData.displayTitle).arg(tile.modelData.problem)` -> red,
+    //       "S15.55: the broken tile's accessible name is "bad %2 wallpaper.json is not valid JSON ..."; its
+    //       `displayTitle` made `fileName` -> red, "S15.55: the titled broken tile's accessible name is "2002, ...".
+    //       shared/wallpaper_manifest.cpp, parse()'s invalid-JSON reason "wallpaper.json is not valid JSON (at
+    //       byte {})." made "... is not valid (at byte {})." (control_batch 2026-11-10, reverted) -> red, "S15.55:
+    //       ... the row's reason is "wallpaper.json is not valid (at byte 1)."".
+    if (!titled) {
+        expect(false, QStringLiteral("S15.55: the titled broken tile is not among the delegates at the grid's end: [%1]").arg(keptPaths.join(u", ")));
+    } else {
+        QQmlExpression name(qmlContext(titled), titled, QStringLiteral("Accessible.name"));
+        const QString got = name.evaluate().toString();
+        const QString problem = titled->property("modelData").value<Wallpaper>().problem;
+        const QString want = sceneTitle + QStringLiteral(", cannot be used: ") + problem;
+        expect(!name.hasError() && got == want && problem == u"Wallpaper Engine scenes are not supported yet.",
+               QStringLiteral("S15.55: the titled broken tile's accessible name is \"%1\"%2, not \"%3\"")
+                   .arg(got, name.hasError() ? QStringLiteral(" (") + name.error().toString() + u')' : QString(), want));
+    }
     if (!broken) {
         expect(false, QStringLiteral("S15.55: the broken tile is not among the delegates at the grid's end: [%1]").arg(keptPaths.join(u", ")));
     } else {
@@ -704,7 +727,8 @@ void importerViews(QQmlEngine& engine, QQuickWindow& window, const QString& root
     //       is hidden" (and its Dismiss line); its `onDismissed: root.importer.dismissNotices()` made
     //       `onDismissed: {}` -> red, "after Dismiss the notices are [Imported Dropped.]" only; the
     //       shared Banner's `visible: banner.text.length > 0` made `visible: false` -> red, all four
-    //       banner lines; restored.
+    //       banner lines; restored. Re-run 2026-11-11 (control_batch) after the Banner gained `dismissible`:
+    //       that last break and the problems `onDismissed: {}` break each red as described.
     const QString staged = drop + QStringLiteral("/.x.wpx");
     if (!writeBytes(staged, *package) || ::rename(QFile::encodeName(staged).constData(), QFile::encodeName(drop + QStringLiteral("/x.wpx")).constData()) != 0) {
         static_cast<void>(setMode(wallpapers, 0755));
@@ -1005,6 +1029,86 @@ void positionControls(QQmlEngine& engine, QQuickWindow& window, const QString& s
     expect(video && pausedShown() == 1, QStringLiteral("S15.1134: on the video (opened %1) the Paused switch is %2; expected 1 (shown)").arg(video).arg(pausedShown()));
 }
 
+// P4.18
+void sourceProblemsBanner(QQmlEngine& engine, QQuickWindow& window, const QString& root) {
+    const QString top = root + QStringLiteral("/sources-view");
+    const QString wpx = top + QStringLiteral("/wallpapers");
+    const QString steam = top + QStringLiteral("/steam");
+    const QString item = steamItemFolder(steam) + QStringLiteral("/1001");
+    if (!QDir().mkpath(top) || !writeBytes(wpx, "a file") || !writeSteamRoot(steam, {steam}).isEmpty() ||
+        !writeItem(steam, QStringLiteral("1001"), videoItem(QStringLiteral("Rain"))).isEmpty()) {
+        harnessFailure("P4.18: the failing library and the fake Steam could not be written");
+        return;
+    }
+    LibraryManager library(wpx, 30, 200, LibraryManager::Watching::Inotify, 2000, {steam});
+    // Never asked to scan: the view requires one, and its banners stay empty.
+    Importer importer(top + QStringLiteral("/drop"), wpx, 30);
+    library.rescan();
+    const auto view = load(engine, window, "LibraryView", library, &importer);
+    const QString heading = QStringLiteral("Some wallpapers could not be listed.");
+    const QString reason = wpx + QStringLiteral(" is not a folder.");
+    const bool listed = view && waitUntil([&] { return library.state() == LibraryManager::State::Ready && library.wallpapers().size() == 1; }, kWaitMs) &&
+                        settleEvents(window);
+    if (!listed) {
+        expect(!view, QStringLiteral("P4.18: the Wallpaper Engine video beside a failing library never listed"));
+        return;
+    }
+    // GOAL: P4.18 -- while the library is Ready and `problems` is not empty, a banner reads "Some
+    //       wallpapers could not be listed." and each problem, with no Dismiss button; when it is
+    //       Unavailable the banner is gone and the centred message says why; with no problems it is gone.
+    // WHY-THIS-SHAPE: the banner is found by its label whether shown or not, so hidden is told apart from
+    //       missing; the Dismiss button is looked for inside that banner only, beside the import banners'.
+    // CONTROL: app/qml/LibraryView.qml, 2026-11-11, control_batch, each alone, reverted: the banner's
+    //       `dismissible: false` deleted -> red, "P4.18: ... Dismiss shown 1"; `root.library.state ===
+    //       LibraryManager.Ready &&` deleted -> red, "P4.18: with nothing listed the view reads [...]";
+    //       `root.library.problems.length > 0` made `true` -> red, "P4.18: with no problems the view reads [...]".
+    QQuickItem* banner = bannerStarting(view.get(), heading);
+    QQuickItem* dismiss = banner ? buttonNamed(banner, QStringLiteral("Dismiss")) : nullptr;
+    expect(banner && banner->isVisible() && textsUnder(view.get()).contains(heading + u'\n' + reason) && !(dismiss && dismiss->isVisible()),
+           QStringLiteral("P4.18: beside a listed item the problems banner is %1, Dismiss shown %2; the view reads [%3]")
+               .arg(banner ? (banner->isVisible() ? QStringLiteral("shown") : QStringLiteral("hidden")) : QStringLiteral("missing"))
+               .arg(dismiss && dismiss->isVisible()).arg(textsUnder(view.get())));
+
+    QDir(item).removeRecursively();
+    const bool empty = waitUntil([&] { return library.state() == LibraryManager::State::Unavailable; }, kWaitMs) && settleEvents(window);
+    const QString centred = QStringLiteral("Wallpapers could not be listed. %1").arg(reason);
+    expect(empty && !textsUnder(view.get()).contains(heading) && textsUnder(view.get()).contains(centred),
+           QStringLiteral("P4.18: with nothing listed the view reads [%1]").arg(textsUnder(view.get())));
+
+    if (!QFile::remove(wpx) || !writeFolder(wpx + QStringLiteral("/ocean"), planEntries(QByteArray(kPlanManifest))).isEmpty()) {
+        harnessFailure("P4.18: the library folder could not be put back");
+        return;
+    }
+    library.rescan();
+    const bool clean = waitUntil([&] { return library.state() == LibraryManager::State::Ready && library.problems().isEmpty() && library.wallpapers().size() == 1; }, kWaitMs) &&
+                       settleEvents(window);
+    expect(clean && !textsUnder(view.get()).contains(heading),
+           QStringLiteral("P4.18: with no problems the view reads [%1]").arg(textsUnder(view.get())));
+
+    // GOAL: P4.30, P4.18 -- an empty library whose only problem is a Steam one shows the import
+    //       instructions and the problems banner together.
+    // WHY-THIS-SHAPE: the banner is found and must be visible, and the instructions are compared whole, so
+    //       a view that shows either alone fails.
+    // CONTROL: app/qml/LibraryView.qml, 2026-11-11, control_batch, each alone, reverted, each red with "P4.30: an
+    //       empty library with only a Steam problem ...": the banner's text needing `grid.count > 0` -> "shows banner
+    //       0"; the "No wallpapers yet" sentence emptied while there are problems -> "shows banner 1 and reads [...]"
+    //       without it; app/library/library_manager.cpp state() Unavailable with only Steam problems -> "(reached 0)".
+    if (!QDir(wpx + QStringLiteral("/ocean")).removeRecursively() ||
+        !writeBytes(steam + QStringLiteral("/steamapps/libraryfolders.vdf"), "\"libraryfolders\" {")) {
+        harnessFailure("P4.30: the library could not be emptied, or the list cut off");
+        return;
+    }
+    library.rescan();
+    const bool steamOnly = waitUntil([&] { return library.state() == LibraryManager::State::Ready && library.wallpapers().isEmpty() && library.problems().size() == 1; }, kWaitMs) &&
+                           settleEvents(window);
+    const QString none = QStringLiteral("No wallpapers yet. Import a .wpx file, or put one in %1.").arg(importer.dropDirectory());
+    QQuickItem* steamBanner = bannerStarting(view.get(), heading);
+    expect(steamOnly && textsUnder(view.get()).contains(none) && steamBanner && steamBanner->isVisible() &&
+               textsUnder(view.get()).contains(heading + u'\n' + library.problems().value(0)),
+           QStringLiteral("P4.30: an empty library with only a Steam problem (reached %1) shows banner %2 and reads [%3]")
+               .arg(steamOnly).arg(steamBanner && steamBanner->isVisible()).arg(textsUnder(view.get())));
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -1066,6 +1170,7 @@ int main(int argc, char* argv[]) {
             busyGrid(engine, window, scratch.path());
             importerViews(engine, window, scratch.path());
             positionControls(engine, window, scratch.path());
+            sourceProblemsBanner(engine, window, scratch.path());
         }
     }
     applier.reset();

@@ -29,4 +29,10 @@ inline QString describeCurrentException()
     return QStringLiteral("an unknown error");
 }
 
+// "Reading <what> failed: <the exception being handled>." Call only where describeCurrentException may.
+inline QString readingFailed(const QString& what)
+{
+    return QStringLiteral("Reading %1 failed: %2.").arg(what, describeCurrentException());
+}
+
 } // namespace wallpaperx

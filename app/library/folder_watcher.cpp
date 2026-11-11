@@ -121,9 +121,22 @@ bool FolderWatcher::openForWriting(int dirFd, const char* name) const
 
 FolderWatcher::FolderWatcher(QString directory, Items items, int settleMs, int pollMs, Watching watching, int holdMs,
                              QObject* parent)
+    : FolderWatcher(std::move(directory), items, isPackageFileName, settleMs, pollMs, watching, holdMs, parent)
+{
+}
+
+FolderWatcher::FolderWatcher(QString directory, bool (*isFileItem)(QByteArrayView name), int settleMs, int pollMs,
+                             Watching watching, int holdMs, QObject* parent)
+    : FolderWatcher(std::move(directory), Items::Files, isFileItem, settleMs, pollMs, watching, holdMs, parent)
+{
+}
+
+FolderWatcher::FolderWatcher(QString directory, Items items, bool (*isFileItem)(QByteArrayView name), int settleMs,
+                             int pollMs, Watching watching, int holdMs, QObject* parent)
     : QObject(parent)
     , m_directory(encodeFileName(directory))
     , m_items(items)
+    , m_isFileItem(isFileItem)
     , m_hold(holdMs)
 {
     m_settle.setSingleShot(true);
@@ -178,7 +191,20 @@ void FolderWatcher::pollInstead(const char* failed, int error)
 
 bool FolderWatcher::isItemName(const QByteArray& name) const
 {
-    return m_items == Items::Files ? isPackageFileName(name) : !name.startsWith('.');
+    return m_items == Items::Files ? m_isFileItem(name) : !name.startsWith('.');
+}
+
+bool FolderWatcher::followsInto(const QByteArray& relative) const
+{
+    switch (m_items) {
+    case Items::Files:
+        return false;
+    case Items::Folders:
+        return true;
+    case Items::ShallowFolders:
+        return relative.isEmpty();
+    }
+    return false;
 }
 
 void FolderWatcher::scanStarting()
@@ -317,6 +343,9 @@ bool FolderWatcher::watchTree(TreeWatch& tree, const QByteArray& relative, QSet<
             if (fresh) {
                 holdOpenFiles(tree, at);
             }
+        }
+        if (!followsInto(at)) {
+            continue;
         }
         // Listed after the watch is placed, so a folder made meanwhile is listed or reported.
         const Listing listing(::opendir(path.constData()), ::closedir);
@@ -545,7 +574,7 @@ bool FolderWatcher::handle(const inotify_event& event)
     // writes, so a name given to finished bytes by link() or rename() needs no close. Moved away
     // or removed: whatever was being written under it is no longer there.
     tree->writing.removeIf([&path](const auto& held) { return isAtOrUnder(held.key(), path); });
-    if (m_items == Items::Folders && (event.mask & IN_ISDIR) != 0) {
+    if (followsInto(dir) && (event.mask & IN_ISDIR) != 0) {
         // Its watch comes only now, so writes into it may have gone unseen while a scan read it.
         // One renamed in, as an import is, was finished before it had this name.
         if ((event.mask & IN_CREATE) != 0) {
@@ -642,7 +671,7 @@ FolderWatcher::Observation FolderWatcher::observe() const
             }
             const QByteArray path = observed.name;
             seen.entries.append(std::move(observed));
-            if (m_items == Items::Folders && known && S_ISDIR(st.st_mode)) {
+            if (followsInto(relative) && known && S_ISDIR(st.st_mode)) {
                 const int fd = ::openat(::dirfd(listing), entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
                 if (fd >= 0) {
                     const Listing inner(::fdopendir(fd), ::closedir);

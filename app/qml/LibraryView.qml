@@ -17,11 +17,13 @@ Item {
 
     readonly property bool listing: library.state === LibraryManager.Ready && grid.count > 0
 
-    // Lines for the user above the grid, shown until dismissed.
+    // Lines for the user above the grid, shown while there is text; with a Dismiss button unless
+    // `dismissible` is false.
     component Banner: Frame {
         id: banner
 
         property string text
+        property bool dismissible: true
         signal dismissed
 
         Layout.fillWidth: true
@@ -37,6 +39,7 @@ Item {
                 text: banner.text
             }
             Button {
+                visible: banner.dismissible
                 text: qsTr("Dismiss")
                 onClicked: banner.dismissed()
             }
@@ -91,6 +94,14 @@ Item {
             onDismissed: root.importer.dismissProblems()
         }
 
+        // When Unavailable the message below says the same. Lasts until the sources read again.
+        Banner {
+            dismissible: false
+            text: root.library.state === LibraryManager.Ready && root.library.problems.length > 0
+                  ? qsTr("Some wallpapers could not be listed.") + "\n" + root.library.problems.join("\n")
+                  : ""
+        }
+
         GridView {
             id: grid
             Layout.fillWidth: true
@@ -117,7 +128,7 @@ Item {
                 // In one pass: chained arg() would fill a "%2" inside the file name too.
                 Accessible.name: tile.modelData.usable
                     ? tile.modelData.displayTitle
-                    : qsTr("%1, cannot be used: %2").replace(/%[12]/g, p => p === "%1" ? tile.modelData.fileName
+                    : qsTr("%1, cannot be used: %2").replace(/%[12]/g, p => p === "%1" ? tile.modelData.displayTitle
                                                                                         : tile.modelData.problem)
                 Accessible.onPressAction: root.library.select(tile.modelData.filePath)
 
@@ -138,24 +149,52 @@ Item {
                             id: preview
                             anchors.fill: parent
                             anchors.margins: 1
-                            visible: tile.modelData.usable
+                            // A Wallpaper Engine item WallpaperX cannot show yet keeps its picture, faded.
+                            opacity: tile.modelData.usable ? 1 : 0.3
                             asynchronous: true
                             fillMode: Image.PreserveAspectCrop
                             // Fixed, so resizing the window does not decode every preview again.
                             sourceSize: Qt.size(2 * grid.tileWidth, 2 * grid.tileWidth * 9 / 16)
                             source: tile.modelData.previewSource
                         }
+                        // Over a faded preview the reason gets a backing, so the picture never makes it unreadable.
+                        Rectangle {
+                            anchors.centerIn: reason
+                            width: reason.contentWidth + 12
+                            height: Math.min(reason.contentHeight, reason.height) + 8
+                            visible: reason.visible && preview.status === Image.Ready
+                            color: palette.base
+                            opacity: 0.85
+                            radius: 2
+                        }
                         Label {
+                            id: reason
                             anchors.fill: parent
                             anchors.margins: 8
-                            visible: !tile.modelData.usable || preview.status === Image.Error
+                            // Below the badge, never under it.
+                            anchors.topMargin: badge.visible ? badge.y + badge.height + 4 : 8
+                            visible: !tile.modelData.usable || preview.status === Image.Error || preview.status === Image.Null
                             wrapMode: Text.Wrap
                             elide: Text.ElideRight
                             horizontalAlignment: Text.AlignHCenter
                             verticalAlignment: Text.AlignVCenter
                             textFormat: Text.PlainText
-                            color: palette.placeholderText
+                            color: preview.status === Image.Ready ? palette.text : palette.placeholderText
                             text: tile.modelData.usable ? qsTr("No preview") : tile.modelData.problem
+                        }
+                        Label {
+                            id: badge
+                            anchors.top: parent.top
+                            anchors.left: parent.left
+                            anchors.margins: 4
+                            leftPadding: 4
+                            rightPadding: 4
+                            visible: tile.modelData.fromWallpaperEngine
+                            textFormat: Text.PlainText
+                            font.pointSize: 8
+                            color: palette.windowText
+                            background: Rectangle { color: palette.window; opacity: 0.8; radius: 2 }
+                            text: qsTr("Wallpaper Engine")
                         }
                     }
                     Label {

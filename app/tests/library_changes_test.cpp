@@ -204,7 +204,7 @@ void copiedFolders(const QString& root) {
     //       size, since a partial asset reads as usable.
     // CONTROL: app/library/folder_watcher.cpp, watchTree()'s `holdOpenFiles(tree, at);` deleted ->
     //       red, "S15.56: a folder copied in with pauses was published as [Copied@1000,Good |
-    //       Copied@5000,Good]"; restored.
+    //       Copied@5000,Good]"; restored. Re-run 2026-11-11, control_batch, same red line.
     {
         Copy copy(dir + QStringLiteral("/copied"), wallpaperTitled("Copied", 5000), 1000);
         if (!copy.ok()) {
@@ -233,7 +233,7 @@ void copiedFolders(const QString& root) {
     // CONTROL: app/library/folder_watcher.cpp, watchTree()'s `holdOpenFiles(tree, at);` deleted ->
     //       red, "S15.56: a folder whose asset was still open was listed: [Copied,Good,Held]";
     //       IN_CLOSE_WRITE deleted from kInsideEvents -> red, "S15.56: a folder whose asset was held
-    //       open was not listed when it closed"; restored.
+    //       open was not listed when it closed"; restored. Re-run 2026-11-11, control_batch, same red line.
     {
         Copy copy(dir + QStringLiteral("/held"), wallpaperTitled("Held"), 18);
         if (!copy.ok()) {
@@ -282,7 +282,7 @@ void startedMidCopy(const QString& root) {
     //       quiet period with a scan forced meanwhile, so a missed hold is published.
     // CONTROL: app/library/folder_watcher.cpp, watchTree()'s `const bool fresh = !tree.inside.contains(wd);`
     //       made `const bool fresh = false;` -> red, "S15.70: a library started mid-copy published
-    //       [Copying@2000,Good | Copying@4000,Good]"; restored.
+    //       [Copying@2000,Good | Copying@4000,Good]"; restored. Re-run 2026-11-11, control_batch, same red line.
     LibraryManager m(dir, kSettleMs);
     History history(m);
     m.rescan();
@@ -455,7 +455,7 @@ void createdDuringScan(const QString& root) {
     //       patch -> red, the same line; the same insert deleted together with handle()'s
     //       `watchTree(*tree, path);` (in the `else` after `unwatchTree(*tree, path);`) -> red, the
     //       same line. The insert, holdOpenFiles and that watchTree call each deleted alone left this
-    //       line green; restored.
+    //       line green; restored. Re-run 2026-11-11, control_batch, same red line.
     std::optional<Copy> copy;
     if (const QString why = heldScanReadsCopy(*m, [&] {
             copy.emplace(m->directory() + QStringLiteral("/open"), wallpaperTitled("Open", 2000), 1000);
@@ -1137,7 +1137,7 @@ void subfolderLater(const QString& root) {
     //       after `unwatchTree(*tree, path);`) deleted together with placeWatch()'s
     //       `if (!watchTree(*tree, {}, &reached)) {` walk made `if (false) {`, one patch -> red,
     //       "S15.73: an asset written in a folder made later was published as [C,Good,Media@1000]";
-    //       the handle() half alone left it green; restored.
+    //       the handle() half alone left it green; restored. Re-run 2026-11-11, control_batch, same red line.
     QFile asset(dir + QStringLiteral("/media/media/video.mp4"));
     const QByteArray bytes(3000, 'm');
     if (!asset.open(QIODevice::WriteOnly) || !writeSlowly(asset, bytes.left(1000), 1, kWriteGapMs)) {
@@ -1198,7 +1198,7 @@ void filledAfterCreation(const QString& root) {
     // CONTROL: app/library/folder_watcher.cpp, handle()'s `watchTree(*tree, path);` (in the `else`
     //       after `unwatchTree(*tree, path);`) deleted -> red, "S15.86: a folder filled piece by
     //       piece after it was made was published as [Good,New@800 | Good,New@1600]", the only line
-    //       red (the first size is wherever the fill was when the quiet period ran out); restored.
+    //       red (the first size is wherever the fill was when the quiet period ran out); restored. Re-run 2026-11-11, control_batch, same red line.
     Entries entries = wallpaperTitled("New", piece);
     const QByteArray first = entries.takeLast().second;
     QFile asset(folder + QStringLiteral("/assets/video.mp4"));
@@ -1260,7 +1260,7 @@ void linkedIn(const QString& root) {
     // CONTROL: app/library/folder_watcher.cpp, handle() given the rule "a created name is still
     //       being written" (`if ((event.mask & IN_CREATE) != 0 && (event.mask & IN_ISDIR) == 0) {
     //       hold(*tree, path); return false; }` before the IN_MODIFY branch) -> red, "S15.61: an asset
-    //       hard-linked in, its staging name unlinked, left the wallpaper [linked(broken)]"; restored.
+    //       hard-linked in, its staging name unlinked, left the wallpaper [linked(broken)]"; restored. Re-run 2026-11-11, control_batch, same red line.
     if (::link(QFile::encodeName(staging + QStringLiteral("/video.mp4")).constData(),
                QFile::encodeName(dir + QStringLiteral("/linked/assets/video.mp4")).constData()) != 0 ||
         ::unlink(QFile::encodeName(staging + QStringLiteral("/video.mp4")).constData()) != 0) {
@@ -1921,10 +1921,10 @@ void steadyChanges(const QString& root) {
     //       one takes six quiet periods), so every scan has a request arrive while it runs. Arrivals
     //       go on until a list is published or the bound passes, so a slow machine only makes it
     //       take longer; reaching the bound is the failure.
-    // CONTROL: app/library/library_manager.cpp, rescan()'s continuation given, first, `if (m_scanning
-    //       == Scanning::YesThenAgain) { m_scanning = Scanning::No; rescan(); return; }` -- a scan asked
-    //       for again is thrown away and started afresh -> red, "S15.63: no list was published while a
-    //       wallpaper arrived every N ms for M ms"; restored.
+    // CONTROL: app/library/library_manager.cpp, 2026-11-11, control_batch, reverted: publish() given, first,
+    //       `if (m_scanning == Scanning::YesThenAgain) { m_scanning = Scanning::No; rescan(); return; }` -- a
+    //       scan asked for again is thrown away and started afresh -> red, "S15.63: no list was published
+    //       while a wallpaper arrived every N ms for M ms".
     const qint64 gap = settle + (scanMs - settle) / 3;
     const qint64 bound = std::max<qint64>(40 * scanMs, kWaitMs);
     QElapsedTimer clock;

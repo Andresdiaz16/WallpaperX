@@ -24,9 +24,11 @@ namespace wallpaperx {
 
 // Tells a scanner of one folder when to scan, and which items a scan may have read half-written.
 //
-// An item is an entry directly in the folder: each *.wpx file (Items::Files), or each folder with
-// everything inside it (Items::Folders). Hidden names are neither items nor part of one: editors'
-// swap files and the importer's unfinished folders stay out of it.
+// An item is an entry directly in the folder: each *.wpx file, or each file of another name a
+// filter accepts (Items::Files); each folder with everything inside it (Items::Folders); or each
+// folder with only the entries directly in it (Items::ShallowFolders), for a tree too large to
+// follow whole, where a write deeper down goes unseen. Hidden names are neither items nor part of
+// one: editors' swap files and the importer's unfinished folders stay out of it.
 //
 // Watched with inotify. A change schedules a scan once changes have been quiet for `settleMs`. A
 // file written to holds its item until it is closed, moved or removed, or `holdMs` pass with no
@@ -53,12 +55,15 @@ class FolderWatcher : public QObject {
     Q_OBJECT
 
 public:
-    enum class Items { Files, Folders };
+    enum class Items { Files, Folders, ShallowFolders };
     // Poll: never try inotify, as if it could not be started.
     enum class Watching { Inotify, Poll };
 
     FolderWatcher(QString directory, Items items, int settleMs, int pollMs, Watching watching, int holdMs,
                   QObject* parent = nullptr);
+    // Items::Files, each file `isFileItem` accepts rather than each *.wpx.
+    FolderWatcher(QString directory, bool (*isFileItem)(QByteArrayView name), int settleMs, int pollMs,
+                  Watching watching, int holdMs, QObject* parent = nullptr);
     ~FolderWatcher() override;
 
     bool polling() const { return std::holds_alternative<PollWatch>(m_watch); }
@@ -73,7 +78,10 @@ signals:
     void scanDue();
 
 private:
-    // The folder's own watch, with Items::Folders one per folder inside an item, and with
+    FolderWatcher(QString directory, Items items, bool (*isFileItem)(QByteArrayView name), int settleMs, int pollMs,
+                  Watching watching, int holdMs, QObject* parent);
+
+    // The folder's own watch, with folder items one per folder followed inside an item, and with
     // Items::Files one per file an item links to.
     struct TreeWatch {
         int wd = -1;
@@ -147,6 +155,9 @@ private:
     bool handle(const inotify_event& event);
     // Whether `name`, directly in the folder, can be an item.
     bool isItemName(const QByteArray& name) const;
+    // Whether the folders inside `relative`, a folder of the tree ("" for the folder itself), are
+    // watched and observed too.
+    bool followsInto(const QByteArray& relative) const;
     QDeadlineTimer holdFromNow();
     // Drops every hold whose deadline has passed, and schedules a scan if one was.
     void releaseHolds();
@@ -156,6 +167,8 @@ private:
 
     QByteArray m_directory;
     Items m_items;
+    // Items::Files only.
+    bool (*m_isFileItem)(QByteArrayView name);
     QTimer m_settle;
     // Runs only while polling.
     QTimer m_poll;

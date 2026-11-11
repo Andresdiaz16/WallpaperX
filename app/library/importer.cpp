@@ -900,7 +900,7 @@ void Importer::scanDropFolder()
     const QString directory = m_dropDirectory;
     QtConcurrent::run([directory] { return listDropFolder(directory); })
         .onFailed([directory]() -> DropScan {
-            return std::unexpected(QStringLiteral("Reading %1 failed: %2.").arg(directory, describeCurrentException()));
+            return std::unexpected(readingFailed(directory));
         })
         .then(this, [this](DropScan listing) {
             const QSet<QByteArray> held = m_watcher.scanFinished();

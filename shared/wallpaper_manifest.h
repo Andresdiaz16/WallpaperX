@@ -153,10 +153,11 @@ public:
 };
 
 // The files of the folder open as `dirfd`, which stays the caller's. Each must, its links followed, be
-// a regular file inside it.
+// a regular file inside it. `manifestName` is the file find()'s sentences say named the one missing.
 class FolderContents final : public Contents {
 public:
-    explicit FolderContents(int dirfd) : m_dir(dirfd) {}
+    explicit FolderContents(int dirfd, std::string manifestName = kManifestName)
+        : m_dir(dirfd), m_manifestName(std::move(manifestName)) {}
 
     std::expected<FileRead, std::string> read(const std::string& name, std::size_t maxBytes) override;
     std::expected<FileFound, std::string> find(const std::string& name) override;
@@ -165,6 +166,7 @@ private:
     std::expected<UniqueFd, std::string> open(const std::string& name, std::string missing, struct stat& st);
 
     int m_dir;
+    std::string m_manifestName;
 };
 
 // Why a wallpaper cannot be used, with wallpaper.json's stat when it was read.

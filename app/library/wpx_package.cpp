@@ -258,9 +258,6 @@ private:
     struct stat m_st;
 };
 
-// Probe answers from an earlier scan, by asset path, each with the version of the asset it is for.
-using KnownAudio = QHash<QString, std::pair<FileStamp, AudioStreams>>;
-
 Wallpaper namedFile(const QString& path)
 {
     Wallpaper file;
@@ -272,25 +269,56 @@ Wallpaper namedFile(const QString& path)
 // The folder `name` in `parent` (a descriptor, or AT_FDCWD), shown as `path`.
 Wallpaper readFolderAt(int parent, const QByteArray& name, const QString& path, const KnownAudio& known = {})
 {
-    Wallpaper folder = namedFile(path);
-    const auto audioOf = [&path, &known](const manifest::Read& video) {
-        const QString assetPath = path + u'/' + QString::fromStdString(video.manifest.assetName);
-        if (const auto it = known.constFind(assetPath); it != known.cend() && it->first == stampFrom(video.asset.st)) {
-            return it->second;
-        }
-        return probeAudioStreams(video.asset.fd.get());
+    const auto audio = [&path, &known](const manifest::Read& video) {
+        return audioOf(known, path + u'/' + QString::fromStdString(video.manifest.assetName), video);
     };
-    auto read = manifest::readFolder(parent, name.toStdString(), encodeFileName(path).toStdString(), audioOf);
+    auto read = manifest::readFolder(parent, name.toStdString(), encodeFileName(path).toStdString(), audio);
     if (!read) {
-        return broken(std::move(folder), read.error());
+        return broken(namedFile(path), read.error());
     }
-    Wallpaper wallpaper = usable(std::move(folder), read->read);
-    wallpaper.assetPath = wallpaper.filePath + u'/' + wallpaper.assetName;
-    wallpaper.audio = read->audio;
-    return wallpaper;
+    return usableFolder(path, read->read, read->audio);
 }
 
 } // namespace
+
+KnownAudio knownAudio(const QList<Wallpaper>& previous)
+{
+    KnownAudio known;
+    for (const Wallpaper& wallpaper : previous) {
+        // Only a probe's answer: any other type's Absent says nothing of the file. Unknown is asked
+        // again, since what kept the probe from answering may have passed.
+        if (wallpaper.usable() && wallpaper.type == u"video" && wallpaper.audio != AudioStreams::Unknown &&
+            !wallpaper.assetPath.isEmpty()) {
+            known.insert(wallpaper.assetPath, {wallpaper.assetStamp, wallpaper.audio});
+        }
+    }
+    return known;
+}
+
+AudioStreams audioOf(const KnownAudio& known, const QString& assetPath, const manifest::Read& video)
+{
+    if (const auto it = known.constFind(assetPath); it != known.cend() && it->first == stampFrom(video.asset.st)) {
+        return it->second;
+    }
+    return probeAudioStreams(video.asset.fd.get());
+}
+
+Wallpaper usableFolder(const QString& path, const manifest::Read& read, AudioStreams audio)
+{
+    Wallpaper wallpaper = usable(namedFile(path), read);
+    wallpaper.assetPath = wallpaper.filePath + u'/' + wallpaper.assetName;
+    wallpaper.audio = audio;
+    return wallpaper;
+}
+
+Wallpaper brokenFolder(const QString& path, QString problem, std::optional<FileStamp> stamp)
+{
+    Wallpaper wallpaper = broken(namedFile(path), std::move(problem));
+    if (stamp) {
+        wallpaper.stamp = *stamp;
+    }
+    return wallpaper;
+}
 
 bool isPlainRelativePath(const QString& name)
 {
@@ -320,7 +348,7 @@ std::optional<QVariant> WallpaperProperty::accept(const QVariant& value) const
 
 QUrl Wallpaper::previewSource() const
 {
-    if (!usable()) {
+    if (filePath.isEmpty() || previewName.isEmpty()) {
         return {};
     }
     return QUrl(QStringLiteral("image://%1/%2")
@@ -421,15 +449,20 @@ std::expected<QByteArray, QString> readWallpaperEntry(const QString& folderPath,
 
 std::expected<QList<Wallpaper>, QString> scanLibrary(const QString& directory, const QList<Wallpaper>& previous)
 {
-    KnownAudio known;
-    for (const Wallpaper& wallpaper : previous) {
-        // Only a probe's answer: any other type's Absent says nothing of the file. Unknown is asked
-        // again, since what kept the probe from answering may have passed.
-        if (wallpaper.usable() && wallpaper.type == u"video" && wallpaper.audio != AudioStreams::Unknown &&
-            !wallpaper.assetPath.isEmpty()) {
-            known.insert(wallpaper.assetPath, {wallpaper.assetStamp, wallpaper.audio});
-        }
+    const KnownAudio known = knownAudio(previous);
+    auto wallpapers = readFolders(
+        directory,
+        [&known](int dirFd, const QByteArray& name, const QString& path) { return readFolderAt(dirFd, name, path, known); },
+        QStringLiteral("It is a link to a folder. A wallpaper has to be a folder inside the library itself."));
+    if (wallpapers) {
+        std::ranges::sort(*wallpapers, listedBefore);
     }
+    return wallpapers;
+}
+
+std::expected<QList<Wallpaper>, QString> readFolders(const QString& directory, const FolderReader& read,
+                                                     const QString& linkProblem)
+{
     const QDir dir(directory);
     std::unique_ptr<DIR, int (*)(DIR*)> listing(::opendir(encodeFileName(dir.absolutePath()).constData()), ::closedir);
     if (!listing) {
@@ -471,21 +504,18 @@ std::expected<QList<Wallpaper>, QString> scanLibrary(const QString& directory, c
         if (S_ISLNK(st.st_mode)) {
             // Not followed: what changes inside a folder is watched, and the watch stops at the link.
             if (struct stat target {}; ::fstatat(dirFd, name.constData(), &target, 0) == 0 && S_ISDIR(target.st_mode)) {
-                wallpapers.append(broken(namedFile(path), QStringLiteral("It is a link to a folder. A wallpaper has to be "
-                                                                         "a folder inside the library itself.")));
+                wallpapers.append(broken(namedFile(path), linkProblem));
             }
             continue;
         }
         if (S_ISDIR(st.st_mode)) {
-            wallpapers.append(readFolderAt(dirFd, name, path, known));
+            wallpapers.append(read(dirFd, name, path));
         }
     }
     // readdir's end and its failure differ only in errno.
     if (const int error = errno; error != 0) {
         return std::unexpected(QStringLiteral("%1 cannot be read: %2.").arg(dir.absolutePath(), systemError(error)));
     }
-
-    std::ranges::sort(wallpapers, listedBefore);
     return wallpapers;
 }
 

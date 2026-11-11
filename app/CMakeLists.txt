@@ -70,10 +70,18 @@ qt_add_executable(wallpaperx
     ../shared/unique_fd.h
     ../shared/audio_streams.h
     ../shared/property_rules.h
+    ../shared/json_document.cpp
+    ../shared/json_document.h
     ../shared/wallpaper_manifest.cpp
     ../shared/wallpaper_manifest.h
+    ../shared/steam_libraries.cpp
+    ../shared/steam_libraries.h
+    ../shared/we_project.cpp
+    ../shared/we_project.h
     library/wpx_package.cpp
     library/wpx_package.h
+    library/wallpaper_engine.cpp
+    library/wallpaper_engine.h
     library/folder_watcher.cpp
     library/folder_watcher.h
     library/library_manager.cpp

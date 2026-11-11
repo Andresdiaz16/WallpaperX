@@ -9,6 +9,7 @@
 #include "wallpaper_position.h"
 
 #include <QByteArray>
+#include <QHash>
 #include <QList>
 #include <QObject>
 #include <QString>
@@ -19,6 +20,7 @@
 #include <QtQml/qqmlregistration.h>
 
 #include <expected>
+#include <functional>
 #include <iterator>
 #include <optional>
 #include <string_view>
@@ -74,9 +76,10 @@ struct FileStamp {
     friend bool operator==(const FileStamp&, const FileStamp&) = default;
 };
 
-// One wallpaper: a folder in the library, or a .wpx archive being checked before it is unpacked.
-// Either usable, with every manifest field read and checked against the files beside it, or
-// broken: `problem` says why, and only the file fields are set.
+// One wallpaper: a folder in the library, a Wallpaper Engine item read in place, or a .wpx archive
+// being checked before it is unpacked. Either usable, with every manifest field read and checked
+// against the files beside it, or not: `problem` says why. A broken one has only the file fields set;
+// a Wallpaper Engine item of a kind WallpaperX cannot show also has its title, tags and preview.
 struct Wallpaper {
     Q_GADGET
     QML_VALUE_TYPE(wallpaper)
@@ -84,6 +87,7 @@ struct Wallpaper {
     Q_PROPERTY(QString fileName MEMBER fileName CONSTANT)
     Q_PROPERTY(QString problem MEMBER problem CONSTANT)
     Q_PROPERTY(bool usable READ usable CONSTANT)
+    Q_PROPERTY(bool fromWallpaperEngine READ fromWallpaperEngine CONSTANT)
     Q_PROPERTY(QString displayTitle READ displayTitle CONSTANT)
     Q_PROPERTY(QString type MEMBER type CONSTANT)
     Q_PROPERTY(QString title MEMBER title CONSTANT)
@@ -96,6 +100,11 @@ struct Wallpaper {
     Q_PROPERTY(QStringList positionModes READ positionModes CONSTANT)
 
 public:
+    // Library: a WallpaperX wallpaper. WallpaperEngine: a Workshop item, whose folder is Steam's and
+    // is only ever read.
+    enum class Source { Library, WallpaperEngine };
+
+    Source source = Source::Library;
     // Absolute path of the wallpaper's folder, or of the archive, as decodeFileName gives it.
     QString filePath;
     QString fileName;
@@ -108,7 +117,8 @@ public:
     QString title;
     QString author;
     QStringList tags;
-    // Plain relative paths inside the folder or archive, checked to name a file there.
+    // Plain relative paths inside the folder or archive, checked to name a file there. A Wallpaper
+    // Engine item may have no preview.
     QString assetName;
     QString previewName;
     // The file the daemon is to open: `assetName` inside a usable folder, checked to resolve
@@ -127,9 +137,10 @@ public:
 
     // False for a default-constructed Wallpaper, which stands for none.
     bool usable() const { return !filePath.isEmpty() && problem.isEmpty(); }
+    bool fromWallpaperEngine() const { return source == Source::WallpaperEngine; }
     QString displayTitle() const { return title.isEmpty() ? fileName : title; }
     // An image://wallpaperx-preview URL naming this version of the preview, so a rewritten one
-    // gets a new URL instead of a cached image. Empty for a broken wallpaper.
+    // gets a new URL instead of a cached image. Empty when it has no preview; a broken one has none.
     QUrl previewSource() const;
     // The names of the position modes the daemon shows it in: every one for a still, all but tile
     // for anything else, as the daemon's positionError() rules.
@@ -201,6 +212,24 @@ std::expected<QByteArray, QString> readWallpaperEntry(const QString& folderPath,
 std::expected<QList<Wallpaper>, QString> scanLibrary(const QString& directory, const QList<Wallpaper>& previous = {});
 // The order scanLibrary lists in.
 bool listedBefore(const Wallpaper& a, const Wallpaper& b);
+
+// scanLibrary's walk, for any folder format: each subfolder directly in `directory` that is not hidden,
+// read by `read` from the open `directory` as its entry `name`, shown as `path`; each link to a folder
+// listed broken with `linkProblem`. A directory that does not exist lists none. Not sorted.
+using FolderReader = std::function<Wallpaper(int directoryFd, const QByteArray& name, const QString& path)>;
+std::expected<QList<Wallpaper>, QString> readFolders(const QString& directory, const FolderReader& read,
+                                                     const QString& linkProblem);
+
+// Probe answers from an earlier scan, by asset path, each with the version of the asset it is for.
+using KnownAudio = QHash<QString, std::pair<FileStamp, AudioStreams>>;
+KnownAudio knownAudio(const QList<Wallpaper>& previous);
+// What the video `read`, its asset open, holds for sound: `known`'s answer for `assetPath` when it is
+// for this version of the file, else the probe's.
+AudioStreams audioOf(const KnownAudio& known, const QString& assetPath, const manifest::Read& video);
+// The usable wallpaper at `path` that `read` describes, the sound found in it already settled.
+Wallpaper usableFolder(const QString& path, const manifest::Read& read, AudioStreams audio);
+// The wallpaper at `path`, broken for `problem`.
+Wallpaper brokenFolder(const QString& path, QString problem, std::optional<FileStamp> stamp = std::nullopt);
 
 // Whether a directory entry named `name` is a package: *.wpx in any case, not hidden.
 bool isPackageFileName(QByteArrayView name);

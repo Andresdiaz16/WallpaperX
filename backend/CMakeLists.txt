@@ -2675,6 +2675,8 @@ if(WALLPAPERX_BUILD_KDE_PLUGIN)
     add_executable(wpxctl
         wpxctl/main.cpp
         ../shared/property_rules.h
+        ../shared/json_document.cpp
+        ../shared/json_document.h
         ../shared/wallpaper_manifest.cpp
         ../shared/wallpaper_manifest.h
     )

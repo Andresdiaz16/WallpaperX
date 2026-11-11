@@ -90,7 +90,7 @@ Item {
                 }
                 Label {
                     anchors.centerIn: parent
-                    visible: preview.status === Image.Error
+                    visible: preview.status === Image.Error || (root.chosen.usable && preview.status === Image.Null)
                     textFormat: Text.PlainText
                     color: palette.placeholderText
                     text: qsTr("No preview")
@@ -108,7 +108,8 @@ Item {
                     wrapMode: Text.Wrap
                     textFormat: Text.PlainText
                     text: {
-                        let parts = [root.chosen.type];
+                        let parts = [root.chosen.fromWallpaperEngine ? qsTr("%1 from Wallpaper Engine").arg(root.chosen.type)
+                                                                     : root.chosen.type];
                         if (root.chosen.author !== "")
                             parts.push(qsTr("by %1").arg(root.chosen.author));
                         if (root.chosen.tags.length > 0)

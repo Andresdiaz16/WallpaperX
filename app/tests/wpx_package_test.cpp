@@ -432,9 +432,9 @@ void deepBeforeSiblings() {
     // WHY-THIS-SHAPE: the deep value is followed by more keys at each level, so growing the
     //       ordered_json object (a vector of pairs with a const key, copied rather than moved when it
     //       reallocates) copies the deep value recursively inside Json::parse.
-    // CONTROL: shared/wallpaper_manifest.cpp parse()'s `if (!nestsWithin(json, kMaxManifestDepth))` made `if (false)`
-    //       (control_batch 2026-11-10, each alone, reverted) -> red, "S15.659: a schema_version nested 100000 deep,
-    //       with keys after it crashed (signal 11)".
+    // CONTROL: shared/json_document.cpp, 2026-11-11, control_batch, reverted (re-run there after the move): parseJsonDocument()'s
+    //       `if (!nestsWithin(json, kMaxJsonDepth))`, which parse() calls, made `if (false)` -> red, "S15.659:
+    //       a schema_version nested 100000 deep, with keys after it crashed (signal 11)".
     const int graded = gradeUnquotable("S15.659", cases, std::size(cases));
     expect(graded == int(std::size(cases)), QStringLiteral("S15.659: %1 manifests were graded, not %2").arg(graded).arg(std::size(cases)));
 }
@@ -478,10 +478,13 @@ void manifestDepthLimit() {
     //       after an escaped quote too, are not levels, and an escaped backslash does not leave a string open.
     // WHY-THIS-SHAPE: the levels alternate arrays and objects, so a scan counting only one kind passes 65 as
     //       ~33; the escaped-backslash case is refused only if the string is seen to close before the deep value.
-    // CONTROL: shared/wallpaper_manifest.cpp nestsWithin, control_batch 2026-11-10, each alone, reverted:
-    //       kMaxManifestDepth 65 -> "FAIL: S15.675: a document nested 65 deep was accepted"; `escaped = true` made
-    //       `false` -> "100 brackets after an escaped quote inside a string was refused". Its `>=`, `'{'`,
-    //       string-opening and `escaped = false` breaks were not re-run at the new site.
+    // CONTROL: 2026-11-11, control_batch, each alone, reverted: shared/json_document.h kMaxJsonDepth 65 ->
+    //       red, "S15.675: a document nested 65 deep was accepted"; shared/json_document.cpp (re-run there after
+    //       the move) nestsWithin()'s
+    //       `escaped = true` made `false` -> red, "100 brackets after an escaped quote inside a string was
+    //       refused"; `++depth > limit` made `>=` -> red, "a document nested 64 deep ..."; `'{'` no longer a
+    //       level -> red, "a document nested 65 deep was accepted"; the `escaped = false` reset deleted -> red,
+    //       "a string ending in an escaped backslash, then 65 deep ...".
     for (const Case& c : cases) {
         if (!c.json.contains("\"extra\"")) {
             harnessFailure(std::string("S15.675: the manifest for ") + c.what + " could not be made");
@@ -1628,8 +1631,7 @@ void previewAddresses(const QString& root) {
     //       "the rewritten preview kept its address"; its `QString::number(stamp.device)` made a
     //       per-call counter -> red, "an unchanged wallpaper's address changed between reads";
     //       previewSource()'s `previewImageId(filePath, previewName, previewStamp)` made `..., stamp)`
-    //       -> red, "the rewritten preview kept its address"; `if (!usable()) {` made `if (false) {`
-    //       -> red, "a broken wallpaper has a preview address"; restored, green each time.
+    //       -> red, "the rewritten preview kept its address"; restored, green each time.
     const QString path = root + QStringLiteral("/changing");
     if (!writeFolder(path, planEntries(QByteArray(kPlanManifest))).isEmpty()) {
         harnessFailure("S15.45: the folder changing could not be written");
@@ -1645,11 +1647,28 @@ void previewAddresses(const QString& root) {
     const QUrl rewritten = readWallpaperFolder(path).previewSource();
     expect(!rewritten.isEmpty() && rewritten != first,
            QStringLiteral("S15.45: the rewritten preview kept its address %1 (now \"%2\")").arg(first.toString(), rewritten.toString()));
-    Wallpaper broken;
-    broken.filePath = path;
-    broken.previewName = QStringLiteral("preview.png");
-    broken.problem = QStringLiteral("x");
-    expect(broken.previewSource().isEmpty(), QStringLiteral("S15.45: a broken wallpaper has a preview address"));
+    // GOAL: S15.45 (restated 2026-11-11) -- an address exists whenever there is a preview name, usable or
+    //       not (an unsupported Wallpaper Engine item keeps its picture); a broken folder has none, because
+    //       reading it as broken drops the name even when its preview file is there.
+    // CONTROL: 2026-11-11, control_batch, each alone, reverted: app/library/wpx_package.cpp previewSource()
+    //       given `if (!usable()) { return {}; }` first -> red, "S15.45: an unusable wallpaper with a preview
+    //       name has no address"; broken()'s result given `previewName = QStringLiteral("preview.png")` ->
+    //       red, "S15.45: a broken wallpaper has a preview address".
+    Wallpaper unsupported;
+    unsupported.filePath = path;
+    unsupported.previewName = QStringLiteral("preview.png");
+    unsupported.problem = QStringLiteral("x");
+    expect(!unsupported.previewSource().isEmpty(), QStringLiteral("S15.45: an unusable wallpaper with a preview name has no address"));
+    Entries noAsset = planEntries(QByteArray(kPlanManifest));
+    noAsset.removeLast();
+    const QString brokenPath = root + QStringLiteral("/no-asset");
+    if (!writeFolder(brokenPath, noAsset).isEmpty() || !QFile::exists(brokenPath + QStringLiteral("/preview.png"))) {
+        harnessFailure("S15.45: the folder missing its asset could not be written with its preview");
+        return;
+    }
+    const Wallpaper broken = readWallpaperFolder(brokenPath);
+    expect(!broken.usable() && broken.previewSource().isEmpty(),
+           QStringLiteral("S15.45: a broken wallpaper has a preview address (usable %1, \"%2\")").arg(broken.usable()).arg(broken.previewSource().toString()));
 
     // GOAL: S15.45 -- the provider decodes a folder's preview scaled down to cover the requested box
     //       and never enlarges it; it reports the full size, and an address it cannot serve gives a

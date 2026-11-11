@@ -106,9 +106,9 @@ void states(const QString& root) {
     //       taken, and only then Ready.
     // WHY-THIS-SHAPE: checked right after rescan() too, before the event loop runs, which is when a
     //       manager that settled Ready eagerly (before the scan came back) would show it.
-    // CONTROL: app/library/library_manager.h, `State m_state = State::Loading;` made
-    //       `State::Ready` -> red, "S15.36: before its first scan the library is 1 with 0
-    //       wallpaper(s)" (1 is Ready); restored.
+    // CONTROL: app/library/library_manager.cpp, 2026-11-11, control_batch, reverted: state()'s no-scan-yet
+    //       `State::Loading` made `State::Ready` -> red, "S15.36: before its first scan the library is 1 with 0
+    //       wallpaper(s)" (1 is Ready).
     const bool loadingBefore = m.state() == LibraryManager::State::Loading && m.wallpapers().isEmpty();
     m.rescan();
     const bool loadingDuring = m.state() == LibraryManager::State::Loading;
@@ -120,15 +120,16 @@ void states(const QString& root) {
         return;
     }
 
-    // GOAL: S15.36 -- whenever stateChanged or wallpapersChanged is emitted, state, reason and list
-    //       already agree: Unavailable has a reason and an empty list, Ready has no reason.
+    // GOAL: S15.36 (restated 2026-11-11) -- whenever stateChanged or wallpapersChanged is emitted, state,
+    //       reason and list already agree: Unavailable has a reason and an empty list, Ready has no reason.
     // WHY-THIS-SHAPE: each emission is recorded with the three fields as a handler reads them, and
     //       each record is checked against the invariant, so an emission between two of the writes
     //       is caught whichever order they come in.
-    // CONTROL: app/library/library_manager.cpp, settle()'s `m_model.assign(std::move(wallpapers));`
-    //       moved after `emit stateChanged();` -> red, "S15.36: a handler saw Unavailable with 1
-    //       wallpaper(s)"; rescan()'s Ready settle given `m_unavailableReason` instead of `{}` -> red,
-    //       "a handler saw state 1 with 1 wallpaper(s) and reason "…/states is not a folder.""; restored.
+    // CONTROL: app/library/library_manager.cpp, 2026-11-11, control_batch, reverted: settle()'s
+    //       `m_model.assign(std::move(wallpapers));` moved after `emit stateChanged();` -> red, "S15.36: a
+    //       handler saw state 1 with 0 wallpaper(s) and reason """ and "expected each signal once each way; saw
+    //       1 Unavailable and 3 Ready record(s)" (the state, worked out from the rows, had not moved in time).
+    //       Re-run 2026-11-11 on P4-1D's settle(), same lines.
     // COVERAGE-ASSERT: both signals must have been seen in both directions.
     struct Seen {
         LibraryManager::State state;
@@ -140,9 +141,11 @@ void states(const QString& root) {
     QObject::connect(&m, &LibraryManager::stateChanged, [&] { seenState.append({m.state(), m.wallpapers().size(), m.unavailableReason()}); });
     QObject::connect(&m, &LibraryManager::wallpapersChanged, [&] { seenList.append({m.state(), m.wallpapers().size(), m.unavailableReason()}); });
 
-    // GOAL: S15.36 -- a path that exists but is a file is Unavailable, saying so, with an empty list.
-    // CONTROL: app/library/library_manager.cpp, rescan()'s `settle(State::Unavailable, ...)` made
-    //       `settle(State::Ready, {}, {})` -> red, "S15.36: a path that is a file read as state 1"; restored.
+    // GOAL: S15.36 -- with no other source, a path that exists but is a file is Unavailable, saying so,
+    //       with an empty list.
+    // CONTROL: app/library/library_manager.cpp, 2026-11-11, control_batch, reverted: publish()'s
+    //       `Problems problems{std::move(scan->libraryProblem), {}}` made `Problems problems{{}, {}}` -> red,
+    //       "S15.36: a path that is a file read as state 1". Re-run 2026-11-11 on P4-1E's publish(), same line.
     const QString moved = dir + QStringLiteral(".moved");
     if (!QDir().rename(dir, moved) || !writeBytes(dir, "a file")) {
         harnessFailure("S15.36: the library folder could not be replaced by a file");
@@ -161,13 +164,13 @@ void states(const QString& root) {
     m.rescan();
     // Each wait or call is made before its expect(): the message argument may be built first.
     const bool cameBack = readyWith(m, 1);
-    // CONTROL: app/library/library_manager.cpp:132, rescan's Ready settle given `m_unavailableReason`,
-    //       control_batch 2026-10-15, app_library_manager '^states$' -> "FAIL: S15.36: after the library folder
-    //       came back it is state 1, "…/states is not a folder.", [Ocean Waves]", with the handler-record line;
-    //       restored, green.
-    expect(cameBack && m.unavailableReason().isEmpty(),
-           QStringLiteral("S15.36: after the library folder came back it is state %1, \"%2\", [%3]")
-               .arg(int(m.state())).arg(m.unavailableReason(), titles(m.wallpapers())));
+    // CONTROL: app/library/library_manager.cpp, 2026-11-11, control_batch, reverted: settle()'s `m_problems =
+    //       std::move(problems);` kept only when the new problems are not empty (a problem outlives its cure)
+    //       -> red, "FAIL: S15.36: after the library folder came back it is state 1, ...". Re-run 2026-11-11 on
+    //       P4-1D's settle() (kept unless the new problems name the folder, or none were held), same line.
+    expect(cameBack && m.unavailableReason().isEmpty() && m.problems().isEmpty(),
+           QStringLiteral("S15.36: after the library folder came back it is state %1, \"%2\", problems [%3], [%4]")
+               .arg(int(m.state())).arg(m.unavailableReason(), m.problems().join(u'|'), titles(m.wallpapers())));
 
     int unavailableSeen = 0;
     int readySeen = 0;
@@ -237,13 +240,13 @@ void overflowingManifest(const QString& root) {
     // WHY-THIS-SHAPE: the wait is for any settled state, then the state and reason are printed, so
     //       a scan that threw is told apart from one stuck in Loading. The scan-failure handler it
     //       would reach is not reachable by any input today (see CONTROL).
-    // CONTROL: shared/wallpaper_manifest.cpp, control_batch 2026-11-10, each alone, reverted: parse()'s `catch (const
-    //       Json::out_of_range&)` clause deleted (the generic `Json::exception` catch takes it) -> red, "S15.48: ...
-    //       wallpaper.json cannot be read: [json.exception.out_of_range.406] ..."; that and the `Json::exception`
-    //       clause deleted, so the throw leaves the scan -> red, "... Reading …/overflow failed:
-    //       [json.exception.out_of_range.406] number overflow ...", library_manager.cpp's onFailed settling
-    //       Unavailable. Those two plus rescan()'s `.onFailed(...)` deleted -> red, "state 0" (earlier run;
-    //       library_manager.cpp unchanged).
+    // CONTROL: shared/json_document.cpp, 2026-11-11, control_batch, each alone, reverted (re-run there after
+    //       the move):
+    //       parseJsonDocument()'s `catch (const Json::out_of_range&)` clause deleted (the generic
+    //       `Json::exception` catch takes it) -> red, "S15.48: ... wallpaper.json cannot be read:
+    //       [json.exception.out_of_range.406] ..."; that and the `Json::exception` clause deleted, so the
+    //       throw leaves scanLibrary -> red, "S15.48: ... state 2 (...)", the catch in
+    //       app/library/library_manager.cpp LibraryManager::readSources() making it the folder's problem.
     LibraryManager m(dir, kSettleMs);
     m.rescan();
     const bool settled = waitUntil([&] { return m.state() != LibraryManager::State::Loading; }, kWaitMs);
@@ -1064,8 +1067,8 @@ void idleLibrary(const QString& root) {
     //       on the main thread, and file opens -- so none can read as "none" while idle.
     // CONTROL: app/library/folder_watcher.cpp, watchTree()'s `const Listing listing(::opendir(path.constData()), ::closedir);`
     //       made to open through `::fdopendir(::open(...))`, so the walk is invisible to the walk
-    //       counter -> red, "S15.44: the counters saw 1 scan(s), 0 walk(s) and 18 file open(s) in the
-    //       first read", the only line red; restored.
+    //       counter -> red, "S15.44: the counters saw 1 scan(s), 0 walk(s) and 33 file open(s) in the
+    //       first read"; restored. Re-run 2026-11-11, control_batch, after followsInto() moved in.
     const OpenCounts firstOpens = scans.take();
     const int firstOpened = files.take();
     if (!ready) {
@@ -1118,7 +1121,8 @@ void revealed(const QString& root) {
     // WHY-THIS-SHAPE: reveal() is called before the event loop runs, so the watch has not reported
     //       the folder and only reveal's own scan can list it.
     // CONTROL: app/library/library_manager.cpp, settle()'s `m_selection = shown->filePath;` deleted ->
-    //       red, "S15.69: a folder revealed right after it was moved in ... selected """; restored.
+    //       red, "S15.69: a folder revealed right after it was moved in ... selected """; restored. Re-run
+    //       2026-11-11 on P4-1E's publish(), control_batch, same line.
     if (!moveInFolder(staging, dir, QStringLiteral("first"), planEntries(titled("First"))).isEmpty()) {
         fault("S15.69", QStringLiteral("first could not be moved in"));
         return;
@@ -1136,7 +1140,7 @@ void revealed(const QString& root) {
     //       queued, so the result it would wrongly act on is the one that cannot list the folder.
     // CONTROL: app/library/library_manager.cpp, settle()'s `if (m_reveal && m_reveal->scanBegun) {`
     //       made `if (m_reveal) {` -> red, "S15.69: a reveal made while an earlier scan was pending
-    //       ended with "…/first" selected"; restored.
+    //       ended with "…/first" selected"; restored. Re-run 2026-11-11 on P4-1E's publish(), same line.
     m.rescan();
     if (!QThreadPool::globalInstance()->waitForDone(kWaitMs) ||
         !moveInFolder(staging, dir, QStringLiteral("second"), planEntries(titled("Second"))).isEmpty()) {
@@ -1181,7 +1185,8 @@ void revealed(const QString& root) {
     // GOAL: S15.69 -- a revealed path that the scan does not list is given up: a later scan that
     //       lists a folder by that name does not select it.
     // CONTROL: app/library/library_manager.cpp, settle()'s `m_reveal.reset();` deleted -> red,
-    //       "S15.69: a path revealed before it existed was selected when it appeared later"; restored.
+    //       "S15.69: a path revealed before it existed was selected when it appeared later"; restored. Re-run
+    //       2026-11-11 on P4-1E's publish(), same line.
     m.clearSelection();
     const QString never = dir + QStringLiteral("/fifth");
     m.reveal(never);
@@ -1208,10 +1213,10 @@ void revealed(const QString& root) {
     //       scan finds the writer and holds it; the result is taken with the pool drained and
     //       posted events delivered, and the folder shown to be absent from it, before the close.
     //       The quiet period here outlasts the test, so the scan after the close is rescan()'s.
-    // CONTROL: app/library/library_manager.cpp, rescan()'s continuation block
+    // CONTROL: app/library/library_manager.cpp, 2026-11-11, control_batch, reverted: publish()'s block
     //       `if (m_reveal && held.contains(...)) { m_reveal->scanBegun = false; }` deleted -> red,
     //       "S15.69: a folder revealed while a file in it was open for writing ended listed 1 and
-    //       selected """; restored.
+    //       selected """.
     m.clearSelection();
     Entries sixth = planEntries(titled("Sixth"));
     const QByteArray asset = sixth.takeLast().second;
@@ -1277,10 +1282,9 @@ void probeReused(const QString& root) {
     //       stamp is unchanged keeps the answer it was probed with.
     // WHY-THIS-SHAPE: the asset is no longer media, so a scan handed nothing reads it as Unknown; the marker
     //       folder makes the rescan's result a change, whose arrival is the barrier.
-    // CONTROL: via control_batch.sh, --phase '^probeReused$', 2026-10-11, LibraryManager::rescan
-    //       (app/library/library_manager.cpp) calling `scanLibrary(directory)` with no rows -> "FAIL: S15.490:
+    // CONTROL: app/library/library_manager.cpp, 2026-11-11, control_batch, --phase '^probeReused$', reverted:
+    //       LibraryManager::readSources() calling `scanLibrary(directory)` with no rows -> "FAIL: S15.490:
     //       after a rescan with ocean's stamp unchanged, ocean's audio reads 0 (Present is 2; rescanned 1)".
-    //       Reverted.
     m.rescan();
     const bool rescanned = readyWith(m, 2);
     expect(rescanned && oceanAudio() == int(AudioStreams::Present),
