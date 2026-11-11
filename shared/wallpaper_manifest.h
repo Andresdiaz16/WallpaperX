@@ -8,7 +8,9 @@
 // Contents of its own) and whether a video has sound (AudioOf).
 
 #include "audio_streams.h"
+#include "plain_path.h"
 #include "property_rules.h"
+#include "system_error.h"
 #include "unique_fd.h"
 #include "wallpaper_position.h"
 
@@ -115,12 +117,7 @@ std::optional<std::string> assetNameIn(std::string_view json);
 std::optional<Value> acceptValue(std::string_view type, const Property* declared, std::string_view key,
                                  const Value& value);
 
-// Refuses what could reach outside a folder: absolute, empty parts, ".", "..", backslashes, NUL.
-bool isPlainRelativePath(std::string_view name);
 bool isValidUtf8(std::string_view text);
-
-// `errno` as the sentence fragment the system gives it.
-std::string systemError(int error);
 
 // ---- the files ------------------------------------------------------------------------------------
 

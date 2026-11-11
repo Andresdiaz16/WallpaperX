@@ -14,7 +14,6 @@
 #include <format>
 #include <limits>
 #include <span>
-#include <system_error>
 
 #include <fcntl.h>
 #include <linux/openat2.h>
@@ -355,19 +354,6 @@ std::optional<Value> acceptValue(std::string_view type, const Property* declared
     return allowed ? std::optional(value) : std::nullopt;
 }
 
-bool isPlainRelativePath(std::string_view name) {
-    if (name.empty() || name.find('\\') != std::string_view::npos || name.find('\0') != std::string_view::npos) {
-        return false;
-    }
-    for (std::size_t from = 0;;) {
-        const std::size_t slash = name.find('/', from);
-        const std::string_view part = name.substr(from, slash == std::string_view::npos ? slash : slash - from);
-        if (part.empty() || part == "." || part == "..") return false;
-        if (slash == std::string_view::npos) return true;
-        from = slash + 1;
-    }
-}
-
 bool isValidUtf8(std::string_view text) {
     for (std::size_t i = 0; i < text.size();) {
         const auto lead = static_cast<unsigned char>(text[i]);
@@ -398,8 +384,6 @@ bool isValidUtf8(std::string_view text) {
     }
     return true;
 }
-
-std::string systemError(int error) { return std::error_code(error, std::generic_category()).message(); }
 
 int openBeneath(int dirfd, const char* name, int flags) {
     open_how how{};

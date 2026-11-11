@@ -146,6 +146,15 @@ target_include_directories(wallpaperx-daemon-lib PUBLIC
     ${HTTPLIB_INCLUDE_DIR}
 )
 
+# Wallpaper Engine scene packages and textures (docs/phase4): bytes in, CPU-side descriptions out.
+# Its own library with no Vulkan and no bus, so its tests run anywhere.
+pkg_check_modules(LZ4 REQUIRED IMPORTED_TARGET liblz4)
+add_library(wallpaperx-we-compat STATIC daemon/we_compat/package.cpp daemon/we_compat/texture.cpp)
+target_include_directories(wallpaperx-we-compat
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../shared
+    PRIVATE ${STB_INCLUDE_DIR})
+target_link_libraries(wallpaperx-we-compat PRIVATE PkgConfig::LZ4)
+
 # Threads::Threads for the render worker. Current glibc folds pthread into libc so this
 # links either way here, but relying on that makes the build silently platform-specific.
 find_package(Threads REQUIRED)
@@ -268,6 +277,7 @@ endif()
 target_link_libraries(wallpaperx-daemon-lib PUBLIC
     wallpaperx-renderer
     wallpaperx-log-escape
+    wallpaperx-we-compat
     SDBusCpp::sdbus-c++
     nlohmann_json::nlohmann_json
     Threads::Threads
@@ -1405,7 +1415,7 @@ endif()
 # These targets have no Q_OBJECT / Qt usage; AUTOMOC is on globally via
 # qt_standard_project_setup(), so turn it off here to skip a pointless moc step.
 if(WALLPAPERX_BUILD_KDE_PLUGIN)
-    set_target_properties(wallpaperx-daemon-lib wallpaperx-daemon wallpaperx-dbus-service-test
+    set_target_properties(wallpaperx-we-compat wallpaperx-daemon-lib wallpaperx-daemon wallpaperx-dbus-service-test
                           wallpaperx-daemon-system-test wallpaperx-http-server-test
                           wallpaperx-log-escape-test wallpaperx-decode-load-test wallpaperx-config-store-test wallpaperx-request-share-test
                           wallpaperx-kpackage-metadata-test wallpaperx-qml-lint-test
@@ -1467,6 +1477,22 @@ set_tests_properties(config_store PROPERTIES LABELS "novulkan"
 # fixed ten-second quiet period, so the entry takes about eleven seconds.
 wallpaperx_add_test(NAME request_share COMMAND $<TARGET_FILE:wallpaperx-request-share-test>)
 set_tests_properties(request_share PROPERTIES LABELS "novulkan")
+# The package reader and texture decoder on synthetic files; and, in the second entry, when
+# WALLPAPERX_TEST_STEAMAPPS names a Steam library's steamapps folder, on every scene package and
+# built-in texture in it, which skips without one. Plain files only, hence `novulkan`.
+set(WALLPAPERX_TEST_STEAMAPPS "" CACHE PATH
+    "A steamapps folder holding Wallpaper Engine items, read (never written) by the we_compat entry")
+add_executable(wallpaperx-we-compat-test tests/we_compat_test.cpp)
+target_link_libraries(wallpaperx-we-compat-test PRIVATE wallpaperx-we-compat)
+target_include_directories(wallpaperx-we-compat-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${STB_INCLUDE_DIR})
+target_link_libraries(wallpaperx-we-compat-test PRIVATE PkgConfig::LZ4)
+set_target_properties(wallpaperx-we-compat-test PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+wallpaperx_add_test(NAME we_compat COMMAND $<TARGET_FILE:wallpaperx-we-compat-test>)
+set_tests_properties(we_compat PROPERTIES LABELS "novulkan")
+wallpaperx_add_test(NAME we_compat_real_items COMMAND $<TARGET_FILE:wallpaperx-we-compat-test> real-items)
+set_tests_properties(we_compat_real_items PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77
+                     ENVIRONMENT "WALLPAPERX_TEST_STEAMAPPS=${WALLPAPERX_TEST_STEAMAPPS}")
+
 wallpaperx_add_test(NAME processor_check COMMAND $<TARGET_FILE:wallpaperx-processor-check-test>)
 set_tests_properties(processor_check PROPERTIES SKIP_RETURN_CODE 77 LABELS "novulkan")
 
